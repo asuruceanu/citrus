@@ -99,16 +99,16 @@ footer { margin-top: 64px; padding-top: 18px; border-top: 1px solid var(--line);
   <header>
     <div class="eyebrow">citrus-graphql · proof of concept</div>
     <h1>GraphQLZero PoC Report</h1>
-    <p class="lede col">How the new Citrus GraphQL module was challenged against a real, public GraphQL API: every query and mutation of GraphQLZero, written three times, once each in the Java, XML and YAML test DSLs, plus edge cases that probe how the module handles real server behaviour.</p>
+    <p class="lede col">How the new Citrus GraphQL module was challenged against a real, public GraphQL API: every query and mutation of GraphQLZero, run five ways (three Java styles plus the XML and YAML test DSLs), plus edge cases that probe how the module handles real server behaviour.</p>
     <div class="meta"><div>Branch <span>feature/graphql-zero-poc</span></div><div>Module <span>endpoints/citrus-graphql-zero-poc</span></div><div>Target <span>https://graphqlzero.almansi.me/api</span></div><div>Run <span>2026-10-09</span></div></div>
   </header>
 
   <section class="verdict" aria-label="Result summary">
-    <div class="ok"><b>29 / 29</b><small>Citrus tests passed</small></div>
-    <div><b>90</b><small>operation calls (30 × 3 DSLs)</small></div>
+    <div class="ok"><b>41 / 41</b><small>Citrus tests passed</small></div>
+    <div><b>150</b><small>operation calls (30 × 5 suites)</small></div>
     <div><b>11</b><small>edge cases</small></div>
-    <div><b>101</b><small>HTTP requests to the live API</small></div>
-    <div><b>54 s</b><small>full <code>mvn verify</code></small></div>
+    <div><b>161</b><small>HTTP requests to the live API</small></div>
+    <div><b>41 s</b><small>test time for all suites</small></div>
     <div class="ok"><b>0</b><small>failures, no retries</small></div>
   </section>
 
@@ -121,13 +121,16 @@ footer { margin-top: 64px; padding-top: 18px; border-top: 1px solid var(--line);
   <h2>How the tests were built</h2>
   <div class="col">
     <p>The schema was taken from the live API by running a full introspection query and converting the result to SDL with graphql-java. That file (<code>graphqlzero.graphqls</code>, 299 lines) is configured on every client, so each document is validated against the real schema <em>before</em> it is sent.</p>
-    <p>To make sure the three DSLs test exactly the same thing, the 30 operations were described once, in a table of document, variables and expected values, and the Java, XML and YAML tests were generated from it. Every expected value was first observed against the live API with plain HTTP calls.</p>
+    <p>To make sure the DSLs test exactly the same thing, the 30 operations were described once, in a table of document, variables and expected values, and the Java, XML and YAML tests were generated from it. Every expected value was first observed against the live API with plain HTTP calls.</p>
+    <p>Two more Java suites then re-run the same 30 operations with the same expectations, but drive the module differently. <code>GraphQlZeroResourceIT</code> loads every document from a <code>.graphql</code> file with <code>queryResource(...)</code>. <code>GraphQlZeroSendReceiveIT</code> skips the <code>$(graphql()...)</code> shorthand and builds the send and receive actions directly. It passes variables as Java records and maps instead of JSON strings, and maps the six single-item responses onto Java records that are checked with AssertJ.</p>
   </div>
   <div class="flow" aria-label="Generation flow">
     <div class="box"><strong>Operation table</strong><small class="mono">30 operations · document · variables · expected values</small></div>
     <div class="arrow" aria-hidden="true">→</div>
     <div class="outs">
-      <div class="box"><strong>GraphQlZeroJavaIT</strong><small class="mono">6 test methods, one per resource</small></div>
+      <div class="box"><strong>GraphQlZeroJavaIT</strong><small class="mono">6 test methods, one per resource, inline documents</small></div>
+      <div class="box"><strong>GraphQlZeroResourceIT</strong><small class="mono">same 30 operations, documents from graphql/zero/*.graphql</small></div>
+      <div class="box"><strong>GraphQlZeroSendReceiveIT</strong><small class="mono">same 30 operations, raw action builders, object variables, entity mapping</small></div>
       <div class="box"><strong>graphqlzero-*.citrus.it.xml</strong><small class="mono">6 XML tests, endpoints declared in the test</small></div>
       <div class="box"><strong>graphqlzero-*.citrus.it.yaml</strong><small class="mono">6 YAML tests, endpoints declared in the test</small></div>
     </div>
@@ -137,11 +140,11 @@ footer { margin-top: 64px; padding-top: 18px; border-top: 1px solid var(--line);
   </div>
 
   <h2>Coverage</h2>
-  <p class="col">All 30 operations, each exercised in every DSL. Each cell shows the Java, XML and YAML run.</p>
+  <p class="col">All 30 operations, each run five ways. In each cell: <span class="mono">J</span> Java with inline documents, <span class="mono">R</span> Java with resource documents, <span class="mono">A</span> Java with raw action builders, <span class="mono">X</span> XML, <span class="mono">Y</span> YAML.</p>
   <div class="scroll">
     <table class="matrix">
       <thead><tr><th>Resource</th><th>Get <span class="chip q">query</span></th><th>List <span class="chip q">query</span></th><th>Create <span class="chip m">mutation</span></th><th>Update <span class="chip m">mutation</span></th><th>Delete <span class="chip m">mutation</span></th><th>Values asserted</th></tr></thead>
-      <tbody><tr><td><strong>Post</strong> <span class="mono" style="color:var(--muted)">posts</span></td><td><div class="dots"><span class="dot" title="Java passed">J</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td><div class="dots"><span class="dot" title="Java passed">J</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td><div class="dots"><span class="dot" title="Java passed">J</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td><div class="dots"><span class="dot" title="Java passed">J</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td><div class="dots"><span class="dot" title="Java passed">J</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td class="num">13 × 3</td></tr><tr><td><strong>User</strong> <span class="mono" style="color:var(--muted)">users</span></td><td><div class="dots"><span class="dot" title="Java passed">J</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td><div class="dots"><span class="dot" title="Java passed">J</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td><div class="dots"><span class="dot" title="Java passed">J</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td><div class="dots"><span class="dot" title="Java passed">J</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td><div class="dots"><span class="dot" title="Java passed">J</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td class="num">14 × 3</td></tr><tr><td><strong>Comment</strong> <span class="mono" style="color:var(--muted)">comments</span></td><td><div class="dots"><span class="dot" title="Java passed">J</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td><div class="dots"><span class="dot" title="Java passed">J</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td><div class="dots"><span class="dot" title="Java passed">J</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td><div class="dots"><span class="dot" title="Java passed">J</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td><div class="dots"><span class="dot" title="Java passed">J</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td class="num">11 × 3</td></tr><tr><td><strong>Todo</strong> <span class="mono" style="color:var(--muted)">todos</span></td><td><div class="dots"><span class="dot" title="Java passed">J</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td><div class="dots"><span class="dot" title="Java passed">J</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td><div class="dots"><span class="dot" title="Java passed">J</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td><div class="dots"><span class="dot" title="Java passed">J</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td><div class="dots"><span class="dot" title="Java passed">J</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td class="num">12 × 3</td></tr><tr><td><strong>Album</strong> <span class="mono" style="color:var(--muted)">albums</span></td><td><div class="dots"><span class="dot" title="Java passed">J</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td><div class="dots"><span class="dot" title="Java passed">J</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td><div class="dots"><span class="dot" title="Java passed">J</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td><div class="dots"><span class="dot" title="Java passed">J</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td><div class="dots"><span class="dot" title="Java passed">J</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td class="num">10 × 3</td></tr><tr><td><strong>Photo</strong> <span class="mono" style="color:var(--muted)">photos</span></td><td><div class="dots"><span class="dot" title="Java passed">J</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td><div class="dots"><span class="dot" title="Java passed">J</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td><div class="dots"><span class="dot" title="Java passed">J</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td><div class="dots"><span class="dot" title="Java passed">J</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td><div class="dots"><span class="dot" title="Java passed">J</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td class="num">11 × 3</td></tr></tbody>
+      <tbody><tr><td><strong>Post</strong> <span class="mono" style="color:var(--muted)">posts</span></td><td><div class="dots"><span class="dot" title="Java (inline) passed">J</span><span class="dot" title="Java (resource documents) passed">R</span><span class="dot" title="Java (raw action builders) passed">A</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td><div class="dots"><span class="dot" title="Java (inline) passed">J</span><span class="dot" title="Java (resource documents) passed">R</span><span class="dot" title="Java (raw action builders) passed">A</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td><div class="dots"><span class="dot" title="Java (inline) passed">J</span><span class="dot" title="Java (resource documents) passed">R</span><span class="dot" title="Java (raw action builders) passed">A</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td><div class="dots"><span class="dot" title="Java (inline) passed">J</span><span class="dot" title="Java (resource documents) passed">R</span><span class="dot" title="Java (raw action builders) passed">A</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td><div class="dots"><span class="dot" title="Java (inline) passed">J</span><span class="dot" title="Java (resource documents) passed">R</span><span class="dot" title="Java (raw action builders) passed">A</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td class="num">13 × 5</td></tr><tr><td><strong>User</strong> <span class="mono" style="color:var(--muted)">users</span></td><td><div class="dots"><span class="dot" title="Java (inline) passed">J</span><span class="dot" title="Java (resource documents) passed">R</span><span class="dot" title="Java (raw action builders) passed">A</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td><div class="dots"><span class="dot" title="Java (inline) passed">J</span><span class="dot" title="Java (resource documents) passed">R</span><span class="dot" title="Java (raw action builders) passed">A</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td><div class="dots"><span class="dot" title="Java (inline) passed">J</span><span class="dot" title="Java (resource documents) passed">R</span><span class="dot" title="Java (raw action builders) passed">A</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td><div class="dots"><span class="dot" title="Java (inline) passed">J</span><span class="dot" title="Java (resource documents) passed">R</span><span class="dot" title="Java (raw action builders) passed">A</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td><div class="dots"><span class="dot" title="Java (inline) passed">J</span><span class="dot" title="Java (resource documents) passed">R</span><span class="dot" title="Java (raw action builders) passed">A</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td class="num">14 × 5</td></tr><tr><td><strong>Comment</strong> <span class="mono" style="color:var(--muted)">comments</span></td><td><div class="dots"><span class="dot" title="Java (inline) passed">J</span><span class="dot" title="Java (resource documents) passed">R</span><span class="dot" title="Java (raw action builders) passed">A</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td><div class="dots"><span class="dot" title="Java (inline) passed">J</span><span class="dot" title="Java (resource documents) passed">R</span><span class="dot" title="Java (raw action builders) passed">A</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td><div class="dots"><span class="dot" title="Java (inline) passed">J</span><span class="dot" title="Java (resource documents) passed">R</span><span class="dot" title="Java (raw action builders) passed">A</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td><div class="dots"><span class="dot" title="Java (inline) passed">J</span><span class="dot" title="Java (resource documents) passed">R</span><span class="dot" title="Java (raw action builders) passed">A</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td><div class="dots"><span class="dot" title="Java (inline) passed">J</span><span class="dot" title="Java (resource documents) passed">R</span><span class="dot" title="Java (raw action builders) passed">A</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td class="num">11 × 5</td></tr><tr><td><strong>Todo</strong> <span class="mono" style="color:var(--muted)">todos</span></td><td><div class="dots"><span class="dot" title="Java (inline) passed">J</span><span class="dot" title="Java (resource documents) passed">R</span><span class="dot" title="Java (raw action builders) passed">A</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td><div class="dots"><span class="dot" title="Java (inline) passed">J</span><span class="dot" title="Java (resource documents) passed">R</span><span class="dot" title="Java (raw action builders) passed">A</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td><div class="dots"><span class="dot" title="Java (inline) passed">J</span><span class="dot" title="Java (resource documents) passed">R</span><span class="dot" title="Java (raw action builders) passed">A</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td><div class="dots"><span class="dot" title="Java (inline) passed">J</span><span class="dot" title="Java (resource documents) passed">R</span><span class="dot" title="Java (raw action builders) passed">A</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td><div class="dots"><span class="dot" title="Java (inline) passed">J</span><span class="dot" title="Java (resource documents) passed">R</span><span class="dot" title="Java (raw action builders) passed">A</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td class="num">12 × 5</td></tr><tr><td><strong>Album</strong> <span class="mono" style="color:var(--muted)">albums</span></td><td><div class="dots"><span class="dot" title="Java (inline) passed">J</span><span class="dot" title="Java (resource documents) passed">R</span><span class="dot" title="Java (raw action builders) passed">A</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td><div class="dots"><span class="dot" title="Java (inline) passed">J</span><span class="dot" title="Java (resource documents) passed">R</span><span class="dot" title="Java (raw action builders) passed">A</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td><div class="dots"><span class="dot" title="Java (inline) passed">J</span><span class="dot" title="Java (resource documents) passed">R</span><span class="dot" title="Java (raw action builders) passed">A</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td><div class="dots"><span class="dot" title="Java (inline) passed">J</span><span class="dot" title="Java (resource documents) passed">R</span><span class="dot" title="Java (raw action builders) passed">A</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td><div class="dots"><span class="dot" title="Java (inline) passed">J</span><span class="dot" title="Java (resource documents) passed">R</span><span class="dot" title="Java (raw action builders) passed">A</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td class="num">10 × 5</td></tr><tr><td><strong>Photo</strong> <span class="mono" style="color:var(--muted)">photos</span></td><td><div class="dots"><span class="dot" title="Java (inline) passed">J</span><span class="dot" title="Java (resource documents) passed">R</span><span class="dot" title="Java (raw action builders) passed">A</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td><div class="dots"><span class="dot" title="Java (inline) passed">J</span><span class="dot" title="Java (resource documents) passed">R</span><span class="dot" title="Java (raw action builders) passed">A</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td><div class="dots"><span class="dot" title="Java (inline) passed">J</span><span class="dot" title="Java (resource documents) passed">R</span><span class="dot" title="Java (raw action builders) passed">A</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td><div class="dots"><span class="dot" title="Java (inline) passed">J</span><span class="dot" title="Java (resource documents) passed">R</span><span class="dot" title="Java (raw action builders) passed">A</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td><div class="dots"><span class="dot" title="Java (inline) passed">J</span><span class="dot" title="Java (resource documents) passed">R</span><span class="dot" title="Java (raw action builders) passed">A</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td class="num">11 × 5</td></tr></tbody>
     </table>
   </div>
 
@@ -153,11 +156,13 @@ footer { margin-top: 64px; padding-top: 18px; border-top: 1px solid var(--line);
     </table>
   </div>
 
-  <h2>One operation, three DSLs</h2>
-  <p class="col">The <code>createPost</code> mutation as it appears in each test. The documents, variables and expectations are identical; only the notation differs.</p>
+  <h2>One operation, five ways</h2>
+  <p class="col">The <code>createPost</code> mutation as it appears in each suite. The documents, variables and expectations are identical; only the notation differs.</p>
   <div class="tabs" data-tabs>
     <div class="tablist" role="tablist" aria-label="DSL">
       <button role="tab" id="tab-java" aria-selected="true" aria-controls="panel-java">Java</button>
+      <button role="tab" id="tab-res" aria-selected="false" aria-controls="panel-res" tabindex="-1">Java · resource</button>
+      <button role="tab" id="tab-raw" aria-selected="false" aria-controls="panel-raw" tabindex="-1">Java · raw actions</button>
       <button role="tab" id="tab-xml" aria-selected="false" aria-controls="panel-xml" tabindex="-1">XML</button>
       <button role="tab" id="tab-yaml" aria-selected="false" aria-controls="panel-yaml" tabindex="-1">YAML</button>
     </div>
@@ -178,6 +183,36 @@ $(graphql().client(graphqlZero)
         .data(&quot;$.createPost.body&quot;, &quot;GraphQL rocks&quot;)
         .message()
         .status(200));</pre></div>
+    <div role="tabpanel" id="panel-res" aria-labelledby="tab-res" hidden><pre>// mutation CreatePost
+$(graphql().client(graphqlZero)
+        .send()
+        .queryResource(&quot;classpath:graphql/zero/create-post.graphql&quot;)
+        .variables(&quot;&quot;&quot;
+            {&quot;input&quot;: {&quot;title&quot;: &quot;Citrus&quot;, &quot;body&quot;: &quot;GraphQL rocks&quot;}}&quot;&quot;&quot;));
+
+$(graphql().client(graphqlZero)
+        .receive()
+        .data(&quot;$.createPost.id&quot;, &quot;101&quot;)
+        .data(&quot;$.createPost.title&quot;, &quot;Citrus&quot;)
+        .data(&quot;$.createPost.body&quot;, &quot;GraphQL rocks&quot;)
+        .message()
+        .status(200));
+
+// graphql/zero/create-post.graphql
+mutation CreatePost($input: CreatePostInput!) {
+  createPost(input: $input) { id title body }
+}</pre></div>
+    <div role="tabpanel" id="panel-raw" aria-labelledby="tab-raw" hidden><pre>// mutation CreatePost (input sent as a record, not a JSON string)
+run(send(&quot;&quot;&quot;
+            mutation CreatePost($input: CreatePostInput!) {
+              createPost(input: $input) { id title body }
+            }&quot;&quot;&quot;,
+        Map.of(&quot;input&quot;, new CreatePostInput(&quot;Citrus&quot;, &quot;GraphQL rocks&quot;))));
+run(receive(new Object[][]{
+        {&quot;$.createPost.id&quot;, &quot;101&quot;},
+        {&quot;$.createPost.title&quot;, &quot;Citrus&quot;},
+        {&quot;$.createPost.body&quot;, &quot;GraphQL rocks&quot;},
+}));</pre></div>
     <div role="tabpanel" id="panel-xml" aria-labelledby="tab-xml" hidden><pre>&lt;!-- mutation CreatePost --&gt;
 &lt;graphql client=&quot;zeroPosts&quot;&gt;
   &lt;send-request&gt;
@@ -237,6 +272,41 @@ $(graphql().client(graphqlZero)
           - &quot;classpath:graphql/graphqlzero.graphqls&quot;
         timeout: 20000</pre></div>
   </div>
+
+  <h2>Raw action builders and typed objects</h2>
+  <div class="col"><p><code>GraphQlZeroSendReceiveIT</code> shows the module without the DSL shorthand. A small helper builds the request action and passes each variable as a Java object; records and maps are serialized as JSON objects with their types intact:</p></div>
+  <div class="code"><div class="cap"><span>GraphQlZeroSendReceiveIT.java</span><button class="copy" type="button" data-copy="ex-raw-helper">Copy</button></div><pre id="ex-raw-helper">private SendMessageAction send(String query, Map&lt;String, ?&gt; variables) {
+    GraphQlClientRequestActionBuilder builder = new GraphQlClientRequestActionBuilder();
+    builder.endpoint(graphqlZero);
+    builder.name(&quot;graphql:send-request&quot;);
+    builder.query(query);
+    for (Map.Entry&lt;String, ?&gt; variable : variables.entrySet()) {
+        builder.variable(variable.getKey(), variable.getValue());
+    }
+    return builder.build();
+}</pre></div>
+  <div class="col"><p>Each single-item read also binds the whole response to Java records with Citrus' JSON mapping support and asserts on the objects with AssertJ, next to the JSONPath checks:</p></div>
+  <div class="code"><div class="cap"><span>GraphQlZeroSendReceiveIT.java</span><button class="copy" type="button" data-copy="ex-raw-get">Copy</button></div><pre id="ex-raw-get">// query GetPost
+run(send(&quot;&quot;&quot;
+            query GetPost($id: ID!) {
+              post(id: $id) {
+                id
+                title
+                user { id name }
+              }
+            }&quot;&quot;&quot;,
+        &quot;&quot;&quot;
+            {&quot;id&quot;: &quot;1&quot;}&quot;&quot;&quot;));
+run(receive(new Object[][]{
+        {&quot;$.post.id&quot;, &quot;1&quot;},
+        {&quot;$.post.title&quot;, &quot;sunt aut facere repellat provident occaecati excepturi optio reprehenderit&quot;},
+        {&quot;$.post.user.name&quot;, &quot;Leanne Graham&quot;},
+}, entity(PostResponse.class, (response, headers, context) -&gt; {
+    assertThat(response.data().post().id()).isEqualTo(&quot;1&quot;);
+    assertThat(response.data().post().title())
+            .isEqualTo(&quot;sunt aut facere repellat provident occaecati excepturi optio reprehenderit&quot;);
+    assertThat(response.data().post().user().name()).isEqualTo(&quot;Leanne Graham&quot;);
+})));</pre></div>
 
   <h2>Edge cases</h2>
   <p class="col">Hand-written tests that go beyond the happy path and check how the module copes with the real server's behaviour.</p>
@@ -299,7 +369,7 @@ $(graphql().client(graphqlZero)
   <div class="col">
     <p>A suite that passes on its first run proves little unless its assertions actually bite. So one expected value was changed on purpose in each DSL (user 1's username, from <code>Bret</code> to <code>NotBret</code>) and the operation tests were run again. Exactly the three affected tests failed, each naming the path, the expected value and the received value:</p>
     <div class="neg"><span class="chip fail">✗ GraphQlZeroJavaIT.users</span> <span class="chip fail">✗ GraphQlZeroUsersXmlIT</span> <span class="chip fail">✗ GraphQlZeroUsersYamlIT</span><p style="margin:10px 0 0"><code>Values not equal for element '$.data.user.username', expected 'NotBret' but was 'Bret'</code></p></div>
-    <p>The change was reverted afterwards and the full suite passed again.</p>
+    <p>The change was reverted afterwards and the full suite passed again. This check ran before the two additional Java suites existed; they use the same expected values and the same assertion path.</p>
   </div>
 
   <h2>What the real server taught us</h2>
@@ -307,15 +377,18 @@ $(graphql().client(graphqlZero)
     <article class="finding"><div class="tag">Apollo · CSRF prevention</div><h3>GET needs a preflight header</h3><p>Apollo rejects GET requests that could be cross-site requests with <code>400</code> and code <code>BAD_REQUEST</code>. Adding <code>apollo-require-preflight: true</code> through the regular <code>.message().header(...)</code> was enough. No module change was needed.</p></article>
     <article class="finding"><div class="tag">GraphQL over HTTP</div><h3>400 even for legacy JSON</h3><p>For an invalid document Apollo answers <code>400</code> with both <code>application/graphql-response+json</code> and legacy <code>application/json</code>. The spec allows <code>200</code> for the legacy type, and Spring GraphQL does that. The module does not care: it checks <code>errors</code> whatever the status.</p></article>
     <article class="finding"><div class="tag">Data model</div><h3>Unknown ids are not errors</h3><p><code>post(id: 9999)</code> returns an object whose fields are all <code>null</code>, with no <code>errors</code>. A whole-object <code>data(...)</code> comparison expresses that precisely.</p></article>
+    <article class="finding"><div class="tag">Java API</div><h3>Records work as variables</h3><p>Passing <code>new CreatePostInput("Citrus", "GraphQL rocks")</code> or nested maps as a variable produced the same JSON input object as the hand-written variables, booleans and ids included. The server accepted all twelve create and update mutations sent this way.</p></article>
     <article class="finding"><div class="tag">Schema</div><h3>The introspected schema loads as is</h3><p>The 299-line SDL from introspection, with enums, input types and nested paginated types, loaded without any change, and caught the invalid <code>isbn</code> field before any network call. That check took 3 ms.</p></article>
   </div>
 
   <h2>Run it</h2>
-  <div class="code"><div class="cap"><span>From the repository root (needs internet access)</span><button class="copy" type="button" data-copy="cmd-run">Copy</button></div><pre id="cmd-run">./mvnw verify -pl endpoints/citrus-graphql-zero-poc</pre></div>
+  <div class="code"><div class="cap"><span>From the repository root (needs internet access; <code>-am</code> builds the branch&#39;s own Citrus modules in the same run)</span><button class="copy" type="button" data-copy="cmd-run">Copy</button></div><pre id="cmd-run">./mvnw verify -pl endpoints/citrus-graphql-zero-poc -am -Dskip.unit.tests=true -Dit.test=GraphQlZero*IT -Dfailsafe.failIfNoSpecifiedTests=false</pre></div>
   <div class="col">
     <h3>Files</h3>
     <ul class="plain">
-      <li><code>GraphQlZeroJavaIT.java</code>: Java DSL, 30 operations</li>
+      <li><code>GraphQlZeroJavaIT.java</code>: Java DSL with inline documents, 30 operations</li>
+      <li><code>GraphQlZeroResourceIT.java</code> and <code>graphql/zero/*.graphql</code>: the same 30 operations with documents loaded from 30 files</li>
+      <li><code>GraphQlZeroSendReceiveIT.java</code>: the same 30 operations with raw action builders, object variables and entity mapping</li>
       <li><code>GraphQlZeroXmlIT.java</code> and <code>graphqlzero-*.citrus.it.xml</code>: XML DSL, 6 tests</li>
       <li><code>GraphQlZeroYamlIT.java</code> and <code>graphqlzero-*.citrus.it.yaml</code>: YAML DSL, 6 tests</li>
       <li><code>GraphQlZeroEdgeCasesIT.java</code>: 11 edge cases</li>
@@ -329,7 +402,7 @@ $(graphql().client(graphqlZero)
     </ul>
   </div>
 
-  <footer>Branch <span class="mono">feature/graphql-zero-poc</span>, cut from <span class="mono">feature/graphql-endpoint</span>. Commit <span class="mono">feedbc1fe</span>. Generated from the test sources and the Maven run of 2026-10-09.</footer>
+  <footer>Branch <span class="mono">feature/graphql-zero-poc</span>, cut from <span class="mono">feature/graphql-endpoint</span>. Commit <span class="mono">068d6070a</span>. Generated from the test sources and the Maven run of 2026-10-09.</footer>
 </main>
 
 <script>
