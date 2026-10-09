@@ -1,0 +1,22 @@
+# citrus-graphql — GraphQLZero proof of concept
+
+Integration tests of the `citrus-graphql` module against the public
+[GraphQLZero](https://graphqlzero.almansi.me) API (`https://graphqlzero.almansi.me/api`, an Apollo
+Server serving the JSONPlaceholder data set). **Needs internet access.**
+
+| Test | DSL | Covers |
+|---|---|---|
+| `GraphQlZeroJavaIT` | Java | all 30 operations (6 resources × get, list, create, update, delete) |
+| `GraphQlZeroXmlIT` | XML | all 30 operations, one test per resource (`*.citrus.it.xml`) |
+| `GraphQlZeroYamlIT` | YAML | all 30 operations, one test per resource (`*.citrus.it.yaml`) |
+| `GraphQlZeroEdgeCasesIT` | Java | GET + Apollo CSRF preflight, schema check before sending, server validation errors (400), unexpected errors, null data, multi-operation documents, aliases/fragments, resource documents, chaining |
+
+Every client validates documents against `src/test/resources/graphql/graphqlzero.graphqls`, the
+schema obtained by introspection of the live API.
+
+```bash
+./mvnw verify -pl endpoints/citrus-graphql-zero-poc
+```
+
+The Java, XML and YAML operation tests are generated from one operation table, so the three DSLs
+exercise exactly the same requests and expectations.
