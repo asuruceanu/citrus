@@ -1,0 +1,365 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GraphQLZero PoC Report</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: a single reading column (~68ch) with wide breakouts for the coverage matrix and code tabs. */
+:root {
+  --bg: #f6f7f8; --surface: #ffffff; --ink: #1c2126; --muted: #5d6670; --line: #dde1e5;
+  --accent: #a3175f; --accent-soft: #f6e6ef; --pass: #1f7a4d; --pass-soft: #e3f2ea;
+  --fail: #b42318; --fail-soft: #fbe9e7; --code-bg: #f0f2f4; --code-ink: #24292f;
+  --display: "Bricolage Grotesque", "Avenir Next", "Segoe UI", sans-serif;
+  --body: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #121518; --surface: #1a1e22; --ink: #e6e9ec; --muted: #9aa4ae; --line: #2c3238;
+  --accent: #e46aa8; --accent-soft: #3a1a2b; --pass: #5ac38c; --pass-soft: #163325;
+  --fail: #f2836f; --fail-soft: #3b1d18; --code-bg: #0e1114; --code-ink: #d5dbe1; color-scheme: dark } }
+:root[data-theme="dark"] {
+  --bg: #121518; --surface: #1a1e22; --ink: #e6e9ec; --muted: #9aa4ae; --line: #2c3238;
+  --accent: #e46aa8; --accent-soft: #3a1a2b; --pass: #5ac38c; --pass-soft: #163325;
+  --fail: #f2836f; --fail-soft: #3b1d18; --code-bg: #0e1114; --code-ink: #d5dbe1; color-scheme: dark }
+
+body { background: var(--bg); color: var(--ink); font: 15px/1.6 var(--body); }
+.page { max-width: 1040px; margin: 0 auto; padding-inline: 20px; padding-block: 40px 72px; }
+.col { max-width: 70ch; }
+h1, h2, h3 { font-family: var(--display); text-wrap: balance; line-height: 1.15; margin: 0; }
+h1 { font-size: clamp(2rem, 5vw, 3.1rem); font-weight: 700; letter-spacing: -0.02em; }
+h2 { font-size: 1.55rem; font-weight: 700; margin-block: 56px 14px; }
+h3 { font-size: 1.1rem; font-weight: 700; margin-block: 28px 8px; }
+p { margin-block: 0 12px; }
+a { color: var(--accent); }
+code, .mono { font-family: var(--mono); font-size: 0.88em; }
+p code, li code, td code { background: var(--code-bg); padding: 1px 5px; border-radius: 4px; }
+.eyebrow { font: 600 0.75rem/1 var(--body); letter-spacing: 0.12em; text-transform: uppercase; color: var(--accent); margin-bottom: 14px; }
+.lede { font-size: 1.12rem; color: var(--muted); margin-top: 14px; }
+.meta { display: flex; flex-wrap: wrap; gap: 8px 18px; margin-top: 18px; color: var(--muted); font-size: 0.85rem; }
+.meta span { font-family: var(--mono); }
+
+.verdict { margin-top: 32px; display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 1px; background: var(--line); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+.verdict div { background: var(--surface); padding: 16px 18px; min-width: 0; }
+.verdict b { display: block; font: 700 1.9rem/1.1 var(--display); font-variant-numeric: tabular-nums; }
+.verdict small { color: var(--muted); font-size: 0.8rem; }
+.verdict .ok b { color: var(--pass); }
+
+.flow { display: grid; grid-template-columns: 1fr auto 1fr; gap: 14px; align-items: center; margin-block: 18px; }
+.flow .box { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; min-width: 0; }
+.flow .box strong { display: block; font-family: var(--display); }
+.flow .arrow { color: var(--accent); font: 600 1.3rem var(--mono); }
+.flow .outs { display: grid; gap: 8px; }
+.flow .outs .box { padding: 10px 14px; }
+@media (max-width: 640px) { .flow { grid-template-columns: 1fr; } .flow .arrow { transform: rotate(90deg); justify-self: center; } }
+
+.scroll { overflow-x: auto; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
+table { border-collapse: collapse; width: 100%; font-size: 0.9rem; }
+th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { font: 600 0.72rem/1.2 var(--body); letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); background: var(--bg); }
+tr:last-child td { border-bottom: 0; }
+td.num { font-variant-numeric: tabular-nums; font-family: var(--mono); }
+.matrix td { white-space: nowrap; }
+.chip { display: inline-flex; align-items: center; gap: 4px; padding: 2px 8px; border-radius: 999px; font: 500 0.75rem/1.5 var(--mono); }
+.chip.pass { background: var(--pass-soft); color: var(--pass); }
+.chip.fail { background: var(--fail-soft); color: var(--fail); }
+.chip.q { background: var(--code-bg); color: var(--muted); }
+.chip.m { background: var(--accent-soft); color: var(--accent); }
+.dots { display: flex; gap: 4px; }
+.dot { width: 22px; height: 22px; border-radius: 5px; display: grid; place-items: center; font: 600 0.62rem var(--mono); background: var(--pass-soft); color: var(--pass); }
+
+.tabs { margin-top: 12px; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; background: var(--surface); }
+.tablist { display: flex; flex-wrap: wrap; gap: 0; border-bottom: 1px solid var(--line); background: var(--bg); }
+.tablist button { font: 500 0.85rem var(--body); color: var(--muted); background: none; border: 0; padding: 10px 16px; cursor: pointer; border-bottom: 2px solid transparent; }
+.tablist button[aria-selected="true"] { color: var(--ink); border-bottom-color: var(--accent); }
+.tablist button:focus-visible, .copy:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+pre { margin: 0; padding: 16px 18px; overflow-x: auto; background: var(--code-bg); color: var(--code-ink); font: 0.82rem/1.55 var(--mono); }
+.code { border: 1px solid var(--line); border-radius: 10px; overflow: hidden; margin-block: 10px 18px; }
+.code .cap { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 8px 14px; background: var(--bg); border-bottom: 1px solid var(--line); font-size: 0.8rem; color: var(--muted); }
+.copy { font: 500 0.75rem var(--body); border: 1px solid var(--line); background: var(--surface); color: var(--ink); border-radius: 6px; padding: 3px 10px; cursor: pointer; }
+
+.findings { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 14px; margin-top: 14px; }
+.finding { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 16px 18px; min-width: 0; }
+.finding h3 { margin-top: 0; }
+.finding p:last-child { margin-bottom: 0; }
+.finding .tag { font: 600 0.7rem var(--body); letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted); }
+
+.neg { border-left: 3px solid var(--fail); background: var(--surface); border-radius: 0 8px 8px 0; padding: 12px 16px; margin-block: 12px; }
+.neg code { color: var(--fail); background: none; padding: 0; }
+ul.plain { padding-left: 1.1em; margin-block: 0 12px; }
+ul.plain li { margin-bottom: 6px; }
+footer { margin-top: 64px; padding-top: 18px; border-top: 1px solid var(--line); color: var(--muted); font-size: 0.85rem; }
+@media (prefers-reduced-motion: no-preference) { .tablist button { transition: color .15s, border-color .15s; } }
+</style>
+
+<main class="page">
+  <header>
+    <div class="eyebrow">citrus-graphql · proof of concept</div>
+    <h1>GraphQLZero PoC Report</h1>
+    <p class="lede col">How the new Citrus GraphQL module was challenged against a real, public GraphQL API: every query and mutation of GraphQLZero, written three times, once each in the Java, XML and YAML test DSLs, plus edge cases that probe how the module handles real server behaviour.</p>
+    <div class="meta"><div>Branch <span>feature/graphql-zero-poc</span></div><div>Module <span>endpoints/citrus-graphql-zero-poc</span></div><div>Target <span>https://graphqlzero.almansi.me/api</span></div><div>Run <span>2026-10-09</span></div></div>
+  </header>
+
+  <section class="verdict" aria-label="Result summary">
+    <div class="ok"><b>29 / 29</b><small>Citrus tests passed</small></div>
+    <div><b>90</b><small>operation calls (30 × 3 DSLs)</small></div>
+    <div><b>11</b><small>edge cases</small></div>
+    <div><b>101</b><small>HTTP requests to the live API</small></div>
+    <div><b>54 s</b><small>full <code>mvn verify</code></small></div>
+    <div class="ok"><b>0</b><small>failures, no retries</small></div>
+  </section>
+
+  <h2>What was tested</h2>
+  <div class="col">
+    <p><a href="https://graphqlzero.almansi.me" target="_blank" rel="noopener">GraphQLZero</a> is a free, public GraphQL API serving the JSONPlaceholder data set from an Apollo Server. It has six related resources (users, posts, comments, todos, albums and photos) and exposes <strong>12 queries and 18 mutations</strong>: for each resource a single-item query, a paginated list query, and create, update and delete mutations. The data is fixed and mutations are not persisted, so every response is deterministic. Created posts always come back with id 101, a deleted post always returns <code>true</code>.</p>
+    <p>That makes it a good opponent for a test framework. It is a third-party server the module was never built against, it follows the Apollo flavour of GraphQL over HTTP, and its answers can be asserted exactly.</p>
+  </div>
+
+  <h2>How the tests were built</h2>
+  <div class="col">
+    <p>The schema was taken from the live API by running a full introspection query and converting the result to SDL with graphql-java. That file (<code>graphqlzero.graphqls</code>, 299 lines) is configured on every client, so each document is validated against the real schema <em>before</em> it is sent.</p>
+    <p>To make sure the three DSLs test exactly the same thing, the 30 operations were described once, in a table of document, variables and expected values, and the Java, XML and YAML tests were generated from it. Every expected value was first observed against the live API with plain HTTP calls.</p>
+  </div>
+  <div class="flow" aria-label="Generation flow">
+    <div class="box"><strong>Operation table</strong><small class="mono">30 operations · document · variables · expected values</small></div>
+    <div class="arrow" aria-hidden="true">→</div>
+    <div class="outs">
+      <div class="box"><strong>GraphQlZeroJavaIT</strong><small class="mono">6 test methods, one per resource</small></div>
+      <div class="box"><strong>graphqlzero-*.citrus.it.xml</strong><small class="mono">6 XML tests, endpoints declared in the test</small></div>
+      <div class="box"><strong>graphqlzero-*.citrus.it.yaml</strong><small class="mono">6 YAML tests, endpoints declared in the test</small></div>
+    </div>
+  </div>
+  <div class="col">
+    <p>Each operation is a send followed by a receive. The receive checks the HTTP status and several values in <code>data</code>. Any GraphQL error in the response fails the test automatically, since the module treats unexpected errors as failures even when the status is 200. The edge cases are hand-written Java tests.</p>
+  </div>
+
+  <h2>Coverage</h2>
+  <p class="col">All 30 operations, each exercised in every DSL. Each cell shows the Java, XML and YAML run.</p>
+  <div class="scroll">
+    <table class="matrix">
+      <thead><tr><th>Resource</th><th>Get <span class="chip q">query</span></th><th>List <span class="chip q">query</span></th><th>Create <span class="chip m">mutation</span></th><th>Update <span class="chip m">mutation</span></th><th>Delete <span class="chip m">mutation</span></th><th>Values asserted</th></tr></thead>
+      <tbody><tr><td><strong>Post</strong> <span class="mono" style="color:var(--muted)">posts</span></td><td><div class="dots"><span class="dot" title="Java passed">J</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td><div class="dots"><span class="dot" title="Java passed">J</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td><div class="dots"><span class="dot" title="Java passed">J</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td><div class="dots"><span class="dot" title="Java passed">J</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td><div class="dots"><span class="dot" title="Java passed">J</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td class="num">13 × 3</td></tr><tr><td><strong>User</strong> <span class="mono" style="color:var(--muted)">users</span></td><td><div class="dots"><span class="dot" title="Java passed">J</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td><div class="dots"><span class="dot" title="Java passed">J</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td><div class="dots"><span class="dot" title="Java passed">J</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td><div class="dots"><span class="dot" title="Java passed">J</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td><div class="dots"><span class="dot" title="Java passed">J</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td class="num">14 × 3</td></tr><tr><td><strong>Comment</strong> <span class="mono" style="color:var(--muted)">comments</span></td><td><div class="dots"><span class="dot" title="Java passed">J</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td><div class="dots"><span class="dot" title="Java passed">J</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td><div class="dots"><span class="dot" title="Java passed">J</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td><div class="dots"><span class="dot" title="Java passed">J</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td><div class="dots"><span class="dot" title="Java passed">J</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td class="num">11 × 3</td></tr><tr><td><strong>Todo</strong> <span class="mono" style="color:var(--muted)">todos</span></td><td><div class="dots"><span class="dot" title="Java passed">J</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td><div class="dots"><span class="dot" title="Java passed">J</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td><div class="dots"><span class="dot" title="Java passed">J</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td><div class="dots"><span class="dot" title="Java passed">J</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td><div class="dots"><span class="dot" title="Java passed">J</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td class="num">12 × 3</td></tr><tr><td><strong>Album</strong> <span class="mono" style="color:var(--muted)">albums</span></td><td><div class="dots"><span class="dot" title="Java passed">J</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td><div class="dots"><span class="dot" title="Java passed">J</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td><div class="dots"><span class="dot" title="Java passed">J</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td><div class="dots"><span class="dot" title="Java passed">J</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td><div class="dots"><span class="dot" title="Java passed">J</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td class="num">10 × 3</td></tr><tr><td><strong>Photo</strong> <span class="mono" style="color:var(--muted)">photos</span></td><td><div class="dots"><span class="dot" title="Java passed">J</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td><div class="dots"><span class="dot" title="Java passed">J</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td><div class="dots"><span class="dot" title="Java passed">J</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td><div class="dots"><span class="dot" title="Java passed">J</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td><div class="dots"><span class="dot" title="Java passed">J</span><span class="dot" title="XML passed">X</span><span class="dot" title="YAML passed">Y</span></div></td><td class="num">11 × 3</td></tr></tbody>
+    </table>
+  </div>
+
+  <h3>What each operation asserts</h3>
+  <div class="scroll">
+    <table>
+      <thead><tr><th>Operation</th><th>Variables</th><th>Expected in <code>data</code></th></tr></thead>
+      <tbody><tr><td><span class="chip q">query</span> <span class="mono">GetPost</span></td><td><code>{&quot;id&quot;: &quot;1&quot;}</code></td><td><code>$.post.id</code> = <code>&quot;1&quot;</code><br><code>$.post.title</code> = <code>&quot;sunt aut facere repellat provident occaecati excepturi optio reprehenderit&quot;</code><br><code>$.post.user.name</code> = <code>&quot;Leanne Graham&quot;</code></td></tr><tr><td><span class="chip q">query</span> <span class="mono">ListPosts</span></td><td><code>{&quot;options&quot;: {&quot;paginate&quot;: {&quot;page&quot;: 1, &quot;limit&quot;: 2}}}</code></td><td><code>$.posts.meta.totalCount</code> = <code>100</code><br><code>$.posts.data.length()</code> = <code>2</code><br><code>$.posts.data[0].id</code> = <code>&quot;1&quot;</code><br><code>$.posts.data[1].title</code> = <code>&quot;qui est esse&quot;</code></td></tr><tr><td><span class="chip m">mutation</span> <span class="mono">CreatePost</span></td><td><code>{&quot;input&quot;: {&quot;title&quot;: &quot;Citrus&quot;, &quot;body&quot;: &quot;GraphQL rocks&quot;}}</code></td><td><code>$.createPost.id</code> = <code>&quot;101&quot;</code><br><code>$.createPost.title</code> = <code>&quot;Citrus&quot;</code><br><code>$.createPost.body</code> = <code>&quot;GraphQL rocks&quot;</code></td></tr><tr><td><span class="chip m">mutation</span> <span class="mono">UpdatePost</span></td><td><code>{&quot;id&quot;: &quot;1&quot;, &quot;input&quot;: {&quot;body&quot;: &quot;Updated by Citrus&quot;}}</code></td><td><code>$.updatePost.id</code> = <code>&quot;1&quot;</code><br><code>$.updatePost.body</code> = <code>&quot;Updated by Citrus&quot;</code></td></tr><tr><td><span class="chip m">mutation</span> <span class="mono">DeletePost</span></td><td><code>{&quot;id&quot;: &quot;1&quot;}</code></td><td><code>$.deletePost</code> = <code>true</code></td></tr><tr><td><span class="chip q">query</span> <span class="mono">GetUser</span></td><td><code>{&quot;id&quot;: &quot;1&quot;}</code></td><td><code>$.user.name</code> = <code>&quot;Leanne Graham&quot;</code><br><code>$.user.username</code> = <code>&quot;Bret&quot;</code><br><code>$.user.email</code> = <code>&quot;Sincere@april.biz&quot;</code><br><code>$.user.address.city</code> = <code>&quot;Gwenborough&quot;</code></td></tr><tr><td><span class="chip q">query</span> <span class="mono">ListUsers</span></td><td><code>{&quot;options&quot;: {&quot;paginate&quot;: {&quot;page&quot;: 1, &quot;limit&quot;: 2}}}</code></td><td><code>$.users.meta.totalCount</code> = <code>10</code><br><code>$.users.data.length()</code> = <code>2</code><br><code>$.users.data[0].id</code> = <code>&quot;1&quot;</code><br><code>$.users.data[1].name</code> = <code>&quot;Ervin Howell&quot;</code></td></tr><tr><td><span class="chip m">mutation</span> <span class="mono">CreateUser</span></td><td><code>{&quot;input&quot;: {&quot;name&quot;: &quot;Citrus Tester&quot;, &quot;username&quot;: &quot;citrus&quot;, &quot;email&quot;: &quot;citrus@example.org&quot;}}</code></td><td><code>$.createUser.id</code> = <code>&quot;11&quot;</code><br><code>$.createUser.username</code> = <code>&quot;citrus&quot;</code><br><code>$.createUser.email</code> = <code>&quot;citrus@example.org&quot;</code></td></tr><tr><td><span class="chip m">mutation</span> <span class="mono">UpdateUser</span></td><td><code>{&quot;id&quot;: &quot;1&quot;, &quot;input&quot;: {&quot;name&quot;: &quot;Leanne Citrus&quot;}}</code></td><td><code>$.updateUser.id</code> = <code>&quot;1&quot;</code><br><code>$.updateUser.name</code> = <code>&quot;Leanne Citrus&quot;</code></td></tr><tr><td><span class="chip m">mutation</span> <span class="mono">DeleteUser</span></td><td><code>{&quot;id&quot;: &quot;1&quot;}</code></td><td><code>$.deleteUser</code> = <code>true</code></td></tr><tr><td><span class="chip q">query</span> <span class="mono">GetComment</span></td><td><code>{&quot;id&quot;: &quot;1&quot;}</code></td><td><code>$.comment.name</code> = <code>&quot;id labore ex et quam laborum&quot;</code><br><code>$.comment.email</code> = <code>&quot;Eliseo@gardner.biz&quot;</code><br><code>$.comment.post.id</code> = <code>&quot;1&quot;</code></td></tr><tr><td><span class="chip q">query</span> <span class="mono">ListComments</span></td><td><code>{&quot;options&quot;: {&quot;paginate&quot;: {&quot;page&quot;: 1, &quot;limit&quot;: 2}}}</code></td><td><code>$.comments.meta.totalCount</code> = <code>500</code><br><code>$.comments.data.length()</code> = <code>2</code><br><code>$.comments.data[0].id</code> = <code>&quot;1&quot;</code></td></tr><tr><td><span class="chip m">mutation</span> <span class="mono">CreateComment</span></td><td><code>{&quot;input&quot;: {&quot;name&quot;: &quot;Citrus&quot;, &quot;email&quot;: &quot;citrus@example.org&quot;, &quot;body&quot;: &quot;Nice post&quot;}}</code></td><td><code>$.createComment.id</code> = <code>&quot;501&quot;</code><br><code>$.createComment.body</code> = <code>&quot;Nice post&quot;</code></td></tr><tr><td><span class="chip m">mutation</span> <span class="mono">UpdateComment</span></td><td><code>{&quot;id&quot;: &quot;1&quot;, &quot;input&quot;: {&quot;body&quot;: &quot;Edited by Citrus&quot;}}</code></td><td><code>$.updateComment.id</code> = <code>&quot;1&quot;</code><br><code>$.updateComment.body</code> = <code>&quot;Edited by Citrus&quot;</code></td></tr><tr><td><span class="chip m">mutation</span> <span class="mono">DeleteComment</span></td><td><code>{&quot;id&quot;: &quot;1&quot;}</code></td><td><code>$.deleteComment</code> = <code>true</code></td></tr><tr><td><span class="chip q">query</span> <span class="mono">GetTodo</span></td><td><code>{&quot;id&quot;: &quot;1&quot;}</code></td><td><code>$.todo.title</code> = <code>&quot;delectus aut autem&quot;</code><br><code>$.todo.completed</code> = <code>false</code><br><code>$.todo.user.id</code> = <code>&quot;1&quot;</code></td></tr><tr><td><span class="chip q">query</span> <span class="mono">ListTodos</span></td><td><code>{&quot;options&quot;: {&quot;paginate&quot;: {&quot;page&quot;: 1, &quot;limit&quot;: 2}}}</code></td><td><code>$.todos.meta.totalCount</code> = <code>200</code><br><code>$.todos.data.length()</code> = <code>2</code><br><code>$.todos.data[0].id</code> = <code>&quot;1&quot;</code></td></tr><tr><td><span class="chip m">mutation</span> <span class="mono">CreateTodo</span></td><td><code>{&quot;input&quot;: {&quot;title&quot;: &quot;Write GraphQL tests&quot;, &quot;completed&quot;: false}}</code></td><td><code>$.createTodo.id</code> = <code>&quot;201&quot;</code><br><code>$.createTodo.title</code> = <code>&quot;Write GraphQL tests&quot;</code><br><code>$.createTodo.completed</code> = <code>false</code></td></tr><tr><td><span class="chip m">mutation</span> <span class="mono">UpdateTodo</span></td><td><code>{&quot;id&quot;: &quot;1&quot;, &quot;input&quot;: {&quot;completed&quot;: true}}</code></td><td><code>$.updateTodo.id</code> = <code>&quot;1&quot;</code><br><code>$.updateTodo.completed</code> = <code>true</code></td></tr><tr><td><span class="chip m">mutation</span> <span class="mono">DeleteTodo</span></td><td><code>{&quot;id&quot;: &quot;1&quot;}</code></td><td><code>$.deleteTodo</code> = <code>true</code></td></tr><tr><td><span class="chip q">query</span> <span class="mono">GetAlbum</span></td><td><code>{&quot;id&quot;: &quot;1&quot;}</code></td><td><code>$.album.title</code> = <code>&quot;quidem molestiae enim&quot;</code><br><code>$.album.user.id</code> = <code>&quot;1&quot;</code></td></tr><tr><td><span class="chip q">query</span> <span class="mono">ListAlbums</span></td><td><code>{&quot;options&quot;: {&quot;paginate&quot;: {&quot;page&quot;: 1, &quot;limit&quot;: 2}}}</code></td><td><code>$.albums.meta.totalCount</code> = <code>100</code><br><code>$.albums.data.length()</code> = <code>2</code><br><code>$.albums.data[0].id</code> = <code>&quot;1&quot;</code></td></tr><tr><td><span class="chip m">mutation</span> <span class="mono">CreateAlbum</span></td><td><code>{&quot;input&quot;: {&quot;title&quot;: &quot;Citrus album&quot;, &quot;userId&quot;: &quot;1&quot;}}</code></td><td><code>$.createAlbum.id</code> = <code>&quot;101&quot;</code><br><code>$.createAlbum.title</code> = <code>&quot;Citrus album&quot;</code></td></tr><tr><td><span class="chip m">mutation</span> <span class="mono">UpdateAlbum</span></td><td><code>{&quot;id&quot;: &quot;1&quot;, &quot;input&quot;: {&quot;title&quot;: &quot;Renamed by Citrus&quot;}}</code></td><td><code>$.updateAlbum.id</code> = <code>&quot;1&quot;</code><br><code>$.updateAlbum.title</code> = <code>&quot;Renamed by Citrus&quot;</code></td></tr><tr><td><span class="chip m">mutation</span> <span class="mono">DeleteAlbum</span></td><td><code>{&quot;id&quot;: &quot;1&quot;}</code></td><td><code>$.deleteAlbum</code> = <code>true</code></td></tr><tr><td><span class="chip q">query</span> <span class="mono">GetPhoto</span></td><td><code>{&quot;id&quot;: &quot;1&quot;}</code></td><td><code>$.photo.title</code> = <code>&quot;accusamus beatae ad facilis cum similique qui sunt&quot;</code><br><code>$.photo.url</code> = <code>&quot;https://picsum.photos/seed/1/600&quot;</code><br><code>$.photo.album.id</code> = <code>&quot;1&quot;</code></td></tr><tr><td><span class="chip q">query</span> <span class="mono">ListPhotos</span></td><td><code>{&quot;options&quot;: {&quot;paginate&quot;: {&quot;page&quot;: 1, &quot;limit&quot;: 2}}}</code></td><td><code>$.photos.meta.totalCount</code> = <code>5000</code><br><code>$.photos.data.length()</code> = <code>2</code><br><code>$.photos.data[0].id</code> = <code>&quot;1&quot;</code></td></tr><tr><td><span class="chip m">mutation</span> <span class="mono">CreatePhoto</span></td><td><code>{&quot;input&quot;: {&quot;title&quot;: &quot;Citrus&quot;, &quot;url&quot;: &quot;https://example.org/citrus.png&quot;, &quot;thumbnailUrl&quot;: &quot;https://example.org/citrus-t.png&quot;}}</code></td><td><code>$.createPhoto.id</code> = <code>&quot;5001&quot;</code><br><code>$.createPhoto.url</code> = <code>&quot;https://example.org/citrus.png&quot;</code></td></tr><tr><td><span class="chip m">mutation</span> <span class="mono">UpdatePhoto</span></td><td><code>{&quot;id&quot;: &quot;1&quot;, &quot;input&quot;: {&quot;title&quot;: &quot;Retitled by Citrus&quot;}}</code></td><td><code>$.updatePhoto.id</code> = <code>&quot;1&quot;</code><br><code>$.updatePhoto.title</code> = <code>&quot;Retitled by Citrus&quot;</code></td></tr><tr><td><span class="chip m">mutation</span> <span class="mono">DeletePhoto</span></td><td><code>{&quot;id&quot;: &quot;1&quot;}</code></td><td><code>$.deletePhoto</code> = <code>true</code></td></tr></tbody>
+    </table>
+  </div>
+
+  <h2>One operation, three DSLs</h2>
+  <p class="col">The <code>createPost</code> mutation as it appears in each test. The documents, variables and expectations are identical; only the notation differs.</p>
+  <div class="tabs" data-tabs>
+    <div class="tablist" role="tablist" aria-label="DSL">
+      <button role="tab" id="tab-java" aria-selected="true" aria-controls="panel-java">Java</button>
+      <button role="tab" id="tab-xml" aria-selected="false" aria-controls="panel-xml" tabindex="-1">XML</button>
+      <button role="tab" id="tab-yaml" aria-selected="false" aria-controls="panel-yaml" tabindex="-1">YAML</button>
+    </div>
+    <div role="tabpanel" id="panel-java" aria-labelledby="tab-java"><pre>// mutation CreatePost
+$(graphql().client(graphqlZero)
+        .send()
+        .query(&quot;&quot;&quot;
+            mutation CreatePost($input: CreatePostInput!) {
+              createPost(input: $input) { id title body }
+            }&quot;&quot;&quot;)
+        .variables(&quot;&quot;&quot;
+            {&quot;input&quot;: {&quot;title&quot;: &quot;Citrus&quot;, &quot;body&quot;: &quot;GraphQL rocks&quot;}}&quot;&quot;&quot;));
+
+$(graphql().client(graphqlZero)
+        .receive()
+        .data(&quot;$.createPost.id&quot;, &quot;101&quot;)
+        .data(&quot;$.createPost.title&quot;, &quot;Citrus&quot;)
+        .data(&quot;$.createPost.body&quot;, &quot;GraphQL rocks&quot;)
+        .message()
+        .status(200));</pre></div>
+    <div role="tabpanel" id="panel-xml" aria-labelledby="tab-xml" hidden><pre>&lt;!-- mutation CreatePost --&gt;
+&lt;graphql client=&quot;zeroPosts&quot;&gt;
+  &lt;send-request&gt;
+    &lt;query&gt;
+      mutation CreatePost($input: CreatePostInput!) {
+        createPost(input: $input) { id title body }
+      }
+    &lt;/query&gt;
+    &lt;variables&gt;{&amp;quot;input&amp;quot;: {&amp;quot;title&amp;quot;: &amp;quot;Citrus&amp;quot;, &amp;quot;body&amp;quot;: &amp;quot;GraphQL rocks&amp;quot;}}&lt;/variables&gt;
+  &lt;/send-request&gt;
+&lt;/graphql&gt;
+&lt;graphql client=&quot;zeroPosts&quot;&gt;
+  &lt;receive-response status=&quot;200&quot;&gt;
+    &lt;data path=&quot;$.createPost.id&quot; value=&quot;101&quot;/&gt;
+    &lt;data path=&quot;$.createPost.title&quot; value=&quot;Citrus&quot;/&gt;
+    &lt;data path=&quot;$.createPost.body&quot; value=&quot;GraphQL rocks&quot;/&gt;
+  &lt;/receive-response&gt;
+&lt;/graphql&gt;</pre></div>
+    <div role="tabpanel" id="panel-yaml" aria-labelledby="tab-yaml" hidden><pre># mutation CreatePost
+- graphql:
+    client: &quot;zeroPosts&quot;
+    sendRequest:
+      query: |
+        mutation CreatePost($input: CreatePostInput!) {
+          createPost(input: $input) { id title body }
+        }
+      variables: &#x27;{&quot;input&quot;: {&quot;title&quot;: &quot;Citrus&quot;, &quot;body&quot;: &quot;GraphQL rocks&quot;}}&#x27;
+- graphql:
+    client: &quot;zeroPosts&quot;
+    receiveResponse:
+      status: 200
+      data:
+        - path: &quot;$.createPost.id&quot;
+          value: &quot;101&quot;
+        - path: &quot;$.createPost.title&quot;
+          value: &quot;Citrus&quot;
+        - path: &quot;$.createPost.body&quot;
+          value: &quot;GraphQL rocks&quot;</pre></div>
+  </div>
+  <div class="col"><p style="margin-top:14px">In XML and YAML the GraphQL client is declared inside the test itself, schema included:</p></div>
+  <div class="tabs" data-tabs>
+    <div class="tablist" role="tablist" aria-label="Endpoint declaration">
+      <button role="tab" id="tab-ep-xml" aria-selected="true" aria-controls="panel-ep-xml">XML</button>
+      <button role="tab" id="tab-ep-yaml" aria-selected="false" aria-controls="panel-ep-yaml" tabindex="-1">YAML</button>
+    </div>
+    <div role="tabpanel" id="panel-ep-xml" aria-labelledby="tab-ep-xml"><pre>&lt;endpoints&gt;
+    &lt;graphql&gt;
+      &lt;client name=&quot;zeroPosts&quot; request-url=&quot;https://graphqlzero.almansi.me/api&quot; schema=&quot;classpath:graphql/graphqlzero.graphqls&quot; timeout=&quot;20000&quot;/&gt;
+    &lt;/graphql&gt;
+  &lt;/endpoints&gt;</pre></div>
+    <div role="tabpanel" id="panel-ep-yaml" aria-labelledby="tab-ep-yaml" hidden><pre>endpoints:
+  - graphql:
+      client:
+        name: &quot;zeroPosts&quot;
+        requestUrl: &quot;https://graphqlzero.almansi.me/api&quot;
+        schema:
+          - &quot;classpath:graphql/graphqlzero.graphqls&quot;
+        timeout: 20000</pre></div>
+  </div>
+
+  <h2>Edge cases</h2>
+  <p class="col">Hand-written tests that go beyond the happy path and check how the module copes with the real server's behaviour.</p>
+  <div class="scroll">
+    <table>
+      <thead><tr><th>Test</th><th>What it challenges</th><th>Observed</th><th>Result</th></tr></thead>
+      <tbody><tr><td class="mono">queryOverGetWithPreflightHeader</td><td>GET encoding of query and variables, a custom header on a GraphQL request</td><td>200, data returned</td><td><span class="chip pass">✓ passed</span></td></tr><tr><td class="mono">queryOverGetWithoutPreflightIsBlocked</td><td>Expected error matched by code and message matcher, non-200 status</td><td>400, BAD_REQUEST (CSRF)</td><td><span class="chip pass">✓ passed</span></td></tr><tr><td class="mono">schemaRejectsUnknownFieldBeforeSending</td><td>Strict document check against the introspected schema</td><td>Rejected in 3 ms, nothing sent</td><td><span class="chip pass">✓ passed</span></td></tr><tr><td class="mono">serverRejectsUnknownField</td><td>strict(false) lets the invalid query through; server error matched exactly</td><td>400, GRAPHQL_VALIDATION_FAILED, application/graphql-response+json</td><td><span class="chip pass">✓ passed</span></td></tr><tr><td class="mono">serverRejectsUnknownFieldWithLegacyJson</td><td>An explicit Accept header is kept; legacy media type</td><td>400, application/json</td><td><span class="chip pass">✓ passed</span></td></tr><tr><td class="mono">unexpectedErrorsFailTheTest</td><td>An error the test did not expect fails the receive</td><td>ValidationException naming the error code</td><td><span class="chip pass">✓ passed</span></td></tr><tr><td class="mono">unknownIdReturnsNullFields</td><td>Whole data object comparison with null values</td><td>All fields null, no errors</td><td><span class="chip pass">✓ passed</span></td></tr><tr><td class="mono">multiOperationDocumentWithOperationName</td><td>Two operations in one document, operationName selects one</td><td>Only GetTodo executed</td><td><span class="chip pass">✓ passed</span></td></tr><tr><td class="mono">aliasesAndFragments</td><td>Aliases and a named fragment pass schema validation and data checks</td><td>Bret / Ervin Howell</td><td><span class="chip pass">✓ passed</span></td></tr><tr><td class="mono">nestedQueryFromResourceWithTypedOptions</td><td>Document from a resource file; a typed number from a Citrus variable inside the variables JSON</td><td>3 of 5 comments</td><td><span class="chip pass">✓ passed</span></td></tr><tr><td class="mono">chainValuesBetweenRequests</td><td>A value extracted from one response is the variable of the next request</td><td>post 11 → user 2 (Antonette)</td><td><span class="chip pass">✓ passed</span></td></tr></tbody>
+    </table>
+  </div>
+
+  <h3>GET with Apollo's CSRF preflight header</h3>
+  <div class="code"><div class="cap"><span>GraphQlZeroEdgeCasesIT.java</span><button class="copy" type="button" data-copy="ex-get">Copy</button></div><pre id="ex-get">public void queryOverGetWithPreflightHeader() {
+    var request = graphql().client(graphqlZero)
+            .send()
+            .get()
+            .query(&quot;query GetPost($id: ID!) { post(id: $id) { id title } }&quot;)
+            .variable(&quot;id&quot;, &quot;1&quot;);
+    request.message().header(&quot;apollo-require-preflight&quot;, &quot;true&quot;);
+    $(request);
+
+    $(graphql().client(graphqlZero)
+            .receive()
+            .data(&quot;$.post.title&quot;, &quot;sunt aut facere repellat provident occaecati excepturi optio reprehenderit&quot;)
+            .message()
+            .status(200));
+}</pre></div>
+  <h3>Schema validation stops a bad query before it is sent</h3>
+  <div class="code"><div class="cap"><span>GraphQlZeroEdgeCasesIT.java</span><button class="copy" type="button" data-copy="ex-schema">Copy</button></div><pre id="ex-schema">public void schemaRejectsUnknownFieldBeforeSending() {
+    $(assertException()
+            .exception(ValidationException.class)
+            .message(&quot;@contains(&#x27;isbn&#x27;)@&quot;)
+            .when(graphql().client(graphqlZero)
+                    .send()
+                    .query(&quot;{ post(id: 1) { isbn } }&quot;)));
+}</pre></div>
+  <h3>Chaining a value from one response into the next request</h3>
+  <div class="code"><div class="cap"><span>GraphQlZeroEdgeCasesIT.java</span><button class="copy" type="button" data-copy="ex-chain">Copy</button></div><pre id="ex-chain">public void chainValuesBetweenRequests() {
+    $(graphql().client(graphqlZero)
+            .send()
+            .query(&quot;query GetPost($id: ID!) { post(id: $id) { user { id } } }&quot;)
+            .variable(&quot;id&quot;, &quot;11&quot;));
+
+    $(graphql().client(graphqlZero)
+            .receive()
+            .message()
+            .extract(fromBody().expression(&quot;$.data.post.user.id&quot;, &quot;authorId&quot;)));
+
+    $(graphql().client(graphqlZero)
+            .send()
+            .query(&quot;query GetUser($id: ID!) { user(id: $id) { id username } }&quot;)
+            .variable(&quot;id&quot;, &quot;${authorId}&quot;));
+
+    $(graphql().client(graphqlZero)
+            .receive()
+            .data(&quot;$.user.id&quot;, &quot;${authorId}&quot;)
+            .data(&quot;$.user.username&quot;, &quot;Antonette&quot;));
+}</pre></div>
+
+  <h2>Proof the tests can fail</h2>
+  <div class="col">
+    <p>A suite that passes on its first run proves little unless its assertions actually bite. So one expected value was changed on purpose in each DSL (user 1's username, from <code>Bret</code> to <code>NotBret</code>) and the operation tests were run again. Exactly the three affected tests failed, each naming the path, the expected value and the received value:</p>
+    <div class="neg"><span class="chip fail">✗ GraphQlZeroJavaIT.users</span> <span class="chip fail">✗ GraphQlZeroUsersXmlIT</span> <span class="chip fail">✗ GraphQlZeroUsersYamlIT</span><p style="margin:10px 0 0"><code>Values not equal for element '$.data.user.username', expected 'NotBret' but was 'Bret'</code></p></div>
+    <p>The change was reverted afterwards and the full suite passed again.</p>
+  </div>
+
+  <h2>What the real server taught us</h2>
+  <div class="findings">
+    <article class="finding"><div class="tag">Apollo · CSRF prevention</div><h3>GET needs a preflight header</h3><p>Apollo rejects GET requests that could be cross-site requests with <code>400</code> and code <code>BAD_REQUEST</code>. Adding <code>apollo-require-preflight: true</code> through the regular <code>.message().header(...)</code> was enough. No module change was needed.</p></article>
+    <article class="finding"><div class="tag">GraphQL over HTTP</div><h3>400 even for legacy JSON</h3><p>For an invalid document Apollo answers <code>400</code> with both <code>application/graphql-response+json</code> and legacy <code>application/json</code>. The spec allows <code>200</code> for the legacy type, and Spring GraphQL does that. The module does not care: it checks <code>errors</code> whatever the status.</p></article>
+    <article class="finding"><div class="tag">Data model</div><h3>Unknown ids are not errors</h3><p><code>post(id: 9999)</code> returns an object whose fields are all <code>null</code>, with no <code>errors</code>. A whole-object <code>data(...)</code> comparison expresses that precisely.</p></article>
+    <article class="finding"><div class="tag">Schema</div><h3>The introspected schema loads as is</h3><p>The 299-line SDL from introspection, with enums, input types and nested paginated types, loaded without any change, and caught the invalid <code>isbn</code> field before any network call. That check took 3 ms.</p></article>
+  </div>
+
+  <h2>Run it</h2>
+  <div class="code"><div class="cap"><span>From the repository root (needs internet access)</span><button class="copy" type="button" data-copy="cmd-run">Copy</button></div><pre id="cmd-run">./mvnw verify -pl endpoints/citrus-graphql-zero-poc</pre></div>
+  <div class="col">
+    <h3>Files</h3>
+    <ul class="plain">
+      <li><code>GraphQlZeroJavaIT.java</code>: Java DSL, 30 operations</li>
+      <li><code>GraphQlZeroXmlIT.java</code> and <code>graphqlzero-*.citrus.it.xml</code>: XML DSL, 6 tests</li>
+      <li><code>GraphQlZeroYamlIT.java</code> and <code>graphqlzero-*.citrus.it.yaml</code>: YAML DSL, 6 tests</li>
+      <li><code>GraphQlZeroEdgeCasesIT.java</code>: 11 edge cases</li>
+      <li><code>graphql/graphqlzero.graphqls</code>: schema from introspection; <code>graphql/post-with-comments.graphql</code>: document loaded as a resource</li>
+    </ul>
+    <h3>Limits of this PoC</h3>
+    <ul class="plain">
+      <li>The tests depend on a public service and the internet, so they belong on a PoC branch, not in the regular build.</li>
+      <li>Expected values come from GraphQLZero's fixed data set. A change to that data would break the tests, not the module.</li>
+      <li>Subscriptions are out of scope for the module and were not tested.</li>
+    </ul>
+  </div>
+
+  <footer>Branch <span class="mono">feature/graphql-zero-poc</span>, cut from <span class="mono">feature/graphql-endpoint</span>. Commit <span class="mono">feedbc1fe</span>. Generated from the test sources and the Maven run of 2026-10-09.</footer>
+</main>
+
+<script>
+document.querySelectorAll('[data-tabs]').forEach(function (group) {
+  var tabs = Array.prototype.slice.call(group.querySelectorAll('[role="tab"]'));
+  function select(tab) {
+    tabs.forEach(function (t) {
+      var on = t === tab;
+      t.setAttribute('aria-selected', on ? 'true' : 'false');
+      t.tabIndex = on ? 0 : -1;
+      document.getElementById(t.getAttribute('aria-controls')).hidden = !on;
+    });
+    tab.focus();
+  }
+  tabs.forEach(function (tab, i) {
+    tab.addEventListener('click', function () { select(tab); });
+    tab.addEventListener('keydown', function (e) {
+      if (e.key === 'ArrowRight') select(tabs[(i + 1) % tabs.length]);
+      if (e.key === 'ArrowLeft') select(tabs[(i - 1 + tabs.length) % tabs.length]);
+    });
+  });
+});
+document.querySelectorAll('[data-copy]').forEach(function (btn) {
+  btn.addEventListener('click', function () {
+    var el = document.getElementById(btn.getAttribute('data-copy'));
+    var done = function () { btn.textContent = 'Copied'; setTimeout(function () { btn.textContent = 'Copy'; }, 1500); };
+    var fallback = function () { var r = document.createRange(); r.selectNodeContents(el); var s = getSelection(); s.removeAllRanges(); s.addRange(r); btn.textContent = 'Selected'; };
+    try { navigator.clipboard.writeText(el.textContent).then(done, fallback); } catch (e) { fallback(); }
+  });
+});
+</script>
+
+</html>
