@@ -20,3 +20,5 @@ schema obtained by introspection of the live API.
 
 The Java, XML and YAML operation tests are generated from one operation table, so the three DSLs
 exercise exactly the same requests and expectations.
+
+The full test report (approach, coverage, examples, findings) is in [REPORT.html](REPORT.html).
