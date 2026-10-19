@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Citrus gRPC — Live Test Report (Beeceptor PoC)</title>
+<style>
+  :root {
+    --bg: #f6f7f9;
+    --card: #ffffff;
+    --ink: #1c2430;
+    --muted: #5b6673;
+    --line: #e3e7ec;
+    --accent: #e8590c;
+    --accent-soft: #fff1e6;
+    --green: #2f9e44;
+    --green-soft: #ebfbee;
+    --code-bg: #0f172a;
+    --code-ink: #e2e8f0;
+    --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  .wrap { max-width: 1040px; margin: 0 auto; padding: 0 24px 72px; }
+  header.hero {
+    background: linear-gradient(120deg, #101828 0%, #1d2939 55%, #2b1a0e 100%);
+    color: #fff; padding: 48px 0 40px; margin-bottom: 32px;
+  }
+  .hero .wrap { padding-bottom: 0; }
+  .eyebrow { text-transform: uppercase; letter-spacing: .14em; font-size: 12px; color: #f2b28a; margin: 0 0 10px; }
+  h1 { margin: 0 0 10px; font-size: 34px; line-height: 1.2; }
+  .sub { color: #cbd5e1; margin: 0 0 22px; max-width: 640px; }
+  .badges { display: flex; flex-wrap: wrap; gap: 10px; }
+  .badge {
+    display: inline-flex; align-items: center; gap: 8px;
+    border-radius: 999px; padding: 6px 14px; font-size: 13.5px; font-weight: 600;
+  }
+  .badge.pass { background: var(--green-soft); color: var(--green); }
+  .badge.ghost { background: rgba(255,255,255,.12); color: #e2e8f0; }
+  h2 { font-size: 21px; margin: 40px 0 6px; }
+  h2 .num { color: var(--accent); font-variant-numeric: tabular-nums; margin-right: 8px; }
+  .lead { color: var(--muted); margin: 0 0 18px; max-width: 760px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 22px 24px; margin: 14px 0; }
+  .grid { display: grid; gap: 14px; }
+  .grid.cols-3 { grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
+  .stat .k { font-size: 12.5px; text-transform: uppercase; letter-spacing: .1em; color: var(--muted); }
+  .stat .v { font-size: 22px; font-weight: 700; margin-top: 4px; }
+  .stat .v small { font-weight: 500; font-size: 13px; color: var(--muted); }
+  table { width: 100%; border-collapse: collapse; background: var(--card); border: 1px solid var(--line); border-radius: 14px; overflow: hidden; }
+  th, td { padding: 12px 14px; text-align: left; vertical-align: top; border-bottom: 1px solid var(--line); font-size: 14.5px; }
+  th { background: #fafbfc; font-size: 12.5px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+  tr:last-child td { border-bottom: 0; }
+  .mono { font-family: var(--mono); font-size: 13px; }
+  code.inline { font-family: var(--mono); font-size: 13px; background: #f1f3f5; padding: 2px 6px; border-radius: 6px; }
+  .result { font-weight: 700; color: var(--green); white-space: nowrap; }
+  .req { font-family: var(--mono); font-size: 12px; color: var(--accent); background: var(--accent-soft); border-radius: 6px; padding: 2px 7px; white-space: nowrap; }
+  pre {
+    background: var(--code-bg); color: var(--code-ink); border-radius: 12px;
+    padding: 16px 18px; overflow-x: auto; font-family: var(--mono); font-size: 13px; line-height: 1.55; margin: 10px 0;
+  }
+  pre .c { color: #94a3b8; }
+  .flow { display: flex; flex-wrap: wrap; align-items: stretch; gap: 10px; margin-top: 8px; }
+  .step {
+    flex: 1 1 150px; background: var(--card); border: 1px solid var(--line); border-radius: 12px;
+    padding: 14px 16px; min-width: 150px;
+  }
+  .step .n { font-size: 12px; font-weight: 700; color: var(--accent); }
+  .step .t { font-weight: 650; margin: 4px 0 4px; }
+  .step p { margin: 0; font-size: 13.5px; color: var(--muted); }
+  .arrow { align-self: center; color: #b6bec9; font-size: 20px; }
+  ul.clean { margin: 8px 0 0; padding-left: 20px; }
+  ul.clean li { margin: 6px 0; }
+  .muted { color: var(--muted); }
+  .tag { display: inline-block; font-size: 12px; border: 1px solid var(--line); background: #fafbfc; color: var(--muted); border-radius: 999px; padding: 2px 10px; margin-right: 6px; }
+  footer { margin-top: 44px; padding-top: 18px; border-top: 1px solid var(--line); color: var(--muted); font-size: 13.5px; }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+
+<header class="hero">
+  <div class="wrap">
+    <p class="eyebrow">PoC · Proof of Concept</p>
+    <h1>Live gRPC testing with Citrus</h1>
+    <p class="sub">
+      A Citrus gRPC client — no generated stubs — talking to a real public gRPC service over TLS:
+      the Beeceptor mock of <span class="mono">grpc2grpc.PetStoreService</span>.
+    </p>
+    <div class="badges">
+      <span class="badge pass">✔ 3 / 3 tests passed</span>
+      <span class="badge ghost">5.6 s wall clock</span>
+      <span class="badge ghost">TLS · HTTP/2</span>
+      <span class="badge ghost">branch poc/686-grpc-live-beeceptor</span>
+    </div>
+  </div>
+</header>
+
+<div class="wrap">
+
+  <div class="grid cols-3">
+    <div class="card stat"><div class="k">Endpoint</div><div class="v mono" style="font-size:15px">grc5b3b373de54.free.beeceptor.com:443</div></div>
+    <div class="card stat"><div class="k">Service</div><div class="v mono" style="font-size:15px">grpc2grpc.PetStoreService</div></div>
+    <div class="card stat"><div class="k">Descriptors</div><div class="v">petstore.proto <small>· loaded at runtime, no stubs</small></div></div>
+  </div>
+
+  <h2><span class="num">1</span>What was tested</h2>
+  <p class="lead">Three live scenarios cover the client features of the new <code class="inline">citrus-grpc</code> module:
+  a unary call with JSON body, a second unary call validating the response shape, and a server-streaming
+  subscription that is cancelled by the test.</p>
+
+  <table>
+    <thead>
+      <tr><th style="width:22%">Scenario</th><th style="width:11%">RPC kind</th><th style="width:30%">Request sent (Citrus)</th><th style="width:29%">Asserted on the live response</th><th>Result</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Pet by id</strong><br><span class="mono muted" style="font-size:12.5px">PetById</span></td>
+        <td><span class="tag">unary</span></td>
+        <td class="mono">{ "id": 123 }</td>
+        <td class="mono">$.pet.id → number<br>$.pet.name → not empty</td>
+        <td class="result">PASSED</td>
+      </tr>
+      <tr>
+        <td><strong>User lookup</strong><br><span class="mono muted" style="font-size:12.5px">UserByName</span></td>
+        <td><span class="tag">unary</span></td>
+        <td class="mono">{ "username": "ada" }</td>
+        <td class="mono">$.user.username → not empty<br>$.user.email → contains "@"</td>
+        <td class="result">PASSED</td>
+      </tr>
+      <tr>
+        <td><strong>Stream + cancel</strong><br><span class="mono muted" style="font-size:12.5px">ListUsers</span></td>
+        <td><span class="tag">server streaming</span></td>
+        <td class="mono">{ "msg": "hello" }</td>
+        <td class="mono">first stream message: $.username → not empty<br>then <code class="inline">cancel()</code> — server sees CANCELLED</td>
+        <td class="result">PASSED</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p class="lead" style="margin-top:14px">The mock returns randomized data on every call, so the assertions check
+  <em>shape and validity</em> (numbers, non-empty strings, e-mail format) rather than fixed values.</p>
+
+  <h2><span class="num">2</span>How it works</h2>
+  <p class="lead">One test class, three Citrus test methods. The client endpoint is bound to the Citrus context
+  and used from the standard Gherkin DSL.</p>
+
+  <div class="flow">
+    <div class="step"><div class="n">1</div><div class="t">Descriptors</div><p>petstore.proto is read from the test classpath at runtime and encoded to Protobuf file descriptors.</p></div>
+    <div class="arrow">→</div>
+    <div class="step"><div class="n">2</div><div class="t">Send</div><p>The JSON body is parsed against the method's request type and sent as a dynamic message — no generated stubs.</p></div>
+    <div class="arrow">→</div>
+    <div class="step"><div class="n">3</div><div class="t">TLS channel</div><p>grpc-java connects with TLS using the JVM's default trust store (public CA certificate).</p></div>
+    <div class="arrow">→</div>
+    <div class="step"><div class="n">4</div><div class="t">Receive</div><p>Responses become Citrus messages; JSONPath validators and matchers check the live payload.</p></div>
+  </div>
+
+  <div class="card">
+    <p style="margin:0 0 10px"><strong>The test in three lines of DSL</strong> <span class="muted">(first scenario, abridged)</span></p>
+<pre>when(grpc().client(petStore).send()
+        .call("grpc2grpc.PetStoreService/PetById")
+        .message().body("{ \"id\": 123 }"));
+
+then(grpc().client(petStore).receive()
+        .response()
+        .message()
+        .validate(jsonPath().expression("$.pet.name", "@notEmpty()@")));</pre>
+  </div>
+
+  <h2><span class="num">3</span>Sample live payloads</h2>
+  <p class="lead">Captured from the same endpoint during the PoC (values are randomized by the mock).</p>
+
+  <div class="grid cols-3">
+    <div class="card">
+      <p style="margin:0 0 8px"><strong>PetById</strong> response</p>
+<pre>{
+  "pet": {
+    "id": 304104,
+    "name": "Jellybean"
+  }
+}</pre>
+    </div>
+    <div class="card">
+      <p style="margin:0 0 8px"><strong>UserByName</strong> response</p>
+<pre>{
+  "user": {
+    "id": 166755,
+    "username": "Nienow8333",
+    "email": "eldorazulauf@schroeder.io",
+    "phone": "4132863446"
+  }
+}</pre>
+    </div>
+    <div class="card">
+      <p style="margin:0 0 8px"><strong>ListUsers</strong> stream (first messages)</p>
+<pre>{"id":168414,"username":"Pacocha4001", ...}
+{"id":945780,"username":"Schroeder1676", ...}
+{"id":830627,"username":"Macejkovic6329", ...}
+...
+<span class="c">(length varies per call - the test cancels)</span></pre>
+    </div>
+  </div>
+
+  <h2><span class="num">4</span>How it was run</h2>
+  <div class="card">
+<pre><span class="c"># from the PoC worktree</span>
+./mvnw verify -Dit.test=BeeceptorLiveIT \
+    -Dfailsafe.failIfNoSpecifiedTests=false \
+    -Dskip.unit.tests=true \
+    -pl endpoints/citrus-grpc -am</pre>
+    <p class="muted" style="margin:8px 0 0">Requires internet access to
+    <span class="mono">grc5b3b373de54.free.beeceptor.com:443</span>.
+    No generated stubs, no test containers, no local services.</p>
+  </div>
+
+  <h2><span class="num">5</span>Small change made for the PoC</h2>
+  <p class="lead">Public endpoints are signed by well-known CAs, but the client could only trust a configured
+  certificate file. On this branch only, <code class="inline">GrpcTlsSupport.clientCredentials()</code> gained a
+  JVM-default-trust-store fallback:</p>
+  <div class="card">
+<pre><span class="c">// tls(true) without a trustCertificate now uses the JVM trust store</span>
+public static ChannelCredentials clientCredentials() {
+    return TlsChannelCredentials.create();
+}</pre>
+  </div>
+
+  <h2><span class="num">6</span>What this proves</h2>
+  <ul class="clean">
+    <li><strong>Real-world protocol stack</strong> — TLS + HTTP/2 (ALPN h2), a public certificate, and a remote service, not an in-process stub.</li>
+    <li><strong>Requirement coverage against a live peer</strong> — descriptor loading from <span class="mono">.proto</span> (<span class="req">GRPC-001</span>), JSON request bodies (<span class="req">GRPC-002</span>), unary calls (<span class="req">GRPC-006</span>), server-streaming messages (<span class="req">GRPC-008</span>), client cancel (<span class="req">GRPC-011</span>) and TLS (<span class="req">GRPC-020</span>).</li>
+    <li><strong>Framework fit</strong> — the standard test action support (`@CitrusTest`, `@BindToRegistry`, Gherkin DSL, JSONPath matchers) works unchanged against an external gRPC service.</li>
+    <li><strong>Interop</strong> — a vanilla gRPC server (Beeceptor's implementation) accepts Citrus's dynamic messages byte-for-byte: no reflection, no stubs, plain descriptors.</li>
+  </ul>
+
+  <h2><span class="num">7</span>Limitations &amp; notes</h2>
+  <ul class="clean">
+    <li>Mock responses are <em>randomized</em>; the tests assert structure, not exact values.</li>
+    <li>The stream length from <span class="mono">ListUsers</span> is not predictable, so the streaming scenario receives one message and cancels. When the length is known, <code class="inline">streamCompleted()</code> would assert the end of stream as well.</li>
+    <li>Client-streaming and bidirectional RPCs are out of scope for the module (as is reflection) and were not exercised.</li>
+    <li>The endpoint is a shared, public Beeceptor instance — availability and rate limits are outside the test's control.</li>
+    <li>This report and the live tests live only on the disposable branch <span class="mono">poc/686-grpc-live-beeceptor</span>; the official <span class="mono">feature/686-grpc-endpoint</span> branch is untouched.</li>
+  </ul>
+
+  <footer>
+    Citrus · gRPC endpoint (issue #686) · Live PoC against
+    <a href="https://app.beeceptor.com/console/grc5b3b373de54" target="_blank" rel="noopener">Beeceptor endpoint grc5b3b373de54</a>
+    · Report generated 2026-10-19 ·
+    artifacts: <span class="mono">BeeceptorLiveIT.java</span>, <span class="mono">petstore.proto</span>,
+    failsafe report <span class="mono">org.citrusframework.grpc.live.BeeceptorLiveIT.txt</span>
+  </footer>
+</div>
+
+</body>
+</html>
