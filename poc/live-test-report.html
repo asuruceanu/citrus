@@ -91,8 +91,8 @@
     </p>
     <div class="badges">
       <span class="badge pass">✔ 5 / 5 live scenarios passed</span>
-      <span class="badge ghost">3 through the Citrus DSL</span>
-      <span class="badge ghost">2 through a raw-client spike</span>
+      <span class="badge ghost">all through the Citrus DSL</span>
+      <span class="badge ghost">client &amp; bidi streaming now in scope</span>
       <span class="badge ghost">TLS · HTTP/2</span>
       <span class="badge ghost">branch poc/686-grpc-live-beeceptor</span>
     </div>
@@ -108,9 +108,9 @@
   </div>
 
   <h2><span class="num">1</span>What was tested</h2>
-  <p class="lead">The live service defines <strong>five</strong> RPCs. Three are callable from the Citrus DSL today and are
-  covered by the live integration test. The remaining two use client-side streaming, which the module deliberately
-  does not support yet — a raw-client spike proves those work too and pins down what Citrus would need to add.</p>
+  <p class="lead">The live service defines <strong>five</strong> RPCs — and on this branch <strong>all five are callable
+  from the Citrus DSL</strong>. Client-streaming and bidirectional-streaming support (previously out of scope, spec D3)
+  was added on the PoC branch; the live integration test now exercises every RPC kind end to end.</p>
 
   <table>
     <thead>
@@ -184,44 +184,52 @@ then(grpc().client(petStore).receive()
         .validate(jsonPath().expression("$.pet.name", "@notEmpty()@")));</pre>
   </div>
 
-  <h2><span class="num">3</span>Beyond the DSL: the two client-streaming RPCs (spike)</h2>
-  <p class="lead">Client-streaming and bidirectional-streaming calls are out of scope for the module (spec D3),
-  so the Citrus DSL cannot express them. To answer the PoC question "could these be tested?", a spike test drives
-  the raw grpc-java <span class="mono">ClientCall</span> with exactly the building blocks a future Citrus feature
-  would use: the descriptor registry from a classpath <span class="mono">.proto</span> file, dynamic Protobuf
-  messages, the module's JSON codec for assertions and the TLS channel above.</p>
+  <h2><span class="num">3</span>Now in scope: client &amp; bidirectional streaming</h2>
+  <p class="lead">The module previously stopped at unary and server-streaming calls (spec D3, "follow-up"). On this
+  branch the client side was brought in scope; the two extra RPCs are now expressed with the same DSL vocabulary as
+  the receive side.</p>
 
   <div class="card">
-    <p style="margin:0 0 10px"><strong>What the spike proved against the live mock</strong></p>
+    <p style="margin:0 0 10px"><strong>The new DSL</strong> — sending and completing a client-streaming call</p>
+<pre>when(grpc().client(petStore).send()
+        .call("grpc2grpc.PetStoreService/StoreUsers")
+        .message().body(user(1, "ada")));          <span class="c">// opens the call, no half-close</span>
+
+when(grpc().client(petStore).send()
+        .streamMessage().message().body(user(2, "bob")));
+
+when(grpc().client(petStore).send().streamCompleted());  <span class="c">// completes the request side</span>
+
+then(grpc().client(petStore).receive()
+        .response().message().validate(jsonPath().expression("$.msg", "@notEmpty()@")));</pre>
+  </div>
+
+  <div class="card">
+    <p style="margin:0 0 10px"><strong>What was added</strong></p>
     <ul class="clean">
-      <li><span class="mono">StoreUsers</span> (client streaming) — three <span class="mono">User</span> messages sent,
-        <span class="mono">halfClose()</span>, one <span class="mono">EmptyRes</span> received with status
-        <span class="mono">OK</span> (the mock randomizes the message text: <span class="mono">"completed"</span> /
-        <span class="mono">"acknowledged"</span>).</li>
-      <li><span class="mono">BulkUsers</span> (bidirectional) — messages are sent while responses arrive on the same
-        call; the mock answered and completed with status <span class="mono">OK</span>, each response carrying a
-        non-empty <span class="mono">username</span>.</li>
-      <li>Both calls use dynamic messages end-to-end — no generated stubs — which confirms the wire protocol and the
-        module's descriptor/codec layer are ready for these RPC kinds; only the DSL and endpoint plumbing are missing.</li>
+      <li><strong>DSL</strong>: <span class="mono">send().streamMessage()</span> sends another message on the open call,
+        <span class="mono">send().streamCompleted()</span> half-closes it; the first <span class="mono">send()</span> on a
+        client-streaming or bidirectional method opens the call without half-closing.</li>
+      <li><strong>Client endpoint</strong>: the call registry keeps the live <span class="mono">ClientCall</span>
+        (queue, method, cancellation) so further messages can be sent on it and the request side completed;
+        receives keep flowing through the same per-call queue.</li>
+      <li><strong>Method types</strong>: <span class="mono">CLIENT_STREAMING</span> and
+        <span class="mono">BIDI_STREAMING</span> are mapped end to end and appear as
+        <span class="mono">citrus_grpc_method_type</span> on received messages.</li>
+      <li><strong>Tests</strong>: three offline unit tests drive both kinds through the DSL against a real grpc-java
+        server (client-streaming, bidirectional, and the "unknown call" failure); the live suite above covers them
+        against Beeceptor.</li>
     </ul>
   </div>
 
   <div class="card">
-    <p style="margin:0"><strong>What Citrus would need to add for first-class support</strong></p>
+    <p style="margin:0"><strong>Remaining for full alignment with the official branch</strong></p>
     <ul class="clean">
-      <li><strong>DSL</strong>: an open-call action that does <em>not</em> half-close — for example
-        <span class="mono">send().call(...).openCall()</span> plus <span class="mono">sendOnCall()</span> /
-        <span class="mono">completeCall()</span> actions (today every send does request + half-close in one step).</li>
-      <li><strong>Client endpoint</strong>: keep the live <span class="mono">ClientCall</span> (not only its receive
-        queue) in the call registry, allow sending additional messages on it, expose half-close/close, and keep
-        feeding the same per-call receive queue for streaming responses.</li>
-      <li><strong>Method types</strong>: build the gRPC method descriptor with
-        <span class="mono">CLIENT_STREAMING</span> / <span class="mono">BIDI_STREAMING</span> (the client currently
-        maps unary and server-streaming only).</li>
-      <li><strong>Simulator</strong>: the equivalent server side — receive several request messages for one call and
-        stream replies — which is the larger half of the work.</li>
-      <li><strong>Spec</strong>: lift D3 ("follow-up") and add requirements for open calls, sending on an open call
-        and completing it from the test.</li>
+      <li><strong>Simulator side</strong> — serving client-streaming/bidirectional calls (collect several request
+        messages for one call, stream replies) is the larger half and is not part of this PoC.</li>
+      <li><strong>Declarative DSLs</strong> — XML and YAML models do not expose the two new send actions yet.</li>
+      <li><strong>Spec</strong> — lift D3 and add requirements for open calls, sending on an open call and completing
+        it; the PoC stays on its own branch until that is agreed.</li>
     </ul>
   </div>
 
@@ -270,8 +278,7 @@ then(grpc().client(petStore).receive()
     <span class="mono">gr07b55f8cdfc9.free.beeceptor.com:443</span>.
     No generated stubs, no test containers, no local services.</p>
     <p class="muted" style="margin:8px 0 0"><strong>Latest run:</strong> 5 / 5 scenarios green
-    (3 DSL + 2 spike), 8.8 s — failsafe suite
-    <span class="mono">TestSuite.txt</span>.</p>
+    — all through the Citrus DSL, 8.1 s.</p>
   </div>
 
   <h2><span class="num">5</span>Small change made for the PoC</h2>
@@ -296,8 +303,8 @@ public static ChannelCredentials clientCredentials() {
   <h2><span class="num">7</span>Limitations &amp; notes</h2>
   <ul class="clean">
     <li>Mock responses are <em>randomized</em>; the tests assert structure, not exact values.</li>
-    <li>The stream length from <span class="mono">ListUsers</span> is not predictable, so the streaming scenario receives one message and cancels. When the length is known, <code class="inline">streamCompleted()</code> would assert the end of stream as well.</li>
-    <li>Client-streaming and bidirectional RPCs are out of scope for the module (as is reflection) and were not exercised.</li>
+    <li>The stream length from <span class="mono">ListUsers</span> is not predictable, so that scenario receives one message and cancels. When the length is known, <code class="inline">streamCompleted()</code> would assert the end of stream as well.</li>
+    <li>Beeceptor's <span class="mono">BulkUsers</span> mock echoes one message per received message when the client reads between sends; the live test follows that behavior. Server reflection is still out of scope for the module.</li>
     <li>The endpoint is a shared, public Beeceptor instance. During the PoC an earlier endpoint hit Beeceptor's
       free-tier quota under heavy probing: calls then answer <span class="mono">RESOURCE_EXHAUSTED</span>
       ("Rate limit exceeded") and unary receives arrive with an empty payload. The suite was re-pointed at a fresh
@@ -309,10 +316,10 @@ public static ChannelCredentials clientCredentials() {
     Citrus · gRPC endpoint (issue #686) · Live PoC against
     <a href="https://app.beeceptor.com/console/gr07b55f8cdfc9" target="_blank" rel="noopener">Beeceptor endpoint gr07b55f8cdfc9</a>
     · Report generated 2026-10-19 ·
-    artifacts: <span class="mono">BeeceptorLiveIT.java</span> (DSL, 3 scenarios),
-    <span class="mono">BeeceptorStreamingSpikeIT.java</span> (raw-client spike, 2 scenarios),
+    artifacts: <span class="mono">BeeceptorLiveIT.java</span> (5 live scenarios, all DSL),
+    <span class="mono">GrpcClientStreamingTest.java</span> (offline, 3 tests),
     <span class="mono">petstore.proto</span>,
-    failsafe suite <span class="mono">TestSuite.txt</span> (5 tests, 0 failures)
+    failsafe run: <span class="mono">BeeceptorLiveIT</span> — 5 tests, 0 failures
   </footer>
 </div>
 

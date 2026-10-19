@@ -83,6 +83,59 @@ public class BeeceptorLiveIT extends TestNGCitrusSpringSupport implements TestAc
     }
 
     @CitrusTest
+    public void shouldCallClientStreamingMethod() {
+        when(grpc().client(petStore).send()
+                .call("grpc2grpc.PetStoreService/StoreUsers")
+                .message()
+                .body(user(1, "ada")));
+
+        when(grpc().client(petStore).send()
+                .streamMessage()
+                .message()
+                .body(user(2, "bob")));
+
+        when(grpc().client(petStore).send()
+                .streamMessage()
+                .message()
+                .body(user(3, "cid")));
+
+        when(grpc().client(petStore).send().streamCompleted());
+
+        then(grpc().client(petStore).receive()
+                .response()
+                .message()
+                .validate(jsonPath().expression("$.msg", "@notEmpty()@")));
+    }
+
+    @CitrusTest
+    public void shouldCallBidirectionalMethod() {
+        when(grpc().client(petStore).send()
+                .call("grpc2grpc.PetStoreService/BulkUsers")
+                .message()
+                .body(user(1, "ada")));
+
+        then(grpc().client(petStore).receive()
+                .streamMessage()
+                .message()
+                .validate(jsonPath().expression("$.username", "@notEmpty()@")));
+
+        // keep sending while the response side is still open
+        when(grpc().client(petStore).send()
+                .streamMessage()
+                .message()
+                .body(user(2, "bob")));
+
+        then(grpc().client(petStore).receive()
+                .streamMessage()
+                .message()
+                .validate(jsonPath().expression("$.username", "@notEmpty()@")));
+
+        when(grpc().client(petStore).send().streamCompleted());
+
+        then(grpc().client(petStore).receive().streamCompleted());
+    }
+
+    @CitrusTest
     public void shouldReceiveStreamMessageAndCancel() {
         when(grpc().client(petStore).send()
                 .call("grpc2grpc.PetStoreService/ListUsers")
@@ -96,5 +149,10 @@ public class BeeceptorLiveIT extends TestNGCitrusSpringSupport implements TestAc
                 .validate(jsonPath().expression("$.username", "@notEmpty()@")));
 
         then(grpc().client(petStore).cancel());
+    }
+
+    private static String user(int id, String username) {
+        return "{ \"id\": %d, \"username\": \"%s\", \"email\": \"%s@example.com\", \"phone\": \"555-%d\" }"
+                .formatted(id, username, username, id);
     }
 }
