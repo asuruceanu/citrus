@@ -27,7 +27,7 @@ import static org.citrusframework.json.dsl.JsonPathSupport.jsonPath;
 
 /**
  * Live test against the public Beeceptor gRPC mock service
- * {@code grc5b3b373de54.free.beeceptor.com:443} (service {@code grpc2grpc.PetStoreService}).
+ * {@code gr07b55f8cdfc9.free.beeceptor.com:443} (service {@code grpc2grpc.PetStoreService}).
  * <p>
  * It proves that the Citrus gRPC client works against a real TLS endpoint on the public internet,
  * using descriptors from a classpath {@code .proto} file and the JVM's default trust store - no
@@ -43,7 +43,7 @@ import static org.citrusframework.json.dsl.JsonPathSupport.jsonPath;
 @Test
 public class BeeceptorLiveIT extends TestNGCitrusSpringSupport implements TestActionSupport {
 
-    private static final String TARGET = "grc5b3b373de54.free.beeceptor.com:443";
+    private static final String TARGET = "gr07b55f8cdfc9.free.beeceptor.com:443";
     private static final String DESCRIPTORS = "classpath:org/citrusframework/grpc/live/petstore.proto";
 
     @BindToRegistry
