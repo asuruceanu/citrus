@@ -227,7 +227,8 @@ then(grpc().client(petStore).receive()
     <p style="margin:0 0 8px"><strong>Aligned with the official branch</strong> —
       <span class="mono">feature/686-grpc-endpoint</span>: <span class="mono">20390a37b</span> (streaming support),
       <span class="mono">3a49a2fa1</span> (unary queue fix + stable parallel IT),
-      <span class="mono">8a94e8535</span> (inline body literals in the tests)</p>
+      <span class="mono">8a94e8535</span> (inline body literals in the tests),
+      <span class="mono">867e4c111</span> (offline Beeceptor simulation)</p>
     <ul class="clean">
       <li><strong>Simulator side</strong> — serves client-streaming and bidirectional calls: further request messages
         arrive as <span class="mono">stream_message</span> with their sequence, the client's half-close as
@@ -236,8 +237,11 @@ then(grpc().client(petStore).receive()
         (<span class="mono">stream-message</span> / <span class="mono">stream-completed</span>).</li>
       <li><strong>Spec</strong> — D3 lifted; AC33–AC36 and GRPC-026–028 added for client streaming, bidirectional
         streaming and simulator support.</li>
+      <li><strong>Offline twin</strong>: the same five scenarios run on the official branch as
+        <span class="mono">BeeceptorSimulationIT</span>, with the Citrus gRPC simulator standing in for Beeceptor —
+        no network, no external quota.</li>
       <li><strong>Verified</strong>: <span class="mono">./mvnw verify -pl endpoints/citrus-grpc -am</span> — 112 unit tests
-        and 22 integration tests, 0 failures.</li>
+        and 27 integration tests, 0 failures.</li>
       <li>Only the live Beeceptor tests, this report and the JVM-trust-store fallback remain PoC-only.</li>
     </ul>
   </div>
