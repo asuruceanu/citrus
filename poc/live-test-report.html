@@ -223,13 +223,17 @@ then(grpc().client(petStore).receive()
   </div>
 
   <div class="card">
-    <p style="margin:0"><strong>Remaining for full alignment with the official branch</strong></p>
+    <p style="margin:0"><strong>Aligned with the official branch</strong> — commit
+      <span class="mono">20390a37b</span> on <span class="mono">feature/686-grpc-endpoint</span></p>
     <ul class="clean">
-      <li><strong>Simulator side</strong> — serving client-streaming/bidirectional calls (collect several request
-        messages for one call, stream replies) is the larger half and is not part of this PoC.</li>
-      <li><strong>Declarative DSLs</strong> — XML and YAML models do not expose the two new send actions yet.</li>
-      <li><strong>Spec</strong> — lift D3 and add requirements for open calls, sending on an open call and completing
-        it; the PoC stays on its own branch until that is agreed.</li>
+      <li><strong>Simulator side</strong> — serves client-streaming and bidirectional calls: further request messages
+        arrive as <span class="mono">stream_message</span> with their sequence, the client's half-close as
+        <span class="mono">stream_end</span>, and replies go back on the same call.</li>
+      <li><strong>Declarative DSLs</strong> — XML and YAML expose the new send and receive actions
+        (<span class="mono">stream-message</span> / <span class="mono">stream-completed</span>).</li>
+      <li><strong>Spec</strong> — D3 lifted; AC33–AC36 and GRPC-026–028 added for client streaming, bidirectional
+        streaming and simulator support.</li>
+      <li>Only the live Beeceptor tests, this report and the JVM-trust-store fallback remain PoC-only.</li>
     </ul>
   </div>
 
