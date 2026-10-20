@@ -87,17 +87,17 @@ public class BeeceptorLiveIT extends TestNGCitrusSpringSupport implements TestAc
         when(grpc().client(petStore).send()
                 .call("grpc2grpc.PetStoreService/StoreUsers")
                 .message()
-                .body(user(1, "ada")));
+                .body("{ \"id\": 1, \"username\": \"ada\", \"email\": \"ada@example.com\", \"phone\": \"555-1\" }"));
 
         when(grpc().client(petStore).send()
                 .streamMessage()
                 .message()
-                .body(user(2, "bob")));
+                .body("{ \"id\": 2, \"username\": \"bob\", \"email\": \"bob@example.com\", \"phone\": \"555-2\" }"));
 
         when(grpc().client(petStore).send()
                 .streamMessage()
                 .message()
-                .body(user(3, "cid")));
+                .body("{ \"id\": 3, \"username\": \"cid\", \"email\": \"cid@example.com\", \"phone\": \"555-3\" }"));
 
         when(grpc().client(petStore).send().streamCompleted());
 
@@ -112,7 +112,7 @@ public class BeeceptorLiveIT extends TestNGCitrusSpringSupport implements TestAc
         when(grpc().client(petStore).send()
                 .call("grpc2grpc.PetStoreService/BulkUsers")
                 .message()
-                .body(user(1, "ada")));
+                .body("{ \"id\": 1, \"username\": \"ada\", \"email\": \"ada@example.com\", \"phone\": \"555-1\" }"));
 
         then(grpc().client(petStore).receive()
                 .streamMessage()
@@ -123,7 +123,7 @@ public class BeeceptorLiveIT extends TestNGCitrusSpringSupport implements TestAc
         when(grpc().client(petStore).send()
                 .streamMessage()
                 .message()
-                .body(user(2, "bob")));
+                .body("{ \"id\": 2, \"username\": \"bob\", \"email\": \"bob@example.com\", \"phone\": \"555-2\" }"));
 
         then(grpc().client(petStore).receive()
                 .streamMessage()
@@ -149,10 +149,5 @@ public class BeeceptorLiveIT extends TestNGCitrusSpringSupport implements TestAc
                 .validate(jsonPath().expression("$.username", "@notEmpty()@")));
 
         then(grpc().client(petStore).cancel());
-    }
-
-    private static String user(int id, String username) {
-        return "{ \"id\": %d, \"username\": \"%s\", \"email\": \"%s@example.com\", \"phone\": \"555-%d\" }"
-                .formatted(id, username, username, id);
     }
 }
