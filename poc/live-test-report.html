@@ -139,14 +139,14 @@
         <td class="result">PASSED</td>
       </tr>
       <tr>
-        <td><strong>Store users</strong><br><span class="mono muted" style="font-size:12.5px">StoreUsers</span><br><span class="tag" style="margin-top:4px">raw-client spike</span></td>
+        <td><strong>Store users</strong><br><span class="mono muted" style="font-size:12.5px">StoreUsers</span><br><span class="tag" style="margin-top:4px">Citrus DSL</span></td>
         <td><span class="tag">client streaming</span></td>
         <td class="mono">3 × User messages, then half-close</td>
         <td class="mono">exactly 1 response, status OK<br>$.msg → non-empty</td>
         <td class="result">PASSED</td>
       </tr>
       <tr>
-        <td><strong>Bulk users</strong><br><span class="mono muted" style="font-size:12.5px">BulkUsers</span><br><span class="tag" style="margin-top:4px">raw-client spike</span></td>
+        <td><strong>Bulk users</strong><br><span class="mono muted" style="font-size:12.5px">BulkUsers</span><br><span class="tag" style="margin-top:4px">Citrus DSL</span></td>
         <td><span class="tag">bidirectional streaming</span></td>
         <td class="mono">2 × User messages, stream stays open while receiving</td>
         <td class="mono">≥ 1 response, status OK<br>each $.username → non-empty</td>
@@ -193,10 +193,10 @@ then(grpc().client(petStore).receive()
     <p style="margin:0 0 10px"><strong>The new DSL</strong> — sending and completing a client-streaming call</p>
 <pre>when(grpc().client(petStore).send()
         .call("grpc2grpc.PetStoreService/StoreUsers")
-        .message().body(user(1, "ada")));          <span class="c">// opens the call, no half-close</span>
+        .message().body("{ \"id\": 1, \"username\": \"ada\", \"email\": \"ada@example.com\", \"phone\": \"555-1\" }"));  <span class="c">// opens the call, no half-close</span>
 
 when(grpc().client(petStore).send()
-        .streamMessage().message().body(user(2, "bob")));
+        .streamMessage().message().body("{ \"id\": 2, \"username\": \"bob\", \"email\": \"bob@example.com\", \"phone\": \"555-2\" }"));
 
 when(grpc().client(petStore).send().streamCompleted());  <span class="c">// completes the request side</span>
 
@@ -216,15 +216,18 @@ then(grpc().client(petStore).receive()
       <li><strong>Method types</strong>: <span class="mono">CLIENT_STREAMING</span> and
         <span class="mono">BIDI_STREAMING</span> are mapped end to end and appear as
         <span class="mono">citrus_grpc_method_type</span> on received messages.</li>
-      <li><strong>Tests</strong>: three offline unit tests drive both kinds through the DSL against a real grpc-java
-        server (client-streaming, bidirectional, and the "unknown call" failure); the live suite above covers them
-        against Beeceptor.</li>
+      <li><strong>Tests</strong>: five offline unit tests — three drive the client side through the DSL against a real
+        grpc-java server (client-streaming, bidirectional, and the "unknown call" failure), two drive the simulator
+        side with a raw grpc-java client (client-streaming and bidirectional request handling). The live suite above
+        covers the client side against Beeceptor.</li>
     </ul>
   </div>
 
   <div class="card">
-    <p style="margin:0"><strong>Aligned with the official branch</strong> — commit
-      <span class="mono">20390a37b</span> on <span class="mono">feature/686-grpc-endpoint</span></p>
+    <p style="margin:0 0 8px"><strong>Aligned with the official branch</strong> —
+      <span class="mono">feature/686-grpc-endpoint</span>: <span class="mono">20390a37b</span> (streaming support),
+      <span class="mono">3a49a2fa1</span> (unary queue fix + stable parallel IT),
+      <span class="mono">8a94e8535</span> (inline body literals in the tests)</p>
     <ul class="clean">
       <li><strong>Simulator side</strong> — serves client-streaming and bidirectional calls: further request messages
         arrive as <span class="mono">stream_message</span> with their sequence, the client's half-close as
@@ -233,6 +236,8 @@ then(grpc().client(petStore).receive()
         (<span class="mono">stream-message</span> / <span class="mono">stream-completed</span>).</li>
       <li><strong>Spec</strong> — D3 lifted; AC33–AC36 and GRPC-026–028 added for client streaming, bidirectional
         streaming and simulator support.</li>
+      <li><strong>Verified</strong>: <span class="mono">./mvnw verify -pl endpoints/citrus-grpc -am</span> — 112 unit tests
+        and 22 integration tests, 0 failures.</li>
       <li>Only the live Beeceptor tests, this report and the JVM-trust-store fallback remain PoC-only.</li>
     </ul>
   </div>
@@ -321,7 +326,7 @@ public static ChannelCredentials clientCredentials() {
     <a href="https://app.beeceptor.com/console/gr07b55f8cdfc9" target="_blank" rel="noopener">Beeceptor endpoint gr07b55f8cdfc9</a>
     · Report generated 2026-10-19 ·
     artifacts: <span class="mono">BeeceptorLiveIT.java</span> (5 live scenarios, all DSL),
-    <span class="mono">GrpcClientStreamingTest.java</span> (offline, 3 tests),
+    <span class="mono">GrpcClientStreamingTest.java</span> (offline, 3 tests), <span class="mono">GrpcServerStreamingTest.java</span> (offline, 2 tests),
     <span class="mono">petstore.proto</span>,
     failsafe run: <span class="mono">BeeceptorLiveIT</span> — 5 tests, 0 failures
   </footer>
