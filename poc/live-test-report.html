@@ -238,7 +238,7 @@ then(grpc().client(petStore).receive()
       <li><strong>Spec</strong> — D3 lifted; AC33–AC36 and GRPC-026–028 added for client streaming, bidirectional
         streaming and simulator support.</li>
       <li><strong>Offline twin</strong>: the same five scenarios run on the official branch as
-        <span class="mono">BeeceptorSimulationIT</span>, with the Citrus gRPC simulator standing in for Beeceptor —
+        <span class="mono">PetStoreSimulationIT</span>, with the Citrus gRPC simulator standing in for Beeceptor —
         no network, no external quota.</li>
       <li><strong>Verified</strong>: <span class="mono">./mvnw verify -pl endpoints/citrus-grpc -am</span> — 112 unit tests
         and 27 integration tests, 0 failures.</li>
