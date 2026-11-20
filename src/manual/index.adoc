@@ -88,6 +88,7 @@ include::spring-support.adoc[]
 include::spi.adoc[]
 
 include::tools.adoc[]
+include::tools-test-distribution.adoc[]
 
 include::samples.adoc[]
 

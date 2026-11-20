@@ -1,0 +1,51 @@
+[[tools-test-distribution]]
+= Test Distribution
+
+Citrus Test Distribution partitions and executes JUnit Platform and Citrus integration tests in parallel across remote worker processes, containers, or Kubernetes pods while preserving standard Maven Surefire/Failsafe reports and local developer workflows.
+
+[[tools-test-distribution-modules]]
+== Modules
+
+* `org.citrusframework:citrus-test-distribution-protocol` — Shared WebSocket/REST protocol DTOs, SHA-256 content-addressed blob cache, capability matcher, and `@LocalOnly` / `@RemoteOnly` / `@AgentRequirement` annotations.
+* `org.citrusframework:citrus-test-distribution-ui` — Zero-Node monitoring Web UI served at `/ui/` (overview KPIs, live SVG Gantt partition waterfall, worker pool health, test history/flakiness, and failing test stack-trace inspector).
+* `org.citrusframework:citrus-test-distribution-coordinator` — Vert.x HTTP/WebSocket coordinator, Longest-Processing-Time (LPT) scheduler, SSE event hub, and JDBC persistence (`HSQLDB` file/mem or `PostgreSQL`).
+* `org.citrusframework:citrus-test-distribution-worker` — Standalone Java worker runtime with child-first `ClassLoader` partition isolation and graceful `SIGTERM` draining (`citrus-agent --mode=worker` or `citrus dist worker start`).
+* `org.citrusframework:citrus-test-distribution` — Optional JUnit Platform `LauncherInterceptor` coordinator and `@CitrusTestFactory` declarative source splitter.
+* `org.citrusframework.mvn:citrus-test-distribution-maven-extension` — Opt-in Maven Core Extension (`-Dcitrus.test.distribution.enabled=true`).
+
+[[tools-test-distribution-maven]]
+== Maven Quickstart
+
+Register the extension in `.mvn/extensions.xml`:
+
+[source,xml]
+----
+<extensions xmlns="http://maven.apache.org/EXTENSIONS/1.0.0">
+  <extension>
+    <groupId>org.citrusframework.mvn</groupId>
+    <artifactId>citrus-test-distribution-maven-extension</artifactId>
+    <version>${citrus.version}</version>
+  </extension>
+</extensions>
+----
+
+Start a coordinator and worker pool via `citrus-jbang`, then run Maven with distribution enabled:
+
+[source,bash]
+----
+citrus dist broker start --port=18080
+citrus dist worker start --broker-url=ws://127.0.0.1:18080/ws/v1/worker --capabilities=docker=true
+
+./mvnw verify \
+  -Dcitrus.test.distribution.enabled=true \
+  -Dcitrus.test.distribution.broker.url=http://127.0.0.1:18080
+----
+
+Normal Maven builds without `-Dcitrus.test.distribution.enabled=true` execute locally with zero coordinator traffic.
+
+[[tools-test-distribution-annotations]]
+== Placement Annotations
+
+* `@LocalOnly` — Pins a test class or method to the local build host JVM.
+* `@RemoteOnly` — Requires execution on a remote worker and fails fast when the coordinator is unreachable.
+* `@AgentRequirement(key = "docker", value = "true")` — Repeatable capability filter matched against registered worker capabilities (supports exact match and `>=` numeric thresholds).

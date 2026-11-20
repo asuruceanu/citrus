@@ -30,12 +30,14 @@ public class DistributionLauncherInterceptor implements LauncherInterceptor {
     @SuppressWarnings("unchecked")
     public <T> T intercept(Invocation<T> invocation) {
         T target = invocation.proceed();
-        if (target instanceof Launcher launcher
-                && DistributionSettings.isEnabled()
-                && !DistributionSettings.isWorkerRole()) {
+        if (target instanceof Launcher launcher && isActiveForCurrentProcess()) {
             return (T) new DistributedLauncher(launcher);
         }
         return target;
+    }
+
+    static boolean isActiveForCurrentProcess() {
+        return DistributionSettings.isEnabled() && !DistributionSettings.isWorkerRole();
     }
 
     @Override
