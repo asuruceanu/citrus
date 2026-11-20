@@ -141,6 +141,40 @@ class DistributedLauncherTest {
                 .hasMessageContaining("broker unreachable");
     }
 
+    @Test
+    void shouldForwardCustomSurefireSystemPropertiesWhileExcludingHostAndDistributionInternals() {
+        java.util.Properties source = new java.util.Properties();
+        source.setProperty("citrus.default.timeout", "15000");
+        source.setProperty("spring.profiles.active", "integration");
+        source.setProperty("custom.service.port", "19090");
+        source.setProperty("citrus.test.distribution.broker.url", "http://127.0.0.1:18080");
+        source.setProperty("junit.platform.launcher.interceptors.enabled", "true");
+        source.setProperty("java.home", "/host/jdk-21");
+        source.setProperty("user.dir", "/host/workspace");
+        source.setProperty("os.name", "Mac OS X");
+        source.setProperty("surefire.real.class.path", "/host/target/surefirebooter.jar");
+        source.setProperty("maven.multiModuleProjectDirectory", "/host/workspace");
+        source.setProperty("basedir", "/host/workspace/module");
+        source.setProperty("localRepository", "/host/.m2/repository");
+
+        java.util.Map<String, String> forwarded = DistributedLauncher.collectPropagatedProperties(source);
+
+        assertThat(forwarded)
+                .containsEntry("citrus.default.timeout", "15000")
+                .containsEntry("spring.profiles.active", "integration")
+                .containsEntry("custom.service.port", "19090")
+                .doesNotContainKeys(
+                        "citrus.test.distribution.broker.url",
+                        "junit.platform.launcher.interceptors.enabled",
+                        "java.home",
+                        "user.dir",
+                        "os.name",
+                        "surefire.real.class.path",
+                        "maven.multiModuleProjectDirectory",
+                        "basedir",
+                        "localRepository");
+    }
+
     public static class RemoteSampleFixture {
         static final AtomicBoolean EXECUTED_IN_COORDINATOR = new AtomicBoolean(false);
 

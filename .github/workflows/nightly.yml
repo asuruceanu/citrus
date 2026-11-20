@@ -23,6 +23,7 @@ on:
 
 jobs:
   report-dependencies:
+    if: github.repository == 'citrusframework/citrus'
     runs-on: ubuntu-latest
     steps:
       - name: Set up JDK
@@ -47,6 +48,7 @@ jobs:
           ./mvnw --no-transfer-progress versions:display-dependency-updates
 
   generate-metadata:
+    if: github.repository == 'citrusframework/citrus'
     runs-on: ubuntu-latest
     permissions:
       contents: write

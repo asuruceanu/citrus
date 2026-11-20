@@ -23,6 +23,7 @@ on:
 
 jobs:
   lts_preview:
+    if: github.repository == 'citrusframework/citrus'
     strategy:
       fail-fast: false
       matrix:

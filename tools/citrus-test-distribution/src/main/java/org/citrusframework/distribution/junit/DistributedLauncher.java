@@ -357,15 +357,43 @@ public class DistributedLauncher implements Launcher {
         return new PackagedClasspath(artifacts, byDigest);
     }
 
+    private static final java.util.Set<String> HOST_SYSTEM_PROPERTY_PREFIXES = java.util.Set.of(
+            "java.", "javax.", "jdk.", "sun.", "os.", "user.", "file.", "path.", "line.",
+            "awt.", "native.", "stdout.", "stderr.", "ftp.", "http.", "https.", "socksProxy",
+            "gopherProxy", "maven.", "surefire.", "failsafe.", "plexus.", "classworlds.",
+            "guice.", "org.slf4j.", "jboss.", "idea.", "eclipse.", "junit.platform.launcher.interceptors",
+            "citrus.test.distribution."
+    );
+
+    private static final java.util.Set<String> HOST_SYSTEM_PROPERTY_KEYS = java.util.Set.of(
+            "basedir", "localRepository", "env", "PID"
+    );
+
     private static Map<String, String> collectPropagatedProperties() {
+        return collectPropagatedProperties(System.getProperties());
+    }
+
+    static Map<String, String> collectPropagatedProperties(java.util.Properties source) {
         Map<String, String> props = new LinkedHashMap<>();
-        System.getProperties().forEach((k, v) -> {
+        source.forEach((k, v) -> {
             String key = String.valueOf(k);
-            if (key.startsWith("citrus.") && !key.startsWith("citrus.test.distribution.")) {
+            if (!isHostOrInternalProperty(key)) {
                 props.put(key, String.valueOf(v));
             }
         });
         return props;
+    }
+
+    private static boolean isHostOrInternalProperty(String key) {
+        if (HOST_SYSTEM_PROPERTY_KEYS.contains(key)) {
+            return true;
+        }
+        for (String prefix : HOST_SYSTEM_PROPERTY_PREFIXES) {
+            if (key.startsWith(prefix)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static void deleteRecursivelyQuietly(Path dir) {

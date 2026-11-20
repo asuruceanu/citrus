@@ -73,6 +73,8 @@ import org.slf4j.LoggerFactory;
 public final class IsolatedPartitionRunner {
 
     private static final Logger LOG = LoggerFactory.getLogger(IsolatedPartitionRunner.class);
+    private static final Object WORKER_JVM_LOCK = new Object();
+    private static final java.util.concurrent.atomic.AtomicInteger ACTIVE_WORKER_SCOPES = new java.util.concurrent.atomic.AtomicInteger();
 
     private final DistributionWorkerConfig config;
     private final BlobCacheDirectory blobCache;
@@ -105,8 +107,11 @@ public final class IsolatedPartitionRunner {
                 }
             }
 
-            applySystemProperties(assignment.systemProperties(), previousProps);
-            setWithBackup(DistributionSettings.ROLE_PROPERTY, DistributionSettings.ROLE_WORKER, previousProps);
+            synchronized (WORKER_JVM_LOCK) {
+                applySystemProperties(assignment.systemProperties(), previousProps);
+                ACTIVE_WORKER_SCOPES.incrementAndGet();
+                System.setProperty(DistributionSettings.ROLE_PROPERTY, DistributionSettings.ROLE_WORKER);
+            }
 
             ClassLoader parentCl = IsolatedPartitionRunner.class.getClassLoader();
             try (URLClassLoader partitionCl = urls.isEmpty()
@@ -133,7 +138,13 @@ public final class IsolatedPartitionRunner {
                     t.getMessage() != null ? t.getMessage() : t.getClass().getName());
         } finally {
             Thread.currentThread().setContextClassLoader(previousCl);
-            restoreSystemProperties(previousProps);
+            synchronized (WORKER_JVM_LOCK) {
+                restoreSystemProperties(previousProps);
+                if (ACTIVE_WORKER_SCOPES.decrementAndGet() <= 0) {
+                    ACTIVE_WORKER_SCOPES.set(0);
+                    System.clearProperty(DistributionSettings.ROLE_PROPERTY);
+                }
+            }
             deleteRecursivelyQuietly(workspaceDir);
         }
     }

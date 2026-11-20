@@ -29,6 +29,7 @@ on:
   push:
     branches:
       - main
+      - incubator/test-distribution
     paths-ignore:
       - '**.adoc'
       - '**.md'
@@ -67,9 +68,19 @@ jobs:
           # gitflow-incremental-builder diffs this branch against origin/main,
           # so it needs real history rather than the default shallow clone.
           fetch-depth: 0
-      - name: Fetch main for incremental build
+      - name: Fetch base branch for incremental build
+        id: fetch_base
         if: github.event_name == 'pull_request'
-        run: git fetch --no-tags origin main:refs/remotes/origin/main
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          if git ls-remote --exit-code --heads origin "${BASE_REF}" >/dev/null 2>&1; then
+            git fetch --no-tags origin "${BASE_REF}:refs/remotes/origin/${BASE_REF}"
+            echo "gib_ref=refs/remotes/origin/${BASE_REF}" >> "$GITHUB_OUTPUT"
+          else
+            git fetch --no-tags origin main:refs/remotes/origin/main
+            echo "gib_ref=refs/remotes/origin/main" >> "$GITHUB_OUTPUT"
+          fi
       - name: Cache Maven cache
         uses: actions/cache@v5
         with:
@@ -110,8 +121,10 @@ jobs:
           ./mvnw --no-transfer-progress install -DskipTests
           -Dmaven.javadoc.skip=true -Dmaven.source.skip=true
           ${MAVEN_PROFILES:+"$MAVEN_PROFILES"}
+          ${GIB_REF_ARG:+"$GIB_REF_ARG"}
         env:
           MAVEN_PROFILES: ${{ github.event_name == 'pull_request' && '-Pgib' || '' }}
+          GIB_REF_ARG: ${{ github.event_name == 'pull_request' && format('-Dgib.referenceBranch={0}', steps.fetch_base.outputs.gib_ref) || '' }}
       - name: Show modules selected by the incremental build
         if: github.event_name == 'pull_request'
         run: cat target/gib-impacted-modules.log || echo "no impacted-modules log (full build)"

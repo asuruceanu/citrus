@@ -1,0 +1,82 @@
+# ---------------------------------------------------------------------------
+# Copyright the original author or authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ---------------------------------------------------------------------------
+
+name: sync-upstream
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 4 * * *"
+
+jobs:
+  sync:
+    if: github.repository == 'asuruceanu/citrus'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Checkout fork repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Fast-forward fork main from upstream and open sync PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git remote add upstream https://github.com/citrusframework/citrus.git
+          git fetch --no-tags upstream main
+          git fetch --no-tags origin main incubator/test-distribution
+
+          if ! git merge-base --is-ancestor refs/remotes/origin/main refs/remotes/upstream/main; then
+            echo "::error::fork main has diverged from citrusframework/citrus:main; refusing non-fast-forward update."
+            exit 1
+          fi
+
+          if [ "$(git rev-parse refs/remotes/origin/main)" != "$(git rev-parse refs/remotes/upstream/main)" ]; then
+            git push origin refs/remotes/upstream/main:refs/heads/main
+          fi
+
+          if git merge-base --is-ancestor refs/remotes/upstream/main refs/remotes/origin/incubator/test-distribution; then
+            echo "incubator/test-distribution already contains upstream/main."
+            exit 0
+          fi
+
+          git push --force-with-lease origin refs/remotes/upstream/main:refs/heads/chore/sync-upstream-main
+
+          EXISTING_PR="$(gh pr list \
+            --repo "${GITHUB_REPOSITORY}" \
+            --state open \
+            --base incubator/test-distribution \
+            --head chore/sync-upstream-main \
+            --json number,headRefName \
+            --jq '.[] | select(.headRefName == "chore/sync-upstream-main") | .number' | head -n 1)"
+
+          UPSTREAM_SHA="$(git rev-parse --short refs/remotes/upstream/main)"
+          if [ -z "${EXISTING_PR}" ]; then
+            gh pr create \
+              --repo "${GITHUB_REPOSITORY}" \
+              --base incubator/test-distribution \
+              --head chore/sync-upstream-main \
+              --title "chore(sync): merge upstream main (${UPSTREAM_SHA}) into incubator/test-distribution" \
+              --body "Automated fast-forward sync of \`citrusframework/citrus:main\` (\`${UPSTREAM_SHA}\`). Merge with **Create a merge commit** (\`--no-ff\`); do not rebase \`incubator/test-distribution\`."
+          else
+            echo "Updated existing sync PR #${EXISTING_PR} to ${UPSTREAM_SHA}."
+          fi
