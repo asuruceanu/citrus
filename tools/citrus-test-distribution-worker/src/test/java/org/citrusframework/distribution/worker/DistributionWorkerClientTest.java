@@ -27,6 +27,7 @@ import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 import org.citrusframework.distribution.broker.DistributionBrokerConfig;
 import org.citrusframework.distribution.broker.DistributionBrokerServer;
@@ -61,6 +62,31 @@ class DistributionWorkerClientTest {
         void shouldPassOnWorker() {
             assertEquals("worker", System.getProperty("citrus.test.distribution.role"));
             assertEquals("hello-remote", System.getProperty("sample.custom.prop", "hello-remote"));
+        }
+    }
+
+    public static class AlphaTenantRemoteTest {
+        @Test
+        void shouldIsolateAlphaTenantProperty() throws InterruptedException {
+            assertEquals("worker", System.getProperty("citrus.test.distribution.role"));
+            assertEquals("alpha", System.getProperty("custom.tenant.id"));
+            AtomicReference<String> inherited = new AtomicReference<>();
+            Thread child = new Thread(() -> inherited.set(System.getProperty("custom.tenant.id")));
+            child.start();
+            child.join(2_000L);
+            assertEquals("alpha", inherited.get());
+            Thread.sleep(250L);
+            assertEquals("alpha", System.getProperty("custom.tenant.id"));
+        }
+    }
+
+    public static class BetaTenantRemoteTest {
+        @Test
+        void shouldIsolateBetaTenantProperty() throws InterruptedException {
+            assertEquals("worker", System.getProperty("citrus.test.distribution.role"));
+            assertEquals("beta", System.getProperty("custom.tenant.id"));
+            Thread.sleep(250L);
+            assertEquals("beta", System.getProperty("custom.tenant.id"));
         }
     }
 
@@ -149,6 +175,127 @@ class DistributionWorkerClientTest {
                 worker.drain(5, TimeUnit.SECONDS);
             }
         }
+    }
+
+    @Test
+    void shouldIsolatePartitionSystemPropertiesAcrossConcurrentWorkersInSameJvm() throws Exception {
+        DistributionBrokerConfig brokerConfig = DistributionBrokerConfig.builder()
+                .port(0)
+                .authToken("worker-secret")
+                .cacheDir(tempDir.resolve("broker-concurrent-cache"))
+                .jdbcUrl("jdbc:hsqldb:mem:worker_concurrent_" + System.nanoTime())
+                .defaultMaxPartitionSize(1)
+                .build();
+
+        try (DistributionBrokerServer broker = new DistributionBrokerServer(brokerConfig)) {
+            broker.start();
+
+            DistributionWorkerConfig alphaConfig = DistributionWorkerConfig.builder()
+                    .workerId("worker-alpha")
+                    .brokerUrl(broker.baseUrl())
+                    .authToken("worker-secret")
+                    .cacheDir(tempDir.resolve("worker-alpha-cache"))
+                    .build();
+            DistributionWorkerConfig betaConfig = DistributionWorkerConfig.builder()
+                    .workerId("worker-beta")
+                    .brokerUrl(broker.baseUrl())
+                    .authToken("worker-secret")
+                    .cacheDir(tempDir.resolve("worker-beta-cache"))
+                    .build();
+
+            try (DistributionWorkerClient workerAlpha = new DistributionWorkerClient(alphaConfig);
+                 DistributionWorkerClient workerBeta = new DistributionWorkerClient(betaConfig)) {
+                workerAlpha.start();
+                workerBeta.start();
+                assertThat(workerAlpha.awaitRegistration(5, TimeUnit.SECONDS)).isTrue();
+                assertThat(workerBeta.awaitRegistration(5, TimeUnit.SECONDS)).isTrue();
+
+                Path testClassesDir = Paths.get(AlphaTenantRemoteTest.class.getProtectionDomain().getCodeSource().getLocation().toURI());
+                ClasspathPackager.PackagedArtifact packaged = ClasspathPackager.packagePath(testClassesDir);
+
+                HttpResponse<String> uploadResp = httpClient.send(
+                        HttpRequest.newBuilder(URI.create(broker.baseUrl() + "/api/v1/cache/blobs/" + packaged.ref().sha256()))
+                                .header("Authorization", "Bearer worker-secret")
+                                .PUT(HttpRequest.BodyPublishers.ofByteArray(packaged.bytes()))
+                                .build(),
+                        HttpResponse.BodyHandlers.ofString());
+                assertThat(uploadResp.statusCode()).isEqualTo(201);
+
+                HttpResponse<String> createResp = postJson(
+                        broker.baseUrl() + "/api/v1/sessions",
+                        "worker-secret",
+                        new CreateSessionRequest("citrus", "main", "1234567", List.of(), 1, 0));
+                BuildSessionResponse session = DistributionJson.fromJson(createResp.body(), BuildSessionResponse.class);
+
+                WorkUnitSpec alphaUnit = new WorkUnitSpec(
+                        AlphaTenantRemoteTest.class.getName() + "#shouldIsolateAlphaTenantProperty",
+                        AlphaTenantRemoteTest.class.getName(),
+                        "shouldIsolateAlphaTenantProperty",
+                        null,
+                        Map.of(),
+                        500L);
+                WorkUnitSpec betaUnit = new WorkUnitSpec(
+                        BetaTenantRemoteTest.class.getName() + "#shouldIsolateBetaTenantProperty",
+                        BetaTenantRemoteTest.class.getName(),
+                        "shouldIsolateBetaTenantProperty",
+                        null,
+                        Map.of(),
+                        500L);
+
+                HttpResponse<String> submitAlpha = postJson(
+                        broker.baseUrl() + "/api/v1/sessions/" + session.sessionId() + "/work",
+                        "worker-secret",
+                        new SubmitWorkRequest(
+                                "sub-alpha",
+                                "module-alpha",
+                                List.of(packaged.ref()),
+                                Map.of("custom.tenant.id", "alpha"),
+                                List.of(alphaUnit),
+                                0,
+                                1));
+                HttpResponse<String> submitBeta = postJson(
+                        broker.baseUrl() + "/api/v1/sessions/" + session.sessionId() + "/work",
+                        "worker-secret",
+                        new SubmitWorkRequest(
+                                "sub-beta",
+                                "module-beta",
+                                List.of(packaged.ref()),
+                                Map.of("custom.tenant.id", "beta"),
+                                List.of(betaUnit),
+                                1,
+                                0));
+                assertThat(submitAlpha.statusCode()).isEqualTo(200);
+                assertThat(submitBeta.statusCode()).isEqualTo(200);
+
+                SessionDetailResponse detail = awaitPartitionsCompletion(
+                        broker.baseUrl(), "worker-secret", session.sessionId(), 2);
+                assertThat(detail.partitions()).hasSize(2);
+                assertThat(detail.partitions()).allSatisfy(p ->
+                        assertThat(p.state()).isEqualTo(PartitionState.COMPLETED));
+                assertThat(detail.tests()).hasSize(2);
+                assertThat(detail.tests()).allSatisfy(rec ->
+                        assertThat(rec.status()).as("Test %s failed: %s", rec.className(), rec.errorMessage())
+                                .isEqualTo(TestOutcomeStatus.PASSED));
+                assertThat(System.getProperty("custom.tenant.id")).isNull();
+
+                workerAlpha.drain(5, TimeUnit.SECONDS);
+                workerBeta.drain(5, TimeUnit.SECONDS);
+            }
+        }
+    }
+
+    private SessionDetailResponse awaitPartitionsCompletion(String baseUrl, String token, String sessionId, int expectedPartitions) throws Exception {
+        long deadline = System.currentTimeMillis() + 10_000L;
+        while (System.currentTimeMillis() < deadline) {
+            SessionDetailResponse detail = fetchDetail(baseUrl, token, sessionId);
+            if (detail.partitions().size() >= expectedPartitions
+                    && detail.partitions().stream().allMatch(p ->
+                    p.state() == PartitionState.COMPLETED || p.state() == PartitionState.FAILED || p.state() == PartitionState.LOST)) {
+                return detail;
+            }
+            Thread.sleep(50L);
+        }
+        return fetchDetail(baseUrl, token, sessionId);
     }
 
     private SessionDetailResponse awaitPartitionCompletion(String baseUrl, String token, String sessionId) throws Exception {

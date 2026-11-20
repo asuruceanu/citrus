@@ -108,7 +108,7 @@ public final class BrokerSessionCoordinator {
     }
 
     public synchronized SubmitWorkResponse submitWork(String sessionId, SubmitWorkRequest request) {
-        SessionRuntime session = sessions.get(sessionId);
+        SessionRuntime session = getOrRehydrateSession(sessionId);
         if (session == null) {
             throw new IllegalArgumentException("Unknown sessionId: " + sessionId);
         }
@@ -116,6 +116,11 @@ public final class BrokerSessionCoordinator {
         SubmitWorkResponse existing = submissionResponses.get(dedupKey);
         if (existing != null) {
             return existing;
+        }
+        Optional<SubmitWorkResponse> persisted = store.findWorkSubmission(sessionId, request.submissionId());
+        if (persisted.isPresent()) {
+            submissionResponses.put(dedupKey, persisted.get());
+            return persisted.get();
         }
 
         session.cachedBlobs += Math.max(0, request.cachedBlobs());
@@ -154,6 +159,7 @@ public final class BrokerSessionCoordinator {
                 request.cachedBlobs(),
                 request.uploadedBlobs()
         );
+        store.saveWorkSubmission(sessionId, response);
         submissionResponses.put(dedupKey, response);
 
         eventHub.publish("work.submitted", sessionId, null, null, Map.of(
@@ -549,6 +555,29 @@ public final class BrokerSessionCoordinator {
                 conn.lastHeartbeatAt,
                 conn.connectedAt
         ));
+    }
+
+    private SessionRuntime getOrRehydrateSession(String sessionId) {
+        SessionRuntime existing = sessions.get(sessionId);
+        if (existing != null) {
+            return existing;
+        }
+        Optional<BuildSessionRecord> stored = store.findSession(sessionId);
+        if (stored.isEmpty()) {
+            return null;
+        }
+        BuildSessionRecord record = stored.get();
+        SessionRuntime rehydrated = new SessionRuntime(
+                record,
+                config.defaultMaxPartitionSize(),
+                config.defaultMaxRetries());
+        rehydrated.cachedBlobs = Math.max(0, record.cachedBlobs());
+        rehydrated.uploadedBlobs = Math.max(0, record.totalBlobs() - record.cachedBlobs());
+        for (PartitionRecord part : store.listPartitions(sessionId)) {
+            rehydrated.partitionIds.add(part.partitionId());
+        }
+        sessions.put(sessionId, rehydrated);
+        return rehydrated;
     }
 
     private static String stringField(Map<String, Object> map, String key) {

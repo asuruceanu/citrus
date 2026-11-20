@@ -118,6 +118,19 @@ class TestDistributionMavenExtensionTest {
         assertThat(participant.getActiveSessionId()).isNull();
     }
 
+    @Test
+    void shouldTimeoutHungGitSubprocessWithinConfiguredBound() {
+        long startNs = System.nanoTime();
+        List<String> lines = GitDiffDetector.runBoundedCommand(tempDir, 150L, "sh", "-c", "sleep 10");
+        long elapsedMs = (System.nanoTime() - startNs) / 1_000_000L;
+
+        assertThat(lines).isEmpty();
+        assertThat(elapsedMs).isLessThan(2_000L);
+        assertThat(TestDistributionLifecycleParticipant.runGit(
+                Path.of("").toAbsolutePath(), "rev-parse", "--is-inside-work-tree"))
+                .isEqualTo("true");
+    }
+
     private MavenProject createSampleProject(String artifactId, Path dir) {
         MavenProject project = new MavenProject();
         project.setGroupId("org.citrusframework");

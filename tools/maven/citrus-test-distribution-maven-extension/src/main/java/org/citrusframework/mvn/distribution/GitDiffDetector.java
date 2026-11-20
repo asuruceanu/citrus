@@ -31,6 +31,8 @@ import java.util.concurrent.TimeUnit;
  */
 public final class GitDiffDetector {
 
+    static final long DEFAULT_GIT_TIMEOUT_MS = 5_000L;
+
     private GitDiffDetector() {
     }
 
@@ -52,37 +54,89 @@ public final class GitDiffDetector {
                 List.copyOf(changed));
     }
 
-    private static String runGitSingleLine(Path dir, String... args) {
+    static String runGitSingleLine(Path dir, String... args) {
         List<String> lines = runGitLines(dir, args);
         return lines.isEmpty() ? "" : lines.get(0).trim();
     }
 
     private static List<String> runGitLines(Path dir, String... args) {
-        List<String> cmd = new ArrayList<>(args.length + 1);
-        cmd.add("git");
-        cmd.addAll(List.of(args));
+        if (dir == null || args == null || args.length == 0) {
+            return List.of();
+        }
+        String[] cmd;
+        if ("git".equals(args[0])) {
+            cmd = args;
+        } else {
+            cmd = new String[args.length + 1];
+            cmd[0] = "git";
+            System.arraycopy(args, 0, cmd, 1, args.length);
+        }
+        return runBoundedCommand(dir, DEFAULT_GIT_TIMEOUT_MS, cmd);
+    }
+
+    static List<String> runBoundedCommand(Path dir, long timeoutMs, String... command) {
+        if (dir == null || command == null || command.length == 0) {
+            return List.of();
+        }
+        Process proc = null;
         try {
-            Process proc = new ProcessBuilder(cmd)
+            proc = new ProcessBuilder(command)
                     .directory(dir.toFile())
                     .redirectErrorStream(true)
                     .start();
-            List<String> lines = new ArrayList<>();
-            try (BufferedReader reader = new BufferedReader(
-                    new InputStreamReader(proc.getInputStream(), StandardCharsets.UTF_8))) {
-                String line;
-                while ((line = reader.readLine()) != null) {
-                    String trimmed = line.trim();
-                    if (!trimmed.isEmpty()) {
-                        lines.add(trimmed);
+            Process started = proc;
+            List<String> collected = new ArrayList<>();
+            Thread drainThread = new Thread(() -> {
+                try (BufferedReader reader = new BufferedReader(
+                        new InputStreamReader(started.getInputStream(), StandardCharsets.UTF_8))) {
+                    String line;
+                    while ((line = reader.readLine()) != null) {
+                        String trimmed = line.trim();
+                        if (!trimmed.isEmpty()) {
+                            collected.add(trimmed);
+                        }
                     }
+                } catch (Exception ignored) {
+                    // stream closed or process terminated
                 }
-            }
-            if (!proc.waitFor(5, TimeUnit.SECONDS) || proc.exitValue() != 0) {
+            }, "citrus-git-stdout-drain");
+            drainThread.setDaemon(true);
+            drainThread.start();
+
+            if (!proc.waitFor(timeoutMs, TimeUnit.MILLISECONDS)) {
+                destroyProcessTree(proc);
                 return List.of();
             }
-            return lines;
-        } catch (Exception e) {
+            if (proc.exitValue() != 0) {
+                return List.of();
+            }
+            drainThread.join(1_000L);
+            return List.copyOf(collected);
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            if (proc != null) {
+                destroyProcessTree(proc);
+            }
             return List.of();
+        } catch (Exception e) {
+            if (proc != null && proc.isAlive()) {
+                destroyProcessTree(proc);
+            }
+            return List.of();
+        }
+    }
+
+    private static void destroyProcessTree(Process proc) {
+        try {
+            proc.descendants().forEach(ProcessHandle::destroyForcibly);
+        } catch (Exception ignored) {
+            // best-effort descendant termination
+        }
+        proc.destroyForcibly();
+        try {
+            proc.getInputStream().close();
+        } catch (Exception ignored) {
+            // unblock drain reader if open
         }
     }
 }

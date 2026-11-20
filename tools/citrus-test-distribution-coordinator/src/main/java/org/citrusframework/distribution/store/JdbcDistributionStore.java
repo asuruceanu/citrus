@@ -36,6 +36,7 @@ import org.citrusframework.distribution.model.PartitionRecord;
 import org.citrusframework.distribution.model.PartitionState;
 import org.citrusframework.distribution.model.SessionStatus;
 import org.citrusframework.distribution.model.SessionSummary;
+import org.citrusframework.distribution.model.SubmitWorkResponse;
 import org.citrusframework.distribution.model.TestExecutionRecord;
 import org.citrusframework.distribution.model.TestHistorySummary;
 import org.citrusframework.distribution.model.TestOutcomeStatus;
@@ -140,6 +141,12 @@ public class JdbcDistributionStore implements DistributionStore {
                         "finished_at BIGINT, " +
                         "required_caps_json VARCHAR(4096), " +
                         "work_units_json " + longText + ")",
+                "CREATE TABLE IF NOT EXISTS dist_work_submissions (" +
+                        "session_id VARCHAR(64) NOT NULL, " +
+                        "submission_id VARCHAR(128) NOT NULL, " +
+                        "response_json " + longText + " NOT NULL, " +
+                        "recorded_at BIGINT NOT NULL, " +
+                        "PRIMARY KEY (session_id, submission_id))",
                 "CREATE TABLE IF NOT EXISTS dist_test_executions (" +
                         "id VARCHAR(64) PRIMARY KEY, " +
                         "session_id VARCHAR(64), " +
@@ -465,6 +472,66 @@ public class JdbcDistributionStore implements DistributionStore {
             return partitions;
         } catch (SQLException e) {
             throw new IllegalStateException("Failed to list partitions for " + sessionId, e);
+        }
+    }
+
+    @Override
+    public synchronized void saveWorkSubmission(String sessionId, SubmitWorkResponse response) {
+        if (sessionId == null || response == null || response.submissionId() == null) {
+            return;
+        }
+        String responseJson = DistributionJson.toJson(response);
+        long now = System.currentTimeMillis();
+        String submissionId = truncate(response.submissionId(), 128);
+        String updateSql = "UPDATE dist_work_submissions SET response_json=?, recorded_at=? " +
+                "WHERE session_id=? AND submission_id=?";
+        String insertSql = "INSERT INTO dist_work_submissions (session_id, submission_id, response_json, recorded_at) " +
+                "VALUES (?, ?, ?, ?)";
+        try (Connection conn = dataSource.getConnection()) {
+            try (PreparedStatement ps = conn.prepareStatement(updateSql)) {
+                ps.setString(1, responseJson);
+                ps.setLong(2, now);
+                ps.setString(3, sessionId);
+                ps.setString(4, submissionId);
+                if (ps.executeUpdate() > 0) {
+                    return;
+                }
+            }
+            try (PreparedStatement ps = conn.prepareStatement(insertSql)) {
+                ps.setString(1, sessionId);
+                ps.setString(2, submissionId);
+                ps.setString(3, responseJson);
+                ps.setLong(4, now);
+                ps.executeUpdate();
+            }
+        } catch (SQLException e) {
+            throw new IllegalStateException(
+                    "Failed to save work submission " + submissionId + " for session " + sessionId, e);
+        }
+    }
+
+    @Override
+    public Optional<SubmitWorkResponse> findWorkSubmission(String sessionId, String submissionId) {
+        if (sessionId == null || submissionId == null) {
+            return Optional.empty();
+        }
+        String sql = "SELECT response_json FROM dist_work_submissions WHERE session_id=? AND submission_id=?";
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, sessionId);
+            ps.setString(2, truncate(submissionId, 128));
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) {
+                    String json = rs.getString(1);
+                    if (json != null && !json.isBlank()) {
+                        return Optional.of(DistributionJson.fromJson(json, SubmitWorkResponse.class));
+                    }
+                }
+                return Optional.empty();
+            }
+        } catch (SQLException e) {
+            throw new IllegalStateException(
+                    "Failed to find work submission " + submissionId + " for session " + sessionId, e);
         }
     }
 

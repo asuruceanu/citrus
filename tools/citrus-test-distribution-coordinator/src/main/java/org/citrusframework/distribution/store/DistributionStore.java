@@ -25,6 +25,7 @@ import org.citrusframework.distribution.model.BuildSessionRecord;
 import org.citrusframework.distribution.model.PartitionRecord;
 import org.citrusframework.distribution.model.SessionStatus;
 import org.citrusframework.distribution.model.SessionSummary;
+import org.citrusframework.distribution.model.SubmitWorkResponse;
 import org.citrusframework.distribution.model.TestExecutionRecord;
 import org.citrusframework.distribution.model.TestHistorySummary;
 import org.citrusframework.distribution.model.WorkerRecord;
@@ -56,6 +57,10 @@ public interface DistributionStore extends AutoCloseable {
     void savePartition(PartitionRecord partition);
 
     List<PartitionRecord> listPartitions(String sessionId);
+
+    void saveWorkSubmission(String sessionId, SubmitWorkResponse response);
+
+    Optional<SubmitWorkResponse> findWorkSubmission(String sessionId, String submissionId);
 
     void saveTestExecution(TestExecutionRecord execution);
 

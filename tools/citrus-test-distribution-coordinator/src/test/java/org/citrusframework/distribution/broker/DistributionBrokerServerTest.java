@@ -297,6 +297,79 @@ class DistributionBrokerServerTest {
         }
     }
 
+    @Test
+    void shouldDeduplicateWorkSubmissionAcrossCoordinatorRestart() throws Exception {
+        String jdbcUrl = "jdbc:hsqldb:file:" + tempDir.resolve("restart-db/broker");
+        Path sharedCache = tempDir.resolve("restart-cache");
+
+        WorkUnitSpec unit = new WorkUnitSpec(
+                "org.example.RestartIT#shouldRunOnce",
+                "org.example.RestartIT",
+                "shouldRunOnce",
+                null,
+                Map.of(),
+                1_000L);
+        ArtifactRef artifact = new ArtifactRef("restart-test.jar", "c".repeat(64), ArtifactKind.JAR, 256L);
+        SubmitWorkRequest submitReq = new SubmitWorkRequest(
+                "sub-restart-1",
+                "citrus-http",
+                List.of(artifact),
+                Map.of("env", "ci"),
+                List.of(unit),
+                1,
+                0);
+
+        String sessionId;
+        SubmitWorkResponse firstSubmit;
+
+        DistributionBrokerConfig config1 = DistributionBrokerConfig.builder()
+                .port(0)
+                .cacheDir(sharedCache)
+                .jdbcUrl(jdbcUrl)
+                .build();
+        try (DistributionBrokerServer server1 = new DistributionBrokerServer(config1)) {
+            server1.start();
+
+            HttpResponse<String> createdResp = postJson(
+                    server1.baseUrl() + "/api/v1/sessions",
+                    new CreateSessionRequest("citrus", "main", "def5678", List.of("pom.xml"), 2, 1));
+            assertThat(createdResp.statusCode()).isEqualTo(201);
+            BuildSessionResponse session = DistributionJson.fromJson(createdResp.body(), BuildSessionResponse.class);
+            sessionId = session.sessionId();
+
+            HttpResponse<String> submitResp1 = postJson(
+                    server1.baseUrl() + "/api/v1/sessions/" + sessionId + "/work",
+                    submitReq);
+            assertThat(submitResp1.statusCode()).isEqualTo(200);
+            firstSubmit = DistributionJson.fromJson(submitResp1.body(), SubmitWorkResponse.class);
+            assertThat(firstSubmit.partitionIds()).hasSize(1);
+        }
+
+        DistributionBrokerConfig config2 = DistributionBrokerConfig.builder()
+                .port(0)
+                .cacheDir(sharedCache)
+                .jdbcUrl(jdbcUrl)
+                .build();
+        try (DistributionBrokerServer server2 = new DistributionBrokerServer(config2)) {
+            server2.start();
+
+            HttpResponse<String> submitResp2 = postJson(
+                    server2.baseUrl() + "/api/v1/sessions/" + sessionId + "/work",
+                    submitReq);
+            assertThat(submitResp2.statusCode()).isEqualTo(200);
+            SubmitWorkResponse secondSubmit = DistributionJson.fromJson(submitResp2.body(), SubmitWorkResponse.class);
+            assertThat(secondSubmit.partitionIds()).isEqualTo(firstSubmit.partitionIds());
+
+            HttpResponse<String> detailResp = httpClient.send(
+                    HttpRequest.newBuilder(URI.create(server2.baseUrl() + "/api/v1/sessions/" + sessionId))
+                            .GET().build(),
+                    HttpResponse.BodyHandlers.ofString());
+            assertThat(detailResp.statusCode()).isEqualTo(200);
+            SessionDetailResponse detail = DistributionJson.fromJson(detailResp.body(), SessionDetailResponse.class);
+            assertThat(detail.partitions()).hasSize(1);
+        }
+    }
+
     private HttpResponse<String> postJson(String url, Object body) throws Exception {
         return httpClient.send(
                 HttpRequest.newBuilder(URI.create(url))
