@@ -31,19 +31,24 @@ import org.citrusframework.CitrusSettings;
 import org.citrusframework.CitrusVersion;
 import org.citrusframework.jbang.cli.commands.Agent;
 import org.citrusframework.jbang.cli.commands.Complete;
+import org.citrusframework.jbang.cli.commands.Dist;
 import org.citrusframework.jbang.cli.commands.Init;
 import org.citrusframework.jbang.cli.commands.Inspect;
 import org.citrusframework.jbang.cli.commands.ListTests;
 import org.citrusframework.jbang.cli.commands.Run;
 
 @CommandDefinition(name = "citrus", description = "Citrus JBang CLI", generateHelp = true,
-        groupCommands = {Init.class, Inspect.class, Run.class, ListTests.class, Agent.class, Complete.class})
+        groupCommands = {Init.class, Inspect.class, Run.class, ListTests.class, Agent.class, Dist.class, Complete.class})
 public class CitrusJBangMain implements GroupCommand<CommandInvocation> {
 
     private Printer out = new Printer.SystemOutPrinter();
 
     @Option(name = "version", shortName = 'V', hasValue = false, description = "Display version information")
     boolean versionRequested;
+
+    public static void main(String... args) {
+        run(args);
+    }
 
     public static void run(String... args) {
         run(new CitrusJBangMain(), args);
@@ -84,6 +89,7 @@ public class CitrusJBangMain implements GroupCommand<CommandInvocation> {
                 new Run(this),
                 new ListTests(this),
                 new Agent(this),
+                new Dist(this),
                 new Complete(this));
     }
 

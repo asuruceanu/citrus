@@ -126,6 +126,11 @@
       <artifactId>citrus-validation-xml</artifactId>
       <version>${project.version}</version>
     </dependency>
+    <dependency>
+      <groupId>org.citrusframework</groupId>
+      <artifactId>citrus-test-distribution-worker</artifactId>
+      <version>${project.version}</version>
+    </dependency>
   </dependencies>
 
   <build>

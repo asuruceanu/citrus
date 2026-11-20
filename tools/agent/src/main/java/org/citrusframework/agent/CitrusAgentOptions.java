@@ -39,6 +39,49 @@ public class CitrusAgentOptions extends CitrusAppOptions<CitrusAgentConfiguratio
                 }
             }
         });
+
+        options.add(new CliOption<>("m", "mode", "Agent mode (standalone or worker)") {
+            @Override
+            protected void doProcess(CitrusAgentConfiguration configuration, String arg, String value, LinkedList<String> remainingArgs) {
+                if (StringUtils.hasText(value)) {
+                    configuration.setMode(value);
+                } else {
+                    throw new CitrusRuntimeException("Missing parameter value for -m/--mode option");
+                }
+            }
+        });
+
+        options.add(new CliOption<>("b", "broker-url", "Test distribution broker URL") {
+            @Override
+            protected void doProcess(CitrusAgentConfiguration configuration, String arg, String value, LinkedList<String> remainingArgs) {
+                if (StringUtils.hasText(value)) {
+                    configuration.setBrokerUrl(value);
+                } else {
+                    throw new CitrusRuntimeException("Missing parameter value for -b/--broker-url option");
+                }
+            }
+        });
+
+        options.add(new CliOption<>("t", "auth-token", "Test distribution broker auth token") {
+            @Override
+            protected void doProcess(CitrusAgentConfiguration configuration, String arg, String value, LinkedList<String> remainingArgs) {
+                configuration.setAuthToken(value != null ? value : "");
+            }
+        });
+
+        options.add(new CliOption<>("C", "capabilities", "Comma-separated worker capabilities (key=value)") {
+            @Override
+            protected void doProcess(CitrusAgentConfiguration configuration, String arg, String value, LinkedList<String> remainingArgs) {
+                configuration.setCapabilities(value != null ? value : "");
+            }
+        });
+
+        options.add(new CliOption<>(null, "cache-dir", "Worker blob cache directory") {
+            @Override
+            protected void doProcess(CitrusAgentConfiguration configuration, String arg, String value, LinkedList<String> remainingArgs) {
+                configuration.setCacheDir(value != null ? value : "");
+            }
+        });
     }
 
     public CitrusAgentConfiguration apply(CitrusAgentConfiguration configuration, String[] arguments) {

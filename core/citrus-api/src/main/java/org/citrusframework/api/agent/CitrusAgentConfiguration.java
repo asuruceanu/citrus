@@ -39,6 +39,16 @@ public class CitrusAgentConfiguration extends CitrusAppConfiguration {
 
     private boolean inspectCode = true;
 
+    private String mode = "standalone";
+
+    private String brokerUrl = "http://localhost:8084";
+
+    private String authToken = "";
+
+    private String capabilities = "";
+
+    private String cacheDir = "";
+
     /**
      * Gets the port.
      */
@@ -70,6 +80,55 @@ public class CitrusAgentConfiguration extends CitrusAppConfiguration {
     @SchemaProperty(description = "When enabled the source code gets analyzed for required modules and dependencies that are added to the classpath.")
     public void setInspectCode(boolean inspectCode) {
         this.inspectCode = inspectCode;
+    }
+
+    public String getMode() {
+        return mode;
+    }
+
+    @SchemaProperty(description = "Agent execution mode: standalone or worker.", defaultValue = "standalone")
+    public void setMode(String mode) {
+        this.mode = mode;
+    }
+
+    public boolean isWorkerMode() {
+        return "worker".equalsIgnoreCase(mode);
+    }
+
+    public String getBrokerUrl() {
+        return brokerUrl;
+    }
+
+    @SchemaProperty(description = "Citrus Test Distribution Broker URL when running in worker mode.", defaultValue = "http://localhost:8084")
+    public void setBrokerUrl(String brokerUrl) {
+        this.brokerUrl = brokerUrl;
+    }
+
+    public String getAuthToken() {
+        return authToken;
+    }
+
+    @SchemaProperty(description = "Shared authentication token for the Citrus Test Distribution Broker.")
+    public void setAuthToken(String authToken) {
+        this.authToken = authToken;
+    }
+
+    public String getCapabilities() {
+        return capabilities;
+    }
+
+    @SchemaProperty(description = "Comma-separated capability key=value pairs advertised in worker mode.")
+    public void setCapabilities(String capabilities) {
+        this.capabilities = capabilities;
+    }
+
+    public String getCacheDir() {
+        return cacheDir;
+    }
+
+    @SchemaProperty(description = "Local content-addressed blob cache directory in worker mode.")
+    public void setCacheDir(String cacheDir) {
+        this.cacheDir = cacheDir;
     }
 
     /**

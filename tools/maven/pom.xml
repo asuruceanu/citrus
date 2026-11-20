@@ -19,5 +19,6 @@
     <module>citrus-maven-plugin</module>
     <module>citrus-maven-plugin-integration</module>
     <module>citrus-agent-maven-plugin</module>
+    <module>citrus-test-distribution-maven-extension</module>
   </modules>
 </project>

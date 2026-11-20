@@ -90,6 +90,9 @@ public final class CitrusTestFactorySupport {
                         filePath = filePath.substring(filePath.indexOf(packageScan.replace('.', File.separatorChar)));
 
                         String testName = FileUtils.getBaseName(String.valueOf(fileResource.getFileName()));
+                        if (!CitrusDynamicSourceFilter.recordAndAllow(testName)) {
+                            continue;
+                        }
 
                         TestLoader testLoader = createTestLoader(testName, filePath);
                         tests.add(DynamicTest.dynamicTest(testName, () -> handler.accept(testLoader)));
@@ -110,10 +113,14 @@ public final class CitrusTestFactorySupport {
      * @return
      */
     public Stream<DynamicTest> dynamicTests(String packageName, String ... testNames) {
-        return Stream.of(testNames).map(testName -> {
-            TestLoader testLoader = createTestLoader(testName, packageName);
-            return DynamicTest.dynamicTest(testName, () -> handler.accept(testLoader));
-        });
+        List<DynamicTest> tests = new ArrayList<>();
+        for (String testName : testNames) {
+            if (CitrusDynamicSourceFilter.recordAndAllow(testName)) {
+                TestLoader testLoader = createTestLoader(testName, packageName);
+                tests.add(DynamicTest.dynamicTest(testName, () -> handler.accept(testLoader)));
+            }
+        }
+        return tests.stream();
     }
 
     /**
@@ -123,10 +130,7 @@ public final class CitrusTestFactorySupport {
      * @return
      */
     public Stream<DynamicTest> dynamicTests(Class<?> testClass, String ... testNames) {
-        return Stream.of(testNames).map(testName -> {
-            TestLoader testLoader = createTestLoader(testName, testClass.getPackage().getName());
-            return DynamicTest.dynamicTest(testName, () -> handler.accept(testLoader));
-        });
+        return dynamicTests(testClass.getPackage().getName(), testNames);
     }
 
     /**

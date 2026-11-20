@@ -53,6 +53,8 @@ public class CitrusAgentServer implements Server {
 
     private CitrusAgentApplication application;
 
+    private DistributionWorkerBridge workerBridge;
+
     /** Completed future marking completed state */
     protected final CompletableFuture<Boolean> completed = new CompletableFuture<>();
 
@@ -140,7 +142,16 @@ public class CitrusAgentServer implements Server {
         configuration.addDefaultProperty(CitrusSettings.DEFAULT_MESSAGE_TYPE_PROPERTY, MessageType.JSON.name(), false);
         configuration.setDefaultProperties();
 
-        if (configuration.isSkipTests()) {
+        if (configuration.isWorkerMode()) {
+            logger.info("Starting Citrus agent in test distribution worker mode connecting to {}", configuration.getBrokerUrl());
+            workerBridge = new DistributionWorkerBridge(configuration);
+            workerBridge.start();
+            Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+                if (workerBridge != null) {
+                    workerBridge.close();
+                }
+            }, "citrus-agent-worker-drain"));
+        } else if (configuration.isSkipTests()) {
             logger.info("Skip tests on startup - waiting for requests to run tests");
         } else if (configuration.hasTests()) {
             logger.info("Run tests on startup ...");
@@ -181,6 +192,10 @@ public class CitrusAgentServer implements Server {
      */
     @Override
     public void stop() {
+        if (workerBridge != null) {
+            workerBridge.close();
+            workerBridge = null;
+        }
         if (application != null) {
             application.stop();
         }

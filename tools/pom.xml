@@ -23,6 +23,11 @@
     <module>cucumber-steps</module>
     <module>jbang</module>
     <module>agent</module>
+    <module>citrus-test-distribution-protocol</module>
+    <module>citrus-test-distribution-ui</module>
+    <module>citrus-test-distribution-coordinator</module>
+    <module>citrus-test-distribution-worker</module>
+    <module>citrus-test-distribution</module>
     <module>archetypes</module>
     <module>mcp-server</module>
   </modules>

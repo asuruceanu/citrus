@@ -40,3 +40,6 @@ nb-configuration.xml
 
 # Claude Code
 settings.local.json
+
+# Scratch distribution test directory
+/dist/

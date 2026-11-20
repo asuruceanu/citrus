@@ -55,6 +55,32 @@
       <artifactId>citrus-validation-xml</artifactId>
       <version>${project.version}</version>
     </dependency>
+    <dependency>
+      <groupId>org.citrusframework</groupId>
+      <artifactId>citrus-test-distribution-protocol</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.citrusframework</groupId>
+      <artifactId>citrus-test-distribution-coordinator</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.citrusframework</groupId>
+      <artifactId>citrus-test-distribution-worker</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.hsqldb</groupId>
+      <artifactId>hsqldb</artifactId>
+      <scope>compile</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.postgresql</groupId>
+      <artifactId>postgresql</artifactId>
+      <scope>compile</scope>
+      <optional>true</optional>
+    </dependency>
 
     <!-- Http client -->
     <dependency>
@@ -156,21 +182,21 @@
             <goals>
               <goal>java</goal>
             </goals>
+            <configuration>
+              <includeProjectDependencies>false</includeProjectDependencies>
+              <includePluginDependencies>true</includePluginDependencies>
+              <executableDependency>
+                <groupId>org.citrusframework</groupId>
+                <artifactId>citrus-schema-generator</artifactId>
+              </executableDependency>
+              <mainClass>org.citrusframework.dsl.schema.generator.CitrusSchemaGenerator</mainClass>
+              <arguments>
+                <argument>${project.build.directory}/generated-resources/citrus-catalog</argument>
+                <argument>${project.version}</argument>
+              </arguments>
+            </configuration>
           </execution>
         </executions>
-        <configuration>
-          <includeProjectDependencies>false</includeProjectDependencies>
-          <includePluginDependencies>true</includePluginDependencies>
-          <executableDependency>
-            <groupId>org.citrusframework</groupId>
-            <artifactId>citrus-schema-generator</artifactId>
-          </executableDependency>
-          <mainClass>org.citrusframework.dsl.schema.generator.CitrusSchemaGenerator</mainClass>
-          <arguments>
-            <argument>${project.build.directory}/generated-resources/citrus-catalog</argument>
-            <argument>${project.version}</argument>
-          </arguments>
-        </configuration>
         <dependencies>
           <dependency>
             <groupId>org.citrusframework</groupId>
