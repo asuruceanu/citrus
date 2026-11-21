@@ -17,10 +17,13 @@
 package org.citrusframework.distribution.config;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+
+import org.citrusframework.distribution.model.PartitionPolicy;
 
 /**
  * Centralized configuration keys, environment variable fallbacks, and host capability detection
@@ -158,6 +161,23 @@ public final class DistributionSettings {
      * Paths are not validated for traversal or absolute forms here; packaging validates them.
      */
     public static List<DeclaredPathSpec> parseDeclaredPaths(String rawValue) {
+        return parseDeclaredPaths(rawValue, true, INPUTS_PROPERTY);
+    }
+
+    /**
+     * Parses a comma-separated declared output path list with the same rules as
+     * {@link #parseDeclaredPaths(String)}, except that the optional marker {@code ?} is rejected:
+     * outputs are collected only when produced, so marking them optional has no meaning.
+     *
+     * @throws IllegalArgumentException if any path carries a leading or trailing {@code ?}
+     */
+    public static List<DeclaredPathSpec> parseDeclaredOutputPaths(String rawValue) {
+        return parseDeclaredPaths(rawValue, false, OUTPUTS_PROPERTY);
+    }
+
+    private static List<DeclaredPathSpec> parseDeclaredPaths(String rawValue,
+                                                             boolean allowOptional,
+                                                             String settingKey) {
         if (rawValue == null) {
             return List.of();
         }
@@ -169,6 +189,10 @@ public final class DistributionSettings {
         Map<String, Boolean> optionalByPath = new LinkedHashMap<>();
         for (String token : trimmedValue.split(",")) {
             String path = token.trim();
+            if (!allowOptional && (path.startsWith("?") || path.endsWith("?"))) {
+                throw new IllegalArgumentException("Optional marker '?' is not supported for " + settingKey
+                        + ": '" + path + "'");
+            }
             boolean optional = false;
             if (path.startsWith("?")) {
                 optional = true;
@@ -203,6 +227,69 @@ public final class DistributionSettings {
             }
         }
         return List.copyOf(result);
+    }
+
+    /**
+     * Parses the {@code fork} setting strictly: {@code null}/blank yields {@code false}, otherwise only
+     * {@code true} or {@code false} (case-insensitive) are accepted.
+     *
+     * @throws IllegalArgumentException for any other value
+     */
+    public static boolean parseForkWorkspace(String rawValue) {
+        if (rawValue == null || rawValue.isBlank()) {
+            return false;
+        }
+        String value = rawValue.trim();
+        if ("true".equalsIgnoreCase(value)) {
+            return true;
+        }
+        if ("false".equalsIgnoreCase(value)) {
+            return false;
+        }
+        throw new IllegalArgumentException("Invalid value '" + value + "' for " + FORK_PROPERTY
+                + " - expected true or false");
+    }
+
+    /**
+     * Parses the partition policy; {@code null}/blank yields {@link PartitionPolicy#LPT}.
+     *
+     * @throws IllegalArgumentException for an unknown policy
+     */
+    public static PartitionPolicy parsePartitionPolicy(String rawValue) {
+        return parseEnum(rawValue, PartitionPolicy.class, PartitionPolicy.LPT, PARTITION_POLICY_PROPERTY);
+    }
+
+    /**
+     * Parses the worker fork mode; {@code null}/blank yields {@link WorkerForkMode#AUTO}.
+     *
+     * @throws IllegalArgumentException for an unknown mode
+     */
+    public static WorkerForkMode parseWorkerForkMode(String rawValue) {
+        return parseEnum(rawValue, WorkerForkMode.class, WorkerForkMode.AUTO, WORKER_FORK_MODE_PROPERTY);
+    }
+
+    /**
+     * Parses the worker working-directory check mode; {@code null}/blank yields {@link WorkerCwdCheckMode#FAIL}.
+     *
+     * @throws IllegalArgumentException for an unknown mode
+     */
+    public static WorkerCwdCheckMode parseWorkerCwdCheckMode(String rawValue) {
+        return parseEnum(rawValue, WorkerCwdCheckMode.class, WorkerCwdCheckMode.FAIL, WORKER_CWD_CHECK_PROPERTY);
+    }
+
+    private static <E extends Enum<E>> E parseEnum(String rawValue, Class<E> type, E defaultValue, String settingKey) {
+        if (rawValue == null || rawValue.isBlank()) {
+            return defaultValue;
+        }
+        String value = rawValue.trim();
+        for (E constant : type.getEnumConstants()) {
+            if (constant.name().equalsIgnoreCase(value)) {
+                return constant;
+            }
+        }
+        String allowed = String.join(", ", Arrays.stream(type.getEnumConstants()).map(Enum::name).toList());
+        throw new IllegalArgumentException("Invalid value '" + value + "' for " + settingKey
+                + " - expected one of " + allowed);
     }
 
     /**

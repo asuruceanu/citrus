@@ -33,15 +33,18 @@ import java.util.Set;
  * <p>
  * A host prefix is only replaced at path-segment boundaries, so sibling directories sharing a name
  * prefix ({@code /work/rest} vs {@code /work/restdocs}) and paths that merely contain the base
- * directory further in ({@code /other/work/rest}) are left untouched. Matching is case-sensitive and
- * URL-encoded or otherwise escaped forms (other than Java-properties style doubled backslashes on
- * Windows) are not recognized. On expansion only a single separator directly after the token is
- * normalized, so a doubled (escaped) backslash after the token keeps its second backslash.
+ * directory further in ({@code /other/work/rest}) are left untouched. Matching is case-insensitive on
+ * Windows and case-sensitive elsewhere. URL-encoded or otherwise escaped forms (other than
+ * Java-properties style doubled backslashes on Windows) are not recognized. On expansion only a
+ * single separator directly after the token is normalized, so a doubled (escaped) backslash after the
+ * token keeps its second backslash.
  */
 public final class PathRewriter {
 
     /** URI prefixes after which a host path may start ({@code file:/C:/..}, {@code file:///work/..}). */
     private static final List<String> FILE_URI_PREFIXES = List.of("file:///", "file://", "file:/");
+
+    private static final boolean WINDOWS = File.separatorChar == '\\';
 
     private PathRewriter() {
     }
@@ -58,7 +61,8 @@ public final class PathRewriter {
             return result;
         }
         List<String> candidates = hostPrefixCandidates(hostBaseDir);
-        props.forEach((key, value) -> result.put(key, candidates.isEmpty() ? value : rewrite(value, candidates)));
+        props.forEach((key, value) ->
+                result.put(key, candidates.isEmpty() ? value : rewriteValue(value, candidates, WINDOWS)));
         return result;
     }
 
@@ -86,12 +90,11 @@ public final class PathRewriter {
             return List.of();
         }
 
-        Set<String> forms = new LinkedHashSet<>();
-        addForms(forms, absolute);
+        Set<String> forms = new LinkedHashSet<>(separatorForms(absolute.toString(), WINDOWS));
         try {
             Path real = absolute.toRealPath();
             if (real.getNameCount() > 0) {
-                addForms(forms, real);
+                forms.addAll(separatorForms(real.toString(), WINDOWS));
             }
         } catch (IOException | SecurityException ignored) {
             // Base directory not resolvable on this host: the absolute form is the only candidate.
@@ -102,16 +105,24 @@ public final class PathRewriter {
                 .toList();
     }
 
-    private static void addForms(Set<String> forms, Path path) {
-        String nativeForm = path.toString();
-        forms.add(nativeForm);
-        if (File.separatorChar == '\\') {
-            forms.add(nativeForm.replace('\\', '/'));
-            forms.add(nativeForm.replace("\\", "\\\\"));
+    /**
+     * Spellings of a native host path to look for: the native form and, on Windows, its forward-slash and
+     * Java-properties escaped (doubled backslash) forms.
+     */
+    static List<String> separatorForms(String nativeForm, boolean windows) {
+        if (!windows) {
+            return List.of(nativeForm);
         }
+        return new LinkedHashSet<>(List.of(
+                nativeForm,
+                nativeForm.replace('\\', '/'),
+                nativeForm.replace("\\", "\\\\"))).stream().toList();
     }
 
-    private static String rewrite(String value, List<String> candidates) {
+    /**
+     * Replaces boundary-delimited occurrences of {@code candidates} (ordered longest first) in {@code value}.
+     */
+    static String rewriteValue(String value, List<String> candidates, boolean ignoreCase) {
         if (value == null || value.isEmpty()) {
             return value;
         }
@@ -123,7 +134,9 @@ public final class PathRewriter {
             if (isPrecedingBoundary(value, i)) {
                 for (String candidate : candidates) {
                     int end = i + candidate.length();
-                    if (value.startsWith(candidate, i) && isFollowingBoundary(value, end)) {
+                    if (end <= value.length()
+                            && value.regionMatches(ignoreCase, i, candidate, 0, candidate.length())
+                            && isFollowingBoundary(value, end)) {
                         match = candidate;
                         break;
                     }

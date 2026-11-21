@@ -97,6 +97,76 @@ class DistributionSettingsAndPathRewriterTest {
     }
 
     @Test
+    void shouldRejectOptionalMarkerOnOutputPaths() {
+        assertThat(DistributionSettings.parseDeclaredOutputPaths(" target/docs/ , target/docs/index.html,NONE-file"))
+                .containsExactly(
+                        new DeclaredPathSpec("target/docs", false),
+                        new DeclaredPathSpec("NONE-file", false));
+        assertThat(DistributionSettings.parseDeclaredOutputPaths("none")).isEmpty();
+        assertThatThrownBy(() -> DistributionSettings.parseDeclaredOutputPaths("target/docs,target/x?"))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("target/x?")
+                .hasMessageContaining(DistributionSettings.OUTPUTS_PROPERTY);
+        assertThatThrownBy(() -> DistributionSettings.parseDeclaredOutputPaths("?target/x"))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void shouldParseForkFlagStrictly() {
+        assertThat(DistributionSettings.parseForkWorkspace(null)).isFalse();
+        assertThat(DistributionSettings.parseForkWorkspace(" ")).isFalse();
+        assertThat(DistributionSettings.parseForkWorkspace(" TRUE ")).isTrue();
+        assertThat(DistributionSettings.parseForkWorkspace("false")).isFalse();
+        assertThatThrownBy(() -> DistributionSettings.parseForkWorkspace("yes"))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining(DistributionSettings.FORK_PROPERTY)
+                .hasMessageContaining("yes");
+    }
+
+    @Test
+    void shouldParseEnumSettingsStrictlyWithDefaults() {
+        assertThat(DistributionSettings.parsePartitionPolicy(null)).isEqualTo(PartitionPolicy.LPT);
+        assertThat(DistributionSettings.parsePartitionPolicy(" single ")).isEqualTo(PartitionPolicy.SINGLE);
+        assertThatThrownBy(() -> DistributionSettings.parsePartitionPolicy("ROUND_ROBIN"))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining(DistributionSettings.PARTITION_POLICY_PROPERTY)
+                .hasMessageContaining("LPT, SINGLE");
+
+        assertThat(DistributionSettings.parseWorkerForkMode("")).isEqualTo(DistributionSettings.WorkerForkMode.AUTO);
+        assertThat(DistributionSettings.parseWorkerForkMode("always")).isEqualTo(DistributionSettings.WorkerForkMode.ALWAYS);
+        assertThatThrownBy(() -> DistributionSettings.parseWorkerForkMode("never"))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining(DistributionSettings.WORKER_FORK_MODE_PROPERTY);
+
+        assertThat(DistributionSettings.parseWorkerCwdCheckMode(null)).isEqualTo(DistributionSettings.WorkerCwdCheckMode.FAIL);
+        assertThat(DistributionSettings.parseWorkerCwdCheckMode("Warn")).isEqualTo(DistributionSettings.WorkerCwdCheckMode.WARN);
+        assertThatThrownBy(() -> DistributionSettings.parseWorkerCwdCheckMode("ignore"))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining(DistributionSettings.WORKER_CWD_CHECK_PROPERTY);
+    }
+
+    @Test
+    void shouldBuildWindowsSeparatorFormsOfHostPrefix() {
+        assertThat(PathRewriter.separatorForms("C:\\work\\app", true))
+                .containsExactlyInAnyOrder("C:\\work\\app", "C:/work/app", "C:\\\\work\\\\app");
+        assertThat(PathRewriter.separatorForms("/work/app", false)).containsExactly("/work/app");
+    }
+
+    @Test
+    void shouldMatchWindowsHostPrefixCaseInsensitivelyAtBoundaries() {
+        List<String> candidates = PathRewriter.separatorForms("C:\\Work\\App", true).stream()
+                .sorted((a, b) -> b.length() - a.length())
+                .toList();
+
+        assertThat(PathRewriter.rewriteValue("c:\\work\\app\\target", candidates, true)).isEqualTo(TOKEN + "\\target");
+        assertThat(PathRewriter.rewriteValue("file:///c:/WORK/app/x.xml", candidates, true)).isEqualTo("file:///" + TOKEN + "/x.xml");
+        assertThat(PathRewriter.rewriteValue("file:/C:/Work/App", candidates, true)).isEqualTo("file:/" + TOKEN);
+        assertThat(PathRewriter.rewriteValue("-Dp=C:\\\\Work\\\\App\\\\db", candidates, true)).isEqualTo("-Dp=" + TOKEN + "\\\\db");
+        assertThat(PathRewriter.rewriteValue("C:\\Work\\AppOther", candidates, true)).isEqualTo("C:\\Work\\AppOther");
+        assertThat(PathRewriter.rewriteValue("c:\\work\\app", candidates, false)).isEqualTo("c:\\work\\app");
+    }
+
+    @Test
     void shouldDeserializeLegacyPayloadsWithSafeDefaults() {
         String legacySubmit = """
                 {"submissionId":"s1","moduleName":"m1","classpathArtifacts":[],"systemProperties":{},"workUnits":[],"cachedBlobs":0,"uploadedBlobs":0}
