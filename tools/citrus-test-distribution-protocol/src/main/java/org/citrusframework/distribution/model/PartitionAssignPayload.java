@@ -25,6 +25,24 @@ public record PartitionAssignPayload(
         int attempt,
         List<ArtifactRef> classpathArtifacts,
         Map<String, String> systemProperties,
-        List<WorkUnitSpec> workUnits
+        List<WorkUnitSpec> workUnits,
+        List<WorkspaceFileSet> inputArtifacts,
+        List<String> outputPaths,
+        boolean forkWorkspace
 ) {
+
+    public PartitionAssignPayload {
+        inputArtifacts = inputArtifacts == null ? List.of() : List.copyOf(inputArtifacts);
+        outputPaths = outputPaths == null ? List.of() : List.copyOf(outputPaths);
+    }
+
+    public PartitionAssignPayload(String partitionId,
+                                  String sessionId,
+                                  int attempt,
+                                  List<ArtifactRef> classpathArtifacts,
+                                  Map<String, String> systemProperties,
+                                  List<WorkUnitSpec> workUnits) {
+        this(partitionId, sessionId, attempt, classpathArtifacts, systemProperties, workUnits,
+                List.of(), List.of(), false);
+    }
 }

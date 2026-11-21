@@ -26,6 +26,27 @@ public record SubmitWorkRequest(
         Map<String, String> systemProperties,
         List<WorkUnitSpec> workUnits,
         int cachedBlobs,
-        int uploadedBlobs
+        int uploadedBlobs,
+        List<WorkspaceFileSet> inputArtifacts,
+        List<String> outputPaths,
+        boolean forkWorkspace,
+        PartitionPolicy partitionPolicy
 ) {
+
+    public SubmitWorkRequest {
+        inputArtifacts = inputArtifacts == null ? List.of() : List.copyOf(inputArtifacts);
+        outputPaths = outputPaths == null ? List.of() : List.copyOf(outputPaths);
+        partitionPolicy = partitionPolicy == null ? PartitionPolicy.LPT : partitionPolicy;
+    }
+
+    public SubmitWorkRequest(String submissionId,
+                             String moduleName,
+                             List<ArtifactRef> classpathArtifacts,
+                             Map<String, String> systemProperties,
+                             List<WorkUnitSpec> workUnits,
+                             int cachedBlobs,
+                             int uploadedBlobs) {
+        this(submissionId, moduleName, classpathArtifacts, systemProperties, workUnits, cachedBlobs, uploadedBlobs,
+                List.of(), List.of(), false, PartitionPolicy.LPT);
+    }
 }

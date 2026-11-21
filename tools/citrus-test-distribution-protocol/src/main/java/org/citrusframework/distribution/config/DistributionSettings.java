@@ -16,7 +16,9 @@
 
 package org.citrusframework.distribution.config;
 
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 
@@ -85,7 +87,133 @@ public final class DistributionSettings {
     public static final String CACHE_DIR_ENV = "CITRUS_DIST_CACHE_DIR";
     public static final String DEFAULT_CACHE_DIR = ".citrus-dist/cache";
 
+    /** Worker capability advertised by workspace-aware workers and required by workspace partitions. */
+    public static final String WORKSPACE_CAPABILITY_KEY = "citrus.workspace.v1";
+    /** Placeholder substituted for the host module base directory in forwarded system properties. */
+    public static final String WORKSPACE_TOKEN = "${citrus.dist.workspace}";
+    /** Case-insensitive explicit empty-list value for {@code inputs} and {@code outputs}. */
+    public static final String NONE_SENTINEL = "none";
+
+    public static final String BASEDIR_PROPERTY = "citrus.test.distribution.basedir";
+
+    public static final String INPUTS_PROPERTY = "citrus.test.distribution.inputs";
+    public static final String INPUTS_ENV = "CITRUS_DIST_INPUTS";
+
+    public static final String OUTPUTS_PROPERTY = "citrus.test.distribution.outputs";
+    public static final String OUTPUTS_ENV = "CITRUS_DIST_OUTPUTS";
+
+    public static final String FORK_PROPERTY = "citrus.test.distribution.fork";
+    public static final String FORK_ENV = "CITRUS_DIST_FORK";
+
+    public static final String PARTITION_POLICY_PROPERTY = "citrus.test.distribution.partitionPolicy";
+    public static final String PARTITION_POLICY_ENV = "CITRUS_DIST_PARTITION_POLICY";
+
+    public static final String WORKER_FORK_MODE_PROPERTY = "citrus.test.distribution.worker.forkMode";
+    public static final String WORKER_FORK_MODE_ENV = "CITRUS_DIST_WORKER_FORK_MODE";
+
+    public static final String WORKER_FORK_JVM_ARGS_PROPERTY = "citrus.test.distribution.worker.forkJvmArgs";
+    public static final String WORKER_FORK_JVM_ARGS_ENV = "CITRUS_DIST_WORKER_FORK_JVM_ARGS";
+    public static final List<String> DEFAULT_FORK_JVM_ARGS = List.of("-Xmx768m", "-XX:ActiveProcessorCount=2");
+
+    public static final String WORKER_CWD_CHECK_PROPERTY = "citrus.test.distribution.worker.cwdCheck";
+    public static final String WORKER_CWD_CHECK_ENV = "CITRUS_DIST_WORKER_CWD_CHECK";
+
+    public static final String WORKER_HANDSHAKE_TIMEOUT_PROPERTY = "citrus.test.distribution.worker.handshakeTimeoutMs";
+    public static final long DEFAULT_WORKER_HANDSHAKE_TIMEOUT_MS = 15_000L;
+
+    /** Whether a worker forks a child JVM only when a partition needs a workspace, or for every partition. */
+    public enum WorkerForkMode {
+        AUTO,
+        ALWAYS
+    }
+
+    /** How a worker reacts when a test partition writes into the worker daemon's working directory. */
+    public enum WorkerCwdCheckMode {
+        FAIL,
+        WARN,
+        OFF
+    }
+
+    /**
+     * A declared input or output path, relative to the module base directory and {@code /}-separated.
+     * Optional paths are skipped when absent instead of failing the build.
+     */
+    public record DeclaredPathSpec(String relativePath, boolean optional) {
+    }
+
     private DistributionSettings() {
+    }
+
+    /**
+     * Parses a comma-separated declared path list as configured by a single winning precedence tier.
+     * <ul>
+     *     <li>{@code null}, blank, or {@code none} (case-insensitive) yields an empty list.</li>
+     *     <li>A leading or trailing {@code ?} marks a path optional.</li>
+     *     <li>{@code \} becomes {@code /}; a single leading {@code ./} and trailing {@code /} are stripped
+     *     ({@code ./none} therefore denotes a literal file named {@code none}).</li>
+     *     <li>Exact duplicates collapse with required winning over optional.</li>
+     *     <li>A path under a declared ancestor is dropped when the ancestor is required, or when both are
+     *     optional; an optional ancestor never hides a required descendant.</li>
+     * </ul>
+     * Paths are not validated for traversal or absolute forms here; packaging validates them.
+     */
+    public static List<DeclaredPathSpec> parseDeclaredPaths(String rawValue) {
+        if (rawValue == null) {
+            return List.of();
+        }
+        String trimmedValue = rawValue.trim();
+        if (trimmedValue.isEmpty() || NONE_SENTINEL.equalsIgnoreCase(trimmedValue)) {
+            return List.of();
+        }
+
+        Map<String, Boolean> optionalByPath = new LinkedHashMap<>();
+        for (String token : trimmedValue.split(",")) {
+            String path = token.trim();
+            boolean optional = false;
+            if (path.startsWith("?")) {
+                optional = true;
+                path = path.substring(1).trim();
+            }
+            if (path.endsWith("?")) {
+                optional = true;
+                path = path.substring(0, path.length() - 1).trim();
+            }
+            path = path.replace('\\', '/');
+            if (path.startsWith("./")) {
+                path = path.substring(2);
+            }
+            while (path.endsWith("/")) {
+                path = path.substring(0, path.length() - 1);
+            }
+            if (path.isEmpty()) {
+                continue;
+            }
+            optionalByPath.merge(path, optional, (existing, added) -> existing && added);
+        }
+
+        List<DeclaredPathSpec> result = new ArrayList<>();
+        for (Map.Entry<String, Boolean> candidate : optionalByPath.entrySet()) {
+            String path = candidate.getKey();
+            boolean optional = candidate.getValue();
+            boolean subsumed = optionalByPath.entrySet().stream()
+                    .anyMatch(ancestor -> path.startsWith(ancestor.getKey() + "/")
+                            && (!ancestor.getValue() || optional));
+            if (!subsumed) {
+                result.add(new DeclaredPathSpec(path, optional));
+            }
+        }
+        return List.copyOf(result);
+    }
+
+    /**
+     * Splits child JVM arguments on whitespace, falling back to {@link #DEFAULT_FORK_JVM_ARGS} when unset.
+     * Quoting is not interpreted, so an argument cannot itself contain whitespace.
+     */
+    public static List<String> parseForkJvmArgs(String rawArgs) {
+        if (rawArgs == null || rawArgs.isBlank()) {
+            return DEFAULT_FORK_JVM_ARGS;
+        }
+        return List.of(rawArgs.trim().split("\\s+"));
     }
 
     public static boolean isEnabled() {
