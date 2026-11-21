@@ -35,6 +35,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
 import org.citrusframework.distribution.config.DistributionJson;
+import org.citrusframework.distribution.config.DistributionSettings;
 import org.citrusframework.distribution.model.PartitionAssignPayload;
 import org.citrusframework.distribution.model.PartitionCompletedPayload;
 import org.citrusframework.distribution.model.WorkerHeartbeatPayload;
@@ -53,7 +54,8 @@ public final class DistributionWorkerClient implements AutoCloseable {
     private static final Logger LOG = LoggerFactory.getLogger(DistributionWorkerClient.class);
 
     private final DistributionWorkerConfig config;
-    private final IsolatedPartitionRunner runner;
+    private final IsolatedPartitionRunner inProcessRunner;
+    private final ForkedPartitionRunner forkedRunner;
     private final HttpClient httpClient;
     private final ExecutorService partitionExecutor;
     private final ScheduledExecutorService scheduler;
@@ -66,7 +68,8 @@ public final class DistributionWorkerClient implements AutoCloseable {
 
     public DistributionWorkerClient(DistributionWorkerConfig config) {
         this.config = config;
-        this.runner = new IsolatedPartitionRunner(config);
+        this.inProcessRunner = new IsolatedPartitionRunner(config);
+        this.forkedRunner = new ForkedPartitionRunner(config);
         this.httpClient = HttpClient.newBuilder()
                 .connectTimeout(Duration.ofSeconds(10))
                 .build();
@@ -122,6 +125,7 @@ public final class DistributionWorkerClient implements AutoCloseable {
      * Abruptly drops the WebSocket connection (primarily for testing disconnect failover).
      */
     public void abortConnection() {
+        assignments.cancel(null, 0);
         running.set(false);
         WebSocket ws = activeWebSocket.getAndSet(null);
         if (ws != null) {
@@ -131,6 +135,7 @@ public final class DistributionWorkerClient implements AutoCloseable {
 
     @Override
     public void close() {
+        assignments.cancel(null, 0);
         drain(10, TimeUnit.SECONDS);
         running.set(false);
         WebSocket ws = activeWebSocket.getAndSet(null);
@@ -199,11 +204,22 @@ public final class DistributionWorkerClient implements AutoCloseable {
         scheduler.schedule(this::connectInternal, config.reconnectDelayMs(), TimeUnit.MILLISECONDS);
     }
 
+    /**
+     * Whether {@code assign} runs in a forked JVM: always with {@code forkMode=ALWAYS}, otherwise when it needs a
+     * workspace (fork requested, inputs or outputs declared).
+     */
+    static boolean requiresFork(DistributionWorkerConfig config, PartitionAssignPayload assign) {
+        return config.forkMode() == DistributionSettings.WorkerForkMode.ALWAYS
+                || assign.forkWorkspace()
+                || !assign.inputArtifacts().isEmpty()
+                || !assign.outputPaths().isEmpty();
+    }
+
     private void sendHeartbeatSafe() {
         if (!running.get() || !isConnected()) {
             return;
         }
-        WorkerHeartbeatPayload hb = new WorkerHeartbeatPayload(config.workerId(), assignments.activePartitionId());
+        WorkerHeartbeatPayload hb = new WorkerHeartbeatPayload(config.workerId(), assignments.executingPartitionId());
         @SuppressWarnings("unchecked")
         Map<String, Object> map = DistributionJson.convert(hb, Map.class);
         sendMessageSafe(WorkerWsMessage.WORKER_HEARTBEAT, map);
@@ -230,27 +246,44 @@ public final class DistributionWorkerClient implements AutoCloseable {
             case WorkerWsMessage.WORKER_REGISTERED -> registeredLatch.countDown();
             case WorkerWsMessage.PARTITION_ASSIGN -> {
                 PartitionAssignPayload assign = DistributionJson.convert(message.payload(), PartitionAssignPayload.class);
+                if (!assignments.canAccept()) {
+                    // One live partition at a time. A cancelled run that is still winding down does not block: the
+                    // new assignment queues behind it on the single-threaded executor.
+                    LOG.warn("Worker {} rejects partition {} attempt {}: still running partition {}",
+                            config.workerId(), assign.partitionId(), assign.attempt(), assignments.activePartitionId());
+                    return;
+                }
                 ActiveAssignmentTracker.Assignment assignment = assignments.start(assign.partitionId(), assign.attempt());
                 CancellationToken token = assignment.token();
+                PartitionRunner runner = requiresFork(config, assign) ? forkedRunner : inProcessRunner;
                 currentExecution = CompletableFuture.runAsync(() -> {
+                    boolean finished = false;
+                    assignments.markExecuting(assignment);
                     try {
                         sendMessageSafe(WorkerWsMessage.PARTITION_STARTED, Map.of(
                                 "partitionId", assign.partitionId(),
                                 "sessionId", assign.sessionId(),
                                 "attempt", assign.attempt()));
-                        IsolatedPartitionRunner.PartitionExecutionResult result = runner.execute(assign, token, event -> {
-                            @SuppressWarnings("unchecked")
-                            Map<String, Object> eventMap = DistributionJson.convert(event, Map.class);
-                            sendMessageSafe(WorkerWsMessage.TEST_EVENT, eventMap);
-                        });
+                        IsolatedPartitionRunner.PartitionExecutionResult result = token.isCancellationRequested()
+                                ? new IsolatedPartitionRunner.PartitionExecutionResult(false, "Partition cancelled before it started")
+                                : runner.execute(assign, token, event -> {
+                                    @SuppressWarnings("unchecked")
+                                    Map<String, Object> eventMap = DistributionJson.convert(event, Map.class);
+                                    sendMessageSafe(WorkerWsMessage.TEST_EVENT, eventMap);
+                                });
                         PartitionCompletedPayload completed = new PartitionCompletedPayload(assign.partitionId(),
                                 assign.sessionId(), assign.attempt(), result.success(), result.errorMessage(),
                                 result.outputArtifacts());
                         @SuppressWarnings("unchecked")
                         Map<String, Object> completedMap = DistributionJson.convert(completed, Map.class);
+                        // Free the slot before reporting: the coordinator may answer with the next assignment at once.
+                        assignments.finish(assignment);
+                        finished = true;
                         sendMessageSafe(WorkerWsMessage.PARTITION_COMPLETED, completedMap);
                     } finally {
-                        assignments.finish(assignment);
+                        if (!finished) {
+                            assignments.finish(assignment);
+                        }
                     }
                 }, partitionExecutor);
             }
@@ -287,6 +320,8 @@ public final class DistributionWorkerClient implements AutoCloseable {
 
         @Override
         public CompletionStage<?> onClose(WebSocket webSocket, int statusCode, String reason) {
+            // The coordinator requeues the partition of a lost connection; its result could never be accepted.
+            assignments.cancel(null, 0);
             activeWebSocket.compareAndSet(webSocket, null);
             scheduleReconnect();
             return null;
@@ -294,6 +329,7 @@ public final class DistributionWorkerClient implements AutoCloseable {
 
         @Override
         public void onError(WebSocket webSocket, Throwable error) {
+            assignments.cancel(null, 0);
             activeWebSocket.compareAndSet(webSocket, null);
             scheduleReconnect();
         }

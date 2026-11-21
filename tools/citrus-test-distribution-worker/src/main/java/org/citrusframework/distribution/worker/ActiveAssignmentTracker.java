@@ -36,6 +36,7 @@ final class ActiveAssignmentTracker {
     }
 
     private final AtomicReference<Assignment> active = new AtomicReference<>();
+    private final AtomicReference<Assignment> executing = new AtomicReference<>();
 
     /**
      * Records a newly received assignment as the active one and returns it.
@@ -51,6 +52,32 @@ final class ActiveAssignmentTracker {
      */
     void finish(Assignment assignment) {
         active.compareAndSet(assignment, null);
+        executing.compareAndSet(assignment, null);
+    }
+
+    /**
+     * Records that {@code assignment} has started executing (it may have waited behind a cancelled run).
+     */
+    void markExecuting(Assignment assignment) {
+        executing.set(assignment);
+    }
+
+    /**
+     * Partition id of the assignment currently executing, or {@code null}; this is what heartbeats report, so a
+     * queued assignment's lease is not renewed while it has not started.
+     */
+    String executingPartitionId() {
+        Assignment assignment = executing.get();
+        return assignment != null ? assignment.partitionId() : null;
+    }
+
+    /**
+     * Whether a new assignment may start: no assignment is active, or the active one has been cancelled and is only
+     * winding down (the single-threaded executor runs the new one after it).
+     */
+    boolean canAccept() {
+        Assignment assignment = active.get();
+        return assignment == null || assignment.token().isCancellationRequested();
     }
 
     /**

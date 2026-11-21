@@ -24,12 +24,8 @@ import java.io.PrintWriter;
 import java.io.Reader;
 import java.io.UncheckedIOException;
 import java.io.Writer;
-import java.net.URI;
 import java.net.URL;
 import java.net.URLClassLoader;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
 import java.nio.charset.Charset;
 import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
@@ -37,7 +33,6 @@ import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.SimpleFileVisitor;
 import java.nio.file.attribute.BasicFileAttributes;
-import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Enumeration;
@@ -55,7 +50,6 @@ import java.util.function.Function;
 import java.util.stream.Stream;
 
 import org.citrusframework.distribution.cache.BlobCacheDirectory;
-import org.citrusframework.distribution.cache.ClasspathPackager;
 import org.citrusframework.distribution.config.DistributionSettings;
 import org.citrusframework.distribution.config.DistributionSettings.WorkerCwdCheckMode;
 import org.citrusframework.distribution.config.PathRewriter;
@@ -71,7 +65,7 @@ import org.slf4j.LoggerFactory;
  * Downloads missing content-addressed blobs, materializes an isolated partition workspace and
  * child-first {@link URLClassLoader}, and executes assigned JUnit Platform work units.
  */
-public final class IsolatedPartitionRunner {
+public final class IsolatedPartitionRunner implements PartitionRunner {
 
     private static final Logger LOG = LoggerFactory.getLogger(IsolatedPartitionRunner.class);
     private static final Object WORKER_JVM_LOCK = new Object();
@@ -82,15 +76,12 @@ public final class IsolatedPartitionRunner {
 
     private final DistributionWorkerConfig config;
     private final BlobCacheDirectory blobCache;
-    private final HttpClient httpClient;
-    private final Set<String> verifiedBlobs = ConcurrentHashMap.newKeySet();
+    private final BrokerBlobClient blobs;
 
     public IsolatedPartitionRunner(DistributionWorkerConfig config) {
         this.config = config;
         this.blobCache = new BlobCacheDirectory(config.cacheDir());
-        this.httpClient = HttpClient.newBuilder()
-                .connectTimeout(Duration.ofSeconds(10))
-                .build();
+        this.blobs = new BrokerBlobClient(config, blobCache);
     }
 
     /**
@@ -118,6 +109,7 @@ public final class IsolatedPartitionRunner {
      * directory is snapshotted before and after the run; new or modified entries fail ({@code FAIL}) or warn
      * ({@code WARN}). Nothing in the working directory is ever deleted or modified.
      */
+    @Override
     public PartitionExecutionResult execute(
             PartitionAssignPayload assignment,
             CancellationToken cancellationToken,
@@ -134,7 +126,7 @@ public final class IsolatedPartitionRunner {
 
             List<URL> urls = new ArrayList<>();
             for (ArtifactRef artifact : assignment.classpathArtifacts() != null ? assignment.classpathArtifacts() : List.<ArtifactRef>of()) {
-                ensureBlobCached(artifact.sha256());
+                blobs.ensureCached(artifact.sha256());
                 urls.add(blobCache.materializeForClasspath(artifact, partitionRoot).toUri().toURL());
             }
 
@@ -245,40 +237,6 @@ public final class IsolatedPartitionRunner {
 
     private static Path workingDirectory() {
         return Path.of(System.getProperty("user.dir")).toAbsolutePath().normalize();
-    }
-
-    /**
-     * Makes sure {@code sha256} is in the local cache with verified content, downloading it (once more if a cached or
-     * downloaded copy fails verification). Digests verified in this JVM are not hashed again.
-     */
-    private void ensureBlobCached(String sha256) throws IOException, InterruptedException {
-        if (verifiedBlobs.contains(sha256) && blobCache.contains(sha256)) {
-            return;
-        }
-        if (blobCache.getVerifiedPath(sha256) == null) {
-            byte[] content = download(sha256);
-            if (!sha256.equals(ClasspathPackager.sha256Hex(content))) {
-                LOG.warn("Blob {} failed verification after download, retrying once", sha256);
-                content = download(sha256);
-            }
-            blobCache.put(sha256, content);
-        }
-        verifiedBlobs.add(sha256);
-    }
-
-    private byte[] download(String sha256) throws IOException, InterruptedException {
-        HttpRequest.Builder reqBuilder = HttpRequest.newBuilder(
-                        URI.create(config.brokerUrl() + "/api/v1/cache/blobs/" + sha256))
-                .timeout(Duration.ofSeconds(60))
-                .GET();
-        if (config.authToken() != null && !config.authToken().isBlank()) {
-            reqBuilder.header("Authorization", "Bearer " + config.authToken());
-        }
-        HttpResponse<byte[]> response = httpClient.send(reqBuilder.build(), HttpResponse.BodyHandlers.ofByteArray());
-        if (response.statusCode() != 200) {
-            throw new IOException("Failed to download blob " + sha256 + " from broker: HTTP " + response.statusCode());
-        }
-        return response.body();
     }
 
     /**

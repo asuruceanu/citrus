@@ -52,4 +52,33 @@ class ActiveAssignmentTrackerTest {
         assertThat(active.token().isCancellationRequested()).isTrue();
         assertThat(new ActiveAssignmentTracker().cancel("p1", 1)).isFalse();
     }
+
+    @Test
+    void shouldAcceptNewAssignmentOnlyWhenIdleOrTheActiveOneIsCancelled() {
+        ActiveAssignmentTracker tracker = new ActiveAssignmentTracker();
+        assertThat(tracker.canAccept()).isTrue();
+        ActiveAssignmentTracker.Assignment running = tracker.start("p1", 1);
+        assertThat(tracker.canAccept()).as("a live run keeps the slot").isFalse();
+        tracker.cancel(null, 0);
+        assertThat(tracker.canAccept()).as("a cancelled run is winding down; the next one queues behind it").isTrue();
+        tracker.finish(running);
+        assertThat(tracker.canAccept()).isTrue();
+    }
+
+    @Test
+    void shouldReportOnlyTheExecutingAssignmentForHeartbeats() {
+        ActiveAssignmentTracker tracker = new ActiveAssignmentTracker();
+        ActiveAssignmentTracker.Assignment winding = tracker.start("p1", 1);
+        tracker.markExecuting(winding);
+        tracker.cancel(null, 0);
+        ActiveAssignmentTracker.Assignment queued = tracker.start("p2", 1);
+        assertThat(tracker.executingPartitionId()).as("queued p2 is not running yet").isEqualTo("p1");
+
+        tracker.finish(winding);
+        assertThat(tracker.executingPartitionId()).isNull();
+        tracker.markExecuting(queued);
+        assertThat(tracker.executingPartitionId()).isEqualTo("p2");
+        tracker.finish(queued);
+        assertThat(tracker.executingPartitionId()).isNull();
+    }
 }
