@@ -238,11 +238,14 @@ public final class DistributionWorkerClient implements AutoCloseable {
                                 "partitionId", assign.partitionId(),
                                 "sessionId", assign.sessionId(),
                                 "attempt", assign.attempt()));
-                        PartitionCompletedPayload completed = runner.execute(assign, token, event -> {
+                        IsolatedPartitionRunner.PartitionExecutionResult result = runner.execute(assign, token, event -> {
                             @SuppressWarnings("unchecked")
                             Map<String, Object> eventMap = DistributionJson.convert(event, Map.class);
                             sendMessageSafe(WorkerWsMessage.TEST_EVENT, eventMap);
                         });
+                        PartitionCompletedPayload completed = new PartitionCompletedPayload(assign.partitionId(),
+                                assign.sessionId(), assign.attempt(), result.success(), result.errorMessage(),
+                                result.outputArtifacts());
                         @SuppressWarnings("unchecked")
                         Map<String, Object> completedMap = DistributionJson.convert(completed, Map.class);
                         sendMessageSafe(WorkerWsMessage.PARTITION_COMPLETED, completedMap);
