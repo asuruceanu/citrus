@@ -17,8 +17,13 @@
 package org.citrusframework.distribution.worker;
 
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.io.PrintStream;
 import java.io.PrintWriter;
+import java.io.Reader;
 import java.io.StringWriter;
+import java.io.Writer;
 import java.lang.reflect.Method;
 import java.net.URI;
 import java.net.URL;
@@ -26,18 +31,24 @@ import java.net.URLClassLoader;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.nio.charset.Charset;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Enumeration;
-import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
+import java.util.Properties;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.BiConsumer;
+import java.util.function.BiFunction;
 import java.util.function.Consumer;
+import java.util.function.Function;
 import java.util.stream.Stream;
 
 import org.citrusframework.distribution.cache.BlobCacheDirectory;
@@ -94,7 +105,9 @@ public final class IsolatedPartitionRunner {
             Consumer<WorkerTestEventPayload> eventSink) {
         Path workspaceDir = null;
         ClassLoader previousCl = Thread.currentThread().getContextClassLoader();
-        Map<String, String> previousProps = new HashMap<>();
+        ThreadScopedProperties systemProps = null;
+        Properties previousScope = null;
+        boolean workerScopeEntered = false;
 
         try {
             workspaceDir = Files.createTempDirectory("citrus-dist-partition-" + assignment.partitionId() + "-");
@@ -108,9 +121,11 @@ public final class IsolatedPartitionRunner {
             }
 
             synchronized (WORKER_JVM_LOCK) {
-                applySystemProperties(assignment.systemProperties(), previousProps);
+                systemProps = installThreadScopedProperties();
                 ACTIVE_WORKER_SCOPES.incrementAndGet();
-                System.setProperty(DistributionSettings.ROLE_PROPERTY, DistributionSettings.ROLE_WORKER);
+                workerScopeEntered = true;
+                systemProps.base().setProperty(DistributionSettings.ROLE_PROPERTY, DistributionSettings.ROLE_WORKER);
+                previousScope = systemProps.enterScope(assignment.systemProperties());
             }
 
             ClassLoader parentCl = IsolatedPartitionRunner.class.getClassLoader();
@@ -138,11 +153,15 @@ public final class IsolatedPartitionRunner {
                     t.getMessage() != null ? t.getMessage() : t.getClass().getName());
         } finally {
             Thread.currentThread().setContextClassLoader(previousCl);
-            synchronized (WORKER_JVM_LOCK) {
-                restoreSystemProperties(previousProps);
-                if (ACTIVE_WORKER_SCOPES.decrementAndGet() <= 0) {
-                    ACTIVE_WORKER_SCOPES.set(0);
-                    System.clearProperty(DistributionSettings.ROLE_PROPERTY);
+            if (systemProps != null) {
+                systemProps.exitScope(previousScope);
+            }
+            if (workerScopeEntered) {
+                synchronized (WORKER_JVM_LOCK) {
+                    if (ACTIVE_WORKER_SCOPES.decrementAndGet() <= 0) {
+                        ACTIVE_WORKER_SCOPES.set(0);
+                        systemProps.base().remove(DistributionSettings.ROLE_PROPERTY);
+                    }
                 }
             }
             deleteRecursivelyQuietly(workspaceDir);
@@ -327,37 +346,307 @@ public final class IsolatedPartitionRunner {
         }
     }
 
-    private static void applySystemProperties(Map<String, String> props, Map<String, String> backup) {
-        if (props == null) {
-            return;
+    private static ThreadScopedProperties installThreadScopedProperties() {
+        Properties current = System.getProperties();
+        if (current instanceof ThreadScopedProperties existing) {
+            return existing;
         }
-        for (Map.Entry<String, String> entry : props.entrySet()) {
-            String key = entry.getKey();
-            if (key == null || key.startsWith("java.") || key.startsWith("os.") || key.startsWith("user.dir")) {
-                continue;
+        ThreadScopedProperties installed = new ThreadScopedProperties(current);
+        System.setProperties(installed);
+        return installed;
+    }
+
+    /**
+     * Thread-scoped {@link Properties} wrapper delegating lookups and mutations to an
+     * {@link InheritableThreadLocal} overlay while a partition executes on the current thread
+     * (or its child threads), falling back to the base JVM {@link Properties} otherwise.
+     */
+    static final class ThreadScopedProperties extends Properties {
+
+        private final Properties base;
+        private final InheritableThreadLocal<Properties> overlay = new InheritableThreadLocal<>();
+
+        ThreadScopedProperties(Properties base) {
+            this.base = Objects.requireNonNull(base, "base properties");
+        }
+
+        Properties base() {
+            return base;
+        }
+
+        Properties enterScope(Map<String, String> partitionOverrides) {
+            Properties previous = overlay.get();
+            Properties snapshot = new Properties();
+            for (String name : base.stringPropertyNames()) {
+                String val = base.getProperty(name);
+                if (val != null) {
+                    snapshot.setProperty(name, val);
+                }
             }
-            setWithBackup(key, entry.getValue(), backup);
+            snapshot.putAll(base);
+            if (partitionOverrides != null) {
+                for (Map.Entry<String, String> entry : partitionOverrides.entrySet()) {
+                    String key = entry.getKey();
+                    if (key == null || key.startsWith("java.") || key.startsWith("os.") || key.startsWith("user.dir")) {
+                        continue;
+                    }
+                    if (entry.getValue() == null) {
+                        snapshot.remove(key);
+                    } else {
+                        snapshot.setProperty(key, entry.getValue());
+                    }
+                }
+            }
+            snapshot.setProperty(DistributionSettings.ROLE_PROPERTY, DistributionSettings.ROLE_WORKER);
+            overlay.set(snapshot);
+            return previous;
         }
-    }
 
-    private static void setWithBackup(String key, String value, Map<String, String> backup) {
-        if (!backup.containsKey(key)) {
-            backup.put(key, System.getProperty(key));
-        }
-        if (value == null) {
-            System.clearProperty(key);
-        } else {
-            System.setProperty(key, value);
-        }
-    }
-
-    private static void restoreSystemProperties(Map<String, String> backup) {
-        for (Map.Entry<String, String> entry : backup.entrySet()) {
-            if (entry.getValue() == null) {
-                System.clearProperty(entry.getKey());
+        void exitScope(Properties previous) {
+            if (previous == null) {
+                overlay.remove();
             } else {
-                System.setProperty(entry.getKey(), entry.getValue());
+                overlay.set(previous);
             }
+        }
+
+        private Properties current() {
+            Properties scoped = overlay.get();
+            return scoped != null ? scoped : base;
+        }
+
+        @Override
+        public Object setProperty(String key, String value) {
+            return current().setProperty(key, value);
+        }
+
+        @Override
+        public void load(Reader reader) throws IOException {
+            current().load(reader);
+        }
+
+        @Override
+        public void load(InputStream inStream) throws IOException {
+            current().load(inStream);
+        }
+
+        @Override
+        @Deprecated
+        public void save(OutputStream out, String comments) {
+            current().save(out, comments);
+        }
+
+        @Override
+        public void store(Writer writer, String comments) throws IOException {
+            current().store(writer, comments);
+        }
+
+        @Override
+        public void store(OutputStream out, String comments) throws IOException {
+            current().store(out, comments);
+        }
+
+        @Override
+        public void loadFromXML(InputStream in) throws IOException {
+            current().loadFromXML(in);
+        }
+
+        @Override
+        public void storeToXML(OutputStream os, String comment) throws IOException {
+            current().storeToXML(os, comment);
+        }
+
+        @Override
+        public void storeToXML(OutputStream os, String comment, String encoding) throws IOException {
+            current().storeToXML(os, comment, encoding);
+        }
+
+        @Override
+        public void storeToXML(OutputStream os, String comment, Charset charset) throws IOException {
+            current().storeToXML(os, comment, charset);
+        }
+
+        @Override
+        public String getProperty(String key) {
+            return current().getProperty(key);
+        }
+
+        @Override
+        public String getProperty(String key, String defaultValue) {
+            return current().getProperty(key, defaultValue);
+        }
+
+        @Override
+        public Enumeration<?> propertyNames() {
+            return current().propertyNames();
+        }
+
+        @Override
+        public Set<String> stringPropertyNames() {
+            return current().stringPropertyNames();
+        }
+
+        @Override
+        public void list(PrintStream out) {
+            current().list(out);
+        }
+
+        @Override
+        public void list(PrintWriter out) {
+            current().list(out);
+        }
+
+        @Override
+        public int size() {
+            return current().size();
+        }
+
+        @Override
+        public boolean isEmpty() {
+            return current().isEmpty();
+        }
+
+        @Override
+        public Enumeration<Object> keys() {
+            return current().keys();
+        }
+
+        @Override
+        public Enumeration<Object> elements() {
+            return current().elements();
+        }
+
+        @Override
+        public boolean contains(Object value) {
+            return current().contains(value);
+        }
+
+        @Override
+        public boolean containsValue(Object value) {
+            return current().containsValue(value);
+        }
+
+        @Override
+        public boolean containsKey(Object key) {
+            return current().containsKey(key);
+        }
+
+        @Override
+        public Object get(Object key) {
+            return current().get(key);
+        }
+
+        @Override
+        public Object put(Object key, Object value) {
+            return current().put(key, value);
+        }
+
+        @Override
+        public Object remove(Object key) {
+            return current().remove(key);
+        }
+
+        @Override
+        public void putAll(Map<?, ?> t) {
+            current().putAll(t);
+        }
+
+        @Override
+        public void clear() {
+            current().clear();
+        }
+
+        @Override
+        public String toString() {
+            return current().toString();
+        }
+
+        @Override
+        public Set<Object> keySet() {
+            return current().keySet();
+        }
+
+        @Override
+        public Collection<Object> values() {
+            return current().values();
+        }
+
+        @Override
+        public Set<Map.Entry<Object, Object>> entrySet() {
+            return current().entrySet();
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            if (o == this) {
+                return true;
+            }
+            return current().equals(o);
+        }
+
+        @Override
+        public int hashCode() {
+            return current().hashCode();
+        }
+
+        @Override
+        public Object getOrDefault(Object key, Object defaultValue) {
+            return current().getOrDefault(key, defaultValue);
+        }
+
+        @Override
+        public void forEach(BiConsumer<? super Object, ? super Object> action) {
+            current().forEach(action);
+        }
+
+        @Override
+        public void replaceAll(BiFunction<? super Object, ? super Object, ?> function) {
+            current().replaceAll(function);
+        }
+
+        @Override
+        public Object putIfAbsent(Object key, Object value) {
+            return current().putIfAbsent(key, value);
+        }
+
+        @Override
+        public boolean remove(Object key, Object value) {
+            return current().remove(key, value);
+        }
+
+        @Override
+        public boolean replace(Object key, Object oldValue, Object newValue) {
+            return current().replace(key, oldValue, newValue);
+        }
+
+        @Override
+        public Object replace(Object key, Object value) {
+            return current().replace(key, value);
+        }
+
+        @Override
+        public Object computeIfAbsent(Object key, Function<? super Object, ?> mappingFunction) {
+            return current().computeIfAbsent(key, mappingFunction);
+        }
+
+        @Override
+        public Object computeIfPresent(Object key, BiFunction<? super Object, ? super Object, ?> remappingFunction) {
+            return current().computeIfPresent(key, remappingFunction);
+        }
+
+        @Override
+        public Object compute(Object key, BiFunction<? super Object, ? super Object, ?> remappingFunction) {
+            return current().compute(key, remappingFunction);
+        }
+
+        @Override
+        public Object merge(Object key, Object value, BiFunction<? super Object, ? super Object, ?> remappingFunction) {
+            return current().merge(key, value, remappingFunction);
+        }
+
+        @Override
+        public Object clone() {
+            return current().clone();
         }
     }
 

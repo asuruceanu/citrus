@@ -146,6 +146,10 @@ public class TestDistributionLifecycleParticipant extends AbstractMavenLifecycle
         return activeSessionId;
     }
 
+    static String runGit(Path dir, String... args) {
+        return GitDiffDetector.runGitSingleLine(dir, args);
+    }
+
     static List<Path> resolveInterceptorClasspathJars() {
         List<Path> paths = new ArrayList<>();
         addCodeSourceLocation(DistributionLauncherInterceptor.class, paths);

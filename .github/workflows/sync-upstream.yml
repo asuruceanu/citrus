@@ -56,6 +56,20 @@ jobs:
 
           if git merge-base --is-ancestor refs/remotes/upstream/main refs/remotes/origin/incubator/test-distribution; then
             echo "incubator/test-distribution already contains upstream/main."
+            if git ls-remote --exit-code --heads origin chore/sync-upstream-main >/dev/null 2>&1; then
+              for PR_NUM in $(gh pr list \
+                --repo "${{ github.repository }}" \
+                --state open \
+                --base incubator/test-distribution \
+                --head chore/sync-upstream-main \
+                --json number,headRefName \
+                --jq '.[] | select(.headRefName == "chore/sync-upstream-main") | .number'); do
+                gh pr close "${PR_NUM}" \
+                  --repo "${{ github.repository }}" \
+                  --comment "Closing sync PR because \`incubator/test-distribution\` already contains \`citrusframework/citrus:main\`."
+              done
+              git push origin --delete chore/sync-upstream-main
+            fi
             exit 0
           fi
 
