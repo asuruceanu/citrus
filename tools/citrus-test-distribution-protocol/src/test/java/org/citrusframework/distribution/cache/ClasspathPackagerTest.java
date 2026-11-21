@@ -19,8 +19,15 @@ package org.citrusframework.distribution.cache;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Random;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipInputStream;
 
 import org.citrusframework.distribution.model.ArtifactKind;
+import org.citrusframework.distribution.model.ArtifactRef;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -75,5 +82,89 @@ class ClasspathPackagerTest {
         assertThat(Files.isDirectory(workspaceEntry)).isTrue();
         assertThat(Files.readString(workspaceEntry.resolve("demo/test.yaml"), StandardCharsets.UTF_8))
                 .isEqualTo("name: demo-test");
+    }
+
+    @Test
+    void shouldStreamDeterministicZipToFileWithSortedDirectoryEntriesAndNoExtraFields() throws Exception {
+        Path dirA = Files.createDirectories(tempDir.resolve("a/sub"));
+        Files.createDirectories(tempDir.resolve("a/empty"));
+        Files.writeString(dirA.resolve("z.txt"), "z", StandardCharsets.UTF_8);
+        Files.writeString(tempDir.resolve("a/b.txt"), "b", StandardCharsets.UTF_8);
+
+        Path dirB = Files.createDirectories(tempDir.resolve("b"));
+        Files.writeString(dirB.resolve("b.txt"), "b", StandardCharsets.UTF_8);
+        Files.createDirectories(dirB.resolve("empty"));
+        Files.writeString(Files.createDirectories(dirB.resolve("sub")).resolve("z.txt"), "z", StandardCharsets.UTF_8);
+
+        Path zipA = tempDir.resolve("a.zip");
+        Path zipB = tempDir.resolve("b.zip");
+        String shaA = ClasspathPackager.createDeterministicZipToFile(tempDir.resolve("a"), zipA);
+        String shaB = ClasspathPackager.createDeterministicZipToFile(dirB, zipB);
+
+        assertThat(shaA).isEqualTo(shaB).isEqualTo(ClasspathPackager.sha256Hex(zipA));
+        assertThat(Files.readAllBytes(zipA)).isEqualTo(Files.readAllBytes(zipB));
+
+        List<String> names = new ArrayList<>();
+        try (ZipInputStream zis = new ZipInputStream(Files.newInputStream(zipA))) {
+            ZipEntry entry;
+            while ((entry = zis.getNextEntry()) != null) {
+                names.add(entry.getName());
+                assertThat(entry.getExtra()).as(entry.getName()).isNull();
+                assertThat(entry.getComment()).isNull();
+                assertThat(entry.getTimeLocal()).isEqualTo(LocalDateTime.of(1980, 2, 1, 0, 0));
+            }
+        }
+        assertThat(names).containsExactly("b.txt", "empty/", "sub/", "sub/z.txt");
+    }
+
+    @Test
+    void shouldRejectSymlinksAndOversizedArchivesWithoutLeavingPartialFiles() throws Exception {
+        Path dir = Files.createDirectories(tempDir.resolve("withLink"));
+        Files.writeString(dir.resolve("ok.txt"), "ok", StandardCharsets.UTF_8);
+        Files.createSymbolicLink(dir.resolve("link.txt"), Files.writeString(tempDir.resolve("secret"), "s"));
+        Path zip = tempDir.resolve("link.zip");
+        assertThatThrownBy(() -> ClasspathPackager.createDeterministicZipToFile(dir, zip))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Symbolic link");
+        assertThat(zip).doesNotExist();
+
+        Path big = Files.createDirectories(tempDir.resolve("big"));
+        byte[] random = new byte[64 * 1024];
+        new Random(42).nextBytes(random);
+        Files.write(big.resolve("random.bin"), random);
+        Path bigZip = tempDir.resolve("big.zip");
+        assertThatThrownBy(() -> ClasspathPackager.createDeterministicZipToFile(big, bigZip, 1_024L))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("1024");
+        assertThat(bigZip).doesNotExist();
+
+        Path file = Files.writeString(tempDir.resolve("plain.txt"), "x");
+        assertThatThrownBy(() -> ClasspathPackager.createDeterministicZipToFile(file, tempDir.resolve("plain.zip")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("not a directory");
+    }
+
+    @Test
+    void shouldStoreFromFileVerifyDigestAndRejectRegularFileOnClasspath() throws Exception {
+        BlobCacheDirectory cache = new BlobCacheDirectory(tempDir.resolve("cache"));
+        Path source = Files.writeString(tempDir.resolve("source.txt"), "content", StandardCharsets.UTF_8);
+        String sha = ClasspathPackager.sha256Hex(source);
+
+        assertThatThrownBy(() -> cache.putFromFile("0".repeat(64), source))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("SHA-256 mismatch");
+        Path stored = cache.putFromFile(sha, source);
+        assertThat(stored).isEqualTo(cache.resolveBlobPath(sha));
+        assertThat(Files.readString(stored)).isEqualTo("content");
+        assertThat(source).as("caller keeps ownership of a source outside the cache").exists();
+        assertThat(cache.putFromFile(sha, source)).isEqualTo(stored);
+        try (var tmp = Files.list(cache.getRootDir().resolve("tmp"))) {
+            assertThat(tmp).isEmpty();
+        }
+
+        ArtifactRef regular = new ArtifactRef("source.txt", sha, ArtifactKind.REGULAR_FILE, 7L);
+        assertThatThrownBy(() -> cache.materializeForClasspath(regular, tempDir.resolve("workspace")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("REGULAR_FILE");
     }
 }
