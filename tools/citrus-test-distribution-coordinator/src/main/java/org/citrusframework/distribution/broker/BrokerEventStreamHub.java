@@ -44,6 +44,13 @@ public final class BrokerEventStreamHub {
     private final Map<String, Set<HttpServerResponse>> sessionSubscribers = new ConcurrentHashMap<>();
     private final Set<HttpServerResponse> globalSubscribers = new CopyOnWriteArraySet<>();
 
+    /**
+     * Events published so far for {@code sessionId}, oldest first.
+     */
+    List<BrokerEvent> sessionEvents(String sessionId) {
+        return List.copyOf(sessionHistory.getOrDefault(sessionId, List.of()));
+    }
+
     public BrokerEvent publish(String type, String sessionId, String partitionId, String workerId, Map<String, Object> data) {
         BrokerEvent event = new BrokerEvent(
                 sequenceGenerator.incrementAndGet(),

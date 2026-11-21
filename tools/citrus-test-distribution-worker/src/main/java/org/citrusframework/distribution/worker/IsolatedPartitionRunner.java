@@ -143,14 +143,17 @@ public final class IsolatedPartitionRunner {
                 }
             }
 
-            return new PartitionCompletedPayload(assignment.partitionId(), assignment.sessionId(), true, null);
+            return new PartitionCompletedPayload(assignment.partitionId(), assignment.sessionId(),
+                    assignment.attempt(), true, null, List.of());
         } catch (Throwable t) {
             LOG.warn("Partition {} failed during execution", assignment.partitionId(), t);
             return new PartitionCompletedPayload(
                     assignment.partitionId(),
                     assignment.sessionId(),
+                    assignment.attempt(),
                     false,
-                    t.getMessage() != null ? t.getMessage() : t.getClass().getName());
+                    t.getMessage() != null ? t.getMessage() : t.getClass().getName(),
+                    List.of());
         } finally {
             Thread.currentThread().setContextClassLoader(previousCl);
             if (systemProps != null) {

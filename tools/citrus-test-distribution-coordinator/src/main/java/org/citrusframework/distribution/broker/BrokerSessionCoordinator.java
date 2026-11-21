@@ -17,15 +17,18 @@
 package org.citrusframework.distribution.broker;
 
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Consumer;
 
 import org.citrusframework.distribution.config.DistributionJson;
+import org.citrusframework.distribution.config.DistributionSettings;
 import org.citrusframework.distribution.model.ArtifactRef;
 import org.citrusframework.distribution.model.BuildSessionRecord;
 import org.citrusframework.distribution.model.BuildSessionResponse;
@@ -50,6 +53,7 @@ import org.citrusframework.distribution.model.WorkerRegisterPayload;
 import org.citrusframework.distribution.model.WorkerState;
 import org.citrusframework.distribution.model.WorkerTestEventPayload;
 import org.citrusframework.distribution.model.WorkerWsMessage;
+import org.citrusframework.distribution.model.WorkspaceFileSet;
 import org.citrusframework.distribution.scheduler.CapabilityMatcher;
 import org.citrusframework.distribution.scheduler.LptPartitionScheduler;
 import org.citrusframework.distribution.store.DistributionStore;
@@ -123,19 +127,27 @@ public final class BrokerSessionCoordinator {
             return persisted.get();
         }
 
-        session.cachedBlobs += Math.max(0, request.cachedBlobs());
-        session.uploadedBlobs += Math.max(0, request.uploadedBlobs());
-
+        boolean needsWorkspace = request.forkWorkspace()
+                || !request.inputArtifacts().isEmpty()
+                || !request.outputPaths().isEmpty();
         List<WorkUnitSpec> units = request.workUnits() != null ? request.workUnits() : List.of();
+        if (needsWorkspace) {
+            units = units.stream().map(BrokerSessionCoordinator::requireWorkspaceCapability).toList();
+        }
         List<String> keys = units.stream().map(WorkUnitSpec::key).toList();
         Map<String, Long> historicalDurations = store.findHistoricalDurationsMs(keys, 10);
 
+        // Schedule before touching any state: an invalid SINGLE submission must leave no trace.
         List<PartitionRecord> scheduled = scheduler.schedule(
                 sessionId,
                 units,
                 historicalDurations,
                 config.defaultDurationMs(),
-                session.maxPartitionSize);
+                session.maxPartitionSize,
+                request.partitionPolicy());
+
+        session.cachedBlobs += Math.max(0, request.cachedBlobs());
+        session.uploadedBlobs += Math.max(0, request.uploadedBlobs());
 
         List<String> partitionIds = new ArrayList<>(scheduled.size());
         for (PartitionRecord part : scheduled) {
@@ -145,6 +157,9 @@ public final class BrokerSessionCoordinator {
                     request.moduleName(),
                     request.classpathArtifacts() != null ? List.copyOf(request.classpathArtifacts()) : List.of(),
                     request.systemProperties() != null ? Map.copyOf(request.systemProperties()) : Map.of(),
+                    request.inputArtifacts(),
+                    request.outputPaths(),
+                    request.forkWorkspace(),
                     session.maxRetries
             );
             partitions.put(part.partitionId(), runtime);
@@ -288,14 +303,31 @@ public final class BrokerSessionCoordinator {
         if (conn == null) {
             return;
         }
-        conn.lastHeartbeatAt = System.currentTimeMillis();
+        long receivedAt = System.currentTimeMillis();
+        boolean wasSilent = conn.lastHeartbeatAt < receivedAt - config.leaseTimeoutMs();
+        boolean wasCancelling = conn.cancelledPartitionId != null;
+        conn.lastHeartbeatAt = receivedAt;
 
+        processWorkerMessage(conn, message);
+
+        // Dispatch only after the message is fully handled, so a message that makes the worker eligible again (back
+        // within the liveness window, or confirming a cancellation) is never itself taken as part of new work.
+        if (wasSilent || (wasCancelling && conn.cancelledPartitionId == null)) {
+            dispatchPendingPartitions();
+        }
+    }
+
+    private void processWorkerMessage(WorkerConnection conn, WorkerWsMessage message) {
         switch (message.type()) {
             case WorkerWsMessage.WORKER_HEARTBEAT -> {
                 WorkerHeartbeatPayload hb = DistributionJson.convert(message.payload(), WorkerHeartbeatPayload.class);
+                if (hb != null && conn.cancelledPartitionId != null
+                        && !conn.cancelledPartitionId.equals(hb.activePartitionId())) {
+                    confirmCancellation(conn);
+                }
                 if (hb != null && hb.activePartitionId() != null) {
                     PartitionRuntime pr = partitions.get(hb.activePartitionId());
-                    if (pr != null) {
+                    if (isActiveOn(pr, conn)) {
                         pr.lastProgressAt = System.currentTimeMillis();
                     }
                 }
@@ -309,7 +341,12 @@ public final class BrokerSessionCoordinator {
             case WorkerWsMessage.PARTITION_STARTED -> {
                 String partitionId = stringField(message.payload(), "partitionId");
                 PartitionRuntime pr = partitionId != null ? partitions.get(partitionId) : null;
-                if (pr != null) {
+                int startedAttempt = intField(message.payload(), "attempt");
+                if (!isActiveOn(pr, conn) || pr.record.state() != PartitionState.ASSIGNED
+                        || (startedAttempt > 0 && startedAttempt != pr.record.attempt())) {
+                    LOG.warn("Discarding {} for partition {} from worker {} (connection {}): not the active assignment",
+                            message.type(), partitionId, conn.workerId, conn.connectionId);
+                } else {
                     long now = System.currentTimeMillis();
                     pr.lastProgressAt = now;
                     pr.record = new PartitionRecord(
@@ -333,9 +370,12 @@ public final class BrokerSessionCoordinator {
                 WorkerTestEventPayload evt = DistributionJson.convert(message.payload(), WorkerTestEventPayload.class);
                 if (evt != null) {
                     PartitionRuntime pr = partitions.get(evt.partitionId());
-                    if (pr != null) {
-                        pr.lastProgressAt = System.currentTimeMillis();
+                    if (!acceptsAttempt(pr, conn, evt.attempt())) {
+                        LOG.warn("Discarding stale {} for partition {} attempt {} from worker {} (connection {})",
+                                message.type(), evt.partitionId(), evt.attempt(), conn.workerId, conn.connectionId);
+                        return;
                     }
+                    pr.lastProgressAt = System.currentTimeMillis();
                     if (evt.status() != TestOutcomeStatus.STARTED) {
                         TestExecutionRecord execRecord = new TestExecutionRecord(
                                 UUID.randomUUID().toString(),
@@ -347,8 +387,8 @@ public final class BrokerSessionCoordinator {
                                 evt.testName(),
                                 evt.status(),
                                 evt.durationMs(),
-                                evt.attempt(),
-                                evt.attempt() > 1 && evt.status() == TestOutcomeStatus.PASSED,
+                                pr.record.attempt(),
+                                pr.record.attempt() > 1 && evt.status() == TestOutcomeStatus.PASSED,
                                 evt.errorMessage(),
                                 evt.stackTrace(),
                                 evt.endpoints() != null ? evt.endpoints() : List.of(),
@@ -363,9 +403,19 @@ public final class BrokerSessionCoordinator {
             }
             case WorkerWsMessage.PARTITION_COMPLETED -> {
                 PartitionCompletedPayload done = DistributionJson.convert(message.payload(), PartitionCompletedPayload.class);
-                if (done != null) {
-                    completePartition(conn, done);
+                if (done == null) {
+                    return;
                 }
+                boolean accepted = acceptsAttempt(partitions.get(done.partitionId()), conn, done.attempt());
+                if (done.partitionId() != null && done.partitionId().equals(conn.cancelledPartitionId)) {
+                    confirmCancellation(conn);
+                }
+                if (!accepted) {
+                    LOG.warn("Discarding stale {} for partition {} attempt {} from worker {} (connection {})",
+                            message.type(), done.partitionId(), done.attempt(), conn.workerId, conn.connectionId);
+                    return;
+                }
+                completePartition(conn, done);
             }
             default -> LOG.debug("Ignoring unknown worker message type {}", message.type());
         }
@@ -398,6 +448,7 @@ public final class BrokerSessionCoordinator {
             if ((pr.record.state() == PartitionState.ASSIGNED || pr.record.state() == PartitionState.RUNNING)
                     && pr.lastProgressAt < cutoff) {
                 String stalledWorkerId = pr.record.workerId();
+                releaseStalledWorker(pr);
                 requeueOrLosePartition(pr, stalledWorkerId, "Worker heartbeat lease expired");
             }
         }
@@ -407,6 +458,7 @@ public final class BrokerSessionCoordinator {
     private void completePartition(WorkerConnection conn, PartitionCompletedPayload done) {
         PartitionRuntime pr = partitions.get(done.partitionId());
         if (pr != null) {
+            pr.activeConnectionId = null;
             PartitionState endState = done.success() ? PartitionState.COMPLETED : PartitionState.FAILED;
             long now = System.currentTimeMillis();
             long started = pr.record.startedAt() > 0L ? pr.record.startedAt() : now;
@@ -429,6 +481,9 @@ public final class BrokerSessionCoordinator {
             if (done.errorMessage() != null) {
                 data.put("errorMessage", done.errorMessage());
             }
+            if (!done.outputArtifacts().isEmpty()) {
+                data.put("outputArtifacts", done.outputArtifacts());
+            }
             eventHub.publish("partition.completed", pr.record.sessionId(), pr.record.partitionId(), conn.workerId, data);
         }
 
@@ -443,6 +498,7 @@ public final class BrokerSessionCoordinator {
     }
 
     private void requeueOrLosePartition(PartitionRuntime pr, String previousWorkerId, String reason) {
+        pr.activeConnectionId = null;
         if (pr.retriesUsed < pr.maxRetries) {
             pr.retriesUsed++;
             pr.record = new PartitionRecord(
@@ -491,10 +547,15 @@ public final class BrokerSessionCoordinator {
                 .toList();
 
         for (PartitionRuntime pr : pending) {
-            WorkerConnection matchingWorker = findIdleMatchingWorker(pr.record.requiredCapabilities());
+            if (pr.lastAssignedWorkerId != null) {
+                pr.earlierAttemptWorkerIds.add(pr.lastAssignedWorkerId);
+            }
+            WorkerConnection matchingWorker = findIdleMatchingWorker(pr.record.requiredCapabilities(),
+                    pr.earlierAttemptWorkerIds);
             if (matchingWorker == null) {
                 continue;
             }
+            pr.lastAssignedWorkerId = matchingWorker.workerId;
             int nextAttempt = pr.retriesUsed + 1;
             long now = System.currentTimeMillis();
             pr.lastProgressAt = now;
@@ -514,6 +575,7 @@ public final class BrokerSessionCoordinator {
 
             matchingWorker.state = WorkerState.BUSY;
             matchingWorker.activePartitionId = pr.record.partitionId();
+            pr.activeConnectionId = matchingWorker.connectionId;
             persistWorker(matchingWorker);
 
             PartitionAssignPayload assignPayload = new PartitionAssignPayload(
@@ -522,7 +584,10 @@ public final class BrokerSessionCoordinator {
                     nextAttempt,
                     pr.classpathArtifacts,
                     pr.systemProperties,
-                    pr.record.workUnits()
+                    pr.record.workUnits(),
+                    pr.inputArtifacts,
+                    pr.outputPaths,
+                    pr.forkWorkspace
             );
             @SuppressWarnings("unchecked")
             Map<String, Object> payloadMap = DistributionJson.convert(assignPayload, Map.class);
@@ -535,14 +600,99 @@ public final class BrokerSessionCoordinator {
         }
     }
 
-    private WorkerConnection findIdleMatchingWorker(Map<String, String> requiredCapabilities) {
+    /**
+     * True when {@code pr} is currently assigned to (or running on) the worker behind {@code conn}.
+     */
+    private static boolean isActiveOn(PartitionRuntime pr, WorkerConnection conn) {
+        return pr != null
+                && (pr.record.state() == PartitionState.ASSIGNED || pr.record.state() == PartitionState.RUNNING)
+                && conn.connectionId.equals(pr.activeConnectionId);
+    }
+
+    /**
+     * Fence for test events and completions: the partition must be active on this exact connection and the payload
+     * must report the current attempt. Attempt {@code 0} (a sender that does not report attempts) is only accepted
+     * from a worker that never held an earlier attempt of this partition: from any such worker it can only mean the
+     * current attempt, whereas a worker that held an earlier attempt — even after reconnecting on a new connection —
+     * may still be reporting that earlier run.
+     */
+    private static boolean acceptsAttempt(PartitionRuntime pr, WorkerConnection conn, int payloadAttempt) {
+        if (!isActiveOn(pr, conn)) {
+            return false;
+        }
+        return payloadAttempt == pr.record.attempt()
+                || (payloadAttempt == 0 && !pr.earlierAttemptWorkerIds.contains(conn.workerId));
+    }
+
+    /**
+     * Tells the worker holding an expired lease to stop (best effort) and detaches it from the partition. The worker
+     * stays out of dispatch until it confirms the cancelled attempt has ended — by reporting a completion for that
+     * partition (discarded, since the attempt is stale) or a heartbeat no longer naming it — because a worker whose
+     * lease expired is usually frozen or still running the attempt.
+     */
+    private void releaseStalledWorker(PartitionRuntime pr) {
+        WorkerConnection stalled = pr.activeConnectionId != null ? workers.get(pr.activeConnectionId) : null;
+        if (stalled == null) {
+            return;
+        }
+        try {
+            stalled.sender.accept(new WorkerWsMessage(WorkerWsMessage.PARTITION_CANCEL, Map.of(
+                    "partitionId", pr.record.partitionId(),
+                    "sessionId", pr.record.sessionId(),
+                    "attempt", pr.record.attempt())));
+        } catch (RuntimeException e) {
+            LOG.debug("Failed to send {} to worker {}", WorkerWsMessage.PARTITION_CANCEL, stalled.workerId, e);
+        }
+        if (pr.record.partitionId().equals(stalled.activePartitionId)) {
+            stalled.activePartitionId = null;
+        }
+        stalled.cancelledPartitionId = pr.record.partitionId();
+        persistWorker(stalled);
+    }
+
+    /**
+     * The worker reported that its cancelled attempt has ended: make it eligible for new work again. Dispatch happens
+     * once the confirming message has been handled (see {@link #handleWorkerMessage(String, WorkerWsMessage)}).
+     */
+    private void confirmCancellation(WorkerConnection conn) {
+        conn.cancelledPartitionId = null;
+        if (conn.state == WorkerState.BUSY && conn.activePartitionId == null) {
+            conn.state = WorkerState.IDLE;
+        }
+        persistWorker(conn);
+    }
+
+    private static WorkUnitSpec requireWorkspaceCapability(WorkUnitSpec unit) {
+        Map<String, String> capabilities = new LinkedHashMap<>();
+        if (unit.requiredCapabilities() != null) {
+            capabilities.putAll(unit.requiredCapabilities());
+        }
+        capabilities.put(DistributionSettings.WORKSPACE_CAPABILITY_KEY, "true");
+        return new WorkUnitSpec(unit.key(), unit.className(), unit.methodName(), unit.dynamicSourceName(),
+                capabilities, unit.estimatedDurationMs());
+    }
+
+    /**
+     * An idle worker that is not finishing a cancelled attempt, has been heard from within the lease timeout, and
+     * satisfies {@code requiredCapabilities}. Workers outside {@code preferAvoiding} (those that ran earlier attempts
+     * of the partition) are chosen first.
+     */
+    private WorkerConnection findIdleMatchingWorker(Map<String, String> requiredCapabilities, Set<String> preferAvoiding) {
+        long aliveSince = System.currentTimeMillis() - config.leaseTimeoutMs();
+        WorkerConnection fallback = null;
         for (WorkerConnection conn : workers.values()) {
-            if (conn.state == WorkerState.IDLE && conn.activePartitionId == null
+            if (conn.state == WorkerState.IDLE && conn.activePartitionId == null && conn.cancelledPartitionId == null
+                    && conn.lastHeartbeatAt >= aliveSince
                     && CapabilityMatcher.matches(requiredCapabilities, conn.capabilities)) {
-                return conn;
+                if (!preferAvoiding.contains(conn.workerId)) {
+                    return conn;
+                }
+                if (fallback == null) {
+                    fallback = conn;
+                }
             }
         }
-        return null;
+        return fallback;
     }
 
     private void persistWorker(WorkerConnection conn) {
@@ -580,6 +730,18 @@ public final class BrokerSessionCoordinator {
         return rehydrated;
     }
 
+    private static int intField(Map<String, Object> map, String key) {
+        Object v = map != null ? map.get(key) : null;
+        if (v instanceof Number number) {
+            return number.intValue();
+        }
+        try {
+            return v != null ? Integer.parseInt(v.toString()) : 0;
+        } catch (NumberFormatException e) {
+            return 0;
+        }
+    }
+
     private static String stringField(Map<String, Object> map, String key) {
         if (map == null) {
             return null;
@@ -608,19 +770,34 @@ public final class BrokerSessionCoordinator {
         private final String moduleName;
         private final List<ArtifactRef> classpathArtifacts;
         private final Map<String, String> systemProperties;
+        private final List<WorkspaceFileSet> inputArtifacts;
+        private final List<String> outputPaths;
+        private final boolean forkWorkspace;
         private final int maxRetries;
         private int retriesUsed;
         private long lastProgressAt = System.currentTimeMillis();
+        /** Connection of the worker currently holding this partition; {@code null} while not assigned. */
+        private String activeConnectionId;
+        /** Worker that received the most recent attempt. */
+        private String lastAssignedWorkerId;
+        /** Workers that received an attempt before the current one. */
+        private final Set<String> earlierAttemptWorkerIds = new HashSet<>();
 
         private PartitionRuntime(PartitionRecord record,
                                  String moduleName,
                                  List<ArtifactRef> classpathArtifacts,
                                  Map<String, String> systemProperties,
+                                 List<WorkspaceFileSet> inputArtifacts,
+                                 List<String> outputPaths,
+                                 boolean forkWorkspace,
                                  int maxRetries) {
             this.record = record;
             this.moduleName = moduleName;
             this.classpathArtifacts = classpathArtifacts;
             this.systemProperties = systemProperties;
+            this.inputArtifacts = inputArtifacts;
+            this.outputPaths = outputPaths;
+            this.forkWorkspace = forkWorkspace;
             this.maxRetries = maxRetries;
         }
     }
@@ -635,6 +812,8 @@ public final class BrokerSessionCoordinator {
         private long lastHeartbeatAt = System.currentTimeMillis();
         private WorkerState state = WorkerState.IDLE;
         private String activePartitionId;
+        /** Partition whose expired attempt this worker was told to cancel and has not yet confirmed ending. */
+        private String cancelledPartitionId;
 
         private WorkerConnection(String connectionId,
                                  String workerId,

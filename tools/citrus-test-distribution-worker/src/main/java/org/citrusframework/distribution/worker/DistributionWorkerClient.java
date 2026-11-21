@@ -60,8 +60,7 @@ public final class DistributionWorkerClient implements AutoCloseable {
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final AtomicBoolean draining = new AtomicBoolean(false);
     private final AtomicReference<WebSocket> activeWebSocket = new AtomicReference<>();
-    private final AtomicReference<String> activePartitionId = new AtomicReference<>();
-    private final AtomicReference<CancellationToken> activeCancellation = new AtomicReference<>();
+    private final ActiveAssignmentTracker assignments = new ActiveAssignmentTracker();
     private volatile CountDownLatch registeredLatch = new CountDownLatch(1);
     private volatile CompletableFuture<Void> currentExecution = CompletableFuture.completedFuture(null);
 
@@ -204,7 +203,7 @@ public final class DistributionWorkerClient implements AutoCloseable {
         if (!running.get() || !isConnected()) {
             return;
         }
-        WorkerHeartbeatPayload hb = new WorkerHeartbeatPayload(config.workerId(), activePartitionId.get());
+        WorkerHeartbeatPayload hb = new WorkerHeartbeatPayload(config.workerId(), assignments.activePartitionId());
         @SuppressWarnings("unchecked")
         Map<String, Object> map = DistributionJson.convert(hb, Map.class);
         sendMessageSafe(WorkerWsMessage.WORKER_HEARTBEAT, map);
@@ -231,14 +230,14 @@ public final class DistributionWorkerClient implements AutoCloseable {
             case WorkerWsMessage.WORKER_REGISTERED -> registeredLatch.countDown();
             case WorkerWsMessage.PARTITION_ASSIGN -> {
                 PartitionAssignPayload assign = DistributionJson.convert(message.payload(), PartitionAssignPayload.class);
-                CancellationToken token = CancellationToken.create();
-                activePartitionId.set(assign.partitionId());
-                activeCancellation.set(token);
+                ActiveAssignmentTracker.Assignment assignment = assignments.start(assign.partitionId(), assign.attempt());
+                CancellationToken token = assignment.token();
                 currentExecution = CompletableFuture.runAsync(() -> {
                     try {
                         sendMessageSafe(WorkerWsMessage.PARTITION_STARTED, Map.of(
                                 "partitionId", assign.partitionId(),
-                                "sessionId", assign.sessionId()));
+                                "sessionId", assign.sessionId(),
+                                "attempt", assign.attempt()));
                         PartitionCompletedPayload completed = runner.execute(assign, token, event -> {
                             @SuppressWarnings("unchecked")
                             Map<String, Object> eventMap = DistributionJson.convert(event, Map.class);
@@ -248,16 +247,16 @@ public final class DistributionWorkerClient implements AutoCloseable {
                         Map<String, Object> completedMap = DistributionJson.convert(completed, Map.class);
                         sendMessageSafe(WorkerWsMessage.PARTITION_COMPLETED, completedMap);
                     } finally {
-                        activePartitionId.compareAndSet(assign.partitionId(), null);
-                        activeCancellation.compareAndSet(token, null);
+                        assignments.finish(assignment);
                     }
                 }, partitionExecutor);
             }
             case WorkerWsMessage.PARTITION_CANCEL -> {
-                CancellationToken token = activeCancellation.get();
-                if (token != null) {
-                    token.cancel();
-                }
+                Map<String, Object> payload = message.payload() != null ? message.payload() : Map.of();
+                Object partitionId = payload.get("partitionId");
+                Object attempt = payload.get("attempt");
+                assignments.cancel(partitionId != null ? partitionId.toString() : null,
+                        attempt instanceof Number number ? number.intValue() : 0);
             }
             default -> LOG.debug("Ignoring unknown message type {} on worker {}", message.type(), config.workerId());
         }
