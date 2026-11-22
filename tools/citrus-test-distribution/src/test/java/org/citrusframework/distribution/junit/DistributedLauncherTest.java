@@ -162,6 +162,20 @@ class DistributedLauncherTest {
         }
     }
 
+    @Test
+    void shouldTreatBlankAndPlaceholderSettingsAsUnsetAndNoneAsClear() {
+        System.setProperty(DistributionSettings.INPUTS_PROPERTY, "");
+        assertThat(DistributedLauncher.WorkspaceSettings.setting(DistributionSettings.INPUTS_PROPERTY, null))
+                .as("the root POM passes undefined settings through as empty values").isNull();
+        System.setProperty(DistributionSettings.INPUTS_PROPERTY, "${citrus.test.distribution.inputs}");
+        assertThat(DistributedLauncher.WorkspaceSettings.setting(DistributionSettings.INPUTS_PROPERTY, null)).isNull();
+        assertThat(DistributedLauncher.WorkspaceSettings.setting(DistributionSettings.INPUTS_PROPERTY, "PATH"))
+                .as("a blank property falls back to the environment variable").isEqualTo(System.getenv("PATH"));
+        System.setProperty(DistributionSettings.INPUTS_PROPERTY, "none");
+        assertThat(DistributionSettings.parseDeclaredPaths(
+                DistributedLauncher.WorkspaceSettings.setting(DistributionSettings.INPUTS_PROPERTY, null))).isEmpty();
+    }
+
     private record Outcome(int passed, int failed) {
     }
 

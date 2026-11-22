@@ -534,15 +534,15 @@ public class DistributedLauncher implements Launcher {
         }
 
         /**
-         * The value of a setting: a present system property wins even when empty (an empty value clears the setting);
-         * otherwise the environment variable. An unresolved {@code ${...}} placeholder counts as unset.
+         * The value of a setting: the system property when set to a non-blank value, otherwise the environment
+         * variable. Blank values and unresolved {@code ${...}} placeholders count as unset (the root POM passes the
+         * properties through to Surefire even when undefined); {@code none} clears a path list explicitly, and the
+         * Maven extension writes the resolved winner, including {@code none} for a cleared list.
          */
         static String setting(String property, String env) {
-            if (System.getProperties().containsKey(property)) {
-                String value = System.getProperty(property);
-                if (value != null && !isPlaceholder(value.trim())) {
-                    return value;
-                }
+            String value = System.getProperty(property);
+            if (value != null && !value.isBlank() && !isPlaceholder(value.trim())) {
+                return value;
             }
             String fromEnv = env != null ? System.getenv(env) : null;
             return fromEnv == null || fromEnv.isBlank() ? null : fromEnv;
