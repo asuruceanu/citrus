@@ -175,8 +175,9 @@ the module's `target/`) and are not evicted automatically. Workers keep their ow
 |`-Xmx768m -XX:ActiveProcessorCount=2`
 |`citrus.test.distribution.worker.cwdCheck` / `CITRUS_DIST_WORKER_CWD_CHECK`
 |For partitions in the shared worker JVM: `FAIL` the partition, only `WARN`, or turn the check `OFF` when tests write
-into the worker's working directory (new top-level entries, or new or changed files below `target/` and `src/`; changes
-to files that already existed at the top level, such as the worker's own log, are ignored). Use `WARN` when several
+into the worker's working directory (new entries, writes into existing top-level directories, and new or changed files below
+`target/` and `src/`; changes to files that already existed at the top level, such as the worker's own log, are
+ignored). Use `WARN` when several
 daemons share a directory.
 |`FAIL`
 |`citrus.test.distribution.worker.handshakeTimeoutMs`

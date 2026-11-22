@@ -213,10 +213,6 @@ public final class IsolatedPartitionRunner implements PartitionRunner {
     }
 
     /**
-     * {@code configured} if absolute (or rooted, on Windows); otherwise resolved against the workspace, falling back
-     * to {@code defaultRelative} when unset or when the relative path would leave the workspace.
-     */
-    /**
      * The assignment's properties with {@code ${citrus.dist.workspace}} expanded and {@code basedir} set to the
      * workspace. Forked partitions use exactly this: they run in the local working directory, so Citrus' relative
      * report defaults already resolve as they do locally.
@@ -228,6 +224,10 @@ public final class IsolatedPartitionRunner implements PartitionRunner {
         return overrides;
     }
 
+    /**
+     * {@code configured} if absolute (or rooted, on Windows); otherwise resolved against the workspace, falling back
+     * to {@code defaultRelative} when unset or when the relative path would leave the workspace.
+     */
     private static String workspaceRelative(Path workspace, String configured, String defaultRelative) {
         Path fallback = workspace.resolve(defaultRelative);
         if (configured == null || configured.isBlank()) {
@@ -308,16 +308,17 @@ public final class IsolatedPartitionRunner implements PartitionRunner {
             }
             try {
                 BasicFileAttributes attrs = Files.readAttributes(entry, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
-                entries.put(root.relativize(entry).toString(), attrs.size() + "@" + attrs.lastModifiedTime().toMillis());
+                entries.put(root.relativize(entry).toString(), (attrs.isDirectory() ? "d:" : "f:")
+                        + attrs.size() + "@" + attrs.lastModifiedTime().toMillis());
             } catch (IOException e) {
                 // Vanished between listing and reading: not part of this snapshot.
             }
         }
 
         /**
-         * Entries of {@code after} that are new, or that changed below {@code target/} or {@code src/}, sorted.
-         * Changes to entries that already existed at the top level are ignored: the worker daemon itself may append to
-         * files there (its own log, {@code nohup.out}) while a partition runs.
+         * Entries of {@code after} that are new or changed, sorted. Changes to regular files that already existed at the
+         * top level are ignored (the worker daemon itself may append to its log or {@code nohup.out} there), and so are
+         * the top-level {@code target/} and {@code src/} directories themselves, whose contents are compared directly.
          */
         List<String> changedEntries(WorkingDirectorySnapshot after) {
             return after.entries().entrySet().stream()
@@ -326,8 +327,15 @@ public final class IsolatedPartitionRunner implements PartitionRunner {
                         if (previous == null) {
                             return true;
                         }
-                        boolean topLevel = !e.getKey().contains("/") && !e.getKey().contains(java.io.File.separator);
-                        return !topLevel && !e.getValue().equals(previous);
+                        if (e.getValue().equals(previous)) {
+                            return false;
+                        }
+                        String name = e.getKey();
+                        boolean topLevel = !name.contains("/") && !name.contains(java.io.File.separator);
+                        if (!topLevel) {
+                            return true;
+                        }
+                        return e.getValue().startsWith("d:") && !name.equals("target") && !name.equals("src");
                     })
                     .map(Map.Entry::getKey)
                     .toList();

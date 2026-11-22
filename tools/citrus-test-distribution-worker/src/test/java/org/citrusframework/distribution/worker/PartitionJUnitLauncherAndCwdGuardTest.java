@@ -326,6 +326,19 @@ class PartitionJUnitLauncherAndCwdGuardTest {
     }
 
     @Test
+    void shouldStillFlagWritesIntoPreExistingTopLevelDirectories() throws Exception {
+        Path root = Files.createDirectories(tempDir.resolve("worker-cwd-dirs"));
+        Path scratch = Files.createDirectories(root.resolve(".citrus-jbang"));
+        scratch.toFile().setLastModified(System.currentTimeMillis() - 60_000);
+        IsolatedPartitionRunner.WorkingDirectorySnapshot before = IsolatedPartitionRunner.WorkingDirectorySnapshot.take(root, null);
+
+        Files.writeString(scratch.resolve("run.log"), "x");
+
+        assertThat(before.changedEntries(IsolatedPartitionRunner.WorkingDirectorySnapshot.take(root, null)))
+                .containsExactly(".citrus-jbang");
+    }
+
+    @Test
     void shouldExposeForkAndCwdSettingsAndAdvertiseWorkspaceCapability() {
         DistributionWorkerConfig defaults = DistributionWorkerConfig.builder().cacheDir(tempDir).build();
         assertThat(defaults.forkMode()).isEqualTo(WorkerForkMode.AUTO);

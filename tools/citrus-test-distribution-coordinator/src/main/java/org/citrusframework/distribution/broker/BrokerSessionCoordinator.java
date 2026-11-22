@@ -404,6 +404,8 @@ public final class BrokerSessionCoordinator {
                     @SuppressWarnings("unchecked")
                     Map<String, Object> evtData = DistributionJson.convert(evt, Map.class);
                     // Attribute to the partition's own session, not whatever session the payload claims.
+                    evtData.put("sessionId", pr.record.sessionId());
+                    evtData.put("partitionId", pr.record.partitionId());
                     eventHub.publish("test.event", pr.record.sessionId(), pr.record.partitionId(), conn.workerId, evtData);
                 }
             }

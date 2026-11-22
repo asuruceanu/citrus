@@ -47,7 +47,7 @@ Implementation on branch `feature/test-distribution-external-resources` (commits
 
 ### 0.7a Final-review adjustments
 - Submissions whose system properties contain `${citrus.dist.workspace}` also require `citrus.workspace.v1` (older workers cannot expand the token).
-- The in-process CWD check ignores modifications of entries that already existed at the top level (the worker's own log); new top-level entries and changes below `target/` and `src/` still count.
+- The in-process CWD check ignores modifications of regular files that already existed at the top level (the worker's own log); new entries, changed top-level directories (other than `target/`/`src/`, whose contents are compared) and changes below `target/` and `src/` still count.
 - Forked partitions get token expansion and `basedir` only (no report/trace redirection): they already run in the local working directory.
 - `forkWorkspace` follows the *declared* inputs (a missing optional input still implies a fork); the working-directory calculation falls back to real paths; leftover processes are killed before outputs are packaged; host inputs leave out the host's internal directories; a relative host `cacheDir` resolves below `target/`; output downloads are size-capped while streaming; test events are attributed to the partition's own session; link checks share `BlobCacheDirectory.findSymlinkComponent`.
 
