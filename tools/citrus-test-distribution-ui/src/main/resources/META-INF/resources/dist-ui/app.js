@@ -9,6 +9,8 @@ import { html } from './vendor/htm-mini.js';
 
 const STORAGE_TOKEN_KEY = 'citrus.dist.authToken';
 const STORAGE_THEME_KEY = 'citrus.dist.theme';
+const POLL_INTERVAL_MS = 4000;
+const VALID_DETAIL_TABS = new Set(['waterfall', 'tests', 'failures', 'files']);
 
 const state = {
   view: 'overview', // 'overview' | 'sessions' | 'session-detail' | 'workers' | 'history'
@@ -47,6 +49,9 @@ document.documentElement.setAttribute('data-theme', state.theme);
 
 let eventSource = null;
 let toastTimer = null;
+let refreshTimer = null;
+let pollTimer = null;
+let suppressHashChange = false;
 
 function showToast(msg) {
   state.toastMessage = msg;
@@ -56,6 +61,62 @@ function showToast(msg) {
     state.toastMessage = '';
     renderApp();
   }, 3200);
+}
+
+function buildHash() {
+  if (state.view === 'session-detail' && state.selectedSessionId) {
+    return `#session/${encodeURIComponent(state.selectedSessionId)}/${state.detailTab || 'waterfall'}`;
+  }
+  return `#${state.view || 'overview'}`;
+}
+
+function syncHash() {
+  const target = buildHash();
+  if (window.location.hash !== target) {
+    suppressHashChange = true;
+    window.history.replaceState(null, '', target);
+    suppressHashChange = false;
+  }
+}
+
+function safeDecodeSegment(val) {
+  if (!val) return null;
+  try {
+    return decodeURIComponent(val);
+  } catch (_) {
+    return val;
+  }
+}
+
+function applyHashFromLocation() {
+  const raw = (window.location.hash || '').replace(/^#/, '').trim();
+  if (!raw) return false;
+  if (raw.startsWith('session/')) {
+    const parts = raw.split('/');
+    const sid = safeDecodeSegment(parts[1]);
+    const tab = parts[2] && VALID_DETAIL_TABS.has(parts[2]) ? parts[2] : 'waterfall';
+    if (sid) {
+      state.selectedSessionId = sid;
+      state.detailTab = tab;
+      state.view = 'session-detail';
+      return true;
+    }
+  }
+  if (['overview', 'sessions', 'session-detail', 'workers', 'history'].includes(raw)) {
+    state.view = raw;
+    return true;
+  }
+  return false;
+}
+
+function setView(view, detailTab = null) {
+  state.view = view;
+  if (detailTab && VALID_DETAIL_TABS.has(detailTab)) {
+    state.detailTab = detailTab;
+  }
+  state.mobileMenuOpen = false;
+  syncHash();
+  renderApp();
 }
 
 function apiHeaders() {
@@ -98,6 +159,14 @@ async function apiPost(path, body = {}) {
   return res.json();
 }
 
+function scheduleRefresh(delayMs = 140) {
+  if (refreshTimer) return;
+  refreshTimer = setTimeout(() => {
+    refreshTimer = null;
+    refreshAll();
+  }, delayMs);
+}
+
 async function refreshAll() {
   try {
     const [sessions, workers, history] = await Promise.all([
@@ -114,7 +183,11 @@ async function refreshAll() {
       await loadSessionDetail(state.selectedSessionId, false);
     } else if (state.sessions.length > 0) {
       state.selectedSessionId = state.sessions[0].sessionId;
+      if (state.view === 'session-detail') {
+        await loadSessionDetail(state.selectedSessionId, false);
+      }
     }
+    syncHash();
     renderApp();
   } catch (err) {
     if (err.message !== 'Unauthorized') {
@@ -128,14 +201,42 @@ async function loadSessionDetail(sessionId, switchView = true) {
     const detail = await apiGet(`/api/v1/sessions/${encodeURIComponent(sessionId)}`);
     state.selectedSessionId = sessionId;
     state.sessionDetail = detail;
+
+    if (state.selectedPartition && Array.isArray(detail.partitions)) {
+      const exact = detail.partitions.find(
+        p => p.partitionId === state.selectedPartition.partitionId
+          && p.attempt === state.selectedPartition.attempt
+      );
+      const fallback = detail.partitions.find(p => p.partitionId === state.selectedPartition.partitionId);
+      state.selectedPartition = exact || fallback || null;
+    }
+    if (state.selectedTestExecution && Array.isArray(detail.tests)) {
+      state.selectedTestExecution = detail.tests.find(t => t.id === state.selectedTestExecution.id) || null;
+    }
+
     if (switchView) {
       state.view = 'session-detail';
       state.mobileMenuOpen = false;
     }
+    syncHash();
     renderApp();
   } catch (err) {
     console.warn('Failed to load session detail:', err.message);
   }
+}
+
+function ensurePollingLoop() {
+  if (pollTimer) clearInterval(pollTimer);
+  pollTimer = setInterval(() => {
+    if (!state.sseConnected && !state.authError) {
+      if (!eventSource || eventSource.readyState === EventSource.CLOSED) {
+        connectSse();
+      }
+      refreshAll();
+    } else if (state.sessions.some(s => s.status === 'RUNNING')) {
+      renderApp();
+    }
+  }, POLL_INTERVAL_MS);
 }
 
 function connectSse() {
@@ -153,14 +254,15 @@ function connectSse() {
     renderApp();
   };
   const eventTypes = [
-    'session.created', 'session.completed', 'work.submitted',
+    'session.created', 'session.completed', 'session.aborted', 'work.submitted',
     'partition.assigned', 'partition.started', 'partition.requeued',
     'partition.completed', 'partition.lost', 'test.event',
-    'worker.registered', 'worker.draining', 'worker.disconnected', 'demo.seeded'
+    'worker.registered', 'worker.draining', 'worker.offline', 'worker.disconnected',
+    'demo.seeded'
   ];
   for (const evt of eventTypes) {
     eventSource.addEventListener(evt, () => {
-      refreshAll();
+      scheduleRefresh();
     });
   }
 }
@@ -182,6 +284,20 @@ async function handleSeedDemo() {
   } catch (err) {
     if (err.message !== 'Unauthorized') {
       showToast(`Failed to seed demo data: ${err.message}`);
+    }
+  }
+}
+
+async function handleAbortSession(sessionId) {
+  try {
+    await apiPost(`/api/v1/sessions/${encodeURIComponent(sessionId)}/abort`, {
+      reason: 'Aborted from Citrus Distribution UI'
+    });
+    await refreshAll();
+    showToast(`Aborted session ${sessionId}`);
+  } catch (err) {
+    if (err.message !== 'Unauthorized') {
+      showToast(`Failed to abort session: ${err.message}`);
     }
   }
 }
@@ -255,7 +371,7 @@ function renderTopbar() {
         >
           ${state.sidebarCollapsed ? '»' : '«'}
         </button>
-        <div class="brand" onClick=${() => { state.view = 'overview'; renderApp(); }}>
+        <div class="brand" onClick=${() => setView('overview')}>
           ${citrusLogoSvg()}
           <span class="brand-title">Citrus</span>
           <span class="brand-subtitle">Test Distribution</span>
@@ -302,9 +418,7 @@ function renderSidebar() {
           loadSessionDetail(state.sessions[0].sessionId, true);
           return;
         }
-        state.view = id;
-        state.mobileMenuOpen = false;
-        renderApp();
+        setView(id);
       }}
     >
       <span class="nav-btn-left">
@@ -339,7 +453,8 @@ function renderOverview() {
   const passedSessions = state.sessions.filter(s => s.status === 'PASSED').length;
   const failedSessions = state.sessions.filter(s => s.status === 'FAILED').length;
   const runningSessions = state.sessions.filter(s => s.status === 'RUNNING').length;
-  const passRate = totalSessions > 0 ? Math.round((passedSessions / Math.max(1, passedSessions + failedSessions)) * 100) : 100;
+  const completedCount = passedSessions + failedSessions;
+  const passRate = completedCount > 0 ? Math.round((passedSessions / completedCount) * 100) : 100;
 
   const onlineWorkers = state.workers.filter(w => w.state !== 'OFFLINE').length;
   const busyWorkers = state.workers.filter(w => w.state === 'BUSY').length;
@@ -365,7 +480,7 @@ function renderOverview() {
       <div class="page-header">
         <div>
           <h1 class="page-title">Test Distribution Control Plane</h1>
-          <p class="page-subtitle">Real-time LPT partition scheduling, content-addressed classpath caching, and Citrus execution telemetry.</p>
+          <p class="page-subtitle">Real-time LPT partition scheduling, content-addressed classpath & workspace caching, and Citrus execution telemetry.</p>
         </div>
         <button class="btn" onClick=${refreshAll}>↻ Refresh</button>
       </div>
@@ -407,7 +522,7 @@ function renderOverview() {
         <div class="card">
           <div class="card-header">
             <h2 class="card-title">Recent Build Sessions</h2>
-            <button class="btn btn-sm" onClick=${() => { state.view = 'sessions'; renderApp(); }}>View All →</button>
+            <button class="btn btn-sm" onClick=${() => setView('sessions')}>View All →</button>
           </div>
           ${renderSessionsTable(state.sessions.slice(0, 6))}
         </div>
@@ -415,7 +530,7 @@ function renderOverview() {
         <div class="card">
           <div class="card-header">
             <h2 class="card-title">Worker Pool Health</h2>
-            <button class="btn btn-sm" onClick=${() => { state.view = 'workers'; renderApp(); }}>Inspect Pool →</button>
+            <button class="btn btn-sm" onClick=${() => setView('workers')}>Inspect Pool →</button>
           </div>
           <div class="card-body" style="display:flex;flex-direction:column;gap:10px">
             ${state.workers.length === 0
@@ -464,6 +579,9 @@ function renderSessionsTable(rows) {
             const speedup = (s.serialDurationMs > 0 && s.wallDurationMs > 0)
               ? `${(s.serialDurationMs / s.wallDurationMs).toFixed(1)}x`
               : null;
+            const wallLabel = s.wallDurationMs > 0
+              ? formatDuration(s.wallDurationMs)
+              : (s.status === 'RUNNING' ? `live · ${formatDuration(Math.max(0, Date.now() - s.startedAt))}` : '—');
             return html`
               <tr class="clickable-row" onClick=${() => loadSessionDetail(s.sessionId, true)}>
                 <td>
@@ -480,6 +598,7 @@ function renderSessionsTable(rows) {
                     <span style="color:var(--emerald-text)">${s.passedTests}✓</span> ·
                     <span style="color:var(--rose-text)"> ${s.failedTests}✗</span> ·
                     <span style="color:var(--text-muted)"> ${s.skippedTests}↷</span>
+                    ${s.totalTests > 0 ? html` <span style="color:var(--text-muted);font-weight:500">/ ${s.totalTests}</span>` : null}
                   </div>
                   <div class="progress-mini">
                     <span class="progress-seg-pass" style=${`width:${passPct}%`}></span>
@@ -489,7 +608,7 @@ function renderSessionsTable(rows) {
                 </td>
                 <td class="mono">${cachePct}</td>
                 <td>
-                  <span class="mono">${s.wallDurationMs > 0 ? formatDuration(s.wallDurationMs) : 'running…'}</span>
+                  <span class="mono">${wallLabel}</span>
                   ${speedup ? html` <span class="speedup-badge">${speedup}</span>` : null}
                 </td>
                 <td style="color:var(--text-muted);font-size:12.5px">${formatAgo(s.startedAt)}</td>
@@ -528,7 +647,7 @@ function renderSessionsExplorer() {
           class="search-input"
           data-focus-id="sessions-search"
           type="search"
-          placeholder="Filter by session ID, branch, commit…"
+          placeholder="Filter by session ID, branch, commit, or project…"
           value=${state.sessionQuery}
           onInput=${e => { state.sessionQuery = e.target.value; renderApp(); }}
         />
@@ -556,10 +675,15 @@ function renderWaterfallSvg(session, partitions) {
 
   const minStart = Math.min(...partitions.map(p => p.startedAt > 0 ? p.startedAt : session.startedAt));
   const nowMs = Date.now();
+  const estOf = p => Math.max(300, p.estimatedDurationMs || 1000);
+  const startOf = p => p.startedAt > 0 ? p.startedAt : minStart;
+  const endOf = p => p.finishedAt > 0
+    ? p.finishedAt
+    : ((p.state === 'RUNNING' || p.state === 'ASSIGNED') ? Math.max(startOf(p) + 300, nowMs) : startOf(p) + estOf(p));
   const maxEnd = Math.max(
     minStart + 1000,
     session.finishedAt > 0 ? session.finishedAt : 0,
-    ...partitions.map(p => p.finishedAt > 0 ? p.finishedAt : (p.state === 'RUNNING' ? nowMs : p.startedAt + p.estimatedDurationMs))
+    ...partitions.map(endOf)
   );
   const totalSpan = Math.max(1000, maxEnd - minStart);
 
@@ -599,7 +723,7 @@ function renderWaterfallSvg(session, partitions) {
         <span class="legend-item"><span class="legend-swatch" style="background:#ef4444"></span> Failed</span>
         <span class="legend-item"><span class="legend-swatch" style="background:#3b82f6"></span> Running</span>
         <span class="legend-item"><span class="legend-swatch" style="background:#f59e0b"></span> Lost / Evicted (Requeued)</span>
-        <span style="margin-left:auto;font-size:12px;color:var(--text-muted)">Click any partition bar to inspect work units & capabilities</span>
+        <span style="margin-left:auto;font-size:12px;color:var(--text-muted)">Click any partition bar to inspect work units, workspace & capabilities</span>
       </div>
 
       <div class="waterfall-scroll">
@@ -623,12 +747,13 @@ function renderWaterfallSvg(session, partitions) {
                 <rect x="4" y=${y + 3} width=${svgWidth - 8} height=${rowHeight - 6} rx="6" fill="#94a3b8" fill-opacity="0.07" />
                 <text x="14" y=${y + 26} font-size="12" font-weight="600" fill="currentColor">${workerId}</text>
                 ${laneParts.map(p => {
-                  const pStart = p.startedAt > 0 ? p.startedAt : minStart;
-                  const pEnd = p.finishedAt > 0 ? p.finishedAt : (p.state === 'RUNNING' ? nowMs : pStart + p.estimatedDurationMs);
-                  const x = labelWidth + Math.max(0, Math.round(((pStart - minStart) / totalSpan) * chartWidth));
+                  const pStart = startOf(p);
+                  const pEnd = endOf(p);
+                  const relX = Math.min(chartWidth - 24, Math.max(0, Math.round(((pStart - minStart) / totalSpan) * chartWidth)));
+                  const x = labelWidth + relX;
                   const w = Math.max(44, Math.round(((Math.max(300, pEnd - pStart)) / totalSpan) * chartWidth));
-                  const clampedW = Math.min(w, chartWidth - (x - labelWidth));
-                  const barLabel = `${p.partitionId} ${p.attempt > 1 ? `(#${p.attempt})` : p.state === 'LOST' ? '(LOST #1)' : ''}`.trim();
+                  const clampedW = Math.max(24, Math.min(w, chartWidth - relX));
+                  const barLabel = `${p.partitionId} ${p.attempt > 1 ? `(#${p.attempt})` : p.state === 'LOST' ? `(LOST #${p.attempt || 1})` : ''}`.trim();
                   const labelInside = clampedW >= barLabel.length * 6.8 + 16;
                   return html`
                     <g class="waterfall-bar" onClick=${() => { state.selectedPartition = p; renderApp(); }}>
@@ -652,6 +777,41 @@ function renderWaterfallSvg(session, partitions) {
   `;
 }
 
+function collectPartitionFailures(partitions) {
+  const latestById = new Map();
+  for (const p of partitions) {
+    const prev = latestById.get(p.partitionId);
+    if (!prev || (p.attempt || 1) >= (prev.attempt || 1)) {
+      latestById.set(p.partitionId, p);
+    }
+  }
+  const out = [];
+  for (const p of latestById.values()) {
+    if (p.state === 'FAILED' || p.state === 'LOST') {
+      out.push(p);
+    }
+  }
+  return out;
+}
+
+function collectLatestTestFailures(tests) {
+  const latestByIdentity = new Map();
+  for (const t of tests) {
+    const key = `${t.workUnitKey || t.className || ''}#${t.className || ''}#${t.testName || ''}`;
+    const prev = latestByIdentity.get(key);
+    if (!prev || (t.attempt || 1) >= (prev.attempt || 1)) {
+      latestByIdentity.set(key, t);
+    }
+  }
+  const out = [];
+  for (const t of latestByIdentity.values()) {
+    if (t.status === 'FAILED') {
+      out.push(t);
+    }
+  }
+  return out;
+}
+
 function renderSessionDetail() {
   if (!state.sessionDetail || !state.sessionDetail.session) {
     return html`
@@ -662,12 +822,19 @@ function renderSessionDetail() {
   }
 
   const { session, changedFiles = [], partitions = [], tests = [] } = state.sessionDetail;
-  const failures = tests.filter(t => t.status === 'FAILED');
-  const flakyRecovered = tests.filter(t => t.flaky);
+  const failures = collectLatestTestFailures(tests);
+  const partitionFailures = collectPartitionFailures(partitions);
+  const totalFailureItems = failures.length + partitionFailures.length;
+  const flakyRecoveredCount = new Set(
+    tests.filter(t => t.flaky).map(t => `${t.className || ''}#${t.testName || ''}`)
+  ).size;
   const cachePct = session.totalBlobs > 0 ? Math.round((session.cachedBlobs / session.totalBlobs) * 100) : 0;
   const speedup = (session.serialDurationMs > 0 && session.wallDurationMs > 0)
     ? `${(session.serialDurationMs / session.wallDurationMs).toFixed(1)}x`
     : '—';
+  const wallValue = session.wallDurationMs > 0
+    ? formatDuration(session.wallDurationMs)
+    : (session.status === 'RUNNING' ? `Live · ${formatDuration(Math.max(0, Date.now() - session.startedAt))}` : '—');
 
   const testFilterPills = ['ALL', 'FAILED', 'FLAKY', 'PASSED', 'SKIPPED'];
   const tq = state.testQuery.trim().toLowerCase();
@@ -678,6 +845,7 @@ function renderSessionDetail() {
     return (t.className || '').toLowerCase().includes(tq)
       || (t.testName || '').toLowerCase().includes(tq)
       || (t.workerId || '').toLowerCase().includes(tq)
+      || (t.partitionId || '').toLowerCase().includes(tq)
       || (t.endpoints || []).some(ep => ep.toLowerCase().includes(tq));
   });
 
@@ -686,7 +854,7 @@ function renderSessionDetail() {
       <div class="page-header">
         <div>
           <div style="margin-bottom:6px">
-            <button class="btn btn-sm" onClick=${() => { state.view = 'sessions'; renderApp(); }}>← All Sessions</button>
+            <button class="btn btn-sm" onClick=${() => setView('sessions')}>← All Sessions</button>
           </div>
           <h1 class="page-title">
             <span class="mono">${session.sessionId}</span>
@@ -694,11 +862,18 @@ function renderSessionDetail() {
             ${speedup !== '—' ? html`<span class="speedup-badge">${speedup} speedup</span>` : null}
           </h1>
           <p class="page-subtitle">
-            Branch <strong class="mono">${session.gitBranch || 'local'}</strong> · Commit <code class="mono">${session.gitCommit || 'HEAD'}</code> · Started ${formatAgo(session.startedAt)}
+            Project <strong>${session.projectName || 'citrus'}</strong> · Branch <strong class="mono">${session.gitBranch || 'local'}</strong> · Commit <code class="mono">${session.gitCommit || 'HEAD'}</code> · Started ${formatAgo(session.startedAt)}
           </p>
         </div>
 
-        <div>
+        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+          ${session.status === 'RUNNING' ? html`
+            <button
+              class="btn btn-danger"
+              onClick=${() => handleAbortSession(session.sessionId)}
+              title="Cancel active worker partitions and abort this build session"
+            >✕ Abort Session</button>
+          ` : null}
           <select
             class="search-input"
             style="min-width:220px"
@@ -722,16 +897,16 @@ function renderSessionDetail() {
         <div class="kpi-card accent-rose">
           <div class="kpi-label">Failed Tests</div>
           <div class="kpi-value">${session.failedTests}</div>
-          <div class="kpi-meta">${session.skippedTests} skipped</div>
+          <div class="kpi-meta">${session.skippedTests} skipped${partitionFailures.length > 0 ? ` · ${partitionFailures.length} failed partition(s)` : ''}</div>
         </div>
         <div class="kpi-card accent-amber">
           <div class="kpi-label">Flaky Recovered</div>
-          <div class="kpi-value">${flakyRecovered.length}</div>
+          <div class="kpi-value">${flakyRecoveredCount}</div>
           <div class="kpi-meta">Passed after partition retry</div>
         </div>
         <div class="kpi-card accent-blue">
           <div class="kpi-label">Wall vs Serial Time</div>
-          <div class="kpi-value">${session.wallDurationMs > 0 ? formatDuration(session.wallDurationMs) : 'Live…'}</div>
+          <div class="kpi-value">${wallValue}</div>
           <div class="kpi-meta">Serial sum: ${formatDuration(session.serialDurationMs)}</div>
         </div>
         <div class="kpi-card">
@@ -742,16 +917,16 @@ function renderSessionDetail() {
       </div>
 
       <div class="subtabs">
-        <button class=${`subtab-btn ${state.detailTab === 'waterfall' ? 'active' : ''}`} onClick=${() => { state.detailTab = 'waterfall'; renderApp(); }}>
+        <button class=${`subtab-btn ${state.detailTab === 'waterfall' ? 'active' : ''}`} onClick=${() => setView('session-detail', 'waterfall')}>
           Waterfall & Partitions (${partitions.length})
         </button>
-        <button class=${`subtab-btn ${state.detailTab === 'tests' ? 'active' : ''}`} onClick=${() => { state.detailTab = 'tests'; renderApp(); }}>
+        <button class=${`subtab-btn ${state.detailTab === 'tests' ? 'active' : ''}`} onClick=${() => setView('session-detail', 'tests')}>
           Test Executions (${tests.length})
         </button>
-        <button class=${`subtab-btn ${state.detailTab === 'failures' ? 'active' : ''}`} onClick=${() => { state.detailTab = 'failures'; renderApp(); }}>
-          Failing Tests (${failures.length})
+        <button class=${`subtab-btn ${state.detailTab === 'failures' ? 'active' : ''}`} onClick=${() => setView('session-detail', 'failures')}>
+          Failing Tests (${totalFailureItems})
         </button>
-        <button class=${`subtab-btn ${state.detailTab === 'files' ? 'active' : ''}`} onClick=${() => { state.detailTab = 'files'; renderApp(); }}>
+        <button class=${`subtab-btn ${state.detailTab === 'files' ? 'active' : ''}`} onClick=${() => setView('session-detail', 'files')}>
           Changed Files (${changedFiles.length})
         </button>
       </div>
@@ -780,7 +955,7 @@ function renderSessionDetail() {
                     <th>State</th>
                     <th>Attempt</th>
                     <th>Work Units</th>
-                    <th>Required Capabilities</th>
+                    <th>Capabilities & Resources</th>
                     <th>Duration</th>
                   </tr>
                 </thead>
@@ -790,17 +965,30 @@ function renderSessionDetail() {
                       ? formatDuration(p.finishedAt - p.startedAt)
                       : (p.state === 'RUNNING' ? 'running…' : formatDuration(p.estimatedDurationMs));
                     const caps = Object.entries(p.requiredCapabilities || {});
+                    const inCount = (p.inputPaths || []).length;
+                    const outCount = (p.producedOutputs || []).length || (p.outputPaths || []).length;
                     return html`
                       <tr class="clickable-row" onClick=${() => { state.selectedPartition = p; renderApp(); }}>
-                        <td class="mono" style="font-weight:700;color:var(--citrus-orange-deep)">${p.partitionId}</td>
+                        <td>
+                          <div class="mono" style="font-weight:700;color:var(--citrus-orange-deep)">${p.partitionId}</div>
+                          ${p.moduleName ? html`<div class="mono" style="font-size:11px;color:var(--text-muted)">${p.moduleName}</div>` : null}
+                        </td>
                         <td class="mono">${p.workerId || 'pending'}</td>
-                        <td>${statusBadge(p.state)}</td>
+                        <td>
+                          ${statusBadge(p.state)}
+                          ${p.errorMessage ? html`<div style="font-size:11px;color:var(--rose-text);margin-top:3px;max-width:260px">${p.errorMessage}</div>` : null}
+                        </td>
                         <td class="mono">#${p.attempt}</td>
                         <td>${(p.workUnits || []).length} units</td>
                         <td>
-                          ${caps.length === 0
+                          ${caps.length === 0 && !p.forkWorkspace && inCount === 0 && outCount === 0
                             ? html`<span style="color:var(--text-muted)">default</span>`
-                            : caps.map(([k, v]) => html`<span class="tag mono">${k}=${v}</span>`)}
+                            : html`
+                                ${caps.map(([k, v]) => html`<span class="tag mono">${k}=${v}</span>`)}
+                                ${p.forkWorkspace ? html`<span class="tag tag-resource mono">forked-workspace</span>` : null}
+                                ${inCount > 0 ? html`<span class="tag tag-resource mono">${inCount} input(s)</span>` : null}
+                                ${outCount > 0 ? html`<span class="tag tag-resource mono">${outCount} output(s)</span>` : null}
+                              `}
                         </td>
                         <td class="mono">${dur}</td>
                       </tr>
@@ -820,7 +1008,7 @@ function renderSessionDetail() {
               class="search-input"
               data-focus-id="detail-tests-search"
               type="search"
-              placeholder="Search class, test method, worker, or Citrus endpoint…"
+              placeholder="Search class, test method, worker, partition, or Citrus endpoint…"
               value=${state.testQuery}
               onInput=${e => { state.testQuery = e.target.value; renderApp(); }}
             />
@@ -866,7 +1054,9 @@ function renderSessionDetail() {
                             <div class="mono" style="font-size:11px;color:var(--text-muted)">${t.partitionId || '—'}</div>
                           </td>
                           <td>
-                            ${(t.endpoints || []).map(ep => html`<span class="tag tag-endpoint mono">${ep}</span>`)}
+                            ${(t.endpoints || []).length === 0
+                              ? html`<span style="color:var(--text-muted)">—</span>`
+                              : (t.endpoints || []).map(ep => html`<span class="tag tag-endpoint mono">${ep}</span>`)}
                           </td>
                           <td class="mono">#${t.attempt}</td>
                           <td class="mono">${formatDuration(t.durationMs)}</td>
@@ -882,35 +1072,54 @@ function renderSessionDetail() {
 
       ${state.detailTab === 'failures' ? html`
         <div>
-          ${failures.length === 0
-            ? html`<div class="card"><div class="empty-state">Zero failing tests in this build session.</div></div>`
-            : failures.map(f => html`
-                <div class="failure-card">
-                  <div class="failure-card-header">
-                    <div>
-                      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
-                        ${statusBadge('FAILED')}
-                        <strong style="font-size:15px">${shortClass(f.className)}#${f.testName}</strong>
-                        <span class="mono" style="font-size:12px;color:var(--text-muted)">on ${f.workerId} (${f.partitionId}) · ${formatDuration(f.durationMs)}</span>
+          ${totalFailureItems === 0
+            ? html`<div class="card"><div class="empty-state">Zero failing tests or partitions in this build session.</div></div>`
+            : html`
+                ${partitionFailures.map(p => html`
+                  <div class="failure-card">
+                    <div class="failure-card-header">
+                      <div>
+                        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+                          ${statusBadge(p.state)}
+                          <strong class="mono" style="font-size:15px">Partition ${p.partitionId} (attempt #${p.attempt})</strong>
+                          <span class="mono" style="font-size:12px;color:var(--text-muted)">on ${p.workerId || 'unassigned'} · ${(p.workUnits || []).length} work unit(s)</span>
+                        </div>
+                        <div style="margin-top:6px;font-weight:600;color:var(--rose-text)">
+                          ${p.errorMessage || `Partition ended in ${p.state} state without completing all work units.`}
+                        </div>
                       </div>
-                      <div style="margin-top:6px;font-weight:600;color:var(--rose-text)">${f.errorMessage || 'Assertion / validation failure'}</div>
-                      <div style="margin-top:6px">
-                        ${(f.endpoints || []).map(ep => html`<span class="tag tag-endpoint mono">endpoint: ${ep}</span>`)}
-                      </div>
+                      <button class="btn btn-sm" onClick=${() => { state.selectedPartition = p; renderApp(); }}>Inspect Partition</button>
                     </div>
-                    <button
-                      class="btn btn-sm"
-                      onClick=${() => {
-                        if (navigator.clipboard && f.stackTrace) {
-                          navigator.clipboard.writeText(f.stackTrace);
-                          showToast('Copied stack trace to clipboard');
-                        }
-                      }}
-                    >Copy Trace</button>
                   </div>
-                  <pre class="stacktrace-box">${f.stackTrace || f.errorMessage || 'No stack trace captured.'}</pre>
-                </div>
-              `)}
+                `)}
+                ${failures.map(f => html`
+                  <div class="failure-card">
+                    <div class="failure-card-header">
+                      <div>
+                        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+                          ${statusBadge('FAILED')}
+                          <strong style="font-size:15px">${shortClass(f.className)}#${f.testName}</strong>
+                          <span class="mono" style="font-size:12px;color:var(--text-muted)">on ${f.workerId} (${f.partitionId} #${f.attempt}) · ${formatDuration(f.durationMs)}</span>
+                        </div>
+                        <div style="margin-top:6px;font-weight:600;color:var(--rose-text)">${f.errorMessage || 'Assertion / validation failure'}</div>
+                        <div style="margin-top:6px">
+                          ${(f.endpoints || []).map(ep => html`<span class="tag tag-endpoint mono">endpoint: ${ep}</span>`)}
+                        </div>
+                      </div>
+                      <button
+                        class="btn btn-sm"
+                        onClick=${() => {
+                          if (navigator.clipboard && (f.stackTrace || f.errorMessage)) {
+                            navigator.clipboard.writeText(f.stackTrace || f.errorMessage);
+                            showToast('Copied stack trace to clipboard');
+                          }
+                        }}
+                      >Copy Trace</button>
+                    </div>
+                    <pre class="stacktrace-box">${f.stackTrace || f.errorMessage || 'No stack trace captured.'}</pre>
+                  </div>
+                `)}
+              `}
         </div>
       ` : null}
 
@@ -1065,7 +1274,11 @@ function renderTestHistory() {
                 </thead>
                 <tbody>
                   ${filtered.map(h => {
-                    const rate = h.totalRuns > 0 ? Math.round((h.passedRuns / h.totalRuns) * 100) : 0;
+                    const passedRuns = typeof h.passedRuns === 'number'
+                      ? h.passedRuns
+                      : Math.max(0, (h.totalRuns || 0) - (h.failedRuns || 0));
+                    const rate = h.totalRuns > 0 ? Math.round((passedRuns / h.totalRuns) * 100) : 0;
+                    const maxMs = h.maxDurationMs > 0 ? h.maxDurationMs : h.avgDurationMs;
                     return html`
                       <tr>
                         <td>
@@ -1088,7 +1301,7 @@ function renderTestHistory() {
                             : html`<span style="color:var(--text-muted)">0</span>`}
                         </td>
                         <td class="mono">${formatDuration(h.avgDurationMs)}</td>
-                        <td class="mono">${formatDuration(h.maxDurationMs)}</td>
+                        <td class="mono">${formatDuration(maxMs)}</td>
                         <td>${statusBadge(h.lastStatus)}</td>
                       </tr>
                     `;
@@ -1105,16 +1318,31 @@ function renderTestHistory() {
 function renderModals() {
   if (state.selectedPartition) {
     const p = state.selectedPartition;
-    const partTests = (state.sessionDetail?.tests || []).filter(t => t.partitionId === p.partitionId);
+    const partTests = (state.sessionDetail?.tests || []).filter(
+      t => t.partitionId === p.partitionId && (!t.attempt || t.attempt === p.attempt)
+    );
+    const inputPaths = p.inputPaths || [];
+    const outputPaths = p.outputPaths || [];
+    const producedOutputs = p.producedOutputs || [];
+    const hasWorkspaceDetails = Boolean(
+      p.moduleName
+      || p.forkWorkspace
+      || (p.workingDirectory && p.workingDirectory !== '.')
+      || inputPaths.length > 0
+      || outputPaths.length > 0
+      || producedOutputs.length > 0
+    );
+
     return html`
       <div class="modal-backdrop" onClick=${() => { state.selectedPartition = null; renderApp(); }}>
         <div class="modal-panel" onClick=${e => e.stopPropagation()}>
           <div class="modal-header">
             <div>
-              <div style="display:flex;align-items:center;gap:8px">
+              <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
                 <strong class="mono" style="font-size:16px">${p.partitionId}</strong>
                 ${statusBadge(p.state)}
                 <span class="tag mono">attempt #${p.attempt}</span>
+                ${p.forkWorkspace ? html`<span class="tag tag-resource mono">forked-workspace</span>` : null}
               </div>
               <div style="font-size:12px;color:var(--text-muted);margin-top:3px">
                 Assigned worker: <strong class="mono">${p.workerId || 'unassigned'}</strong> · Est. ${formatDuration(p.estimatedDurationMs)}
@@ -1123,12 +1351,56 @@ function renderModals() {
             <button class="btn btn-sm" onClick=${() => { state.selectedPartition = null; renderApp(); }}>✕ Close</button>
           </div>
           <div class="modal-body">
+            ${p.errorMessage ? html`
+              <div class=${`alert-banner ${p.state === 'FAILED' ? 'alert-banner-rose' : 'alert-banner-amber'}`}>
+                ${p.errorMessage}
+              </div>
+            ` : null}
+
             <h3 style="margin:0 0 8px;font-size:13px;text-transform:uppercase;color:var(--text-muted)">Required Capabilities</h3>
             <div style="margin-bottom:16px">
               ${Object.entries(p.requiredCapabilities || {}).length === 0
                 ? html`<span style="color:var(--text-muted)">No special placement constraints</span>`
                 : Object.entries(p.requiredCapabilities).map(([k, v]) => html`<span class="tag mono">${k}=${v}</span>`)}
             </div>
+
+            ${hasWorkspaceDetails ? html`
+              <div style="margin-bottom:16px">
+                <h3 style="margin:0 0 8px;font-size:13px;text-transform:uppercase;color:var(--text-muted)">Workspace & External Test Resources</h3>
+                <div class="kv-grid">
+                  <div class="kv-box">
+                    <div class="kv-label">Module</div>
+                    <div class="kv-val mono">${p.moduleName || '—'}</div>
+                  </div>
+                  <div class="kv-box">
+                    <div class="kv-label">Isolation Mode</div>
+                    <div class="kv-val">${p.forkWorkspace ? 'Forked JVM + Workspace' : 'In-Process ClassLoader'}</div>
+                  </div>
+                  <div class="kv-box">
+                    <div class="kv-label">Working Directory</div>
+                    <div class="kv-val mono">${p.workingDirectory || '.'}</div>
+                  </div>
+                </div>
+                ${inputPaths.length > 0 ? html`
+                  <div style="margin-bottom:8px">
+                    <div style="font-size:11.5px;font-weight:700;color:var(--text-muted);margin-bottom:4px">Materialized Inputs (${inputPaths.length})</div>
+                    <div>${inputPaths.map(ip => html`<span class="tag mono">${ip}</span>`)}</div>
+                  </div>
+                ` : null}
+                ${outputPaths.length > 0 ? html`
+                  <div style="margin-bottom:8px">
+                    <div style="font-size:11.5px;font-weight:700;color:var(--text-muted);margin-bottom:4px">Declared Outputs (${outputPaths.length})</div>
+                    <div>${outputPaths.map(op => html`<span class="tag mono">${op}</span>`)}</div>
+                  </div>
+                ` : null}
+                ${producedOutputs.length > 0 ? html`
+                  <div>
+                    <div style="font-size:11.5px;font-weight:700;color:var(--emerald-text);margin-bottom:4px">Collected Outputs (${producedOutputs.length})</div>
+                    <div>${producedOutputs.map(op => html`<span class="tag tag-resource mono">${op}</span>`)}</div>
+                  </div>
+                ` : null}
+              </div>
+            ` : null}
 
             <h3 style="margin:0 0 8px;font-size:13px;text-transform:uppercase;color:var(--text-muted)">Scheduled Work Units (${(p.workUnits || []).length})</h3>
             <div style="display:flex;flex-direction:column;gap:6px;margin-bottom:16px">
@@ -1173,7 +1445,7 @@ function renderModals() {
         <div class="modal-panel" onClick=${e => e.stopPropagation()}>
           <div class="modal-header">
             <div>
-              <div style="display:flex;align-items:center;gap:8px">
+              <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
                 ${statusBadge(t.status)}
                 ${t.flaky ? html`<span class="badge badge-flaky">FLAKY #${t.attempt}</span>` : null}
                 <strong style="font-size:15px">${t.testName}</strong>
@@ -1184,7 +1456,7 @@ function renderModals() {
           </div>
           <div class="modal-body">
             <div style="margin-bottom:12px;font-size:13px">
-              Worker: <strong class="mono">${t.workerId}</strong> · Partition: <strong class="mono">${t.partitionId}</strong> · Duration: <strong class="mono">${formatDuration(t.durationMs)}</strong>
+              Worker: <strong class="mono">${t.workerId}</strong> · Partition: <strong class="mono">${t.partitionId}</strong> (#${t.attempt}) · Duration: <strong class="mono">${formatDuration(t.durationMs)}</strong>
             </div>
             <div style="margin-bottom:14px">
               ${(t.endpoints || []).map(ep => html`<span class="tag tag-endpoint mono">endpoint: ${ep}</span>`)}
@@ -1301,6 +1573,31 @@ export function renderApp() {
   }
 }
 
+window.addEventListener('hashchange', () => {
+  if (suppressHashChange) return;
+  const prevSid = state.selectedSessionId;
+  if (applyHashFromLocation()) {
+    if (state.view === 'session-detail'
+        && state.selectedSessionId
+        && (state.selectedSessionId !== prevSid || state.sessionDetail?.session?.sessionId !== state.selectedSessionId)) {
+      loadSessionDetail(state.selectedSessionId, false);
+      return;
+    }
+    renderApp();
+  }
+});
+
+window.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && (state.selectedPartition || state.selectedTestExecution || state.showAuthModal)) {
+    state.selectedPartition = null;
+    state.selectedTestExecution = null;
+    state.showAuthModal = false;
+    renderApp();
+  }
+});
+
+applyHashFromLocation();
 renderApp();
+ensurePollingLoop();
 connectSse();
 refreshAll();

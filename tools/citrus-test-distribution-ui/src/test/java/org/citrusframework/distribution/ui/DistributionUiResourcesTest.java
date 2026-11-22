@@ -41,7 +41,23 @@ class DistributionUiResourcesTest {
             assertThat(htm).isNotNull();
 
             String stylesText = new String(styles.readAllBytes(), StandardCharsets.UTF_8);
-            assertThat(stylesText).contains("--citrus-orange: #f5921d");
+            assertThat(stylesText)
+                    .contains("--citrus-orange: #f5921d")
+                    .contains(".btn-danger");
+
+            String appText = new String(app.readAllBytes(), StandardCharsets.UTF_8);
+            assertThat(appText)
+                    .contains("worker.offline")
+                    .contains("session.aborted")
+                    .contains("/abort")
+                    .contains("POLL_INTERVAL_MS")
+                    .contains("EventSource.CLOSED")
+                    .contains("forkWorkspace")
+                    .contains("inputPaths")
+                    .contains("producedOutputs")
+                    .contains("errorMessage")
+                    .contains("safeDecodeSegment")
+                    .contains("collectLatestTestFailures");
 
             String htmText = new String(htm.readAllBytes(), StandardCharsets.UTF_8);
             assertThat(htmText)
