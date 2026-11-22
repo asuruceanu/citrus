@@ -2,11 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add an exclusive, self-healing, disk-space-bounded local file cache to Citrus Test Distribution workers with CLI, system property, and environment variable configuration across `DistributionWorkerClient`, `citrus jb dist worker start`, and `citrus-agent --mode worker`.
+**Goal:** Add an exclusive, self-healing, disk-space-bounded local file cache to Citrus Test Distribution workers with CLI, system property, and environment variable configuration across `DistributionWorkerClient`, `citrus jb dist worker start`, and `citrus-agent --mode worker`, plus live worker cache health telemetry in the Coordinator Web UI.
 
-**Architecture:** Keep `BlobCacheDirectory` in `citrus-test-distribution-protocol` as a minimal content-addressed store by adding only non-recursive blob enumeration (`listBlobs`), deletion (`delete`), and clean non-atomic move fallback cleanup, while extending `DistributionSettings` with worker cache config resolution and strict byte-size/boolean parsers. Introduce package-private `WorkerFileCache` in `citrus-test-distribution-worker` owned once per `DistributionWorkerClient` to enforce exclusive `.lock` ownership, startup `tmp/` sweeping, `(size, mtime, fileKey)` fast-path verification, partition-scoped `PinLease` protection, streaming bounded downloads in `BrokerBlobClient`, and deterministic `(mtime, accessSequence, sha256)` LRU eviction down to `--cache-free-space-buffer-size`. Expose matching CLI flags in `DistWorkerStart` and `CitrusAgentOptions`/`CitrusAgentConfiguration`.
+**Architecture:** Keep `BlobCacheDirectory` in `citrus-test-distribution-protocol` as a minimal content-addressed store (`listBlobs`, `delete`, clean non-atomic move fallback), extend `DistributionSettings` with worker cache config resolution and strict byte-size/boolean parsers, and add backward-compatible `WorkerCacheStats` telemetry to worker register/heartbeat/record models. Introduce package-private `WorkerFileCache` in `citrus-test-distribution-worker` owned once per `DistributionWorkerClient` to enforce exclusive `.lock` ownership, startup `tmp/` sweeping, `(size, mtime, fileKey)` fast-path verification, partition-scoped `PinLease` protection, streaming bounded downloads in `BrokerBlobClient`, `O(1)` incremental cache metrics, and deterministic `(mtime, accessSequence, sha256)` LRU eviction down to `--cache-free-space-buffer-size`. Persist `WorkerCacheStats` in `JdbcDistributionStore` / `BrokerSessionCoordinator`, render worker cache health and low-disk alerts in `citrus-test-distribution-ui`, and expose matching CLI flags in `DistWorkerStart` and `CitrusAgentOptions`/`CitrusAgentConfiguration`.
 
-**Tech Stack:** Java 21 (`java.nio.file.Files`, `FileChannel`, `FileLock`, `FileStore`, `java.net.http.HttpClient`), Aesh CLI (`tools/jbang`), Citrus Agent (`core/citrus-api`, `tools/agent`, `tools/schema-generator`), JUnit Jupiter 5, AssertJ.
+**Tech Stack:** Java 21 (`java.nio.file.Files`, `FileChannel`, `FileLock`, `FileStore`, `java.net.http.HttpClient`), Vert.x + JDBC (`citrus-test-distribution-coordinator`), Vanilla JS/CSS (`citrus-test-distribution-ui`), Aesh CLI (`tools/jbang`), Citrus Agent (`core/citrus-api`, `tools/agent`, `tools/schema-generator`), JUnit Jupiter 5, AssertJ.
 
 **Spec:** `docs/superpowers/specs/2026-11-22-test-distribution-local-file-cache-design.md`
 
@@ -31,21 +31,31 @@
 2. **Duplicate SHA-256 digests within a partition's artifacts or overlapping output digests:** `WorkerFileCache.pinAll` and `stageAndPinOutput` must track per-lease digest sets so duplicate digests in `classpathArtifacts` + `inputArtifacts` increment pin count once per lease and `PinLease.close()` decrements cleanly to `0` without leaking permanent pins or unpinning early (pinned in Task 2).
 3. **Symlinked or relative `cacheDir` inside worker `user.dir` (including macOS `/var` -> `/private/var`):** `IsolatedPartitionRunner` must pass both `config.cacheDir()` and `cache.rootDir()` (or exclude canonicalized paths) when taking `WorkingDirectorySnapshot` so worker cache writes inside `user.dir` never trigger false-positive CWD mutation errors (pinned in Task 3).
 4. **Suffix case-sensitivity, whitespace, and non-binary/decimal units in `--cache-free-space-buffer-size`:** Outer/inner whitespace around valid suffixes (`" 512 MiB "`) is accepted, while lowercase (`"2gib"`), SI (`"2GB"`), fractional (`"1.5GiB"`), and negative (`"-1MiB"`) values throw `IllegalArgumentException` naming `KiB`, `MiB`, `GiB`, or integer bytes (pinned in Task 1).
-5. **Stray non-digest files inside `<cacheDir>/blobs/` (e.g., `.DS_Store` or manual notes):** `BlobCacheDirectory.listBlobs()` must ignore non-regular files, symlinks, and filenames not matching `^[a-f0-9]{64}$` instead of failing eviction with `IllegalArgumentException` (pinned in Task 1).
+5. **Zero-buffer (`freeSpaceBufferBytes == 0`) or failed disk probe (`usableDiskBytes == -1`) in telemetry & stray files in `blobs/`:** `WorkerFileCache.statsSnapshot()` and `app.js` must never divide by `0` or report `lowDiskSpace = true` when `usableDiskBytes < 0` or `freeSpaceBufferBytes == 0`, and `BlobCacheDirectory.listBlobs()` must ignore `.DS_Store`, symlinks, and non-digest filenames instead of failing startup/eviction (pinned in Tasks 1, 2, and 4).
 
 ---
 
-### Task 1: Protocol Worker Cache Settings and `BlobCacheDirectory` Primitives
+### Task 1: Protocol Worker Cache Settings, Wire Telemetry Models, and `BlobCacheDirectory` Primitives
 
 **Files:**
 - Modify: `tools/citrus-test-distribution-protocol/src/main/java/org/citrusframework/distribution/config/DistributionSettings.java`
 - Modify: `tools/citrus-test-distribution-protocol/src/main/java/org/citrusframework/distribution/cache/BlobCacheDirectory.java`
+- Create: `tools/citrus-test-distribution-protocol/src/main/java/org/citrusframework/distribution/protocol/WorkerCacheStats.java`
+- Modify: `tools/citrus-test-distribution-protocol/src/main/java/org/citrusframework/distribution/protocol/WorkerRegisterPayload.java`
+- Modify: `tools/citrus-test-distribution-protocol/src/main/java/org/citrusframework/distribution/protocol/WorkerHeartbeatPayload.java`
+- Modify: `tools/citrus-test-distribution-protocol/src/main/java/org/citrusframework/distribution/protocol/WorkerRecord.java`
 - Modify: `tools/citrus-test-distribution-protocol/src/test/java/org/citrusframework/distribution/config/DistributionSettingsAndPathRewriterTest.java`
 - Create: `tools/citrus-test-distribution-protocol/src/test/java/org/citrusframework/distribution/cache/BlobCacheDirectoryTest.java`
 
 **Interfaces:**
-- Consumes: `ClasspathPackager.MAX_BLOB_BYTES`, `ClasspathPackager.sha256Hex(Path)`
+- Consumes: `ClasspathPackager.MAX_BLOB_BYTES`, `ClasspathPackager.sha256Hex(Path)`, `WorkerState`
 - Produces:
+  - `WorkerCacheStats`:
+    - `public record WorkerCacheStats(boolean cleanupEnabled, long freeSpaceBufferBytes, int blobCount, long cachedBytes, long usableDiskBytes, long evictedBlobsTotal, boolean lowDiskSpace)`
+  - Backward-compatible trailing `WorkerCacheStats cacheStats` field + legacy convenience constructors (`null` `cacheStats`) on:
+    - `WorkerRegisterPayload(String workerId, String host, Map<String, String> capabilities, WorkerCacheStats cacheStats)` + 3-arg overload
+    - `WorkerHeartbeatPayload(String workerId, String activePartitionId, WorkerCacheStats cacheStats)` + 2-arg overload
+    - `WorkerRecord(String workerId, String host, Map<String, String> capabilities, WorkerState state, String activePartitionId, long lastHeartbeatAt, long registeredAt, WorkerCacheStats cacheStats)` + 7-arg overload
   - `DistributionSettings` constants:
     - `WORKER_CACHE_DIR_PROPERTY = "citrus.test.distribution.worker.cacheDir"`
     - `WORKER_CACHE_DIR_ENV = "CITRUS_DIST_WORKER_CACHE_DIR"`
@@ -86,18 +96,19 @@ Add tests to `DistributionSettingsAndPathRewriterTest.java` covering:
   - Verifies invalid non-blank `CITRUS_DIST_WORKER_CACHE_FREE_SPACE_BUFFER_SIZE="bad"` throws `IllegalArgumentException` even when `TEST_DISTRIBUTION_AGENT_CACHE_FREE_SPACE_BUFFER_SIZE="1GiB"` is valid
   - Verifies setting `citrus.test.distribution.cacheDir="/tmp/global-cache"` does NOT change `DistributionSettings.getWorkerCacheDir()`
 
-- [ ] **Step 2: Write failing unit tests for `BlobCacheDirectory.listBlobs`, `delete`, and `moveIntoPlace` cleanup**
+- [ ] **Step 2: Write failing unit tests for `BlobCacheDirectory.listBlobs`, `delete`, `moveIntoPlace` cleanup, and `WorkerCacheStats` JSON round-trip**
 
 Create `BlobCacheDirectoryTest.java` testing:
 - `shouldListStoredBlobsIgnoringStrayFilesAndSymlinks`: stores two valid SHA-256 blobs, writes `<root>/blobs/.DS_Store`, `<root>/blobs/aa/not-a-digest.txt`, and (on POSIX) a symlink inside `<root>/blobs/aa/`; asserts `listBlobs()` returns only the two valid `BlobEntry` records with exact `sha256`, `path`, `sizeBytes`, and `lastModifiedMillis`.
 - `shouldDeleteExistingBlobAndReturnFalseWhenMissing`: asserts `delete(sha)` returns `true` then `false`, removing `<root>/blobs/<prefix>/<sha>` while rejecting malformed digest strings with `IllegalArgumentException`.
+- `shouldRoundTripWorkerCacheStatsAndLegacyPayloadsWithoutCacheStats`: verifies `DistributionJson.toJson` / `fromJson` round-trips `WorkerRegisterPayload`, `WorkerHeartbeatPayload`, and `WorkerRecord` both with populated `WorkerCacheStats` and when legacy JSON omits `"cacheStats"` (deserializing `cacheStats() == null`).
 
 - [ ] **Step 3: Run protocol tests to verify failure**
 
 Run: `./mvnw test -Dtest=DistributionSettingsAndPathRewriterTest,BlobCacheDirectoryTest -pl tools/citrus-test-distribution-protocol`
 Expected: FAIL (compilation failure on missing symbols).
 
-- [ ] **Step 4: Implement worker cache settings in `DistributionSettings.java` and `listBlobs`/`delete` in `BlobCacheDirectory.java`**
+- [ ] **Step 4: Implement worker cache settings in `DistributionSettings.java`, wire models (`WorkerCacheStats`, `WorkerRegisterPayload`, `WorkerHeartbeatPayload`, `WorkerRecord`), and `listBlobs`/`delete` in `BlobCacheDirectory.java`**
 
 In `DistributionSettings.java`:
 - Add the constants and methods from **Interfaces**.
@@ -153,6 +164,7 @@ git commit -m "feat(distribution): add worker cache settings parsers and blob en
     - `Optional<ArtifactRef> stageAndPinOutput(Path workspaceDir, String rawOutputPath, Map<String, String> baselineHashes, Consumer<String> pinRegistrar) throws IOException` (or `PinLease.pin(String sha256)` so newly packaged forked output digests join the active partition lease under `evictionLock`)
     - `void ensureFreeSpaceForDownload(long expectedBytes)`
     - `void evictAfterPartition()`
+    - `WorkerCacheStats statsSnapshot()` (`O(1)` incremental `blobCount`, `cachedBytes`, `evictedBlobsTotal` + live `spaceProbe.usableBytes(canonicalDir)` returning `-1L` on `IOException`, with `lowDiskSpace = usableDiskBytes >= 0 && freeSpaceBufferBytes > 0 && usableDiskBytes < freeSpaceBufferBytes`)
     - `@Override public void close()`
 
 - [ ] **Step 1: Write failing tests in `WorkerFileCacheTest.java`**
@@ -173,6 +185,8 @@ Cover every P0/P1 invariant in `WorkerFileCacheTest.java`:
 - `shouldSaturateAdditionOnNearMaxBufferAndEvict100kSyntheticEntriesUnderFiveSeconds`:
   - Verifies `freeSpaceBufferBytes = Long.MAX_VALUE - 10` with `expectedBytes = 1024` does not overflow negative.
   - Verifies eviction batching over `100,000` synthetic `BlobEntry` items evicting `10,000` small entries completes in `< 5 s` and calls `DiskSpaceProbe` at most `(10_000 / 64) + 3` times.
+- `shouldMaintainAccurateIncrementalStatsSnapshotAcrossStartupPromoteCorruptAndEvict`:
+  - Seeds pre-existing blob before `open()`, asserts `statsSnapshot()` reflects initial `blobCount == 1` and `cachedBytes`; promotes a second blob (`blobCount == 2`, duplicate promote of existing digest does not double-count), corrupts blob 1 and calls `verifyOrInvalidate` (`blobCount == 1`), evicts blob 2 (`blobCount == 0`, `cachedBytes == 0`, `evictedBlobsTotal == 1`), and verifies `statsSnapshot()` returns `usableDiskBytes == -1L` with `lowDiskSpace == false` when `spaceProbe` throws `IOException` or when `freeSpaceBufferBytes == 0L`.
 
 - [ ] **Step 2: Run worker test to verify failure**
 
@@ -229,7 +243,7 @@ git commit -m "feat(distribution): implement exclusive WorkerFileCache with LRU 
     - `ForkedPartitionRunner(DistributionWorkerConfig config, WorkerFileCache cache, BrokerBlobClient blobs)`
     - `ForkedPartitionRunner(DistributionWorkerConfig config)` (package-private test convenience constructor; acquires and closes a locked `WorkerFileCache` per `execute()`)
   - `DistributionWorkerClient`:
-    - Opens `WorkerFileCache` eagerly in `new DistributionWorkerClient(config)` (fail-fast `.lock`), shares single `WorkerFileCache` and `BrokerBlobClient` across `inProcessRunner` and `forkedRunner`, and closes `BrokerBlobClient` + `httpClient` + `WorkerFileCache` in `close()` after draining and awaiting `partitionExecutor` termination.
+    - Opens `WorkerFileCache` eagerly in `new DistributionWorkerClient(config)` (fail-fast `.lock`), shares single `WorkerFileCache` and `BrokerBlobClient` across `inProcessRunner` and `forkedRunner`, attaches `workerCache.statsSnapshot()` to `WorkerRegisterPayload` (`connectInternal()`) and `WorkerHeartbeatPayload` (`sendHeartbeatSafe()`), and closes `BrokerBlobClient` + `httpClient` + `WorkerFileCache` in `close()` after draining and awaiting `partitionExecutor` termination.
 
 - [ ] **Step 1: Write failing tests in `BrokerBlobClientCacheTest.java` and `DistributionWorkerClientTest.java`**
 
@@ -268,6 +282,7 @@ Expected: FAIL (compilation / missing behavior).
   - In `ForkedPartitionRunner`, package modified outputs via `cache.stageAndPinOutput(fork.workspaceDir, rawOutput, inputBaseline, lease::pin)` so output blobs are pinned before `blobs.uploadMissing(toUpload)`, release `PinLease` after upload, and run `cache.evictAfterPartition()` after `fork.close()`.
 - In `DistributionWorkerClient.java`:
   - Open `WorkerFileCache` in constructor, create shared `BrokerBlobClient`, pass both to `inProcessRunner` and `forkedRunner` (closing `cache`/`blobClient` if constructor throws).
+  - Attach `workerCache.statsSnapshot()` in `WorkerRegisterPayload` (`connectInternal()`) and `WorkerHeartbeatPayload` (`sendHeartbeatSafe()`), and trigger `sendHeartbeatSafe()` after `workerCache.evictAfterPartition()` completes so `/api/v1/workers` immediately reflects post-partition cache size and evictions.
   - In `close()`, drain, cancel assignments, close WebSocket, shut down `scheduler` and `partitionExecutor` (`partitionExecutor.awaitTermination(5, TimeUnit.SECONDS)`), then close `blobClient`, `httpClient`, and `workerCache` in nested `try/finally`.
 
 - [ ] **Step 4: Run all worker tests to verify pass**
@@ -284,7 +299,61 @@ git commit -m "feat(distribution): stream worker blob downloads and wire shared 
 
 ---
 
-### Task 4: JBang CLI & Citrus Agent Worker Cache Options and Schema
+### Task 4: Coordinator Persistence, Demo Seeder & Web UI Worker Cache Telemetry
+
+**Files:**
+- Modify: `tools/citrus-test-distribution-coordinator/src/main/java/org/citrusframework/distribution/broker/store/JdbcDistributionStore.java`
+- Modify: `tools/citrus-test-distribution-coordinator/src/main/java/org/citrusframework/distribution/broker/BrokerSessionCoordinator.java`
+- Modify: `tools/citrus-test-distribution-coordinator/src/main/java/org/citrusframework/distribution/broker/demo/DemoDataSeeder.java`
+- Modify: `tools/citrus-test-distribution-coordinator/src/test/java/org/citrusframework/distribution/broker/store/JdbcDistributionStoreTest.java`
+- Modify: `tools/citrus-test-distribution-coordinator/src/test/java/org/citrusframework/distribution/broker/BrokerSessionCoordinatorTest.java`
+- Modify: `tools/citrus-test-distribution-coordinator/src/test/java/org/citrusframework/distribution/broker/DistributionBrokerUiTest.java`
+- Modify: `tools/citrus-test-distribution-ui/src/main/resources/org/citrusframework/distribution/ui/dist-ui/app.js`
+- Modify: `tools/citrus-test-distribution-ui/src/main/resources/org/citrusframework/distribution/ui/dist-ui/styles.css`
+- Modify: `tools/citrus-test-distribution-ui/src/test/java/org/citrusframework/distribution/ui/DistributionUiResourcesTest.java`
+
+**Interfaces:**
+- Consumes: `WorkerCacheStats`, `WorkerRegisterPayload.cacheStats()`, `WorkerHeartbeatPayload.cacheStats()`, `WorkerRecord.cacheStats()`
+- Produces:
+  - `JdbcDistributionStore`: `cache_stats_json VARCHAR(2048)` column in `dist_workers` DDL + additive `ensureWorkerColumns` `ALTER TABLE` migration + `upsertWorker` / `listWorkers` JSON serialization (`null`-safe).
+  - `BrokerSessionCoordinator`: stores `volatile WorkerCacheStats cacheStats` on `WorkerConnection`, populates on `WORKER_REGISTER`, updates when non-null on `WORKER_HEARTBEAT`, and preserves across `persistWorker` / `abortSession`.
+  - `DemoDataSeeder`: populates realistic `WorkerCacheStats` across all seeded demo workers (healthy warm caches, `--no-cache-cleanup`, and low-disk pressure with evictions).
+  - `app.js` & `styles.css`: `renderWorkerCacheTelemetry(w)` inside `Workers Pool` cards (`AUTO LRU` / `NO CLEANUP` badge, `LOW DISK` badge, cached bytes + blob count, usable disk vs buffer progress bar with safe `0`-buffer / `-1`-unknown guards, `evictedBlobsTotal`, and muted fallback when `cacheStats == null`), `LOW_DISK` filter pill in `Workers Pool`, and compact `LOW DISK` badge in `Overview` (`Worker Pool Health`).
+
+- [ ] **Step 1: Write failing tests in `JdbcDistributionStoreTest`, `BrokerSessionCoordinatorTest`, `DistributionBrokerUiTest`, and `DistributionUiResourcesTest`**
+
+- In `JdbcDistributionStoreTest.java`: verify `upsertWorker` + `listWorkers` round-trips both `null` and non-null `WorkerCacheStats`, and verify opening a `JdbcDistributionStore` over a pre-existing `dist_workers` table lacking `cache_stats_json` migrates cleanly via `ensureWorkerColumns`.
+- In `BrokerSessionCoordinatorTest.java`: verify `WORKER_REGISTER` stores initial `WorkerCacheStats`, `WORKER_HEARTBEAT` updates `cacheStats` when present and retains prior `cacheStats` when `hb.cacheStats() == null`, and `abortSession` preserves `cacheStats`.
+- In `DistributionBrokerUiTest.java`: verify `/api/v1/demo/seed` followed by `GET /api/v1/workers` returns workers containing `cacheStats` including both `"lowDiskSpace":true` and `"cleanupEnabled":false` examples.
+- In `DistributionUiResourcesTest.java`: assert `app.js` and `styles.css` include `renderWorkerCacheTelemetry`, `lowDiskSpace`, `freeSpaceBufferBytes`, `evictedBlobsTotal`, and `.worker-cache-panel` styling.
+
+- [ ] **Step 2: Run UI and coordinator tests to verify failure**
+
+Run: `./mvnw test -Dtest=DistributionUiResourcesTest,JdbcDistributionStoreTest,BrokerSessionCoordinatorTest,DistributionBrokerUiTest -pl tools/citrus-test-distribution-ui,tools/citrus-test-distribution-coordinator -am`
+Expected: FAIL (missing `cache_stats_json` persistence, coordinator propagation, demo stats, and UI telemetry rendering).
+
+- [ ] **Step 3: Implement coordinator store/session telemetry, demo seeder stats, and Web UI `Local File Cache` rendering**
+
+- Update `JdbcDistributionStore.java`, `BrokerSessionCoordinator.java`, and `DemoDataSeeder.java` per **Interfaces**.
+- Update `app.js` and `styles.css`:
+  - Add `renderWorkerCacheTelemetry(w)` in `app.js` guarding `usableDiskBytes < 0` (`"N/A"`) and `freeSpaceBufferBytes <= 0` (`100%` bar width, never `NaN`/`Infinity`).
+  - Add `LOW_DISK` filter option in `renderWorkersPool()` (`state.workerFilter === 'LOW_DISK'` filtering `w.cacheStats && w.cacheStats.lowDiskSpace`) and compact `LOW DISK` badge in `Overview` (`Worker Pool Health`).
+
+- [ ] **Step 4: Run UI and coordinator tests to verify pass**
+
+Run: `./mvnw test -pl tools/citrus-test-distribution-ui,tools/citrus-test-distribution-coordinator -am`
+Expected: PASS (`0` failures).
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add tools/citrus-test-distribution-ui tools/citrus-test-distribution-coordinator
+git commit -m "feat(distribution): surface worker local file cache telemetry in coordinator and UI"
+```
+
+---
+
+### Task 5: JBang CLI & Citrus Agent Worker Cache Options and Schema
 
 **Files:**
 - Modify: `core/citrus-api/src/main/java/org/citrusframework/api/agent/CitrusAgentConfiguration.java`
@@ -364,7 +433,7 @@ git commit -m "feat(distribution): add worker cache CLI options to JBang and Cit
 
 ---
 
-### Task 5: End-to-End Warm Cache Verification, Documentation, and Spec Wording Hygiene
+### Task 6: End-to-End Warm Cache & Telemetry Verification, Documentation, and Spec Wording Hygiene
 
 **Files:**
 - Modify: `tools/citrus-test-distribution/src/test/java/org/citrusframework/distribution/junit/DistributedLauncherTest.java`
@@ -372,15 +441,15 @@ git commit -m "feat(distribution): add worker cache CLI options to JBang and Cit
 - Modify: `docs/superpowers/specs/2026-11-21-test-distribution-external-resources-design.md`
 
 **Interfaces:**
-- Consumes: `DistributionWorkerConfig`, `DistributionWorkerClient`, `DistributedLauncher`, `DistributionSettings`
-- Produces: End-to-end warm-cache reuse + extension-off regression tests, updated AsciiDoc user manual, and zero vendor mentions across the repository.
+- Consumes: `DistributionWorkerConfig`, `DistributionWorkerClient`, `DistributedLauncher`, `DistributionSettings`, `WorkerRecord`, `WorkerCacheStats`
+- Produces: End-to-end warm-cache reuse + `/api/v1/workers` telemetry + extension-off regression tests, updated AsciiDoc user manual, and zero vendor mentions across the repository.
 
-- [ ] **Step 1: Write E2E warm-cache reuse and extension-off tests in `DistributedLauncherTest.java`**
+- [ ] **Step 1: Write E2E warm-cache reuse, live telemetry, and extension-off tests in `DistributedLauncherTest.java`**
 
 Add tests in `DistributedLauncherTest.java`:
 - `shouldReuseWorkerLocalFileCacheAcrossSessionsAndPersistAfterWorkerRestart`:
   - Starts broker + worker 1 configured with explicit `workerCacheDir` (`cacheCleanup = true`, `cacheFreeSpaceBufferBytes = 0L`).
-  - Runs session 1 with `src/test/resources/data.txt` input and verifies test passes and `<workerCacheDir>/blobs/` + `<workerCacheDir>/.lock` exist with zero files in `<workerCacheDir>/tmp/`.
+  - Runs session 1 with `src/test/resources/data.txt` input and verifies test passes, `<workerCacheDir>/blobs/` + `<workerCacheDir>/.lock` exist with zero files in `<workerCacheDir>/tmp/`, and `GET /api/v1/workers` reports non-null `cacheStats` with `blobCount > 0` and `cachedBytes > 0`.
   - Stops worker 1, deletes the blob from the *broker's* blob cache directory (`brokerCacheDir.resolve("blobs")`) to prove session 2 cannot re-download inputs from the broker, starts worker 2 on the same `workerCacheDir`, and runs session 2 with the identical input artifact — asserting session 2 passes purely from the warm worker local file cache!
 - `shouldNotCreateDefaultWorkerCacheWhenDistributionDisabled`:
   - Overrides `user.home` to an isolated subdirectory under `tempDir` in `try/finally`, sets `citrus.test.distribution.enabled=false`, executes a local fixture via JUnit `Launcher`, and asserts `<isolatedUserHome>/.citrus-test-distribution-agent` does not exist.
@@ -410,7 +479,7 @@ git commit -m "test(distribution): verify warm worker file cache reuse and updat
 Edit lines 6 and 69 of `docs/superpowers/specs/2026-11-21-test-distribution-external-resources-design.md` to replace the 2 third-party product references with neutral phrasing (`distributed test execution setups` / `other distributed test runners`).
 
 Verify zero third-party vendor mentions across the entire repository (`0` matches in `git grep -i`) and run full multi-module verification:
-- Run: `./mvnw verify -pl core/citrus-api,tools/schema-generator,tools/citrus-test-distribution-protocol,tools/citrus-test-distribution-coordinator,tools/citrus-test-distribution-worker,tools/citrus-test-distribution,tools/maven/citrus-test-distribution-maven-extension,tools/agent,tools/jbang` -> Expected: `BUILD SUCCESS` (`0` failures).
+- Run: `./mvnw verify -pl core/citrus-api,tools/schema-generator,tools/citrus-test-distribution-protocol,tools/citrus-test-distribution-ui,tools/citrus-test-distribution-coordinator,tools/citrus-test-distribution-worker,tools/citrus-test-distribution,tools/maven/citrus-test-distribution-maven-extension,tools/agent,tools/jbang` -> Expected: `BUILD SUCCESS` (`0` failures).
 
 Commit standalone wording cleanup:
 ```bash

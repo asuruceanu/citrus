@@ -32,6 +32,7 @@ This feature implements a **Worker Local File Cache**: a deterministic user-home
 - Share a single `WorkerFileCache` and `BrokerBlobClient` owned and closed by `DistributionWorkerClient` across both `IsolatedPartitionRunner` and `ForkedPartitionRunner`, with package-private runner constructors preventing external unlocked instantiation.
 - Stream blob downloads via bounded `64 KiB` chunks capped at `ClasspathPackager.MAX_BLOB_BYTES` (`256 MiB`) into `<cacheDir>/tmp/`, closing file handles deterministically before atomic promotion into `blobs/`, and self-heal corrupt or externally mutated entries.
 - Evict unpinned cached blobs in Least-Recently-Used (LRU) order whenever usable disk space on the cache's `FileStore` drops below `cacheFreeSpaceBufferSize`, while strictly pinning blobs across download, classloading, child JVM execution, and output upload.
+- Report sanitized `WorkerCacheStats` telemetry (`cleanupEnabled`, `freeSpaceBufferBytes`, `blobCount`, `cachedBytes`, `usableDiskBytes`, `evictedBlobsTotal`, `lowDiskSpace` — omitting host filesystem paths) on worker registration and heartbeats, persist it in `JdbcDistributionStore`, and render local file cache health and low-disk alerts in the Coordinator Web UI (`Workers Pool` and `Overview`).
 - Enforce zero external vendor product mentions across all new code, tests, specs, and user manual updates; isolate the 2-line cleanup of historical `docs/superpowers/specs/2026-11-21-test-distribution-external-resources-design.md` into a separate `docs:` commit (or standalone doc PR).
 
 ### Non-Goals
@@ -186,16 +187,33 @@ This feature implements a **Worker Local File Cache**: a deterministic user-home
   - Deletes candidates while accumulating `freedBytes += entry.sizeBytes()`, re-probing `diskSpaceProbe.usableSpace(canonicalDir)` only once `freedBytes >= deficit` or every `64` deletions (plus a final verification probe before exiting), keeping syscalls bounded even at `100k+` small blobs.
   - **Soft Buffer Shortfall vs Hard `ENOSPC`:** If unpinned candidates are exhausted while `usableSpace` remains below `freeSpaceBufferBytes + additionalBytesRequired`, logs a single rate-limited `WARN` per shortage episode (resetting once `usableSpace >= freeSpaceBufferBytes`) and returns so the partition may still succeed if actual free space suffices; actual `ENOSPC` fails at write time with `IOException`, cleans up `tmp/` and `partitionRoot` in `finally`, and fails the partition cleanly without crashing the worker daemon.
 
+### 5.7 Worker Cache Telemetry & Web UI (`WorkerCacheStats`)
+
+- **Protocol Wire Model (`citrus-test-distribution-protocol`):**
+  - `public record WorkerCacheStats(boolean cleanupEnabled, long freeSpaceBufferBytes, int blobCount, long cachedBytes, long usableDiskBytes, long evictedBlobsTotal, boolean lowDiskSpace)` — intentionally omits host `cacheDir` paths so filesystem layout is never exposed via `/api/v1/workers`.
+  - `WorkerRegisterPayload`, `WorkerHeartbeatPayload`, and `WorkerRecord` gain nullable trailing `WorkerCacheStats cacheStats` fields while preserving backward-compatible convenience constructors (`null` `cacheStats`) for older workers and existing callers.
+- **`O(1)` Worker Snapshot (`WorkerFileCache.statsSnapshot()`):**
+  - `WorkerFileCache` seeds `blobCount` and `cachedBytes` once during `open()` and maintains `blobCount`, `cachedBytes`, and `evictedBlobsTotal` incrementally under `evictionLock` across download promotion, forked output staging, corrupt-blob removal, and eviction — performing **zero** `listBlobs()` directory walks on heartbeats.
+  - `statsSnapshot()` queries `spaceProbe.usableBytes(canonicalDir)` (returning `-1L` if `IOException` occurs so heartbeats never fail) and sets `lowDiskSpace = usableDiskBytes >= 0 && freeSpaceBufferBytes > 0 && usableDiskBytes < freeSpaceBufferBytes`.
+  - `DistributionWorkerClient` attaches `workerCache.statsSnapshot()` to `WorkerRegisterPayload` and `WorkerHeartbeatPayload`.
+- **Coordinator Persistence & Demo Seeding (`citrus-test-distribution-coordinator`):**
+  - `JdbcDistributionStore` adds `cache_stats_json VARCHAR(2048)` to `dist_workers` (including additive `ALTER TABLE` migration in `ensureWorkerColumns`) and round-trips `WorkerRecord.cacheStats()`.
+  - `BrokerSessionCoordinator` records `cacheStats` on registration, updates it on heartbeats when non-null, and preserves it across state transitions.
+  - `DemoDataSeeder` populates realistic `WorkerCacheStats` across demo workers (healthy warm caches, `--no-cache-cleanup`, and low-disk pressure with evictions).
+- **Web UI (`citrus-test-distribution-ui`):**
+  - `Workers Pool` cards display a `Local File Cache` section when `w.cacheStats` is present (`AUTO LRU` / `NO CLEANUP` policy badge, `LOW DISK` warning badge, cached bytes + blob count, usable disk space vs configured buffer bar with safe `0`-buffer / `-1`-unknown guards, and `evictedBlobsTotal`), plus a `Low Disk` filter pill and compact `LOW DISK` indicator in `Overview` (`Worker Pool Health`).
+
 ---
 
 ## 6. Entry Points & Documentation Touchpoints
 
-1. **`tools/citrus-test-distribution-protocol`:** `DistributionSettings` (worker cache keys, precedence, `parseByteSize`, `parseBooleanStrict`), `BlobCacheDirectory` (`BlobEntry`, `listBlobs`, `touch`, `delete`, `sweepTempFiles`, `moveIntoPlace` fallback cleanup).
-2. **`tools/citrus-test-distribution-worker`:** `DistributionWorkerConfig`, `WorkerFileCache`, `BrokerBlobClient`, `DistributionWorkerClient`, package-private `IsolatedPartitionRunner` & `ForkedPartitionRunner` constructors.
-3. **`tools/jbang`:** `DistWorkerStart` + worker CLI boolean/option normalizer + `DistCommandTest`.
-4. **`core/citrus-api`, `tools/agent`, `tools/schema-generator`:** `CitrusAgentConfiguration`, `citrus-agent-configuration.json`, `CitrusAgentOptions` (exact option matching + `--[no-]cache-cleanup` + validation), `DistributionWorkerBridge`.
-5. **`src/manual/tools-test-distribution.adoc`:** Worker Local File Cache flags, properties, env vars + aliases, single-worker exclusivity requirement, and multi-worker shared-drive buffer sizing guidance.
-6. **Separate Hygiene Commit / PR:** Remove the 2 vendor references in `docs/superpowers/specs/2026-11-21-test-distribution-external-resources-design.md` as an isolated `docs:` commit (or standalone doc PR) separate from cache implementation commits.
+1. **`tools/citrus-test-distribution-protocol`:** `DistributionSettings` (worker cache keys, precedence, `parseByteSize`, `parseBooleanStrict`), `BlobCacheDirectory` (`BlobEntry`, `listBlobs`, `touch`, `delete`, `sweepTempFiles`, `moveIntoPlace` fallback cleanup), `WorkerCacheStats`, and backward-compatible `cacheStats` field on `WorkerRegisterPayload`, `WorkerHeartbeatPayload`, and `WorkerRecord`.
+2. **`tools/citrus-test-distribution-worker`:** `DistributionWorkerConfig`, `WorkerFileCache` (including `O(1)` `statsSnapshot()`), `BrokerBlobClient`, `DistributionWorkerClient`, package-private `IsolatedPartitionRunner` & `ForkedPartitionRunner` constructors.
+3. **`tools/citrus-test-distribution-coordinator` & `tools/citrus-test-distribution-ui`:** `JdbcDistributionStore` (`cache_stats_json` column + migration), `BrokerSessionCoordinator`, `DemoDataSeeder`, and Web UI `Workers Pool` / `Overview` cache telemetry rendering (`app.js`, `styles.css`).
+4. **`tools/jbang`:** `DistWorkerStart` + worker CLI boolean/option normalizer + `DistCommandTest`.
+5. **`core/citrus-api`, `tools/agent`, `tools/schema-generator`:** `CitrusAgentConfiguration`, `citrus-agent-configuration.json`, `CitrusAgentOptions` (exact option matching + `--[no-]cache-cleanup` + validation), `DistributionWorkerBridge`.
+6. **`src/manual/tools-test-distribution.adoc`:** Worker Local File Cache flags, properties, env vars + aliases, single-worker exclusivity requirement, and multi-worker shared-drive buffer sizing guidance.
+7. **Separate Hygiene Commit / PR:** Remove the 2 vendor references in `docs/superpowers/specs/2026-11-21-test-distribution-external-resources-design.md` as an isolated `docs:` commit (or standalone doc PR) separate from cache implementation commits.
 
 ---
 
