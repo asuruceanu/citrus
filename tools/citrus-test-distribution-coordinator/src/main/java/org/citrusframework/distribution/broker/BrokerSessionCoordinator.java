@@ -160,6 +160,7 @@ public final class BrokerSessionCoordinator {
                     request.inputArtifacts(),
                     request.outputPaths(),
                     request.forkWorkspace(),
+                    request.workingDirectory(),
                     session.maxRetries
             );
             partitions.put(part.partitionId(), runtime);
@@ -587,7 +588,8 @@ public final class BrokerSessionCoordinator {
                     pr.record.workUnits(),
                     pr.inputArtifacts,
                     pr.outputPaths,
-                    pr.forkWorkspace
+                    pr.forkWorkspace,
+                    pr.workingDirectory
             );
             @SuppressWarnings("unchecked")
             Map<String, Object> payloadMap = DistributionJson.convert(assignPayload, Map.class);
@@ -773,6 +775,7 @@ public final class BrokerSessionCoordinator {
         private final List<WorkspaceFileSet> inputArtifacts;
         private final List<String> outputPaths;
         private final boolean forkWorkspace;
+        private final String workingDirectory;
         private final int maxRetries;
         private int retriesUsed;
         private long lastProgressAt = System.currentTimeMillis();
@@ -790,6 +793,7 @@ public final class BrokerSessionCoordinator {
                                  List<WorkspaceFileSet> inputArtifacts,
                                  List<String> outputPaths,
                                  boolean forkWorkspace,
+                                 String workingDirectory,
                                  int maxRetries) {
             this.record = record;
             this.moduleName = moduleName;
@@ -798,6 +802,7 @@ public final class BrokerSessionCoordinator {
             this.inputArtifacts = inputArtifacts;
             this.outputPaths = outputPaths;
             this.forkWorkspace = forkWorkspace;
+            this.workingDirectory = workingDirectory;
             this.maxRetries = maxRetries;
         }
     }

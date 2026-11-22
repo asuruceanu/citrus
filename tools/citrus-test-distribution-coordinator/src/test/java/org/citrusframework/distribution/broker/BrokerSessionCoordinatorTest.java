@@ -90,6 +90,7 @@ class BrokerSessionCoordinatorTest {
         assertThat(assign.inputArtifacts()).isEqualTo(inputs);
         assertThat(assign.outputPaths()).containsExactly("target/docs");
         assertThat(assign.forkWorkspace()).isFalse();
+        assertThat(assign.workingDirectory()).isEqualTo("target");
 
         submit(sessionId, "sub-fork-only", List.of(), List.of(), true, unit("fork.B"));
         assertThat(legacy.assignments()).as("fork=true alone also requires a workspace worker").isEmpty();
@@ -397,7 +398,7 @@ class BrokerSessionCoordinatorTest {
     private void submit(String sessionId, String submissionId, List<WorkspaceFileSet> inputs, List<String> outputs,
                         boolean fork, WorkUnitSpec... units) {
         coordinator.submitWork(sessionId, new SubmitWorkRequest(submissionId, "module", List.of(), Map.of(),
-                List.of(units), 0, 0, inputs, outputs, fork, PartitionPolicy.LPT));
+                List.of(units), 0, 0, inputs, outputs, fork, PartitionPolicy.LPT, "target"));
     }
 
     /**

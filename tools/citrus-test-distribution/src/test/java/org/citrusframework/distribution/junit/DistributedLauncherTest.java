@@ -176,6 +176,18 @@ class DistributedLauncherTest {
                 DistributedLauncher.WorkspaceSettings.setting(DistributionSettings.INPUTS_PROPERTY, null))).isEmpty();
     }
 
+    @Test
+    void shouldSendTheWorkingDirectoryRelativeToTheModule() {
+        Path module = tempDir.resolve("mod");
+        assertThat(DistributedLauncher.WorkspaceSettings.relativeWorkingDirectory(module, module.resolve("target")))
+                .as("Surefire runs in target/ in this repository").isEqualTo("target");
+        assertThat(DistributedLauncher.WorkspaceSettings.relativeWorkingDirectory(module, module)).as("Failsafe: module root").isEmpty();
+        assertThat(DistributedLauncher.WorkspaceSettings.relativeWorkingDirectory(module, tempDir.resolve("elsewhere")))
+                .as("outside the module: workspace root").isEmpty();
+        assertThat(DistributedLauncher.WorkspaceSettings.relativeWorkingDirectory(module, module.resolve("target/sub")))
+                .isEqualTo("target/sub");
+    }
+
     private record Outcome(int passed, int failed) {
     }
 

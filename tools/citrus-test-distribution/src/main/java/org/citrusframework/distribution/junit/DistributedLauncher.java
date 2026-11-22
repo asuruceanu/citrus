@@ -207,7 +207,8 @@ public class DistributedLauncher implements Launcher {
                     workspace.inputArtifacts(),
                     workspace.outputPaths(),
                     workspace.forkWorkspace(),
-                    workspace.partitionPolicy()));
+                    workspace.partitionPolicy(),
+                    workspace.workingDirectory()));
 
             Set<String> submittedPartitions = Set.copyOf(submitted.partitionIds());
             Set<String> pendingPartitions = new HashSet<>(submitted.partitionIds());
@@ -468,7 +469,22 @@ public class DistributedLauncher implements Launcher {
      * host cache), declared outputs, fork flag and partition policy.
      */
     record WorkspaceSettings(Path hostBaseDir, BlobCacheDirectory cache, List<WorkspaceFileSet> inputArtifacts,
-                             List<String> outputPaths, boolean forkWorkspace, PartitionPolicy partitionPolicy) {
+                             List<String> outputPaths, boolean forkWorkspace, PartitionPolicy partitionPolicy,
+                             String workingDirectory) {
+
+        /**
+         * {@code userDir} relative to {@code hostBaseDir} ({@code /}-separated), or empty when it is the module directory
+         * or lies outside it. In Citrus, Surefire runs tests in {@code target/} and Failsafe in the module directory;
+         * forked workers reproduce this inside the workspace so relative paths resolve as they do locally.
+         */
+        static String relativeWorkingDirectory(Path hostBaseDir, Path userDir) {
+            Path base = hostBaseDir.toAbsolutePath().normalize();
+            Path cwd = userDir.toAbsolutePath().normalize();
+            if (!cwd.startsWith(base) || cwd.equals(base)) {
+                return "";
+            }
+            return base.relativize(cwd).toString().replace('\\', '/');
+        }
 
         /**
          * The host cache directory relative to the module, when it lies inside it, so remote outputs cannot target it.
@@ -517,7 +533,8 @@ public class DistributedLauncher implements Launcher {
             PartitionPolicy policy = DistributionSettings.parsePartitionPolicy(
                     setting(DistributionSettings.PARTITION_POLICY_PROPERTY, DistributionSettings.PARTITION_POLICY_ENV));
             return new WorkspaceSettings(hostBaseDir, cache, List.copyOf(inputs), outputs,
-                    fork || !inputs.isEmpty() || !outputs.isEmpty(), policy);
+                    fork || !inputs.isEmpty() || !outputs.isEmpty(), policy,
+                    relativeWorkingDirectory(hostBaseDir, Path.of(System.getProperty("user.dir", ""))));
         }
 
         /**

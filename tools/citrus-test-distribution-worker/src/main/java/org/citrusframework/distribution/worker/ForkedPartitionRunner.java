@@ -146,6 +146,7 @@ final class ForkedPartitionRunner implements PartitionRunner {
                 WorkspacePackager.materializeIntoDirectory(blobCache, input, workspace);
             }
             Map<String, String> baseline = WorkspacePackager.snapshotBaselineHashes(workspace, assignment.outputPaths());
+            Path workingDirectory = childWorkingDirectory(workspace, assignment.workingDirectory());
 
             verifyJUnitPlatform(classpath);
             Path argfile = ipc.resolve("classpath.argfile");
@@ -165,7 +166,7 @@ final class ForkedPartitionRunner implements PartitionRunner {
 
             ForkedPartitionMain.ForkedExecutionSummary summary;
             try (ServerSocket server = new ServerSocket(0, 50, InetAddress.getLoopbackAddress())) {
-                fork.process = launch(argfile, request, server.getLocalPort(), workspace, fork.tmpDir);
+                fork.process = launch(argfile, request, server.getLocalPort(), workspace, workingDirectory, fork.tmpDir);
                 fork.watcher = processWatcher(fork, cancellationToken);
                 summary = runProtocol(server, fork, token, cancellationToken, eventSink);
             }
@@ -315,7 +316,26 @@ final class ForkedPartitionRunner implements PartitionRunner {
         }
     }
 
-    private Process launch(Path argfile, Path request, int port, Path workspace, Path tmpDir) throws IOException {
+    /**
+     * The child's working directory: the host test JVM's working directory relative to its module (for Citrus'
+     * Surefire setup {@code target}), reproduced inside the workspace; the workspace root when empty.
+     *
+     * @throws IllegalArgumentException if the relative path is unsafe
+     */
+    static Path childWorkingDirectory(Path workspace, String relative) throws IOException {
+        if (relative == null || relative.isBlank()) {
+            return workspace;
+        }
+        Path directory = workspace.resolve(WorkspacePackager.validateRelativePath(relative));
+        Path link = BlobCacheDirectory.isLinkLike(directory) ? directory : null;
+        if (link != null) {
+            throw new IllegalArgumentException("Working directory '" + relative + "' is a link");
+        }
+        return Files.createDirectories(directory);
+    }
+
+    private Process launch(Path argfile, Path request, int port, Path workspace, Path workingDirectory, Path tmpDir)
+            throws IOException {
         String java = Path.of(System.getProperty("java.home"), "bin",
                 File.separatorChar == '\\' ? "java.exe" : "java").toString();
         List<String> command = new ArrayList<>();
@@ -329,7 +349,7 @@ final class ForkedPartitionRunner implements PartitionRunner {
         command.add(ForkedPartitionMain.class.getName());
         command.add(request.toString());
         command.add(String.valueOf(port));
-        return new ProcessBuilder(command).directory(workspace.toFile()).start();
+        return new ProcessBuilder(command).directory(workingDirectory.toFile()).start();
     }
 
     /**

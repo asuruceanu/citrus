@@ -176,12 +176,14 @@ class DistributionSettingsAndPathRewriterTest {
         assertThat(req.outputPaths()).isEmpty();
         assertThat(req.forkWorkspace()).isFalse();
         assertThat(req.partitionPolicy()).isEqualTo(PartitionPolicy.LPT);
+        assertThat(req.workingDirectory()).as("legacy: workspace root").isEmpty();
 
         String legacyAssign = """
                 {"partitionId":"p1","sessionId":"s1","attempt":2,"classpathArtifacts":[],"systemProperties":{},"workUnits":[]}
                 """;
         PartitionAssignPayload assign = DistributionJson.fromJson(legacyAssign, PartitionAssignPayload.class);
         assertThat(assign.attempt()).isEqualTo(2);
+        assertThat(assign.workingDirectory()).isEmpty();
         assertThat(assign.inputArtifacts()).isEmpty();
         assertThat(assign.outputPaths()).isEmpty();
         assertThat(assign.forkWorkspace()).isFalse();
@@ -228,6 +230,20 @@ class DistributionSettingsAndPathRewriterTest {
                 """;
         assertThatThrownBy(() -> DistributionJson.fromJson(withNullOutput, SubmitWorkRequest.class))
                 .hasRootCauseInstanceOf(NullPointerException.class);
+    }
+
+    @Test
+    void shouldCarryTheWorkingDirectoryRelativeToTheWorkspace() {
+        SubmitWorkRequest req = new SubmitWorkRequest("s1", "m1", List.of(), Map.of(), List.of(), 0, 0,
+                List.of(), List.of(), false, PartitionPolicy.LPT, "target");
+        assertThat(DistributionJson.fromJson(DistributionJson.toJson(req), SubmitWorkRequest.class).workingDirectory())
+                .isEqualTo("target");
+        assertThat(new SubmitWorkRequest("s1", "m1", List.of(), Map.of(), List.of(), 0, 0,
+                List.of(), List.of(), false, null, null).workingDirectory()).isEmpty();
+        PartitionAssignPayload assign = new PartitionAssignPayload("p1", "s1", 1, List.of(), Map.of(), List.of(),
+                List.of(), List.of(), true, "target");
+        assertThat(DistributionJson.fromJson(DistributionJson.toJson(assign), PartitionAssignPayload.class).workingDirectory())
+                .isEqualTo("target");
     }
 
     @Test

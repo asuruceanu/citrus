@@ -82,6 +82,16 @@ class ForkedPartitionRunnerTest {
         }
     }
 
+    /** Expects the module's Surefire working directory (target/) inside the workspace. */
+    public static class WorkingDirectoryFixture {
+        @Test
+        void runInTargetDirectory() throws Exception {
+            Path basedir = Path.of(System.getProperty("basedir")).toRealPath();
+            check(Path.of("").toRealPath().equals(basedir.resolve("target")), "CWD is <workspace>/target: " + Path.of("").toRealPath());
+            Files.writeString(Path.of("relative-output.txt"), "written relative to the working directory");
+        }
+    }
+
     public static class PlainFixture {
         @Test
         void passes() {
@@ -190,6 +200,51 @@ class ForkedPartitionRunnerTest {
                     HttpResponse.BodyHandlers.discarding());
             assertThat(uploaded.statusCode()).as("output blob uploaded to the coordinator").isEqualTo(200);
         }
+    }
+
+    @Test
+    void shouldRunTestsInTheRequestedWorkingDirectoryInsideTheWorkspace() throws Exception {
+        DistributionBrokerConfig brokerConfig = DistributionBrokerConfig.builder()
+                .port(0)
+                .cacheDir(tempDir.resolve("broker-cache"))
+                .jdbcUrl("jdbc:hsqldb:mem:forked_wd_" + System.nanoTime())
+                .build();
+        try (DistributionBrokerServer broker = new DistributionBrokerServer(brokerConfig)) {
+            broker.start();
+            DistributionWorkerConfig config = workerConfig(tempDir.resolve("worker-cache"), broker.baseUrl());
+            BlobCacheDirectory cache = new BlobCacheDirectory(config.cacheDir());
+            PartitionAssignPayload base = assignment(cache, Map.of(), List.of(), List.of("target"),
+                    unit(WorkingDirectoryFixture.class, "runInTargetDirectory"));
+            PartitionAssignPayload inTarget = new PartitionAssignPayload(base.partitionId(), base.sessionId(), base.attempt(),
+                    base.classpathArtifacts(), base.systemProperties(), base.workUnits(), base.inputArtifacts(),
+                    base.outputPaths(), true, "target");
+
+            List<WorkerTestEventPayload> events = new CopyOnWriteArrayList<>();
+            IsolatedPartitionRunner.PartitionExecutionResult result = new ForkedPartitionRunner(config).execute(
+                    inTarget, CancellationToken.create(), events::add);
+
+            assertThat(result.success()).as(result.errorMessage()).isTrue();
+            assertThat(finished(events)).singleElement().satisfies(e -> assertThat(e.status()).as(e.errorMessage())
+                    .isEqualTo(TestOutcomeStatus.PASSED));
+            Path host = Files.createDirectories(tempDir.resolve("host-wd"));
+            assertThat(WorkspacePackager.materializeIntoDirectory(cache, result.outputArtifacts().getFirst(), host))
+                    .extracting(WorkspacePackager.MaterializedEntry::workspaceRelativePath)
+                    .containsExactly("target/relative-output.txt");
+        }
+    }
+
+    @Test
+    void shouldRejectWorkingDirectoriesOutsideTheWorkspace() throws Exception {
+        DistributionWorkerConfig config = workerConfig(tempDir.resolve("worker-cache"), "http://127.0.0.1:9");
+        BlobCacheDirectory cache = new BlobCacheDirectory(config.cacheDir());
+        PartitionAssignPayload base = assignment(cache, Map.of(), List.of(), List.of(), unit(PlainFixture.class, "passes"));
+        PartitionAssignPayload escaping = new PartitionAssignPayload(base.partitionId(), base.sessionId(), base.attempt(),
+                base.classpathArtifacts(), base.systemProperties(), base.workUnits(), List.of(), List.of(), true, "../outside");
+
+        IsolatedPartitionRunner.PartitionExecutionResult result = new ForkedPartitionRunner(config).execute(
+                escaping, CancellationToken.create(), e -> { });
+        assertThat(result.success()).isFalse();
+        assertThat(result.errorMessage()).contains("../outside");
     }
 
     @Test
