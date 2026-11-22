@@ -26,17 +26,24 @@ import org.citrusframework.distribution.config.DistributionSettings;
 import org.citrusframework.distribution.model.ArtifactKind;
 import org.citrusframework.distribution.model.ArtifactRef;
 import org.citrusframework.distribution.model.BrokerEvent;
+import org.citrusframework.distribution.model.BuildSessionRecord;
+import org.citrusframework.distribution.model.CompleteSessionRequest;
 import org.citrusframework.distribution.model.CreateSessionRequest;
 import org.citrusframework.distribution.model.PartitionAssignPayload;
 import org.citrusframework.distribution.model.PartitionCompletedPayload;
 import org.citrusframework.distribution.model.PartitionPolicy;
 import org.citrusframework.distribution.model.PartitionRecord;
 import org.citrusframework.distribution.model.PartitionState;
+import org.citrusframework.distribution.model.ReportLocalTestsRequest;
+import org.citrusframework.distribution.model.SessionStatus;
 import org.citrusframework.distribution.model.SubmitWorkRequest;
+import org.citrusframework.distribution.model.TestExecutionRecord;
 import org.citrusframework.distribution.model.TestOutcomeStatus;
 import org.citrusframework.distribution.model.WorkUnitSpec;
 import org.citrusframework.distribution.model.WorkerHeartbeatPayload;
+import org.citrusframework.distribution.model.WorkerRecord;
 import org.citrusframework.distribution.model.WorkerRegisterPayload;
+import org.citrusframework.distribution.model.WorkerState;
 import org.citrusframework.distribution.model.WorkerTestEventPayload;
 import org.citrusframework.distribution.model.WorkerWsMessage;
 import org.citrusframework.distribution.model.WorkspaceFileSet;
@@ -419,6 +426,252 @@ class BrokerSessionCoordinatorTest {
         assertThat(store.findWorkSubmission(sessionId, "sub-conflict")).isEmpty();
     }
 
+    @Test
+    void shouldPreserveEvictedAttemptRecordPersistWorkspaceMetadataAndComputeAccurateFlakyAndLiveTotals() {
+        String sessionId = coordinator.createSession(
+                new CreateSessionRequest("citrus", "main", "abc", List.of(), 5, 1)).sessionId();
+        Worker worker1 = register("conn-w1", "worker-1", WORKSPACE_CAPS);
+
+        ArtifactRef inputBlob = new ArtifactRef("res.zip", "a".repeat(64), ArtifactKind.DIRECTORY_ZIP, 12L);
+        List<WorkspaceFileSet> inputs = List.of(new WorkspaceFileSet("src/test/resources", inputBlob));
+        coordinator.submitWork(sessionId, new SubmitWorkRequest(
+                "sub-live",
+                "citrus-http",
+                List.of(),
+                Map.of(),
+                List.of(unit("pkg.A"), unit("pkg.B")),
+                3,
+                1,
+                inputs,
+                List.of("target/docs"),
+                true,
+                PartitionPolicy.LPT,
+                "target"));
+
+        BuildSessionRecord liveAfterSubmit = store.findSession(sessionId).orElseThrow();
+        assertThat(liveAfterSubmit.status()).isEqualTo(SessionStatus.RUNNING);
+        assertThat(liveAfterSubmit.totalBlobs()).isEqualTo(4);
+        assertThat(liveAfterSubmit.cachedBlobs()).isEqualTo(3);
+        assertThat(liveAfterSubmit.totalTests()).isEqualTo(2);
+
+        PartitionAssignPayload assign1 = worker1.lastAssignment();
+        worker1.send(WorkerWsMessage.PARTITION_STARTED,
+                Map.of("partitionId", assign1.partitionId(), "sessionId", sessionId, "attempt", 1));
+        worker1.send(WorkerWsMessage.TEST_EVENT, DistributionJson.convert(new WorkerTestEventPayload(
+                assign1.partitionId(), sessionId, 1, "pkg.A", "pkg.A", "testStable",
+                TestOutcomeStatus.PASSED, 100L, null, null, List.of("httpClient")), Map.class));
+        worker1.send(WorkerWsMessage.TEST_EVENT, DistributionJson.convert(new WorkerTestEventPayload(
+                assign1.partitionId(), sessionId, 1, "pkg.B", "pkg.B", "testFlaky",
+                TestOutcomeStatus.STARTED, 0L, null, null, List.of()), Map.class));
+
+        BuildSessionRecord liveAfterFirstPass = store.findSession(sessionId).orElseThrow();
+        assertThat(liveAfterFirstPass.passedTests()).isEqualTo(1);
+        assertThat(liveAfterFirstPass.totalTests()).isEqualTo(2);
+
+        coordinator.handleWorkerDisconnect("conn-w1");
+
+        List<PartitionRecord> attemptsDuringRetry = store.listPartitions(sessionId);
+        assertThat(attemptsDuringRetry).hasSize(2);
+        assertThat(attemptsDuringRetry.get(0).attempt()).isEqualTo(1);
+        assertThat(attemptsDuringRetry.get(0).state()).isEqualTo(PartitionState.LOST);
+        assertThat(attemptsDuringRetry.get(0).workerId()).isEqualTo("worker-1");
+        assertThat(attemptsDuringRetry.get(0).errorMessage()).contains("Worker disconnected");
+        assertThat(attemptsDuringRetry.get(1).attempt()).isEqualTo(2);
+        assertThat(attemptsDuringRetry.get(1).state()).isEqualTo(PartitionState.PENDING);
+
+        Worker worker2 = register("conn-w2", "worker-2", WORKSPACE_CAPS);
+        PartitionAssignPayload assign2 = worker2.lastAssignment();
+        assertThat(assign2.attempt()).isEqualTo(2);
+
+        worker2.send(WorkerWsMessage.PARTITION_STARTED,
+                Map.of("partitionId", assign2.partitionId(), "sessionId", sessionId, "attempt", 2));
+        worker2.send(WorkerWsMessage.TEST_EVENT, DistributionJson.convert(new WorkerTestEventPayload(
+                assign2.partitionId(), sessionId, 2, "pkg.A", "pkg.A", "testStable",
+                TestOutcomeStatus.PASSED, 110L, null, null, List.of("httpClient")), Map.class));
+        worker2.send(WorkerWsMessage.TEST_EVENT, DistributionJson.convert(new WorkerTestEventPayload(
+                assign2.partitionId(), sessionId, 2, "pkg.B", "pkg.B", "testFlaky",
+                TestOutcomeStatus.PASSED, 190L, null, null, List.of("kafkaEndpoint")), Map.class));
+
+        WorkspaceFileSet producedDoc = new WorkspaceFileSet(
+                "target/docs",
+                new ArtifactRef("docs.zip", "b".repeat(64), ArtifactKind.DIRECTORY_ZIP, 24L));
+        worker2.complete(assign2, 2, List.of(producedDoc));
+
+        PartitionRecord completedAttempt2 = partition(sessionId);
+        assertThat(completedAttempt2.attempt()).isEqualTo(2);
+        assertThat(completedAttempt2.state()).isEqualTo(PartitionState.COMPLETED);
+        assertThat(completedAttempt2.moduleName()).isEqualTo("citrus-http");
+        assertThat(completedAttempt2.forkWorkspace()).isTrue();
+        assertThat(completedAttempt2.workingDirectory()).isEqualTo("target");
+        assertThat(completedAttempt2.inputPaths()).containsExactly("src/test/resources");
+        assertThat(completedAttempt2.outputPaths()).containsExactly("target/docs");
+        assertThat(completedAttempt2.producedOutputs()).containsExactly("target/docs");
+
+        List<TestExecutionRecord> allExecs = store.listTestExecutions(sessionId);
+        TestExecutionRecord stableAttempt2 = allExecs.stream()
+                .filter(e -> e.attempt() == 2 && "testStable".equals(e.testName()))
+                .findFirst().orElseThrow();
+        TestExecutionRecord flakyAttempt2 = allExecs.stream()
+                .filter(e -> e.attempt() == 2 && "testFlaky".equals(e.testName()))
+                .findFirst().orElseThrow();
+        assertThat(stableAttempt2.flaky()).as("stable test passed on attempt 1 too").isFalse();
+        assertThat(flakyAttempt2.flaky()).as("flaky test was interrupted when worker-1 disconnected").isTrue();
+
+        BuildSessionRecord completed = coordinator.completeSession(sessionId, new CompleteSessionRequest(0, 0, 0, 0L));
+        assertThat(completed.status()).isEqualTo(SessionStatus.PASSED);
+        assertThat(completed.totalTests()).isEqualTo(2);
+        assertThat(completed.passedTests()).isEqualTo(2);
+        assertThat(completed.failedTests()).isZero();
+        assertThat(completed.serialDurationMs()).isEqualTo(300L);
+    }
+
+    @Test
+    void shouldPersistPartitionFailureReasonAndFailSessionWhenPartitionCrashesWithZeroTests() {
+        String sessionId = newSession(0);
+        Worker worker = register("conn-crash", "worker-crash", WORKSPACE_CAPS);
+        submit(sessionId, "sub-crash", List.of(), List.of("target/docs"), false, unit("pkg.CrashIT"));
+        PartitionAssignPayload assign = worker.lastAssignment();
+
+        worker.send(WorkerWsMessage.PARTITION_COMPLETED, DistributionJson.convert(new PartitionCompletedPayload(
+                assign.partitionId(),
+                sessionId,
+                1,
+                false,
+                "Undeclared write to shared working directory: dirty.tmp",
+                List.of()), Map.class));
+
+        PartitionRecord crashed = partition(sessionId);
+        assertThat(crashed.state()).isEqualTo(PartitionState.FAILED);
+        assertThat(crashed.errorMessage()).isEqualTo("Undeclared write to shared working directory: dirty.tmp");
+
+        BuildSessionRecord completed = coordinator.completeSession(sessionId, new CompleteSessionRequest(0, 0, 0, 0L));
+        assertThat(completed.status()).isEqualTo(SessionStatus.FAILED);
+    }
+
+    @Test
+    void shouldRecordLocalTestExecutionsAndAbortRunningSession() {
+        String sessionId = newSession(1);
+        Worker worker = register("conn-abort", "worker-abort", Map.of());
+        submit(sessionId, "sub-abort", List.of(), List.of(), false, unit("pkg.RemoteIT"));
+        PartitionAssignPayload assign = worker.lastAssignment();
+        worker.send(WorkerWsMessage.PARTITION_STARTED,
+                Map.of("partitionId", assign.partitionId(), "sessionId", sessionId, "attempt", 1));
+
+        int savedLocal = coordinator.reportLocalTests(sessionId, new ReportLocalTestsRequest(
+                "local-maven-host",
+                List.of(new WorkerTestEventPayload(
+                        "local", sessionId, 1, "pkg.LocalOnlyIT#shouldRunLocally",
+                        "pkg.LocalOnlyIT", "shouldRunLocally", TestOutcomeStatus.PASSED,
+                        75L, null, null, List.of("localHttpServer")))));
+        assertThat(savedLocal).isEqualTo(1);
+        assertThat(store.findSession(sessionId).orElseThrow().passedTests()).isEqualTo(1);
+
+        BuildSessionRecord aborted = coordinator.abortSession(sessionId, "Cancelled by user");
+        assertThat(aborted.status()).isEqualTo(SessionStatus.ABORTED);
+        assertThat(worker.messagesOfType(WorkerWsMessage.PARTITION_CANCEL)).hasSize(1);
+        assertThat(partition(sessionId).state()).isEqualTo(PartitionState.LOST);
+        assertThat(partition(sessionId).errorMessage()).isEqualTo("Cancelled by user");
+        assertThat(lastEvent(sessionId, "session.aborted").data()).containsEntry("status", "ABORTED");
+    }
+
+    @Test
+    void shouldMarkSessionFailedOnBuildExceptionWithoutInflatingFailedTestCount() {
+        String sessionWithFailedTest = newSession(0);
+        Worker worker = register("conn-bf", "worker-bf", Map.of());
+        submit(sessionWithFailedTest, "sub-bf-1", List.of(), List.of(), false, unit("pkg.FailingIT"));
+        PartitionAssignPayload assign1 = worker.lastAssignment();
+        worker.send(WorkerWsMessage.TEST_EVENT, DistributionJson.convert(new WorkerTestEventPayload(
+                assign1.partitionId(), sessionWithFailedTest, 1, "pkg.FailingIT",
+                "pkg.FailingIT", "shouldFail", TestOutcomeStatus.FAILED, 90L, "boom", "trace", List.of()), Map.class));
+        worker.send(WorkerWsMessage.PARTITION_COMPLETED, DistributionJson.convert(new PartitionCompletedPayload(
+                assign1.partitionId(), sessionWithFailedTest, 1, true, null, List.of()), Map.class));
+
+        BuildSessionRecord finished1 = coordinator.completeSession(
+                sessionWithFailedTest, new CompleteSessionRequest(0, 0, 0, 0L, true));
+        assertThat(finished1.status()).isEqualTo(SessionStatus.FAILED);
+        assertThat(finished1.failedTests()).as("remote failure is not double-counted").isEqualTo(1);
+        assertThat(finished1.totalTests()).isEqualTo(1);
+
+        String sessionWithCompileError = newSession(0);
+        BuildSessionRecord finished2 = coordinator.completeSession(
+                sessionWithCompileError, new CompleteSessionRequest(0, 0, 0, 0L, true));
+        assertThat(finished2.status()).isEqualTo(SessionStatus.FAILED);
+        assertThat(finished2.failedTests()).as("no synthetic test failure invented").isZero();
+    }
+
+    @Test
+    void shouldAbortPersistedRunningSessionAndMarkPersistedPartitionsLostAfterRehydration() {
+        long now = System.currentTimeMillis();
+        store.saveSession(new BuildSessionRecord(
+                "sess-rehydrated-abort", "citrus", "main", "deadbeef",
+                SessionStatus.RUNNING, now - 5_000L, 0L,
+                2, 0, 0, 0, 10, 8, 0L, 0L));
+        store.upsertWorker(new WorkerRecord(
+                "worker-persisted-1", "host-1", Map.of(),
+                WorkerState.BUSY, "part-persisted-run", now, now - 10_000L));
+        store.savePartition(new PartitionRecord(
+                "part-persisted-run", "sess-rehydrated-abort", "worker-persisted-1",
+                PartitionState.RUNNING, 1, 2_000L, now - 3_000L, 0L,
+                Map.of(), List.of(unit("pkg.PersistedIT"))));
+        store.savePartition(new PartitionRecord(
+                "part-persisted-pending", "sess-rehydrated-abort", null,
+                PartitionState.PENDING, 1, 1_500L, 0L, 0L,
+                Map.of(), List.of(unit("pkg.PendingIT"))));
+
+        BuildSessionRecord aborted = coordinator.abortSession("sess-rehydrated-abort", "Aborted from UI");
+        assertThat(aborted.status()).isEqualTo(SessionStatus.ABORTED);
+
+        List<PartitionRecord> parts = store.listPartitions("sess-rehydrated-abort");
+        assertThat(parts).hasSize(2);
+        assertThat(parts).allSatisfy(p -> {
+            assertThat(p.state()).isEqualTo(PartitionState.LOST);
+            assertThat(p.errorMessage()).isEqualTo("Aborted from UI");
+        });
+        assertThat(store.listWorkers())
+                .filteredOn(w -> "worker-persisted-1".equals(w.workerId()))
+                .singleElement()
+                .satisfies(w -> {
+                    assertThat(w.state()).isEqualTo(WorkerState.IDLE);
+                    assertThat(w.activePartitionId()).isNull();
+                });
+    }
+
+    @Test
+    void shouldSupersedeFailedRemoteAttemptOnLocalFallbackAcrossRehydrationAndReconcileMixedLocalCounts() {
+        String sessionId = newSession(1);
+        submit(sessionId, "sub-recover", List.of(), List.of(), false, unit("pkg.LostIT#testRecover"));
+
+        Worker w1 = register("conn-rec-1", "w-rec-1", Map.of());
+        PartitionAssignPayload a1 = w1.lastAssignment();
+        w1.send(WorkerWsMessage.TEST_EVENT, DistributionJson.convert(new WorkerTestEventPayload(
+                a1.partitionId(), sessionId, 1, "pkg.LostIT#testRecover", "pkg.LostIT", "testRecover",
+                TestOutcomeStatus.FAILED, 120L, "Socket closed", "trace", List.of()), Map.class));
+        coordinator.handleWorkerDisconnect("conn-rec-1");
+
+        Worker w2 = register("conn-rec-2", "w-rec-2", Map.of());
+        PartitionAssignPayload a2 = w2.lastAssignment();
+        assertThat(a2.attempt()).isEqualTo(2);
+        coordinator.handleWorkerDisconnect("conn-rec-2");
+
+        coordinator.reportLocalTests(sessionId, new ReportLocalTestsRequest(
+                "local-host",
+                List.of(new WorkerTestEventPayload(
+                        "local", sessionId, 1, "pkg.LostIT#testRecover", "pkg.LostIT", "testRecover",
+                        TestOutcomeStatus.PASSED, 90L, null, null, List.of()))));
+
+        BrokerSessionCoordinator rehydrated = new BrokerSessionCoordinator(
+                DistributionBrokerConfig.builder().cacheDir(tempDir.resolve("cache-rehydrated")).leaseTimeoutMs(LEASE_MS).build(),
+                store,
+                new BrokerEventStreamHub());
+        BuildSessionRecord completed = rehydrated.completeSession(
+                sessionId, new CompleteSessionRequest(2, 0, 0, 250L));
+
+        assertThat(completed.status()).isEqualTo(SessionStatus.PASSED);
+        assertThat(completed.failedTests()).isZero();
+        assertThat(completed.passedTests()).isEqualTo(2);
+        assertThat(completed.totalTests()).isEqualTo(2);
+    }
+
     private String newSession(int maxRetries) {
         return coordinator.createSession(new CreateSessionRequest("citrus", "main", "abc", List.of(), 1, maxRetries)).sessionId();
     }
@@ -441,7 +694,7 @@ class BrokerSessionCoordinatorTest {
     }
 
     private PartitionRecord partition(String sessionId) {
-        return store.listPartitions(sessionId).getFirst();
+        return store.listPartitions(sessionId).getLast();
     }
 
     private BrokerEvent lastEvent(String sessionId, String type) {

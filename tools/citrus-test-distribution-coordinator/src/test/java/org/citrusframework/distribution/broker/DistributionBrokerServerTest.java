@@ -44,10 +44,12 @@ import org.citrusframework.distribution.model.PartitionAssignPayload;
 import org.citrusframework.distribution.model.PartitionCompletedPayload;
 import org.citrusframework.distribution.model.PartitionPolicy;
 import org.citrusframework.distribution.model.PartitionState;
+import org.citrusframework.distribution.model.ReportLocalTestsRequest;
 import org.citrusframework.distribution.model.SessionDetailResponse;
 import org.citrusframework.distribution.model.SessionStatus;
 import org.citrusframework.distribution.model.SubmitWorkRequest;
 import org.citrusframework.distribution.model.SubmitWorkResponse;
+import org.citrusframework.distribution.model.TestHistorySummary;
 import org.citrusframework.distribution.model.TestOutcomeStatus;
 import org.citrusframework.distribution.model.WorkUnitSpec;
 import org.citrusframework.distribution.model.WorkerRegisterPayload;
@@ -247,7 +249,8 @@ class DistributionBrokerServerTest {
                     "partitionId", assignPayload2.partitionId(),
                     "sessionId", session.sessionId()));
 
-            sendWs(dockerWs2, WorkerWsMessage.TEST_EVENT, DistributionJson.convert(new WorkerTestEventPayload(
+            @SuppressWarnings("unchecked")
+            Map<String, Object> testEventMap = DistributionJson.convert(new WorkerTestEventPayload(
                     assignPayload2.partitionId(),
                     session.sessionId(),
                     2,
@@ -258,12 +261,15 @@ class DistributionBrokerServerTest {
                     420L,
                     null,
                     null,
-                    List.of("httpClient")), Map.class));
+                    List.of("httpClient")), Map.class);
+            sendWs(dockerWs2, WorkerWsMessage.TEST_EVENT, testEventMap);
 
-            sendWs(dockerWs2, WorkerWsMessage.PARTITION_COMPLETED, DistributionJson.convert(
+            @SuppressWarnings("unchecked")
+            Map<String, Object> doneMap = DistributionJson.convert(
                     new PartitionCompletedPayload(assignPayload2.partitionId(), session.sessionId(),
                             assignPayload2.attempt(), true, null, List.of()),
-                    Map.class));
+                    Map.class);
+            sendWs(dockerWs2, WorkerWsMessage.PARTITION_COMPLETED, doneMap);
 
             HttpResponse<String> completeResp = postJson(
                     server.baseUrl() + "/api/v1/sessions/" + session.sessionId() + "/complete",
@@ -277,9 +283,13 @@ class DistributionBrokerServerTest {
             SessionDetailResponse detail = DistributionJson.fromJson(detailResp.body(), SessionDetailResponse.class);
             assertThat(detail.session().status()).isEqualTo(SessionStatus.PASSED);
             assertThat(detail.session().passedTests()).isEqualTo(2);
-            assertThat(detail.partitions()).hasSize(1);
-            assertThat(detail.partitions().get(0).state()).isEqualTo(PartitionState.COMPLETED);
-            assertThat(detail.partitions().get(0).workerId()).isEqualTo("worker-docker-2");
+            assertThat(detail.partitions()).hasSize(2);
+            assertThat(detail.partitions().get(0).attempt()).isEqualTo(1);
+            assertThat(detail.partitions().get(0).state()).isEqualTo(PartitionState.LOST);
+            assertThat(detail.partitions().get(0).workerId()).isEqualTo("worker-docker-1");
+            assertThat(detail.partitions().get(1).attempt()).isEqualTo(2);
+            assertThat(detail.partitions().get(1).state()).isEqualTo(PartitionState.COMPLETED);
+            assertThat(detail.partitions().get(1).workerId()).isEqualTo("worker-docker-2");
 
             // Replay SSE history from sequence 0 (completed session closes SSE stream cleanly after replay)
             HttpResponse<String> sseReplay = httpClient.send(
@@ -397,6 +407,57 @@ class DistributionBrokerServerTest {
         }
     }
 
+    @Test
+    void shouldSupportLocalTestsReportingHistoryFieldsAndAbortEndpointOverHttp() throws Exception {
+        DistributionBrokerConfig config = DistributionBrokerConfig.builder()
+                .port(0)
+                .cacheDir(tempDir.resolve("abort-cache"))
+                .jdbcUrl("jdbc:hsqldb:mem:broker_abort_" + System.nanoTime())
+                .build();
+
+        try (DistributionBrokerServer server = new DistributionBrokerServer(config)) {
+            server.start();
+
+            BuildSessionResponse session = DistributionJson.fromJson(postJson(
+                    server.baseUrl() + "/api/v1/sessions",
+                    new CreateSessionRequest("citrus", "feature/ui", "1234567", List.of("README.md"), 4, 1)).body(),
+                    BuildSessionResponse.class);
+
+            HttpResponse<String> localResp = postJson(
+                    server.baseUrl() + "/api/v1/sessions/" + session.sessionId() + "/local-tests",
+                    new ReportLocalTestsRequest("maven-host", List.of(
+                            new WorkerTestEventPayload("local", session.sessionId(), 1,
+                                    "org.example.LocalIT#shouldVerifyLocal", "org.example.LocalIT", "shouldVerifyLocal",
+                                    TestOutcomeStatus.PASSED, 180L, null, null, List.of("localEndpoint")))));
+            assertThat(localResp.statusCode()).isEqualTo(200);
+            assertThat(localResp.body()).contains("\"recorded\":1");
+
+            HttpResponse<String> historyResp = httpClient.send(
+                    HttpRequest.newBuilder(URI.create(server.baseUrl() + "/api/v1/tests/history?limit=10")).GET().build(),
+                    HttpResponse.BodyHandlers.ofString());
+            assertThat(historyResp.statusCode()).isEqualTo(200);
+            TestHistorySummary[] history = DistributionJson.fromJson(historyResp.body(), TestHistorySummary[].class);
+            assertThat(history).hasSize(1);
+            assertThat(history[0].passedRuns()).isEqualTo(1);
+            assertThat(history[0].maxDurationMs()).isEqualTo(180L);
+            assertThat(history[0].lastStatus()).isEqualTo(TestOutcomeStatus.PASSED);
+
+            HttpResponse<String> abortResp = postJson(
+                    server.baseUrl() + "/api/v1/sessions/" + session.sessionId() + "/abort",
+                    Map.of("reason", "Manual abort from UI"));
+            assertThat(abortResp.statusCode()).isEqualTo(200);
+            assertThat(abortResp.body()).contains("\"status\":\"ABORTED\"");
+
+            HttpResponse<String> sseReplay = httpClient.send(
+                    HttpRequest.newBuilder(URI.create(server.baseUrl() + "/api/v1/sessions/" + session.sessionId() + "/events?afterSeq=0"))
+                            .timeout(Duration.ofSeconds(5))
+                            .GET().build(),
+                    HttpResponse.BodyHandlers.ofString());
+            assertThat(sseReplay.statusCode()).isEqualTo(200);
+            assertThat(sseReplay.body()).contains("event: session.aborted");
+        }
+    }
+
     private HttpResponse<String> postJson(String url, Object body) throws Exception {
         return httpClient.send(
                 HttpRequest.newBuilder(URI.create(url))
@@ -445,5 +506,24 @@ class DistributionBrokerServerTest {
         WorkerWsMessage pollMessage(long timeoutMs) throws InterruptedException {
             return messages.poll(timeoutMs, TimeUnit.MILLISECONDS);
         }
+    }
+
+    @Test
+    void shouldBindLoopbackWhenEphemeralPortRequestedWithWildcardHost() {
+        DistributionBrokerConfig ephemeralWildcard = DistributionBrokerConfig.builder()
+            .host("0.0.0.0")
+            .port(0)
+            .jdbcUrl("jdbc:hsqldb:mem:ephemeral_host_test")
+            .cacheDir(tempDir.resolve("ephemeral-cache"))
+            .build();
+        DistributionBrokerConfig explicitPortWildcard = DistributionBrokerConfig.builder()
+            .host("0.0.0.0")
+            .port(8765)
+            .jdbcUrl("jdbc:hsqldb:mem:explicit_host_test")
+            .cacheDir(tempDir.resolve("explicit-cache"))
+            .build();
+
+        assertThat(DistributionBrokerVerticle.resolveListenHost(ephemeralWildcard)).isEqualTo("127.0.0.1");
+        assertThat(DistributionBrokerVerticle.resolveListenHost(explicitPortWildcard)).isEqualTo("0.0.0.0");
     }
 }

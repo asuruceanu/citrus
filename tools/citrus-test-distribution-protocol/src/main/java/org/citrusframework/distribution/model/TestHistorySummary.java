@@ -21,8 +21,32 @@ public record TestHistorySummary(
         String className,
         String testName,
         long avgDurationMs,
+        long maxDurationMs,
         int totalRuns,
+        int passedRuns,
         int failedRuns,
-        int flakyRuns
+        int flakyRuns,
+        TestOutcomeStatus lastStatus
 ) {
+
+    public TestHistorySummary(String workUnitKey,
+                              String className,
+                              String testName,
+                              long avgDurationMs,
+                              int totalRuns,
+                              int failedRuns,
+                              int flakyRuns) {
+        this(
+                workUnitKey,
+                className,
+                testName,
+                avgDurationMs,
+                avgDurationMs,
+                totalRuns,
+                Math.max(0, totalRuns - failedRuns),
+                failedRuns,
+                flakyRuns,
+                failedRuns > 0 ? TestOutcomeStatus.FAILED : TestOutcomeStatus.PASSED
+        );
+    }
 }

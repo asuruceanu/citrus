@@ -1,20 +1,29 @@
 [[tools-test-distribution]]
 = Test Distribution
 
-Citrus Test Distribution partitions and executes JUnit Platform and Citrus integration tests in parallel across remote worker processes, containers, or Kubernetes pods while preserving standard Maven Surefire/Failsafe reports and local developer workflows.
+Citrus Test Distribution partitions and executes JUnit Platform and Citrus integration tests in parallel across remote worker processes, containers, or Kubernetes pods while preserving standard Maven Surefire/Failsafe reports, real-time Web UI observability, and local developer workflows.
 
 [[tools-test-distribution-modules]]
 == Modules
 
-* `org.citrusframework:citrus-test-distribution-protocol` — Shared WebSocket/REST protocol DTOs, SHA-256 content-addressed blob cache, capability matcher, and `@LocalOnly` / `@RemoteOnly` / `@AgentRequirement` annotations.
-* `org.citrusframework:citrus-test-distribution-ui` — Zero-Node monitoring Web UI served at `/ui/` (overview KPIs, live SVG Gantt partition waterfall, worker pool health, test history/flakiness, and failing test stack-trace inspector).
+* `org.citrusframework:citrus-test-distribution-protocol` — Shared WebSocket/REST protocol DTOs, SHA-256 content-addressed blob cache, Citrus endpoint telemetry collector, capability matcher, and `@LocalOnly` / `@RemoteOnly` / `@AgentRequirement` annotations.
+* `org.citrusframework:citrus-test-distribution-ui` — Zero-Node monitoring Web UI served at `/ui/` (overview KPIs, live SVG Gantt partition waterfall, workspace/resource inspector, worker pool health, test history/flakiness, and failing test / partition crash diagnostics).
 * `org.citrusframework:citrus-test-distribution-coordinator` — Vert.x HTTP/WebSocket coordinator, Longest-Processing-Time (LPT) scheduler, SSE event hub, and JDBC persistence (`HSQLDB` file/mem or `PostgreSQL`).
-* `org.citrusframework:citrus-test-distribution-worker` — Standalone Java worker runtime with child-first `ClassLoader` partition isolation and graceful `SIGTERM` draining (`citrus-agent --mode=worker` or `citrus dist worker start`).
-* `org.citrusframework:citrus-test-distribution` — Optional JUnit Platform `LauncherInterceptor` coordinator and `@CitrusTestFactory` declarative source splitter.
-* `org.citrusframework.mvn:citrus-test-distribution-maven-extension` — Opt-in Maven Core Extension (`-Dcitrus.test.distribution.enabled=true`).
+* `org.citrusframework:citrus-test-distribution-worker` — Standalone Java worker runtime with child-first `ClassLoader` or forked-JVM workspace isolation and graceful `SIGTERM` draining (`citrus-agent --mode=worker` or `citrus dist worker start`).
+* `org.citrusframework:citrus-test-distribution` — JUnit Platform `LauncherInterceptor` coordinator, `@LocalOnly` / lost-partition local fallback executor, Surefire XML writer, and `@CitrusTestFactory` declarative source splitter.
+* `org.citrusframework.mvn:citrus-test-distribution-maven-extension` — Opt-in Maven Core Extension (`-Dcitrus.test.distribution.enabled=true`) coordinating reactor-wide build sessions.
+
+[[tools-test-distribution-architecture]]
+== Architecture and Execution Flow
+
+A distributed test run involves three components:
+
+. *Build Host (Maven Extension + JUnit `LauncherInterceptor`):* Opens a single build session on the coordinator (recording project name, Git branch, commit SHA, and changed workspace files), discovers JUnit Platform test descriptors per module, executes `@LocalOnly` tests locally, packages the test classpath and any declared external input paths into SHA-256 content-addressed blobs, uploads only missing digests, submits remote work units, streams live test and partition events over Server-Sent Events (SSE), writes standard `TEST-*.xml` Surefire/Failsafe reports, and atomically commits any declared output files back into the module.
+. *Coordinator (`DistributionBrokerServer`):* Persists sessions, partitions, worker leases, and historical test durations in JDBC (`HSQLDB` or `PostgreSQL`), schedules work units onto capability-matching workers using Longest-Processing-Time (LPT) bin packing seeded from historical execution times, deduplicates classpath/workspace blobs on disk, monitors worker heartbeats, automatically requeues evicted or stalled partitions up to `maxRetries`, and serves the real-time Web UI and REST/SSE APIs.
+. *Workers (`DistributionWorkerClient`):* Maintain outbound WebSocket connections (`/ws/v1/worker`) to the coordinator, advertise auto-detected host capabilities (`os`, `arch`, `jdk`, `cpuCores`, `memoryMb`, `citrus.workspace.v1`) plus user tags, pull missing blobs into a local content-addressed cache, execute assigned partitions in either an isolated child-first `ClassLoader` or a forked workspace JVM, stream per-test outcomes and captured Citrus endpoint names, and drain cleanly on `SIGTERM`.
 
 [[tools-test-distribution-maven]]
-== Maven Quickstart
+== Maven Quickstart and Build Host Settings
 
 Register the extension in `.mvn/extensions.xml`:
 
@@ -34,21 +43,319 @@ Start a coordinator and worker pool via `citrus-jbang`, then run Maven with dist
 [source,bash]
 ----
 citrus dist broker start --port=18080
-citrus dist worker start --broker-url=ws://127.0.0.1:18080/ws/v1/worker --capabilities=docker=true
+citrus dist worker start --broker-url=http://127.0.0.1:18080 --capabilities=docker=true
 
 ./mvnw verify \
   -Dcitrus.test.distribution.enabled=true \
   -Dcitrus.test.distribution.brokerUrl=http://127.0.0.1:18080
 ----
 
-Normal Maven builds without `-Dcitrus.test.distribution.enabled=true` execute locally with zero coordinator traffic.
+Normal Maven builds without `-Dcitrus.test.distribution.enabled=true` execute locally with zero coordinator traffic. In multi-module Maven reactors, the extension automatically shares one coordinator `sessionId` across all modules, reports both remote partitions and `@LocalOnly` module executions into that session, and aborts the session on the coordinator if the Maven build is interrupted (`Ctrl+C`).
+
+TIP: Projects that do not use the Maven extension can add `org.citrusframework:citrus-test-distribution` to the test runtime classpath and enable JUnit Platform interceptor discovery (`-Djunit.platform.launcher.interceptors.enabled=true -Dcitrus.test.distribution.enabled=true`).
+
+.Build host system properties and environment variables
+[cols="2,4,1",options="header"]
+|===
+|Property / Environment Variable |Description |Default
+
+|`citrus.test.distribution.enabled` / `CITRUS_DIST_ENABLED`
+|Enables distributed test execution for the build or JUnit run.
+|`false`
+
+|`citrus.test.distribution.brokerUrl` / `CITRUS_DIST_BROKER_URL`
+|Base HTTP(S) URL of the coordinator (for example `http://127.0.0.1:18080`).
+|`http://localhost:8567`
+
+|`citrus.test.distribution.authToken` / `CITRUS_DIST_AUTH_TOKEN`
+|Optional shared Bearer token sent on coordinator REST, SSE, and WebSocket requests.
+|none
+
+|`citrus.test.distribution.projectName`
+|Display name recorded on the build session (defaults to the root Maven artifactId or working directory name).
+|auto-detected
+
+|`citrus.test.distribution.fallbackLocal` / `CITRUS_DIST_FALLBACK_LOCAL`
+|When `true`, falls back to local execution if the coordinator is unreachable (unless `@RemoteOnly` tests are present) and re-runs permanently `LOST` partitions locally.
+|`true`
+
+|`citrus.test.distribution.maxPartitionSize` / `CITRUS_DIST_MAX_PARTITION_SIZE`
+|Maximum work units grouped into a single partition under the `LPT` policy.
+|`5`
+
+|`citrus.test.distribution.maxRetries` / `CITRUS_DIST_MAX_RETRIES`
+|Maximum automatic coordinator retries when a worker disconnects or stalls mid-partition.
+|`1`
+
+|`citrus.test.distribution.defaultTestDurationMs` / `CITRUS_DIST_DEFAULT_DURATION_MS`
+|Estimated duration (ms) assumed by the LPT scheduler for tests with no prior history.
+|`1000`
+
+|`citrus.test.distribution.connectTimeoutMs` / `CITRUS_DIST_CONNECT_TIMEOUT_MS`
+|HTTP connect timeout (ms) when contacting the coordinator.
+|`3000`
+
+|`citrus.test.distribution.sessionTimeoutMs` / `CITRUS_DIST_SESSION_TIMEOUT_MS`
+|Maximum time (ms) a module waits for all submitted partitions in a session to finish.
+|`600000`
+
+|`citrus.test.distribution.cacheDir` / `CITRUS_DIST_CACHE_DIR`
+|Local content-addressed staging/download cache directory (relative paths under Maven resolve inside `target/`).
+|`.citrus-dist/cache`
+|===
+
+For module-level workspace and isolation settings (`inputs`, `outputs`, `fork`, `partitionPolicy`), see <<tools-test-distribution-external-resources>>.
+
+[[tools-test-distribution-coordinator]]
+== Coordinator, CLI, and REST API
+
+The coordinator (`citrus-test-distribution-coordinator`) runs an embedded Vert.x HTTP/WebSocket server backed by a content-addressed filesystem blob cache and a JDBC telemetry store (`HSQLDB` by default, or `PostgreSQL` for shared CI deployments).
+
+=== JBang CLI Commands
+
+`citrus-jbang` ships built-in subcommands under `citrus dist` for starting and inspecting a distribution cluster:
+
+[source,bash]
+----
+# Start coordinator + Web UI with pre-seeded demo telemetry on port 8765
+citrus dist broker start --port=8765 --demo
+
+# Start coordinator backed by PostgreSQL and Bearer token auth
+citrus dist broker start \
+  --host=0.0.0.0 \
+  --port=8765 \
+  --jdbc-url=jdbc:postgresql://db.internal:5432/citrus_dist \
+  --cache-dir=/var/lib/citrus/blobs \
+  --auth-token=secret-ci-token
+
+# Check coordinator health and connected worker pool
+citrus dist status --broker-url=http://localhost:8765 --auth-token=secret-ci-token
+
+# List recent build sessions (table or --json)
+citrus dist sessions --broker-url=http://localhost:8765 --limit=20
+----
+
+.`citrus dist broker start` options
+[cols="2,4,1",options="header"]
+|===
+|Option |Description |Default
+
+|`--host`
+|Bind address for HTTP, WebSocket, and Web UI traffic.
+|`0.0.0.0`
+
+|`-p`, `--port`
+|HTTP and WebSocket listen port.
+|`8765`
+
+|`--jdbc-url`
+|JDBC URL for session, partition, worker, and test history persistence (`jdbc:hsqldb:file:...`, `jdbc:hsqldb:mem:...`, or `jdbc:postgresql://...`).
+|`jdbc:hsqldb:file:~/.citrus/dist-db/citrus_dist`
+
+|`--cache-dir`
+|Directory storing SHA-256 content-addressed classpath and workspace blobs.
+|`~/.citrus/dist-broker-cache`
+
+|`--auth-token`
+|Shared Bearer token protecting `/api/*` and `/ws/v1/worker`.
+|none
+
+|`--max-partition-size`
+|Default maximum work units per LPT partition when not specified by the client.
+|`10`
+
+|`--max-retries`
+|Default maximum partition retries when a worker disconnects or its lease expires.
+|`1`
+
+|`--duration-seconds`
+|Optional bounded run duration in seconds (`0` runs until `Ctrl+C` / `SIGTERM`).
+|`0`
+
+|`--demo`
+|Seeds realistic sample sessions, workers, multi-attempt retries, workspace resources, and failure stack traces at startup.
+|`false`
+|===
+
+When embedding `DistributionBrokerConfig.fromSettings()`, the coordinator also reads `citrus.test.distribution.jdbcUrl` (`CITRUS_DIST_JDBC_URL`), `citrus.test.distribution.jdbcUser` (`CITRUS_DIST_JDBC_USER`, default `SA`), `citrus.test.distribution.jdbcPassword` (`CITRUS_DIST_JDBC_PASSWORD`), `citrus.test.distribution.cacheDir` (`CITRUS_DIST_CACHE_DIR`), `citrus.test.distribution.authToken` (`CITRUS_DIST_AUTH_TOKEN`), and `citrus.test.distribution.demo.data` (`CITRUS_DIST_DEMO_DATA`).
+
+=== Coordinator HTTP, SSE, and WebSocket Endpoints
+
+When `--auth-token` is configured, all `/api/*` and `/ws/v1/worker` endpoints require either an `Authorization: Bearer <token>` header or a `?token=<token>` query parameter (used by browser `EventSource` and WebSocket clients). `/health` and static `/ui/*` assets remain unauthenticated so load-balancer health probes and the Web UI login prompt can load cleanly.
+
+.Coordinator service endpoints
+[cols="2,1,4",options="header"]
+|===
+|Endpoint |Method |Description
+
+|`/health`
+|`GET`
+|Liveness probe returning `{"status":"UP"}`.
+
+|`/` , `/ui` , `/ui/*`
+|`GET`
+|Serves the Distribution Web UI (`META-INF/resources/dist-ui/index.html`).
+
+|`/ws/v1/worker`
+|`GET` (WS)
+|Bidirectional worker control channel (`worker.register`, `worker.registered`, `worker.heartbeat`, `worker.draining`, `partition.assign`, `partition.started`, `test.event`, `partition.completed`, `partition.cancel`).
+
+|`/api/v1/sessions`
+|`POST`
+|Creates a new `RUNNING` build session with project metadata and Git changed files.
+
+|`/api/v1/sessions?limit=50`
+|`GET`
+|Lists recent build sessions ordered by start timestamp descending.
+
+|`/api/v1/sessions/:sessionId`
+|`GET`
+|Returns full `SessionDetailResponse` (session summary, changed files, all partition attempt records, and test execution records).
+
+|`/api/v1/sessions/:sessionId/work`
+|`POST`
+|Submits remote work units, blob references, capability filters, and workspace input/output declarations for scheduling.
+
+|`/api/v1/sessions/:sessionId/local-tests`
+|`POST`
+|Records `@LocalOnly` and local fallback `TestExecutionRecord` items (`partitionId="local"`) so single- and multi-module sessions reflect 100% of executed tests and captured Citrus endpoints.
+
+|`/api/v1/sessions/:sessionId/complete`
+|`POST`
+|Finalizes a session (`PASSED` or `FAILED`), deduplicating test outcomes across partition retry attempts and verifying all partitions completed or recovered.
+
+|`/api/v1/sessions/:sessionId/abort`
+|`POST`
+|Aborts a `RUNNING` session, sends `PARTITION_CANCEL` to active workers, marks in-flight or pending partitions `LOST` with the abort reason, and emits `session.aborted`.
+
+|`/api/v1/sessions/:sessionId/events`
+|`GET` (SSE)
+|Streams real-time session events (`session.created`, `work.submitted`, `partition.assigned`, `test.event`, `partition.requeued`, `partition.lost`, `partition.completed`, `session.completed`, `session.aborted`) with replay from sequence `0`.
+
+|`/api/v1/events/stream`
+|`GET` (SSE)
+|Global live telemetry stream consumed by the Web UI across all sessions and worker state transitions (`worker.registered`, `worker.offline`, `session.*`, `partition.*`, `test.event`).
+
+|`/api/v1/cache/missing`
+|`POST`
+|Accepts a list of SHA-256 digests and returns only digests missing from the coordinator blob store.
+
+|`/api/v1/cache/blobs/:sha256`
+|`PUT` / `GET`
+|Uploads or downloads a content-addressed classpath or workspace archive blob (up to 256 MiB per blob).
+
+|`/api/v1/workers`
+|`GET`
+|Lists registered workers with state (`IDLE`, `BUSY`, `DRAINING`, `OFFLINE`), host, heartbeat timestamp, active partition, and capability tags.
+
+|`/api/v1/tests/history?limit=100`
+|`GET`
+|Returns aggregated cross-session `TestHistorySummary` records (`totalRuns`, `passedRuns`, `failedRuns`, `flakyRuns`, `avgDurationMs`, `maxDurationMs`, `lastStatus`).
+
+|`/api/v1/demo/seed`
+|`POST`
+|Idempotently seeds sample workers, build sessions, multi-attempt partition timelines, workspace metadata, and failure traces for UI exploration.
+|===
+
+[[tools-test-distribution-ui]]
+== Distribution Web UI
+
+Whenever `citrus-test-distribution-ui` is on the coordinator classpath (included automatically by `citrus-test-distribution-coordinator` and `citrus-jbang`), the coordinator serves the Distribution Web UI at `http://<host>:<port>/ui/`.
+
+The UI is a zero-Node ES module single-page application built with lightweight `htm` virtual DOM templates and SVG charts, requiring no external build toolchain or CDN access.
+
+=== Real-Time Transport, Deep Links, and Authentication
+
+* *Live SSE with Automatic Polling Fallback:* On load, the UI opens an `EventSource` stream against `/api/v1/events/stream` (`Live SSE` badge in the top bar) and coalesces burst events so rapid `test.event` updates refresh views smoothly without flooding the browser. If SSE disconnects or is blocked by a reverse proxy, the UI switches to a 4-second background HTTP polling loop (`Polling` badge), ticks elapsed clocks for `RUNNING` sessions locally, and automatically reconnects `EventSource` once the coordinator becomes reachable again.
+* *URL Hash Routing:* Views and session sub-tabs synchronize with the URL hash (`#overview`, `#sessions`, `#session/<sessionId>/<tab>`, `#workers`, `#history`), preserving navigation state across browser reloads and shareable links.
+* *Bearer Token Authentication:* Clicking `🔑 Auth` in the top bar (or submitting the prompt shown automatically on HTTP `401`) stores the shared Bearer token in browser `localStorage`, attaching `Authorization: Bearer <token>` to REST requests and `?token=<token>` to SSE connections.
+* *Demo Telemetry & Theme Toggle:* Clicking `✦ Seed Demo Data` populates sample sessions and workers via `POST /api/v1/demo/seed`. The sun/moon toggle switches between dark and light themes.
+
+=== UI Views and Telemetry Binding
+
+==== Overview Dashboard (`#overview`)
+
+Provides fleet-wide KPIs across recent sessions and workers:
+
+* *Build Sessions* and *Session Pass Rate* (`PASSED` out of completed sessions).
+* *Online Workers* (non-`OFFLINE` workers — `IDLE`, `BUSY`, and `DRAINING` — vs total registered fleet).
+* *Distribution Speedup* (aggregate serial test time divided by distributed wall-clock duration) and *Blob Cache Efficiency* (`cachedBlobs / totalBlobs`).
+* *Flaky Tests Detected* (tests that failed or were interrupted on an initial attempt and passed on automatic partition retry), plus quick-jump tables for *Recent Build Sessions* and *Worker Pool Health*.
+
+==== Build Sessions Explorer (`#sessions`)
+
+Lists build sessions with instant text filtering by session ID, Git branch, commit SHA, or project name, and status filter pills (`ALL`, `RUNNING`, `PASSED`, `FAILED`, `ABORTED`). `RUNNING` sessions display live-updated test progress bars, blob cache hit percentages, and elapsed wall time as partitions and `@LocalOnly` tests report in.
+
+==== Session Waterfall and Inspector (`#session/<sessionId>/<tab>`)
+
+Inspects a single build session across five session KPIs (`Passed Tests`, `Failed Tests`, `Flaky Recovered`, `Wall vs Serial Time`, `Blob Cache Hit`), an `✕ Abort Session` control while `RUNNING`, and four sub-tabs:
+
+* *Execution Waterfall (`waterfall`):* Renders an interactive worker-swimlane SVG Gantt chart of all partition attempts alongside the *Partition Breakdown* table. When a worker disconnects or stalls mid-partition, attempt `#1` remains visible as `LOST` on the original worker swimlane while attempt `#2` renders on the recovery worker swimlane. Clicking any waterfall bar or partition row opens the *Partition Detail Modal* showing state, attempt number, worker assignment, required capabilities, Failure / Eviction Reason (`errorMessage`), *Workspace & External Test Resources* (`moduleName`, `forkWorkspace` isolation mode, `workingDirectory`, materialized `inputPaths`, declared `outputPaths`, and collected `producedOutputs`), work units, and executed tests.
+* *Test Executions (`tests`):* Lists every remote and `@LocalOnly` test execution with status pills (`ALL`, `FAILED`, `FLAKY`, `PASSED`, `SKIPPED`) and search across test class, method, worker ID, or *Citrus Endpoints*. During execution on both remote workers and local fallback runs, Citrus automatically hooks `CitrusInstanceManager` / `TestActionListener` to record the deduplicated Citrus endpoint names (or endpoint URIs) exercised by each test, displaying them as inline badges and in the *Test Execution Detail Modal*.
+* *Failing Tests (`failures`):* Surfaces full stack traces with one-click `Copy Trace` buttons for every `FAILED` test execution, *and* renders partition-level crash or eviction diagnostic cards whenever a partition fails or is lost (`FAILED` or `LOST` with `errorMessage`) — ensuring forked JVM crashes, `ClassNotFoundException`, undeclared working-directory writes (`cwdCheck=FAIL`), or aborted partitions are immediately visible even when zero individual JUnit tests completed.
+* *Changed Files (`files`):* Displays the workspace Git delta (`Δ <path>`) captured when the session started.
+
+==== Workers Pool (`#workers`)
+
+Displays cards for every worker in the cluster, filterable by state (`ALL`, `IDLE`, `BUSY`, `DRAINING`, `OFFLINE`) and searchable by worker ID, host name, or capability key/value (such as `docker=true`, `os=linux`, `citrus.workspace.v1=true`), along with last heartbeat age and active partition ID.
+
+==== Test History and Flakiness (`#history`)
+
+Displays cross-session historical aggregates from `/api/v1/tests/history` (`Total Runs`, `Pass Rate` computed from `passedRuns / totalRuns`, `Flaky Retries`, `Avg Duration`, `Max Duration`, and `Last Status`), with search and a `⚡ Flaky Only` toggle to isolate unstable integration tests.
+
+[[tools-test-distribution-workers]]
+== Worker Pool and Citrus Agent Mode
+
+Workers can be launched either via `citrus-jbang` (`citrus dist worker start`) or through the containerized `citrus-agent` server in `worker` mode:
+
+[source,bash]
+----
+# Standalone JBang worker (accepts http://, https://, ws://, or wss:// broker URLs)
+citrus dist worker start \
+  --broker-url=http://127.0.0.1:8765 \
+  --worker-id=worker-k8s-01 \
+  --auth-token=secret-ci-token \
+  --capabilities=docker=true,kafka=true
+
+# Citrus Agent container / JAR in worker mode
+java -jar citrus-agent.jar \
+  --mode worker \
+  --broker-url http://coordinator.internal:8765 \
+  --auth-token secret-ci-token \
+  --capabilities docker=true,zone=eu-central-1
+----
+
+Every worker automatically advertises host capabilities (`os`, `arch`, `jdk`, `cpuCores`, `memoryMb`, and `citrus.workspace.v1=true`) merged with any custom `--capabilities` `key=value` pairs. On `SIGTERM` or shutdown, the worker sends `worker.draining` so the coordinator stops assigning new partitions while allowing any in-flight partition to finish within its drain timeout before closing the WebSocket.
 
 [[tools-test-distribution-annotations]]
 == Placement Annotations
 
-* `@LocalOnly` — Pins a test class or method to the local build host JVM.
-* `@RemoteOnly` — Requires execution on a remote worker and fails fast when the coordinator is unreachable.
-* `@AgentRequirement(key = "docker", value = "true")` — Repeatable capability filter matched against registered worker capabilities (supports exact match and `>=` numeric thresholds).
+* `@LocalOnly` — Pins a test class or method to the local build host JVM (executed locally and reported to the coordinator under `partitionId="local"`).
+* `@RemoteOnly` — Requires execution on a remote worker and fails fast when the coordinator is unreachable regardless of `fallbackLocal`.
+* `@AgentRequirement(key = "docker", value = "true")` — Repeatable capability filter matched against registered worker capabilities. Supports exact string matching (`os=linux`, `docker=true`) and numeric threshold expressions (`memoryMb>=4096`, `cpuCores>=4`, `jdk>=21`).
+
+[source,java]
+----
+@CitrusSupport
+@AgentRequirement(key = "docker", value = "true")
+@AgentRequirement(key = "memoryMb", value = ">=4096")
+class KafkaTestcontainersIT implements TestActionSupport {
+
+    @Test
+    @CitrusTest
+    void shouldConsumeOrderEvents() {
+        // Scheduled only on workers advertising docker=true and memoryMb >= 4096
+    }
+
+    @Test
+    @LocalOnly
+    void shouldInspectDeveloperLocalKeystore() {
+        // Always executed on the local build machine
+    }
+}
+----
+
+Declarative XML and YAML tests produced via `@CitrusTestFactory` are also split into individual distributable work units so large declarative test suites scale across workers automatically.
 
 [[tools-test-distribution-external-resources]]
 == External Test Resources

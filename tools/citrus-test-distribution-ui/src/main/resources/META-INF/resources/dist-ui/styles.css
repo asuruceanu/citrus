@@ -399,6 +399,17 @@ pre,
   font-size: 12px;
 }
 
+.btn-danger {
+  background: var(--rose-bg);
+  border-color: rgba(239, 68, 68, 0.35);
+  color: var(--rose-text);
+}
+
+.btn-danger:hover {
+  background: rgba(239, 68, 68, 0.22);
+  border-color: var(--rose);
+}
+
 /* KPI Grid */
 .kpi-grid {
   display: grid;
@@ -637,6 +648,62 @@ pre,
   background: rgba(59, 130, 246, 0.1);
   border-color: rgba(59, 130, 246, 0.28);
   color: var(--blue-text);
+}
+
+.tag-resource {
+  background: var(--emerald-bg);
+  border-color: rgba(16, 185, 129, 0.28);
+  color: var(--emerald-text);
+}
+
+.alert-banner {
+  padding: 10px 14px;
+  border-radius: 10px;
+  font-size: 12.5px;
+  font-weight: 600;
+  margin-bottom: 16px;
+  border: 1px solid var(--border-color);
+}
+
+.alert-banner-rose {
+  background: var(--rose-bg);
+  border-color: rgba(239, 68, 68, 0.35);
+  color: var(--rose-text);
+}
+
+.alert-banner-amber {
+  background: var(--amber-bg);
+  border-color: rgba(245, 158, 11, 0.35);
+  color: var(--amber-text);
+}
+
+.kv-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.kv-box {
+  padding: 8px 12px;
+  border-radius: 8px;
+  background: var(--bg-subtle);
+  border: 1px solid var(--border-color);
+}
+
+.kv-label {
+  font-size: 10.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+}
+
+.kv-val {
+  font-size: 12.5px;
+  font-weight: 600;
+  margin-top: 2px;
+  word-break: break-all;
 }
 
 /* Tables */

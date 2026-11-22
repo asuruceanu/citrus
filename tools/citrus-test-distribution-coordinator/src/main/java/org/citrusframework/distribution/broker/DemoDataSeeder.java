@@ -178,19 +178,24 @@ public final class DemoDataSeeder {
         WorkUnitSpec camelJmsUnit = unit("org.citrusframework.camel.CamelJmsTransactionIT", 8_400L, Map.of("docker", "true"));
         WorkUnitSpec jmsReplyUnit = unit("org.citrusframework.jms.JmsRequestReplyCorrelationIT", 5_100L, Map.of("docker", "true"));
 
-        saveCompletedPartition(store, "part-902-lost", "sess-citrus-pr-2108", "k8s-worker-spot-lost",
+        store.savePartition(new PartitionRecord(
+                "part-902", "sess-citrus-pr-2108", "k8s-worker-spot-lost",
                 PartitionState.LOST, 1, 13_500L, s2Start + 500L, s2Start + 9_200L,
-                Map.of("docker", "true"), List.of(camelJmsUnit, jmsReplyUnit));
+                Map.of("docker", "true"), List.of(camelJmsUnit, jmsReplyUnit),
+                "citrus-camel", false, ".", List.of(), List.of(), List.of(),
+                "Worker disconnected during execution"));
 
-        saveCompletedPartition(store, "part-902-retry", "sess-citrus-pr-2108", "k8s-worker-eu-02",
+        store.savePartition(new PartitionRecord(
+                "part-902", "sess-citrus-pr-2108", "k8s-worker-eu-02",
                 PartitionState.COMPLETED, 2, 13_500L, s2Start + 9_600L, s2Start + 23_800L,
-                Map.of("docker", "true"), List.of(camelJmsUnit, jmsReplyUnit));
+                Map.of("docker", "true"), List.of(camelJmsUnit, jmsReplyUnit),
+                "citrus-camel", false, ".", List.of(), List.of(), List.of(), null));
 
-        saveTest(store, "t-2108-1", "sess-citrus-pr-2108", "part-902-retry", "k8s-worker-eu-02",
+        saveTest(store, "t-2108-1", "sess-citrus-pr-2108", "part-902", "k8s-worker-eu-02",
                 "org.citrusframework.camel.CamelJmsTransactionIT", "shouldRollbackJmsOnCamelException",
                 TestOutcomeStatus.PASSED, 8_640L, 2, true, null, null,
                 List.of("jmsOrderInboundQueue", "camelTxRouteEndpoint"), s2Start + 18_200L);
-        saveTest(store, "t-2108-2", "sess-citrus-pr-2108", "part-902-retry", "k8s-worker-eu-02",
+        saveTest(store, "t-2108-2", "sess-citrus-pr-2108", "part-902", "k8s-worker-eu-02",
                 "org.citrusframework.jms.JmsRequestReplyCorrelationIT", "shouldCorrelateReplyByMessageId",
                 TestOutcomeStatus.PASSED, 5_120L, 2, false, null, null,
                 List.of("jmsReplyEndpoint"), s2Start + 23_700L);
@@ -248,14 +253,20 @@ public final class DemoDataSeeder {
                 List.of("soapMtomClient"), s2Start + 16_700L);
 
         // Partition D: Declarative YAML & XML dynamic tests on mac-studio-ci-01
-        saveCompletedPartition(store, "part-904-yaml", "sess-citrus-pr-2108", "mac-studio-ci-01",
+        store.savePartition(new PartitionRecord(
+                "part-904-yaml", "sess-citrus-pr-2108", "mac-studio-ci-01",
                 PartitionState.COMPLETED, 1, 14_200L, s2Start + 700L, s2Start + 25_900L,
-                Map.of("os", "macos"),
+                Map.of("os", "macos", "workspace", "true"),
                 List.of(
                         new WorkUnitSpec("org.citrusframework.yaml.YamlDeclarativeFactoryIT::order-fulfillment-flow.yaml",
                                 "org.citrusframework.yaml.YamlDeclarativeFactoryIT", "yamlTests", "order-fulfillment-flow.yaml", Map.of("os", "macos"), 6_500L),
                         new WorkUnitSpec("org.citrusframework.yaml.YamlDeclarativeFactoryIT::payment-webhook-retry.yaml",
-                                "org.citrusframework.yaml.YamlDeclarativeFactoryIT", "yamlTests", "payment-webhook-retry.yaml", Map.of("os", "macos"), 7_700L)));
+                                "org.citrusframework.yaml.YamlDeclarativeFactoryIT", "yamlTests", "payment-webhook-retry.yaml", Map.of("os", "macos"), 7_700L)),
+                "citrus-yaml", true, ".",
+                List.of("src/test/resources/scenarios"),
+                List.of("target/citrus-reports"),
+                List.of("target/citrus-reports"),
+                null));
 
         for (int i = 0; i < 8; i++) {
             TestOutcomeStatus st = (i == 7) ? TestOutcomeStatus.SKIPPED : TestOutcomeStatus.PASSED;

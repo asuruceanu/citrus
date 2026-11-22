@@ -20,6 +20,14 @@ public record CompleteSessionRequest(
         int localPassedTests,
         int localFailedTests,
         int localSkippedTests,
-        long localSerialDurationMs
+        long localSerialDurationMs,
+        boolean buildFailed
 ) {
+    public CompleteSessionRequest(
+            int localPassedTests,
+            int localFailedTests,
+            int localSkippedTests,
+            long localSerialDurationMs) {
+        this(localPassedTests, localFailedTests, localSkippedTests, localSerialDurationMs, false);
+    }
 }

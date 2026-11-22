@@ -23,6 +23,10 @@ import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CopyOnWriteArrayList;
 
+import org.citrusframework.TestActionRunner;
+import org.citrusframework.annotations.CitrusEndpoint;
+import org.citrusframework.annotations.CitrusResource;
+import org.citrusframework.annotations.CitrusTest;
 import org.citrusframework.distribution.config.DistributionSettings;
 import org.citrusframework.distribution.config.DistributionSettings.WorkerCwdCheckMode;
 import org.citrusframework.distribution.config.DistributionSettings.WorkerForkMode;
@@ -30,6 +34,13 @@ import org.citrusframework.distribution.model.PartitionAssignPayload;
 import org.citrusframework.distribution.model.TestOutcomeStatus;
 import org.citrusframework.distribution.model.WorkUnitSpec;
 import org.citrusframework.distribution.model.WorkerTestEventPayload;
+import org.citrusframework.dsl.TestActionSupport;
+import org.citrusframework.endpoint.Endpoint;
+import org.citrusframework.endpoint.direct.annotation.DirectEndpointConfig;
+import org.citrusframework.junit.jupiter.CitrusSupport;
+import org.citrusframework.message.DefaultMessageQueue;
+import org.citrusframework.message.MessageQueue;
+import org.citrusframework.spi.BindToRegistry;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInfo;
 import org.junit.jupiter.api.io.TempDir;
@@ -357,6 +368,100 @@ class PartitionJUnitLauncherAndCwdGuardTest {
         assertThat(custom.cwdCheckMode()).isEqualTo(WorkerCwdCheckMode.WARN);
         assertThat(custom.forkJvmArgs()).containsExactly("-Xmx1g");
         assertThat(custom.capabilities()).as("explicit opt-out is kept").containsEntry(DistributionSettings.WORKSPACE_CAPABILITY_KEY, "false");
+    }
+
+    @CitrusSupport
+    public static class CitrusEndpointsFixture implements TestActionSupport {
+
+        @CitrusEndpoint(name = "ordersHttp")
+        @DirectEndpointConfig(queueName = "orders.queue")
+        @BindToRegistry(name = "ordersHttp")
+        private Endpoint ordersEndpoint;
+
+        @CitrusEndpoint(name = "auditKafka")
+        @DirectEndpointConfig(queueName = "audit.queue")
+        @BindToRegistry(name = "auditKafka")
+        private Endpoint auditEndpoint;
+
+        @CitrusEndpoint(name = "billingSoap")
+        @DirectEndpointConfig(queueName = "billing.queue")
+        @BindToRegistry(name = "billingSoap")
+        private Endpoint billingEndpoint;
+
+        @BindToRegistry(name = "orders.queue")
+        public MessageQueue ordersQueue() {
+            return new DefaultMessageQueue("orders.queue");
+        }
+
+        @BindToRegistry(name = "audit.queue")
+        public MessageQueue auditQueue() {
+            return new DefaultMessageQueue("audit.queue");
+        }
+
+        @BindToRegistry(name = "billing.queue")
+        public MessageQueue billingQueue() {
+            return new DefaultMessageQueue("billing.queue");
+        }
+
+        @Test
+        @CitrusTest
+        void shouldProcessOrder(@CitrusResource TestActionRunner runner) {
+            runner.run(send(ordersEndpoint).message().body("order-1"));
+            runner.run(receive(ordersEndpoint).message().body("order-1"));
+            runner.run(sequential().actions(
+                    send("auditKafka").message().body("audit-1"),
+                    receive("auditKafka").message().body("audit-1")
+            ));
+        }
+
+        @Test
+        @CitrusTest
+        void shouldChargeBilling(@CitrusResource TestActionRunner runner) {
+            runner.run(send(billingEndpoint).message().body("invoice-1"));
+            runner.run(receive(billingEndpoint).message().body("invoice-1"));
+        }
+
+        @Test
+        @CitrusTest
+        void shouldNotCaptureUnexecutedTrailingActionInFailedContainer(@CitrusResource TestActionRunner runner) {
+            runner.run(sequential().actions(
+                    send(ordersEndpoint).message().body("before-boom"),
+                    fail("boom"),
+                    send("unexecutedQueue").message().body("never-reached")
+            ));
+        }
+    }
+
+    @Test
+    void shouldCaptureCitrusEndpointsPerTestFromDirectAndContainerActions() {
+        List<WorkerTestEventPayload> events = new CopyOnWriteArrayList<>();
+        PartitionJUnitLauncher.ExecutionSummary summary = PartitionJUnitLauncher.executeWorkUnits(
+                "p-citrus",
+                "s-citrus",
+                1,
+                List.of(
+                        unit(CitrusEndpointsFixture.class, "shouldProcessOrder"),
+                        unit(CitrusEndpointsFixture.class, "shouldChargeBilling"),
+                        unit(CitrusEndpointsFixture.class, "shouldNotCaptureUnexecutedTrailingActionInFailedContainer"),
+                        unit(OverloadedFixture.class, "named()")
+                ),
+                getClass().getClassLoader(),
+                CancellationToken.create(),
+                events::add
+        );
+
+        assertThat(summary.success()).as(summary.errorMessage()).isTrue();
+        List<WorkerTestEventPayload> completed = finished(events);
+        assertThat(completed).hasSize(4);
+        assertThat(completed.get(0).testName()).startsWith("shouldProcessOrder");
+        assertThat(completed.get(0).endpoints()).containsExactly("ordersHttp", "auditKafka");
+        assertThat(completed.get(1).testName()).startsWith("shouldChargeBilling");
+        assertThat(completed.get(1).endpoints()).containsExactly("billingSoap");
+        assertThat(completed.get(2).testName()).startsWith("shouldNotCaptureUnexecutedTrailingActionInFailedContainer");
+        assertThat(completed.get(2).status()).isEqualTo(TestOutcomeStatus.FAILED);
+        assertThat(completed.get(2).endpoints()).containsExactly("ordersHttp");
+        assertThat(completed.get(3).testName()).isEqualTo("named()");
+        assertThat(completed.get(3).endpoints()).isEmpty();
     }
 
     private IsolatedPartitionRunner runner(WorkerCwdCheckMode mode) {

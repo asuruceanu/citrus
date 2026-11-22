@@ -38,6 +38,7 @@ import org.citrusframework.distribution.model.PartitionAssignPayload;
 import org.citrusframework.distribution.model.PartitionCompletedPayload;
 import org.citrusframework.distribution.model.PartitionRecord;
 import org.citrusframework.distribution.model.PartitionState;
+import org.citrusframework.distribution.model.ReportLocalTestsRequest;
 import org.citrusframework.distribution.model.SessionDetailResponse;
 import org.citrusframework.distribution.model.SessionStatus;
 import org.citrusframework.distribution.model.SessionSummary;
@@ -152,25 +153,50 @@ public final class BrokerSessionCoordinator {
 
         session.cachedBlobs += Math.max(0, request.cachedBlobs());
         session.uploadedBlobs += Math.max(0, request.uploadedBlobs());
+        session.submittedUnitCount += units.size();
+        List<String> inputPaths = request.inputArtifacts().stream()
+                .map(WorkspaceFileSet::relativePath)
+                .toList();
 
         List<String> partitionIds = new ArrayList<>(scheduled.size());
         for (PartitionRecord part : scheduled) {
-            store.savePartition(part);
+            PartitionRecord enriched = new PartitionRecord(
+                    part.partitionId(),
+                    part.sessionId(),
+                    part.workerId(),
+                    part.state(),
+                    part.attempt(),
+                    part.estimatedDurationMs(),
+                    part.startedAt(),
+                    part.finishedAt(),
+                    part.requiredCapabilities(),
+                    part.workUnits(),
+                    request.moduleName(),
+                    request.forkWorkspace(),
+                    request.workingDirectory(),
+                    inputPaths,
+                    request.outputPaths(),
+                    List.of(),
+                    null
+            );
+            store.savePartition(enriched);
             PartitionRuntime runtime = new PartitionRuntime(
-                    part,
+                    enriched,
                     request.moduleName(),
                     request.classpathArtifacts() != null ? List.copyOf(request.classpathArtifacts()) : List.of(),
                     request.systemProperties() != null ? Map.copyOf(request.systemProperties()) : Map.of(),
                     request.inputArtifacts(),
+                    inputPaths,
                     request.outputPaths(),
                     request.forkWorkspace(),
                     request.workingDirectory(),
                     session.maxRetries
             );
-            partitions.put(part.partitionId(), runtime);
-            session.partitionIds.add(part.partitionId());
-            partitionIds.add(part.partitionId());
+            partitions.put(enriched.partitionId(), runtime);
+            session.partitionIds.add(enriched.partitionId());
+            partitionIds.add(enriched.partitionId());
         }
+        refreshRunningSessionSummary(session);
 
         SubmitWorkResponse response = new SubmitWorkResponse(
                 request.submissionId(),
@@ -194,61 +220,231 @@ public final class BrokerSessionCoordinator {
         return response;
     }
 
-    public synchronized BuildSessionRecord completeSession(String sessionId, CompleteSessionRequest request) {
-        SessionRuntime session = sessions.get(sessionId);
+    public synchronized int reportLocalTests(String sessionId, ReportLocalTestsRequest request) {
+        SessionRuntime session = getOrRehydrateSession(sessionId);
         if (session == null) {
-            return store.findSession(sessionId)
-                    .orElseThrow(() -> new IllegalArgumentException("Unknown sessionId: " + sessionId));
+            throw new IllegalArgumentException("Unknown sessionId: " + sessionId);
         }
+        if (request == null || request.executions().isEmpty()) {
+            return 0;
+        }
+        String workerId = (request.workerId() != null && !request.workerId().isBlank())
+                ? request.workerId()
+                : "local-host";
+        int recorded = 0;
+        for (WorkerTestEventPayload evt : request.executions()) {
+            if (evt == null || evt.status() == null || evt.status() == TestOutcomeStatus.STARTED) {
+                continue;
+            }
+            String testKey = testIdentityKey(evt.workUnitKey(), evt.className(), evt.testName());
+            int localAttempt = session.nextAttemptFor(testKey);
+            boolean flaky = localAttempt > 1
+                    && evt.status() == TestOutcomeStatus.PASSED
+                    && session.failedOrInterruptedTests.contains(testKey);
+            TestExecutionRecord execRecord = new TestExecutionRecord(
+                    UUID.randomUUID().toString(),
+                    sessionId,
+                    "local",
+                    workerId,
+                    evt.workUnitKey(),
+                    evt.className(),
+                    evt.testName(),
+                    evt.status(),
+                    evt.durationMs(),
+                    localAttempt,
+                    flaky,
+                    evt.errorMessage(),
+                    evt.stackTrace(),
+                    evt.endpoints() != null ? evt.endpoints() : List.of(),
+                    System.currentTimeMillis()
+            );
+            store.saveTestExecution(execRecord);
+            session.recordExecution(execRecord);
+            if (evt.workUnitKey() != null && !evt.workUnitKey().isBlank()) {
+                session.locallyExecutedWorkUnitKeys.add(evt.workUnitKey());
+            }
+            session.reportedLocalTestCount++;
+            recorded++;
 
-        List<TestExecutionRecord> executions = store.listTestExecutions(sessionId);
-        int passed = (request != null ? request.localPassedTests() : 0);
-        int failed = (request != null ? request.localFailedTests() : 0);
-        int skipped = (request != null ? request.localSkippedTests() : 0);
-        long serialMs = (request != null ? request.localSerialDurationMs() : 0L);
+            @SuppressWarnings("unchecked")
+            Map<String, Object> evtData = DistributionJson.convert(evt, Map.class);
+            evtData.put("sessionId", sessionId);
+            evtData.put("partitionId", "local");
+            eventHub.publish("test.event", sessionId, "local", workerId, evtData);
+        }
+        if (recorded > 0) {
+            refreshRunningSessionSummary(session);
+        }
+        return recorded;
+    }
 
-        for (TestExecutionRecord exec : executions) {
-            serialMs += Math.max(0L, exec.durationMs());
-            if (exec.status() == TestOutcomeStatus.PASSED) {
-                passed++;
-            } else if (exec.status() == TestOutcomeStatus.FAILED) {
-                failed++;
-            } else if (exec.status() == TestOutcomeStatus.SKIPPED) {
-                skipped++;
+    public synchronized BuildSessionRecord abortSession(String sessionId, String reason) {
+        SessionRuntime session = getOrRehydrateSession(sessionId);
+        if (session == null) {
+            throw new IllegalArgumentException("Unknown sessionId: " + sessionId);
+        }
+        if (session.record.status() != SessionStatus.RUNNING) {
+            return session.record;
+        }
+        String abortReason = (reason != null && !reason.isBlank()) ? reason : "Session aborted";
+        long now = System.currentTimeMillis();
+
+        Set<String> abortedPartitionIds = new HashSet<>();
+        for (PartitionRuntime pr : partitions.values()) {
+            if (!sessionId.equals(pr.record.sessionId())) {
+                continue;
+            }
+            if (pr.record.state() == PartitionState.ASSIGNED || pr.record.state() == PartitionState.RUNNING) {
+                String activeWorkerId = pr.record.workerId();
+                abortedPartitionIds.add(pr.record.partitionId());
+                releaseStalledWorker(pr);
+                pr.activeConnectionId = null;
+                pr.inFlightTestKey = null;
+                pr.record = pr.buildRecord(
+                        activeWorkerId,
+                        PartitionState.LOST,
+                        pr.record.attempt(),
+                        pr.record.startedAt() > 0L ? pr.record.startedAt() : now,
+                        now,
+                        pr.record.producedOutputs(),
+                        abortReason
+                );
+                store.savePartition(pr.record);
+            } else if (pr.record.state() == PartitionState.PENDING) {
+                abortedPartitionIds.add(pr.record.partitionId());
+                pr.record = pr.buildRecord(
+                        null,
+                        PartitionState.LOST,
+                        pr.record.attempt(),
+                        0L,
+                        now,
+                        List.of(),
+                        abortReason
+                );
+                store.savePartition(pr.record);
             }
         }
 
-        boolean anyLostOrFailedPartition = store.listPartitions(sessionId).stream()
-                .anyMatch(p -> p.state() == PartitionState.FAILED || p.state() == PartitionState.LOST);
+        for (PartitionRecord persisted : store.listPartitions(sessionId)) {
+            if (persisted.state() == PartitionState.ASSIGNED
+                    || persisted.state() == PartitionState.RUNNING
+                    || persisted.state() == PartitionState.PENDING) {
+                abortedPartitionIds.add(persisted.partitionId());
+                store.savePartition(new PartitionRecord(
+                        persisted.partitionId(),
+                        persisted.sessionId(),
+                        persisted.workerId(),
+                        PartitionState.LOST,
+                        persisted.attempt(),
+                        persisted.estimatedDurationMs(),
+                        persisted.state() == PartitionState.PENDING ? 0L : (persisted.startedAt() > 0L ? persisted.startedAt() : now),
+                        now,
+                        persisted.requiredCapabilities(),
+                        persisted.workUnits(),
+                        persisted.moduleName(),
+                        persisted.forkWorkspace(),
+                        persisted.workingDirectory(),
+                        persisted.inputPaths(),
+                        persisted.outputPaths(),
+                        persisted.producedOutputs(),
+                        abortReason
+                ));
+            }
+        }
 
-        SessionStatus finalStatus = (failed > 0 || anyLostOrFailedPartition) ? SessionStatus.FAILED : SessionStatus.PASSED;
+        if (!abortedPartitionIds.isEmpty()) {
+            Set<String> liveWorkerIds = new HashSet<>();
+            for (WorkerConnection wc : workers.values()) {
+                liveWorkerIds.add(wc.workerId);
+            }
+            for (WorkerRecord wr : store.listWorkers()) {
+                if (wr.state() == WorkerState.BUSY
+                        && wr.activePartitionId() != null
+                        && abortedPartitionIds.contains(wr.activePartitionId())
+                        && !liveWorkerIds.contains(wr.workerId())) {
+                    store.upsertWorker(new WorkerRecord(
+                            wr.workerId(),
+                            wr.host(),
+                            wr.capabilities(),
+                            WorkerState.IDLE,
+                            null,
+                            wr.lastHeartbeatAt(),
+                            wr.registeredAt()
+                    ));
+                }
+            }
+        }
+
+        SessionSummary summary = computeSessionSummary(session, null, now);
+        store.updateSessionStatus(sessionId, SessionStatus.ABORTED, now, summary);
+        BuildSessionRecord updated = store.findSession(sessionId).orElse(session.record);
+        session.record = updated;
+
+        eventHub.publish("session.aborted", sessionId, null, null, Map.of(
+                "status", SessionStatus.ABORTED.name(),
+                "reason", abortReason,
+                "totalTests", summary.totalTests(),
+                "passedTests", summary.passedTests(),
+                "failedTests", summary.failedTests(),
+                "skippedTests", summary.skippedTests(),
+                "wallDurationMs", summary.wallDurationMs()
+        ));
+        dispatchPendingPartitions();
+        return updated;
+    }
+
+    public synchronized BuildSessionRecord completeSession(String sessionId, CompleteSessionRequest request) {
+        SessionRuntime session = getOrRehydrateSession(sessionId);
+        if (session == null) {
+            throw new IllegalArgumentException("Unknown sessionId: " + sessionId);
+        }
+        if (session.record.status() == SessionStatus.ABORTED) {
+            return session.record;
+        }
+
         long finishedAt = System.currentTimeMillis();
-        long wallMs = Math.max(0L, finishedAt - session.record.startedAt());
-        int totalTests = passed + failed + skipped;
-        int totalBlobs = session.cachedBlobs + session.uploadedBlobs;
+        SessionSummary summary = computeSessionSummary(session, request, finishedAt);
 
-        SessionSummary summary = new SessionSummary(
-                totalTests,
-                passed,
-                failed,
-                skipped,
-                totalBlobs,
-                session.cachedBlobs,
-                serialMs,
-                wallMs
-        );
+        Map<String, PartitionRecord> latestPartitions = new LinkedHashMap<>();
+        for (PartitionRecord part : store.listPartitions(sessionId)) {
+            PartitionRecord prev = latestPartitions.get(part.partitionId());
+            if (prev == null || part.attempt() >= prev.attempt()) {
+                latestPartitions.put(part.partitionId(), part);
+            }
+        }
+
+        boolean unrecoveredPartitionFailure = false;
+        for (PartitionRecord latest : latestPartitions.values()) {
+            if (latest.state() == PartitionState.FAILED) {
+                unrecoveredPartitionFailure = true;
+                break;
+            }
+            if (latest.state() != PartitionState.COMPLETED) {
+                boolean recoveredLocally = !latest.workUnits().isEmpty()
+                        && latest.workUnits().stream().allMatch(u -> session.locallyExecutedWorkUnitKeys.contains(u.key()));
+                if (!recoveredLocally) {
+                    unrecoveredPartitionFailure = true;
+                    break;
+                }
+            }
+        }
+
+        boolean buildFailed = request != null && request.buildFailed();
+        SessionStatus finalStatus = (summary.failedTests() > 0 || unrecoveredPartitionFailure || buildFailed)
+                ? SessionStatus.FAILED
+                : SessionStatus.PASSED;
         store.updateSessionStatus(sessionId, finalStatus, finishedAt, summary);
 
         BuildSessionRecord updated = store.findSession(sessionId).orElse(session.record);
         session.record = updated;
         eventHub.publish("session.completed", sessionId, null, null, Map.of(
                 "status", finalStatus.name(),
-                "totalTests", totalTests,
-                "passedTests", passed,
-                "failedTests", failed,
-                "skippedTests", skipped,
-                "serialDurationMs", serialMs,
-                "wallDurationMs", wallMs
+                "totalTests", summary.totalTests(),
+                "passedTests", summary.passedTests(),
+                "failedTests", summary.failedTests(),
+                "skippedTests", summary.skippedTests(),
+                "serialDurationMs", summary.serialDurationMs(),
+                "wallDurationMs", summary.wallDurationMs()
         ));
         return updated;
     }
@@ -354,17 +550,14 @@ public final class BrokerSessionCoordinator {
                 } else {
                     long now = System.currentTimeMillis();
                     pr.lastProgressAt = now;
-                    pr.record = new PartitionRecord(
-                            pr.record.partitionId(),
-                            pr.record.sessionId(),
+                    pr.record = pr.buildRecord(
                             conn.workerId,
                             PartitionState.RUNNING,
                             pr.record.attempt(),
-                            pr.record.estimatedDurationMs(),
                             pr.record.startedAt() > 0L ? pr.record.startedAt() : now,
                             0L,
-                            pr.record.requiredCapabilities(),
-                            pr.record.workUnits()
+                            pr.record.producedOutputs(),
+                            null
                     );
                     store.savePartition(pr.record);
                     eventHub.publish("partition.started", pr.record.sessionId(), partitionId, conn.workerId, Map.of(
@@ -381,7 +574,18 @@ public final class BrokerSessionCoordinator {
                         return;
                     }
                     pr.lastProgressAt = System.currentTimeMillis();
-                    if (evt.status() != TestOutcomeStatus.STARTED) {
+                    SessionRuntime session = getOrRehydrateSession(pr.record.sessionId());
+                    String testKey = testIdentityKey(evt.workUnitKey(), evt.className(), evt.testName());
+                    if (evt.status() == TestOutcomeStatus.STARTED) {
+                        pr.inFlightTestKey = testKey;
+                    } else {
+                        if (testKey.equals(pr.inFlightTestKey)) {
+                            pr.inFlightTestKey = null;
+                        }
+                        boolean hadPriorFailure = session != null && session.failedOrInterruptedTests.contains(testKey);
+                        boolean flaky = pr.record.attempt() > 1
+                                && evt.status() == TestOutcomeStatus.PASSED
+                                && hadPriorFailure;
                         TestExecutionRecord execRecord = new TestExecutionRecord(
                                 UUID.randomUUID().toString(),
                                 pr.record.sessionId(),
@@ -393,13 +597,17 @@ public final class BrokerSessionCoordinator {
                                 evt.status(),
                                 evt.durationMs(),
                                 pr.record.attempt(),
-                                pr.record.attempt() > 1 && evt.status() == TestOutcomeStatus.PASSED,
+                                flaky,
                                 evt.errorMessage(),
                                 evt.stackTrace(),
                                 evt.endpoints() != null ? evt.endpoints() : List.of(),
                                 System.currentTimeMillis()
                         );
                         store.saveTestExecution(execRecord);
+                        if (session != null) {
+                            session.recordExecution(execRecord);
+                            refreshRunningSessionSummary(session);
+                        }
                     }
                     @SuppressWarnings("unchecked")
                     Map<String, Object> evtData = DistributionJson.convert(evt, Map.class);
@@ -467,20 +675,21 @@ public final class BrokerSessionCoordinator {
         PartitionRuntime pr = partitions.get(done.partitionId());
         if (pr != null) {
             pr.activeConnectionId = null;
+            pr.inFlightTestKey = null;
             PartitionState endState = done.success() ? PartitionState.COMPLETED : PartitionState.FAILED;
             long now = System.currentTimeMillis();
             long started = pr.record.startedAt() > 0L ? pr.record.startedAt() : now;
-            pr.record = new PartitionRecord(
-                    pr.record.partitionId(),
-                    pr.record.sessionId(),
+            List<String> producedOutputs = done.outputArtifacts().stream()
+                    .map(WorkspaceFileSet::relativePath)
+                    .toList();
+            pr.record = pr.buildRecord(
                     conn.workerId,
                     endState,
                     pr.record.attempt(),
-                    pr.record.estimatedDurationMs(),
                     started,
                     now,
-                    pr.record.requiredCapabilities(),
-                    pr.record.workUnits()
+                    producedOutputs,
+                    done.errorMessage()
             );
             store.savePartition(pr.record);
             Map<String, Object> data = new LinkedHashMap<>();
@@ -507,38 +716,54 @@ public final class BrokerSessionCoordinator {
 
     private void requeueOrLosePartition(PartitionRuntime pr, String previousWorkerId, String reason) {
         pr.activeConnectionId = null;
+        SessionRuntime session = getOrRehydrateSession(pr.record.sessionId());
+        if (pr.inFlightTestKey != null) {
+            if (session != null) {
+                session.failedOrInterruptedTests.add(pr.inFlightTestKey);
+            }
+            pr.inFlightTestKey = null;
+        }
+        long now = System.currentTimeMillis();
+        long startedAt = pr.record.startedAt() > 0L ? pr.record.startedAt() : now;
         if (pr.retriesUsed < pr.maxRetries) {
+            PartitionRecord evictedAttempt = pr.buildRecord(
+                    previousWorkerId,
+                    PartitionState.LOST,
+                    pr.record.attempt(),
+                    startedAt,
+                    now,
+                    pr.record.producedOutputs(),
+                    reason
+            );
+            store.savePartition(evictedAttempt);
+
             pr.retriesUsed++;
-            pr.record = new PartitionRecord(
-                    pr.record.partitionId(),
-                    pr.record.sessionId(),
+            int nextAttempt = pr.retriesUsed + 1;
+            pr.record = pr.buildRecord(
                     null,
                     PartitionState.PENDING,
-                    pr.record.attempt(),
-                    pr.record.estimatedDurationMs(),
+                    nextAttempt,
                     0L,
                     0L,
-                    pr.record.requiredCapabilities(),
-                    pr.record.workUnits()
+                    List.of(),
+                    null
             );
             store.savePartition(pr.record);
             eventHub.publish("partition.requeued", pr.record.sessionId(), pr.record.partitionId(), previousWorkerId, Map.of(
                     "reason", reason,
                     "retriesUsed", pr.retriesUsed,
-                    "maxRetries", pr.maxRetries
+                    "maxRetries", pr.maxRetries,
+                    "nextAttempt", nextAttempt
             ));
         } else {
-            pr.record = new PartitionRecord(
-                    pr.record.partitionId(),
-                    pr.record.sessionId(),
+            pr.record = pr.buildRecord(
                     previousWorkerId,
                     PartitionState.LOST,
                     pr.record.attempt(),
-                    pr.record.estimatedDurationMs(),
-                    pr.record.startedAt(),
-                    System.currentTimeMillis(),
-                    pr.record.requiredCapabilities(),
-                    pr.record.workUnits()
+                    startedAt,
+                    now,
+                    pr.record.producedOutputs(),
+                    reason
             );
             store.savePartition(pr.record);
             eventHub.publish("partition.lost", pr.record.sessionId(), pr.record.partitionId(), previousWorkerId, Map.of(
@@ -567,17 +792,14 @@ public final class BrokerSessionCoordinator {
             int nextAttempt = pr.retriesUsed + 1;
             long now = System.currentTimeMillis();
             pr.lastProgressAt = now;
-            pr.record = new PartitionRecord(
-                    pr.record.partitionId(),
-                    pr.record.sessionId(),
+            pr.record = pr.buildRecord(
                     matchingWorker.workerId,
                     PartitionState.ASSIGNED,
                     nextAttempt,
-                    pr.record.estimatedDurationMs(),
                     now,
                     0L,
-                    pr.record.requiredCapabilities(),
-                    pr.record.workUnits()
+                    List.of(),
+                    null
             );
             store.savePartition(pr.record);
 
@@ -716,6 +938,106 @@ public final class BrokerSessionCoordinator {
         ));
     }
 
+    private void refreshRunningSessionSummary(SessionRuntime session) {
+        if (session == null || session.record.status() != SessionStatus.RUNNING) {
+            return;
+        }
+        int passed = 0;
+        int failed = 0;
+        int skipped = 0;
+        long serialMs = 0L;
+        for (TestExecutionRecord exec : session.latestExecutionsByTest.values()) {
+            serialMs += Math.max(0L, exec.durationMs());
+            if (exec.status() == TestOutcomeStatus.PASSED) {
+                passed++;
+            } else if (exec.status() == TestOutcomeStatus.FAILED) {
+                failed++;
+            } else if (exec.status() == TestOutcomeStatus.SKIPPED) {
+                skipped++;
+            }
+        }
+        int executedTests = passed + failed + skipped;
+        int totalTests = Math.max(session.submittedUnitCount, executedTests);
+        int totalBlobs = session.cachedBlobs + session.uploadedBlobs;
+        SessionSummary summary = new SessionSummary(
+                totalTests,
+                passed,
+                failed,
+                skipped,
+                totalBlobs,
+                session.cachedBlobs,
+                serialMs,
+                0L
+        );
+        store.updateSessionStatus(session.record.sessionId(), SessionStatus.RUNNING, 0L, summary);
+        session.record = store.findSession(session.record.sessionId()).orElse(session.record);
+    }
+
+    private static SessionSummary computeSessionSummary(SessionRuntime session, CompleteSessionRequest request, long finishedAt) {
+        int passed = 0;
+        int failed = 0;
+        int skipped = 0;
+        long serialMs = 0L;
+
+        int recordedLocalPassed = 0;
+        int recordedLocalFailed = 0;
+        int recordedLocalSkipped = 0;
+        long recordedLocalSerialMs = 0L;
+
+        for (TestExecutionRecord exec : session.latestExecutionsByTest.values()) {
+            long dur = Math.max(0L, exec.durationMs());
+            serialMs += dur;
+            boolean isLocal = "local".equals(exec.partitionId());
+            if (isLocal) {
+                recordedLocalSerialMs += dur;
+            }
+            if (exec.status() == TestOutcomeStatus.PASSED) {
+                passed++;
+                if (isLocal) {
+                    recordedLocalPassed++;
+                }
+            } else if (exec.status() == TestOutcomeStatus.FAILED) {
+                failed++;
+                if (isLocal) {
+                    recordedLocalFailed++;
+                }
+            } else if (exec.status() == TestOutcomeStatus.SKIPPED) {
+                skipped++;
+                if (isLocal) {
+                    recordedLocalSkipped++;
+                }
+            }
+        }
+
+        if (request != null) {
+            passed += Math.max(0, request.localPassedTests() - recordedLocalPassed);
+            failed += Math.max(0, request.localFailedTests() - recordedLocalFailed);
+            skipped += Math.max(0, request.localSkippedTests() - recordedLocalSkipped);
+            serialMs += Math.max(0L, request.localSerialDurationMs() - recordedLocalSerialMs);
+        }
+
+        int totalTests = passed + failed + skipped;
+        int totalBlobs = session.cachedBlobs + session.uploadedBlobs;
+        long wallMs = Math.max(0L, finishedAt - session.record.startedAt());
+        return new SessionSummary(
+                totalTests,
+                passed,
+                failed,
+                skipped,
+                totalBlobs,
+                session.cachedBlobs,
+                serialMs,
+                wallMs
+        );
+    }
+
+    private static String testIdentityKey(String workUnitKey, String className, String testName) {
+        String keyPart = (workUnitKey != null && !workUnitKey.isBlank()) ? workUnitKey : "";
+        String cls = (className != null && !className.isBlank()) ? className : "";
+        String tst = (testName != null && !testName.isBlank()) ? testName : "";
+        return keyPart + "|" + cls + "#" + tst;
+    }
+
     private SessionRuntime getOrRehydrateSession(String sessionId) {
         SessionRuntime existing = sessions.get(sessionId);
         if (existing != null) {
@@ -732,8 +1054,21 @@ public final class BrokerSessionCoordinator {
                 config.defaultMaxRetries());
         rehydrated.cachedBlobs = Math.max(0, record.cachedBlobs());
         rehydrated.uploadedBlobs = Math.max(0, record.totalBlobs() - record.cachedBlobs());
+        Set<String> seenPartitionIds = new HashSet<>();
         for (PartitionRecord part : store.listPartitions(sessionId)) {
-            rehydrated.partitionIds.add(part.partitionId());
+            if (seenPartitionIds.add(part.partitionId())) {
+                rehydrated.partitionIds.add(part.partitionId());
+                rehydrated.submittedUnitCount += part.workUnits().size();
+            }
+        }
+        for (TestExecutionRecord exec : store.listTestExecutions(sessionId)) {
+            rehydrated.recordExecution(exec);
+            if ("local".equals(exec.partitionId())) {
+                rehydrated.reportedLocalTestCount++;
+                if (exec.workUnitKey() != null && !exec.workUnitKey().isBlank()) {
+                    rehydrated.locallyExecutedWorkUnitKeys.add(exec.workUnitKey());
+                }
+            }
         }
         sessions.put(sessionId, rehydrated);
         return rehydrated;
@@ -764,13 +1099,39 @@ public final class BrokerSessionCoordinator {
         private final int maxPartitionSize;
         private final int maxRetries;
         private final List<String> partitionIds = new ArrayList<>();
+        private final Set<String> failedOrInterruptedTests = new HashSet<>();
+        private final Map<String, TestExecutionRecord> latestExecutionsByTest = new LinkedHashMap<>();
+        private final Set<String> locallyExecutedWorkUnitKeys = new HashSet<>();
         private int cachedBlobs;
         private int uploadedBlobs;
+        private int submittedUnitCount;
+        private int reportedLocalTestCount;
 
         private SessionRuntime(BuildSessionRecord record, int maxPartitionSize, int maxRetries) {
             this.record = record;
             this.maxPartitionSize = maxPartitionSize;
             this.maxRetries = maxRetries;
+        }
+
+        private int nextAttemptFor(String key) {
+            TestExecutionRecord previous = latestExecutionsByTest.get(key);
+            return previous == null ? 1 : previous.attempt() + 1;
+        }
+
+        private void recordExecution(TestExecutionRecord exec) {
+            String key = testIdentityKey(exec.workUnitKey(), exec.className(), exec.testName());
+            if ("|#".equals(key)) {
+                key = exec.id();
+            }
+            if (exec.status() == TestOutcomeStatus.FAILED) {
+                failedOrInterruptedTests.add(key);
+            }
+            TestExecutionRecord previous = latestExecutionsByTest.get(key);
+            if (previous == null
+                    || exec.attempt() > previous.attempt()
+                    || (exec.attempt() == previous.attempt() && exec.recordedAt() >= previous.recordedAt())) {
+                latestExecutionsByTest.put(key, exec);
+            }
         }
     }
 
@@ -780,6 +1141,7 @@ public final class BrokerSessionCoordinator {
         private final List<ArtifactRef> classpathArtifacts;
         private final Map<String, String> systemProperties;
         private final List<WorkspaceFileSet> inputArtifacts;
+        private final List<String> inputPaths;
         private final List<String> outputPaths;
         private final boolean forkWorkspace;
         private final String workingDirectory;
@@ -788,6 +1150,8 @@ public final class BrokerSessionCoordinator {
         private long lastProgressAt = System.currentTimeMillis();
         /** Connection of the worker currently holding this partition; {@code null} while not assigned. */
         private String activeConnectionId;
+        /** Test key currently STARTED on this partition attempt and not yet completed. */
+        private String inFlightTestKey;
         /** Worker that received the most recent attempt. */
         private String lastAssignedWorkerId;
         /** Workers that received an attempt before the current one. */
@@ -798,6 +1162,7 @@ public final class BrokerSessionCoordinator {
                                  List<ArtifactRef> classpathArtifacts,
                                  Map<String, String> systemProperties,
                                  List<WorkspaceFileSet> inputArtifacts,
+                                 List<String> inputPaths,
                                  List<String> outputPaths,
                                  boolean forkWorkspace,
                                  String workingDirectory,
@@ -807,10 +1172,39 @@ public final class BrokerSessionCoordinator {
             this.classpathArtifacts = classpathArtifacts;
             this.systemProperties = systemProperties;
             this.inputArtifacts = inputArtifacts;
+            this.inputPaths = inputPaths;
             this.outputPaths = outputPaths;
             this.forkWorkspace = forkWorkspace;
             this.workingDirectory = workingDirectory;
             this.maxRetries = maxRetries;
+        }
+
+        private PartitionRecord buildRecord(String workerId,
+                                            PartitionState state,
+                                            int attempt,
+                                            long startedAt,
+                                            long finishedAt,
+                                            List<String> producedOutputs,
+                                            String errorMessage) {
+            return new PartitionRecord(
+                    record.partitionId(),
+                    record.sessionId(),
+                    workerId,
+                    state,
+                    attempt,
+                    record.estimatedDurationMs(),
+                    startedAt,
+                    finishedAt,
+                    record.requiredCapabilities(),
+                    record.workUnits(),
+                    moduleName,
+                    forkWorkspace,
+                    workingDirectory,
+                    inputPaths,
+                    outputPaths,
+                    producedOutputs,
+                    errorMessage
+            );
         }
     }
 

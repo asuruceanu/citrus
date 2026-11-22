@@ -91,6 +91,42 @@ class DistributionBrokerUiTest {
                     HttpResponse.BodyHandlers.ofString());
             assertThat(seedResp.statusCode()).isEqualTo(200);
             assertThat(seedResp.body()).contains("\"seededSessions\":6");
+
+            HttpResponse<String> detailResp = client.send(
+                    HttpRequest.newBuilder(URI.create(server.baseUrl() + "/api/v1/sessions/sess-citrus-main-942"))
+                            .header("Authorization", "Bearer ui-token")
+                            .GET()
+                            .build(),
+                    HttpResponse.BodyHandlers.ofString());
+            assertThat(detailResp.statusCode()).isEqualTo(200);
+            assertThat(detailResp.body())
+                    .contains("\"partitionId\":\"part-942-01\"")
+                    .contains("httpOrderServer");
+
+            HttpResponse<String> prDetailResp = client.send(
+                    HttpRequest.newBuilder(URI.create(server.baseUrl() + "/api/v1/sessions/sess-citrus-pr-2108"))
+                            .header("Authorization", "Bearer ui-token")
+                            .GET()
+                            .build(),
+                    HttpResponse.BodyHandlers.ofString());
+            assertThat(prDetailResp.statusCode()).isEqualTo(200);
+            assertThat(prDetailResp.body())
+                    .contains("\"partitionId\":\"part-902\"")
+                    .contains("\"forkWorkspace\":true")
+                    .contains("\"producedOutputs\":[\"target/citrus-reports\"]")
+                    .contains("Worker disconnected during execution");
+
+            HttpResponse<String> historyResp = client.send(
+                    HttpRequest.newBuilder(URI.create(server.baseUrl() + "/api/v1/tests/history?limit=25"))
+                            .header("Authorization", "Bearer ui-token")
+                            .GET()
+                            .build(),
+                    HttpResponse.BodyHandlers.ofString());
+            assertThat(historyResp.statusCode()).isEqualTo(200);
+            assertThat(historyResp.body())
+                    .contains("\"passedRuns\":")
+                    .contains("\"maxDurationMs\":")
+                    .contains("\"lastStatus\":\"PASSED\"");
         }
     }
 }
