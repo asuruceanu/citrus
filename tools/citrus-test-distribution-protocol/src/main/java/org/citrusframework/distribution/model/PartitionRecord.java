@@ -29,6 +29,53 @@ public record PartitionRecord(
         long startedAt,
         long finishedAt,
         Map<String, String> requiredCapabilities,
-        List<WorkUnitSpec> workUnits
+        List<WorkUnitSpec> workUnits,
+        String moduleName,
+        boolean forkWorkspace,
+        String workingDirectory,
+        List<String> inputPaths,
+        List<String> outputPaths,
+        List<String> producedOutputs,
+        String errorMessage
 ) {
+
+    public PartitionRecord {
+        requiredCapabilities = requiredCapabilities == null ? Map.of() : Map.copyOf(requiredCapabilities);
+        workUnits = workUnits == null ? List.of() : List.copyOf(workUnits);
+        workingDirectory = workingDirectory == null ? "" : workingDirectory;
+        inputPaths = inputPaths == null ? List.of() : List.copyOf(inputPaths);
+        outputPaths = outputPaths == null ? List.of() : List.copyOf(outputPaths);
+        producedOutputs = producedOutputs == null ? List.of() : List.copyOf(producedOutputs);
+    }
+
+    public PartitionRecord(String partitionId,
+                           String sessionId,
+                           String workerId,
+                           PartitionState state,
+                           int attempt,
+                           long estimatedDurationMs,
+                           long startedAt,
+                           long finishedAt,
+                           Map<String, String> requiredCapabilities,
+                           List<WorkUnitSpec> workUnits) {
+        this(
+                partitionId,
+                sessionId,
+                workerId,
+                state,
+                attempt,
+                estimatedDurationMs,
+                startedAt,
+                finishedAt,
+                requiredCapabilities,
+                workUnits,
+                null,
+                false,
+                "",
+                List.of(),
+                List.of(),
+                List.of(),
+                null
+        );
+    }
 }
