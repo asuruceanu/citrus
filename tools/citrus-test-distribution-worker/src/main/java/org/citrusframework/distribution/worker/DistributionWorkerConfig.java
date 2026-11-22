@@ -125,7 +125,7 @@ public final class DistributionWorkerConfig {
     public static final class Builder {
         private String workerId = "worker-" + UUID.randomUUID().toString().substring(0, 8);
         private String hostName = resolveHostName();
-        private String brokerUrl = DistributionSettings.getBrokerUrl();
+        private String brokerUrl = normalizeBrokerBaseUrl(DistributionSettings.getBrokerUrl());
         private String authToken = DistributionSettings.getAuthToken();
         private Path cacheDir = java.nio.file.Paths.get(DistributionSettings.getCacheDir()).resolve("worker");
         private Map<String, String> capabilities = new LinkedHashMap<>(DistributionSettings.detectHostCapabilities(null));
@@ -157,9 +157,25 @@ public final class DistributionWorkerConfig {
 
         public Builder brokerUrl(String brokerUrl) {
             if (brokerUrl != null && !brokerUrl.isBlank()) {
-                this.brokerUrl = brokerUrl.replaceAll("/+$", "");
+                this.brokerUrl = normalizeBrokerBaseUrl(brokerUrl);
             }
             return this;
+        }
+
+        private static String normalizeBrokerBaseUrl(String rawUrl) {
+            if (rawUrl == null || rawUrl.isBlank()) {
+                return DistributionSettings.DEFAULT_BROKER_URL;
+            }
+            String normalized = rawUrl.trim().replaceAll("/+$", "");
+            if (normalized.startsWith("wss://")) {
+                normalized = "https://" + normalized.substring("wss://".length());
+            } else if (normalized.startsWith("ws://")) {
+                normalized = "http://" + normalized.substring("ws://".length());
+            }
+            if (normalized.endsWith("/ws/v1/worker")) {
+                normalized = normalized.substring(0, normalized.length() - "/ws/v1/worker".length());
+            }
+            return normalized;
         }
 
         public Builder authToken(String authToken) {

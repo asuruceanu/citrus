@@ -284,6 +284,18 @@ class DistributionWorkerClientTest {
         }
     }
 
+    @Test
+    void shouldNormalizeWebSocketBrokerUrlsToHttpBaseUrl() {
+        assertThat(DistributionWorkerConfig.builder()
+                .brokerUrl("ws://127.0.0.1:18080/ws/v1/worker")
+                .build()
+                .brokerUrl()).isEqualTo("http://127.0.0.1:18080");
+        assertThat(DistributionWorkerConfig.builder()
+                .brokerUrl("wss://broker.example.org/ws/v1/worker/")
+                .build()
+                .brokerUrl()).isEqualTo("https://broker.example.org");
+    }
+
     private SessionDetailResponse awaitPartitionsCompletion(String baseUrl, String token, String sessionId, int expectedPartitions) throws Exception {
         long deadline = System.currentTimeMillis() + 10_000L;
         while (System.currentTimeMillis() < deadline) {

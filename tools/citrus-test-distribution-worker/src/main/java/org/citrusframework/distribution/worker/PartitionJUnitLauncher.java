@@ -27,6 +27,7 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Consumer;
 
+import org.citrusframework.distribution.config.CitrusEndpointCollector;
 import org.citrusframework.distribution.model.TestOutcomeStatus;
 import org.citrusframework.distribution.model.WorkUnitSpec;
 import org.citrusframework.distribution.model.WorkerTestEventPayload;
@@ -80,15 +81,19 @@ public final class PartitionJUnitLauncher {
         Thread thread = Thread.currentThread();
         ClassLoader previous = thread.getContextClassLoader();
         thread.setContextClassLoader(testClassLoader);
-        try {
+        try (CitrusEndpointCollector endpointCollector = CitrusEndpointCollector.install(testClassLoader)) {
             resetCitrusExtensionIfPresent(testClassLoader);
             List<String> unmatched = new ArrayList<>();
             for (WorkUnitSpec unit : workUnits) {
                 if (cancellationToken != null && cancellationToken.isCancellationRequested()) {
                     break;
                 }
-                boolean reported = executeWorkUnit(new EventFactory(partitionId, sessionId, attempt, unit), testClassLoader,
-                        cancellationToken, eventSink);
+                boolean reported = executeWorkUnit(
+                        new EventFactory(partitionId, sessionId, attempt, unit),
+                        testClassLoader,
+                        endpointCollector,
+                        cancellationToken,
+                        eventSink);
                 if (!reported && (cancellationToken == null || !cancellationToken.isCancellationRequested())) {
                     unmatched.add(unit.key() + " (" + (unit.methodName() != null ? unit.methodName() : unit.className()) + ")");
                 }
@@ -143,6 +148,7 @@ public final class PartitionJUnitLauncher {
      */
     private static boolean executeWorkUnit(EventFactory events,
                                            ClassLoader classLoader,
+                                           CitrusEndpointCollector endpointCollector,
                                            CancellationToken cancellationToken,
                                            Consumer<WorkerTestEventPayload> eventSink) throws ClassNotFoundException {
         WorkUnitSpec unit = events.unit();
@@ -158,7 +164,7 @@ public final class PartitionJUnitLauncher {
                     .selectors(selector)
                     .configurationParameter("junit.platform.launcher.interceptors.enabled", "false")
                     .build();
-            EventListener listener = new EventListener(events, eventSink);
+            EventListener listener = new EventListener(events, endpointCollector, eventSink);
             LauncherExecutionRequestBuilder execution = LauncherExecutionRequestBuilder.request(discoveryRequest)
                     .listeners(listener);
             if (cancellationToken != null) {
@@ -199,10 +205,10 @@ public final class PartitionJUnitLauncher {
     private record EventFactory(String partitionId, String sessionId, int attempt, WorkUnitSpec unit) {
 
         WorkerTestEventPayload event(TestIdentifier identifier, TestOutcomeStatus status, long durationMs,
-                                     String errorMessage, String stackTrace) {
+                                     String errorMessage, String stackTrace, List<String> endpoints) {
             return new WorkerTestEventPayload(partitionId, sessionId, attempt, unit.key(),
                     resolveClassName(identifier, unit.className()), identifier.getDisplayName(), status, durationMs,
-                    errorMessage, stackTrace, List.of());
+                    errorMessage, stackTrace, endpoints != null ? endpoints : List.of());
         }
 
         private static String resolveClassName(TestIdentifier identifier, String fallback) {
@@ -224,12 +230,17 @@ public final class PartitionJUnitLauncher {
     private static final class EventListener implements TestExecutionListener {
 
         private final EventFactory events;
+        private final CitrusEndpointCollector endpointCollector;
         private final Consumer<WorkerTestEventPayload> eventSink;
         private final Map<String, Long> startTimes = new ConcurrentHashMap<>();
         private volatile boolean reported;
 
-        private EventListener(EventFactory events, Consumer<WorkerTestEventPayload> eventSink) {
+        private EventListener(
+                EventFactory events,
+                CitrusEndpointCollector endpointCollector,
+                Consumer<WorkerTestEventPayload> eventSink) {
             this.events = events;
+            this.endpointCollector = endpointCollector;
             this.eventSink = eventSink;
         }
 
@@ -237,8 +248,9 @@ public final class PartitionJUnitLauncher {
         public void executionStarted(TestIdentifier testIdentifier) {
             if (testIdentifier.isTest()) {
                 reported = true;
+                endpointCollector.startTest();
                 startTimes.put(testIdentifier.getUniqueId(), System.currentTimeMillis());
-                eventSink.accept(events.event(testIdentifier, TestOutcomeStatus.STARTED, 0L, null, null));
+                eventSink.accept(events.event(testIdentifier, TestOutcomeStatus.STARTED, 0L, null, null, List.of()));
             }
         }
 
@@ -246,7 +258,7 @@ public final class PartitionJUnitLauncher {
         public void executionSkipped(TestIdentifier testIdentifier, String reason) {
             if (testIdentifier.isTest() || testIdentifier.getSource().isPresent()) {
                 reported = true;
-                eventSink.accept(events.event(testIdentifier, TestOutcomeStatus.SKIPPED, 0L, reason, null));
+                eventSink.accept(events.event(testIdentifier, TestOutcomeStatus.SKIPPED, 0L, reason, null, List.of()));
             }
         }
 
@@ -257,7 +269,8 @@ public final class PartitionJUnitLauncher {
                     reported = true;
                     eventSink.accept(events.event(testIdentifier, TestOutcomeStatus.FAILED, 0L,
                             result.getThrowable().map(Throwable::getMessage).orElse("Container failed"),
-                            result.getThrowable().map(EventListener::formatStackTrace).orElse(null)));
+                            result.getThrowable().map(EventListener::formatStackTrace).orElse(null),
+                            endpointCollector.drainEndpoints()));
                 }
                 return;
             }
@@ -269,7 +282,8 @@ public final class PartitionJUnitLauncher {
             };
             eventSink.accept(events.event(testIdentifier, status, Math.max(0L, System.currentTimeMillis() - started),
                     result.getThrowable().map(Throwable::getMessage).orElse(null),
-                    result.getThrowable().map(EventListener::formatStackTrace).orElse(null)));
+                    result.getThrowable().map(EventListener::formatStackTrace).orElse(null),
+                    endpointCollector.drainEndpoints()));
         }
 
         private static String formatStackTrace(Throwable throwable) {
