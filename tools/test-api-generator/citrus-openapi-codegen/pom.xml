@@ -19,6 +19,8 @@
 
   <properties>
     <openapi-java-folder>${project.build.directory}/openapi-java-resources</openapi-java-folder>
+    <!-- Citrus Test Distribution: see the External Test Resources section of the user manual. -->
+    <citrus.test.distribution.inputs>target/generated-test-sources</citrus.test.distribution.inputs>
   </properties>
 
   <dependencies>

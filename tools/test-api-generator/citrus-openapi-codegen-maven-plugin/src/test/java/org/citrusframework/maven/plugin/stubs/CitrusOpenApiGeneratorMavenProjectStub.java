@@ -30,7 +30,7 @@ public class CitrusOpenApiGeneratorMavenProjectStub extends MavenProjectStub {
     private void initModel() {
         MavenXpp3Reader reader = new MavenXpp3Reader();
         try {
-            setModel(reader.read(new FileReader("pom.xml")));
+            setModel(reader.read(new FileReader(new File(PlexusTestCase.getBasedir(), "pom.xml"))));
         } catch (IOException | XmlPullParserException e) {
             throw new IllegalArgumentException(e);
         }

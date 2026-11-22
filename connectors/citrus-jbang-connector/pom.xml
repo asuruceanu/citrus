@@ -13,7 +13,18 @@
   <artifactId>citrus-jbang-connector</artifactId>
   <name>Citrus :: Connectors :: JBang</name>
 
+  <properties>
+    <!-- Citrus Test Distribution: see the External Test Resources section of the user manual. -->
+    <citrus.test.distribution.fork>true</citrus.test.distribution.fork>
+  </properties>
+
   <dependencies>
+    <dependency>
+      <groupId>org.citrusframework</groupId>
+      <artifactId>citrus-test-distribution-protocol</artifactId>
+      <version>${project.version}</version>
+      <scope>test</scope>
+    </dependency>
     <dependency>
       <groupId>org.citrusframework</groupId>
       <artifactId>citrus-base</artifactId>

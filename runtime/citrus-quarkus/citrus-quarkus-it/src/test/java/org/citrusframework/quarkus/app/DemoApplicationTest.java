@@ -27,6 +27,7 @@ import org.citrusframework.annotations.CitrusEndpoint;
 import org.citrusframework.annotations.CitrusFramework;
 import org.citrusframework.annotations.CitrusResource;
 import org.citrusframework.context.TestContext;
+import org.citrusframework.distribution.annotations.LocalOnly;
 import org.citrusframework.endpoint.direct.DirectEndpoint;
 import org.citrusframework.endpoint.direct.DirectEndpointBuilder;
 import org.citrusframework.endpoint.direct.annotation.DirectEndpointConfig;
@@ -43,6 +44,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 
 @QuarkusTest
+@LocalOnly(reason = "Quarkus bootstraps the application from the local project layout and Maven repository")
 @CitrusSupport(applicationPropertiesSupplier = DemoApplicationTest.class)
 public class DemoApplicationTest implements ApplicationPropertiesSupplier, TestActionSupport {
 

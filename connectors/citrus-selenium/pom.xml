@@ -39,6 +39,11 @@
     </plugins>
   </build>
 
+  <properties>
+    <!-- Citrus Test Distribution: see the External Test Resources section of the user manual. -->
+    <citrus.test.distribution.fork>true</citrus.test.distribution.fork>
+  </properties>
+
   <dependencies>
     <dependency>
       <groupId>org.citrusframework</groupId>

@@ -12,6 +12,11 @@
   <artifactId>citrus-camel</artifactId>
   <name>Citrus :: Endpoints :: Apache Camel</name>
 
+  <properties>
+    <!-- Citrus Test Distribution: see the External Test Resources section of the user manual. -->
+    <citrus.test.distribution.fork>true</citrus.test.distribution.fork>
+  </properties>
+
   <dependencies>
     <dependency>
       <groupId>org.citrusframework</groupId>
