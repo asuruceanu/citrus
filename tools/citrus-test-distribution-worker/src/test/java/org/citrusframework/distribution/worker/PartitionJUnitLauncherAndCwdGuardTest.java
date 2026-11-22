@@ -310,6 +310,22 @@ class PartitionJUnitLauncherAndCwdGuardTest {
     }
 
     @Test
+    void shouldIgnoreChangesToPreExistingTopLevelFilesSuchAsTheWorkersOwnLog() throws Exception {
+        Path root = Files.createDirectories(tempDir.resolve("worker-cwd"));
+        Path log = Files.writeString(root.resolve("worker.log"), "start\n");
+        Files.createDirectories(root.resolve("target"));
+        IsolatedPartitionRunner.WorkingDirectorySnapshot before = IsolatedPartitionRunner.WorkingDirectorySnapshot.take(root, null);
+
+        Files.writeString(log, "more log lines\n", java.nio.file.StandardOpenOption.APPEND);
+        log.toFile().setLastModified(System.currentTimeMillis() + 5_000);
+        Files.writeString(root.resolve("new-file.txt"), "x");
+        Files.writeString(root.resolve("target/written.txt"), "x");
+
+        assertThat(before.changedEntries(IsolatedPartitionRunner.WorkingDirectorySnapshot.take(root, null)))
+                .containsExactly("new-file.txt", "target" + java.io.File.separator + "written.txt");
+    }
+
+    @Test
     void shouldExposeForkAndCwdSettingsAndAdvertiseWorkspaceCapability() {
         DistributionWorkerConfig defaults = DistributionWorkerConfig.builder().cacheDir(tempDir).build();
         assertThat(defaults.forkMode()).isEqualTo(WorkerForkMode.AUTO);

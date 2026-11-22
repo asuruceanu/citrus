@@ -157,7 +157,7 @@ final class ForkedPartitionRunner implements PartitionRunner {
             new SecureRandom().nextBytes(secret);
             String token = HexFormat.of().formatHex(secret);
             Map<String, String> properties = new LinkedHashMap<>(
-                    IsolatedPartitionRunner.partitionOverrides(assignment.systemProperties(), workspace));
+                    IsolatedPartitionRunner.workspaceOverrides(assignment.systemProperties(), workspace));
             properties.put(DistributionSettings.ROLE_PROPERTY, DistributionSettings.ROLE_WORKER);
             Path request = ipc.resolve("request.json");
             writeOwnerOnly(request, DistributionJson.toJson(new ForkedPartitionMain.ForkRequest(assignment.partitionId(),
@@ -178,6 +178,8 @@ final class ForkedPartitionRunner implements PartitionRunner {
                 return new IsolatedPartitionRunner.PartitionExecutionResult(false, crashDiagnostic(fork));
             }
             awaitExit(fork, POST_RESULT_EXIT_WAIT_MS);
+            // Processes left behind by tests must not keep writing while outputs are hashed and packaged.
+            fork.killAll();
             if (!summary.success()) {
                 return new IsolatedPartitionRunner.PartitionExecutionResult(false, summary.errorMessage());
             }
@@ -327,9 +329,9 @@ final class ForkedPartitionRunner implements PartitionRunner {
             return workspace;
         }
         Path directory = workspace.resolve(WorkspacePackager.validateRelativePath(relative));
-        Path link = BlobCacheDirectory.isLinkLike(directory) ? directory : null;
+        Path link = BlobCacheDirectory.findSymlinkComponent(workspace, directory);
         if (link != null) {
-            throw new IllegalArgumentException("Working directory '" + relative + "' is a link");
+            throw new IllegalArgumentException("Working directory '" + relative + "' passes through a link: " + link);
         }
         return Files.createDirectories(directory);
     }

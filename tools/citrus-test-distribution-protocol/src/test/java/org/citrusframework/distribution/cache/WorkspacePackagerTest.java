@@ -147,6 +147,24 @@ class WorkspacePackagerTest {
     }
 
     @Test
+    void shouldLeaveExcludedDirectoriesOutOfDirectoryInputs(@TempDir Path tempDir) throws Exception {
+        BlobCacheDirectory cache = new BlobCacheDirectory(tempDir.resolve("cache"));
+        Path baseDir = Files.createDirectories(tempDir.resolve("module"));
+        Files.createDirectories(baseDir.resolve("target/generated"));
+        Files.writeString(baseDir.resolve("target/generated/a.txt"), "a");
+        Files.createDirectories(baseDir.resolve("target/.citrus-dist/cache/blobs"));
+        Files.writeString(baseDir.resolve("target/.citrus-dist/cache/blobs/x"), "blob");
+
+        WorkspaceFileSet target = WorkspacePackager.packageInputToCache(cache, baseDir, "target", false,
+                List.of("target/.citrus-dist")).orElseThrow();
+        Path workspace = Files.createDirectories(tempDir.resolve("ws"));
+        assertThat(WorkspacePackager.materializeIntoDirectory(cache, target, workspace))
+                .extracting(MaterializedEntry::workspaceRelativePath)
+                .containsExactly("target/generated/a.txt");
+        assertThat(workspace.resolve("target/.citrus-dist")).doesNotExist();
+    }
+
+    @Test
     void shouldPackageAndMaterializeSingleRegularFileInput(@TempDir Path tempDir) throws Exception {
         BlobCacheDirectory cache = new BlobCacheDirectory(tempDir.resolve("cache"));
         Path baseDir = Files.createDirectories(tempDir.resolve("module"));

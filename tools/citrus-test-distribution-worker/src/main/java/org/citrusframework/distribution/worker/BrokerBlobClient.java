@@ -56,10 +56,6 @@ final class BrokerBlobClient {
                 .build();
     }
 
-    BlobCacheDirectory cache() {
-        return blobCache;
-    }
-
     /**
      * Makes sure {@code sha256} is in the local cache with verified content, downloading it from the coordinator if
      * absent or corrupted (once more if the download fails verification). Digests verified in this JVM are not hashed

@@ -342,7 +342,7 @@ public class BlobCacheDirectory {
      * (including {@code target} itself) that is a symbolic link, or {@code null} if there is none.
      * {@code target} must be located under {@code root}.
      */
-    static Path findSymlinkComponent(Path root, Path target) {
+    public static Path findSymlinkComponent(Path root, Path target) {
         Path current = root;
         for (Path name : root.relativize(target)) {
             current = current.resolve(name);

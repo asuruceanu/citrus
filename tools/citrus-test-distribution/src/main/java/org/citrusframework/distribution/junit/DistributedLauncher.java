@@ -480,6 +480,15 @@ public class DistributedLauncher implements Launcher {
         static String relativeWorkingDirectory(Path hostBaseDir, Path userDir) {
             Path base = hostBaseDir.toAbsolutePath().normalize();
             Path cwd = userDir.toAbsolutePath().normalize();
+            if (!cwd.startsWith(base)) {
+                // The two may differ only by a symbolic link (e.g. /var vs /private/var on macOS).
+                try {
+                    base = base.toRealPath();
+                    cwd = cwd.toRealPath();
+                } catch (IOException | SecurityException e) {
+                    return "";
+                }
+            }
             if (!cwd.startsWith(base) || cwd.equals(base)) {
                 return "";
             }
@@ -490,6 +499,10 @@ public class DistributedLauncher implements Launcher {
          * The host cache directory relative to the module, when it lies inside it, so remote outputs cannot target it.
          */
         List<String> cacheExclusion() {
+            return cacheExclusion(hostBaseDir, cache);
+        }
+
+        private static List<String> cacheExclusion(Path hostBaseDir, BlobCacheDirectory cache) {
             Path cacheRoot = cache.getRootDir();
             return cacheRoot.startsWith(hostBaseDir) && !cacheRoot.equals(hostBaseDir)
                     ? List.of(hostBaseDir.relativize(cacheRoot).toString().replace('\\', '/'))
@@ -499,15 +512,19 @@ public class DistributedLauncher implements Launcher {
         static WorkspaceSettings resolve() {
             Path hostBaseDir = resolveHostBaseDir();
             String cacheDir = setting(DistributionSettings.CACHE_DIR_PROPERTY, DistributionSettings.CACHE_DIR_ENV);
+            // A relative cache directory lives under target/, keeping the module root free of tool directories.
             BlobCacheDirectory cache = new BlobCacheDirectory(cacheDir != null && !cacheDir.isBlank()
-                    ? hostBaseDir.resolve(cacheDir)
+                    ? hostBaseDir.resolve("target").resolve(cacheDir)
                     : hostBaseDir.resolve("target").resolve(".citrus-dist").resolve("cache"));
+            List<String> internal = new ArrayList<>(List.of("target/.citrus-dist-outputs", "target/.citrus-dist"));
+            internal.addAll(cacheExclusion(hostBaseDir, cache));
 
+            List<DistributionSettings.DeclaredPathSpec> declaredInputs = DistributionSettings.parseDeclaredPaths(
+                    setting(DistributionSettings.INPUTS_PROPERTY, DistributionSettings.INPUTS_ENV));
             List<WorkspaceFileSet> inputs = new ArrayList<>();
-            for (DistributionSettings.DeclaredPathSpec input : DistributionSettings.parseDeclaredPaths(
-                    setting(DistributionSettings.INPUTS_PROPERTY, DistributionSettings.INPUTS_ENV))) {
+            for (DistributionSettings.DeclaredPathSpec input : declaredInputs) {
                 try {
-                    WorkspacePackager.packageInputToCache(cache, hostBaseDir, input.relativePath(), input.optional())
+                    WorkspacePackager.packageInputToCache(cache, hostBaseDir, input.relativePath(), input.optional(), internal)
                             .ifPresent(inputs::add);
                 } catch (IOException e) {
                     throw new java.io.UncheckedIOException("Failed to package declared input '" + input.relativePath() + "'", e);
@@ -519,21 +536,19 @@ public class DistributedLauncher implements Launcher {
                     .toList();
             for (String output : outputs) {
                 // Outputs are never written through links; fail now rather than after the remote run.
-                Path current = hostBaseDir;
-                for (Path name : Path.of(output)) {
-                    current = current.resolve(name);
-                    if (BlobCacheDirectory.isLinkLike(current)) {
-                        throw new IllegalArgumentException("Declared output '" + output
-                                + "' passes through a symbolic link or junction: " + current);
-                    }
+                Path link = BlobCacheDirectory.findSymlinkComponent(hostBaseDir, hostBaseDir.resolve(output));
+                if (link != null) {
+                    throw new IllegalArgumentException("Declared output '" + output
+                            + "' passes through a symbolic link or junction: " + link);
                 }
             }
             boolean fork = DistributionSettings.parseForkWorkspace(
                     setting(DistributionSettings.FORK_PROPERTY, DistributionSettings.FORK_ENV));
             PartitionPolicy policy = DistributionSettings.parsePartitionPolicy(
                     setting(DistributionSettings.PARTITION_POLICY_PROPERTY, DistributionSettings.PARTITION_POLICY_ENV));
+            // Declaring inputs implies a forked JVM, even when only optional inputs were declared and none exist.
             return new WorkspaceSettings(hostBaseDir, cache, List.copyOf(inputs), outputs,
-                    fork || !inputs.isEmpty() || !outputs.isEmpty(), policy,
+                    fork || !declaredInputs.isEmpty() || !outputs.isEmpty(), policy,
                     relativeWorkingDirectory(hostBaseDir, Path.of(System.getProperty("user.dir", ""))));
         }
 

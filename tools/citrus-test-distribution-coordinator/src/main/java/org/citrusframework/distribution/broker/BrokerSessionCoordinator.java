@@ -127,9 +127,13 @@ public final class BrokerSessionCoordinator {
             return persisted.get();
         }
 
+        // Pre-workspace workers cannot materialize inputs, return outputs or expand the workspace token that hosts
+        // put into forwarded system properties.
         boolean needsWorkspace = request.forkWorkspace()
                 || !request.inputArtifacts().isEmpty()
-                || !request.outputPaths().isEmpty();
+                || !request.outputPaths().isEmpty()
+                || (request.systemProperties() != null && request.systemProperties().values().stream()
+                        .anyMatch(value -> value != null && value.contains(DistributionSettings.WORKSPACE_TOKEN)));
         List<WorkUnitSpec> units = request.workUnits() != null ? request.workUnits() : List.of();
         if (needsWorkspace) {
             units = units.stream().map(BrokerSessionCoordinator::requireWorkspaceCapability).toList();
@@ -380,8 +384,8 @@ public final class BrokerSessionCoordinator {
                     if (evt.status() != TestOutcomeStatus.STARTED) {
                         TestExecutionRecord execRecord = new TestExecutionRecord(
                                 UUID.randomUUID().toString(),
-                                evt.sessionId(),
-                                evt.partitionId(),
+                                pr.record.sessionId(),
+                                pr.record.partitionId(),
                                 conn.workerId,
                                 evt.workUnitKey(),
                                 evt.className(),
@@ -399,7 +403,8 @@ public final class BrokerSessionCoordinator {
                     }
                     @SuppressWarnings("unchecked")
                     Map<String, Object> evtData = DistributionJson.convert(evt, Map.class);
-                    eventHub.publish("test.event", evt.sessionId(), evt.partitionId(), conn.workerId, evtData);
+                    // Attribute to the partition's own session, not whatever session the payload claims.
+                    eventHub.publish("test.event", pr.record.sessionId(), pr.record.partitionId(), conn.workerId, evtData);
                 }
             }
             case WorkerWsMessage.PARTITION_COMPLETED -> {

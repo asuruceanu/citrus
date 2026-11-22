@@ -113,6 +113,17 @@ public final class WorkspacePackager {
      */
     public static Optional<WorkspaceFileSet> packageInputToCache(BlobCacheDirectory cache, Path baseDir,
                                                                  String rawRelativePath, boolean optional) throws IOException {
+        return packageInputToCache(cache, baseDir, rawRelativePath, optional, List.of());
+    }
+
+    /**
+     * Like {@link #packageInputToCache(BlobCacheDirectory, Path, String, boolean)}, leaving out everything at or below
+     * the module-relative {@code excludedPaths} (for example the host's own cache and staging directories under
+     * {@code target/} when an input covers {@code target}).
+     */
+    public static Optional<WorkspaceFileSet> packageInputToCache(BlobCacheDirectory cache, Path baseDir,
+                                                                 String rawRelativePath, boolean optional,
+                                                                 List<String> excludedPaths) throws IOException {
         String relative = validateRelativePath(rawRelativePath);
         Path base = baseDir.toAbsolutePath().normalize();
         Path target = resolveWithoutSymlinks(base, relative, "declared input");
@@ -128,7 +139,10 @@ public final class WorkspacePackager {
             return Optional.of(packageRegularFile(cache, relative, target));
         }
         if (attrs.isDirectory()) {
-            return Optional.of(packageEntries(cache, relative, target, ClasspathPackager.listEntries(target)));
+            List<String> entries = ClasspathPackager.listEntries(target).stream()
+                    .filter(entry -> !isExcluded(relative + "/" + stripSlash(entry), excludedPaths))
+                    .toList();
+            return Optional.of(packageEntries(cache, relative, target, entries));
         }
         throw new IllegalArgumentException("Declared input path '" + relative + "' is not a regular file or directory");
     }
@@ -252,6 +266,19 @@ public final class WorkspacePackager {
         return BlobCacheDirectory.extractZipSafely(blob, destination).stream()
                 .map(file -> new MaterializedEntry(relative + "/" + file.relativePath(), file.sha256(), file.file()))
                 .toList();
+    }
+
+    private static boolean isExcluded(String moduleRelative, List<String> excludedPaths) {
+        for (String excluded : excludedPaths) {
+            if (moduleRelative.equals(excluded) || moduleRelative.startsWith(excluded + "/")) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static String stripSlash(String entry) {
+        return entry.endsWith("/") ? entry.substring(0, entry.length() - 1) : entry;
     }
 
     private static Path resolveWithoutSymlinks(Path base, String relative, String description) {

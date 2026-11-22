@@ -295,14 +295,7 @@ final class HostOutputCommitter {
     }
 
     private Path linkOnPath(Path destination) {
-        Path current = hostBaseDir;
-        for (Path name : hostBaseDir.relativize(destination)) {
-            current = current.resolve(name);
-            if (BlobCacheDirectory.isLinkLike(current)) {
-                return current;
-            }
-        }
-        return null;
+        return BlobCacheDirectory.findSymlinkComponent(hostBaseDir, destination);
     }
 
     private static void copyPermissions(Path from, Path to) {

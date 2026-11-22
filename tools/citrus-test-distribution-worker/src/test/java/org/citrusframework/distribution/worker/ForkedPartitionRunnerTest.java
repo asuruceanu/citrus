@@ -70,7 +70,8 @@ class ForkedPartitionRunnerTest {
                     + System.getProperty("custom.dir"));
             String tmp = System.getProperty("java.io.tmpdir");
             check(File.separatorChar == '\\' || tmp.length() <= 40, "short tmpdir: " + tmp);
-            check(System.getProperty("citrus.report.directory").startsWith(basedir.toString()), "reports in workspace");
+            check(System.getProperty("citrus.report.directory") == null,
+                    "forked JVMs keep Citrus' default report directory (relative to the working directory, as locally)");
             check(DistributionSettings.ROLE_WORKER.equals(System.getProperty(DistributionSettings.ROLE_PROPERTY)), "role");
             Files.createDirectories(Path.of("target/docs"));
             Files.writeString(Path.of("target/docs/report.html"), "<html>report</html>");

@@ -188,6 +188,23 @@ class DistributedLauncherTest {
                 .isEqualTo("target/sub");
     }
 
+    @Test
+    void shouldResolveTheWorkingDirectoryThroughSymlinks() throws Exception {
+        Path real = Files.createDirectories(tempDir.resolve("real-module/target"));
+        Path link = Files.createSymbolicLink(tempDir.resolve("linked-module"), real.getParent());
+        assertThat(DistributedLauncher.WorkspaceSettings.relativeWorkingDirectory(link, real)).isEqualTo("target");
+    }
+
+    @Test
+    void shouldForkWhenOnlyMissingOptionalInputsAreDeclared() {
+        Path module = tempDir.resolve("module-optional");
+        System.setProperty(DistributionSettings.BASEDIR_PROPERTY, module.toString());
+        System.setProperty(DistributionSettings.INPUTS_PROPERTY, "?not/there");
+        DistributedLauncher.WorkspaceSettings settings = DistributedLauncher.WorkspaceSettings.resolve();
+        assertThat(settings.inputArtifacts()).isEmpty();
+        assertThat(settings.forkWorkspace()).as("declaring inputs implies a forked JVM").isTrue();
+    }
+
     private record Outcome(int passed, int failed) {
     }
 

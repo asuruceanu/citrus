@@ -365,6 +365,34 @@ class BrokerSessionCoordinatorTest {
     }
 
     @Test
+    void shouldGateSubmissionsCarryingTheWorkspaceTokenAwayFromLegacyWorkers() {
+        String sessionId = newSession(1);
+        Worker legacy = register("legacy", "worker-legacy", Map.of());
+        coordinator.submitWork(sessionId, new SubmitWorkRequest("sub-token", "module", List.of(),
+                Map.of("project.build.directory", DistributionSettings.WORKSPACE_TOKEN + "/target"),
+                List.of(unit("t.T")), 0, 0));
+        assertThat(legacy.assignments()).as("an older worker cannot expand the token").isEmpty();
+
+        Worker modern = register("modern", "worker-modern", WORKSPACE_CAPS);
+        assertThat(modern.assignments()).hasSize(1);
+    }
+
+    @Test
+    void shouldRecordTestEventsUnderThePartitionsOwnSession() {
+        String sessionId = newSession(1);
+        String otherSession = newSession(1);
+        Worker worker = register("conn-1", "worker-1", Map.of());
+        submit(sessionId, "sub-1", List.of(), List.of(), false, unit("a.A"));
+        PartitionAssignPayload assign = worker.lastAssignment();
+
+        worker.send(WorkerWsMessage.TEST_EVENT, DistributionJson.convert(new WorkerTestEventPayload(assign.partitionId(),
+                otherSession, 1, "key", "pkg.Test", "spoofed", TestOutcomeStatus.PASSED, 5L, null, null, List.of()), Map.class));
+
+        assertThat(store.listTestExecutions(otherSession)).isEmpty();
+        assertThat(store.listTestExecutions(sessionId)).extracting(e -> e.testName()).containsExactly("spoofed");
+    }
+
+    @Test
     void shouldGateOutputsOnlySubmissionsAwayFromLegacyWorkers() {
         String sessionId = newSession(1);
         Worker legacy = register("legacy", "worker-legacy", Map.of());

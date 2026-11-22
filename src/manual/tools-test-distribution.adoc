@@ -157,8 +157,8 @@ serialized within the JVM and across JVMs (lock file `target/.citrus-dist-output
 * A partition that crashed or did not complete fails the build, even when it reported no test results.
 
 Staging happens in `target/.citrus-dist-outputs/tx-*` and is removed afterwards; downloaded blobs are kept in
-`target/.citrus-dist/cache` (configurable with `citrus.test.distribution.cacheDir`, relative to the module) and are not
-evicted automatically. Workers keep their own cache in `<cacheDir>/worker`, relative to the worker's working directory
+`target/.citrus-dist/cache` (configurable with `citrus.test.distribution.cacheDir`; a relative value is resolved below
+the module's `target/`) and are not evicted automatically. Workers keep their own cache in `<cacheDir>/worker`, relative to the worker's working directory
 (default `.citrus-dist/cache/worker`).
 
 [[tools-test-distribution-external-resources-worker]]
@@ -175,7 +175,9 @@ evicted automatically. Workers keep their own cache in `<cacheDir>/worker`, rela
 |`-Xmx768m -XX:ActiveProcessorCount=2`
 |`citrus.test.distribution.worker.cwdCheck` / `CITRUS_DIST_WORKER_CWD_CHECK`
 |For partitions in the shared worker JVM: `FAIL` the partition, only `WARN`, or turn the check `OFF` when tests write
-into the worker's working directory. Use `WARN` when several daemons share a directory.
+into the worker's working directory (new top-level entries, or new or changed files below `target/` and `src/`; changes
+to files that already existed at the top level, such as the worker's own log, are ignored). Use `WARN` when several
+daemons share a directory.
 |`FAIL`
 |`citrus.test.distribution.worker.handshakeTimeoutMs`
 |How long a forked JVM may take to connect back to its worker.
@@ -188,9 +190,27 @@ partition (lease expiry, lost connection, worker shutdown) kills the forked JVM 
 uploaded from a cancelled or crashed run. The forked JVM's `java.io.tmpdir` is a short `/tmp/cdtmp-*` directory on POSIX
 systems so Unix domain socket paths stay within platform limits.
 
+[[tools-test-distribution-external-resources-compat]]
+=== Requirements and caveats
+
+* Partitions with inputs, outputs or `fork=true`, and partitions whose forwarded system properties contain the module
+path, are only assigned to workers of this version (capability `citrus.workspace.v1`). With only older workers they wait
+until the session times out.
+* Forked JVMs get `forkJvmArgs`, not Surefire's `argLine` or `environmentVariables`; set what the tests need through
+`forkJvmArgs` or system properties.
+* A local working directory outside the module (unusual) maps to the workspace root.
+* Without the Maven extension, invalid `fork` or `partitionPolicy` values are reported when the module runs distributed
+rather than at build start.
+* The forked JVM uses the worker's copy of the distribution protocol classes; keep hosts and workers on the same Citrus
+version.
+* Tests of a partition that crashed are missing from the Surefire reports; the build fails with the crash diagnostic.
+* Worker caches are not evicted automatically.
+
 [[tools-test-distribution-external-resources-limits]]
 === Limits
 
+* The same limits apply to classpath directories such as `target/test-classes` (packaged for every distributed module):
+no symbolic links or special files, valid names, at most 50,000 entries.
 * Each blob (a file, or a directory packaged as ZIP) is at most 256 MiB compressed; an archive holds at most 50,000
 entries, 256 MiB per entry and 2 GiB uncompressed in total.
 * Symbolic links and Windows junctions in inputs or outputs are rejected, as are absolute paths, `..`, `:` and Windows

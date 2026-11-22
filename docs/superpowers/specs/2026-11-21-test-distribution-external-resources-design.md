@@ -45,8 +45,15 @@ Implementation on branch `feature/test-distribution-external-resources` (commits
 
 ### 0.7 Rollout (§5.6) — re-derived, see the rewritten §5.6.
 
+### 0.7a Final-review adjustments
+- Submissions whose system properties contain `${citrus.dist.workspace}` also require `citrus.workspace.v1` (older workers cannot expand the token).
+- The in-process CWD check ignores modifications of entries that already existed at the top level (the worker's own log); new top-level entries and changes below `target/` and `src/` still count.
+- Forked partitions get token expansion and `basedir` only (no report/trace redirection): they already run in the local working directory.
+- `forkWorkspace` follows the *declared* inputs (a missing optional input still implies a fork); the working-directory calculation falls back to real paths; leftover processes are killed before outputs are packaged; host inputs leave out the host's internal directories; a relative host `cacheDir` resolves below `target/`; output downloads are size-capped while streaming; test events are attributed to the partition's own session; link checks share `BlobCacheDirectory.findSymlinkComponent`.
+
 ### 0.8 Known limitations added during implementation
-- Host cache and worker cache are not evicted. Crashed partitions' tests are absent from JUnit/Surefire reports (the build still fails). A pre-attempt worker cannot finish a retry of a partition it ran before (fails safely after lease expiry). Protocol classes in the child come from the worker, so client/worker protocol version skew moves to the module side. The rollout was verified locally (standard Maven); the fork-for-fixed-ports choices and leaving jbang `ListTest`/`CommandParityTest` unpinned are unverified on real workers.
+- Host cache and worker cache are not evicted. Crashed partitions' tests are absent from JUnit/Surefire reports (the build still fails). A pre-attempt worker cannot finish a retry of a partition it ran before (fails safely after lease expiry). Protocol classes in the child come from the worker, so client/worker protocol version skew moves to the module side. The rollout was verified locally (standard Maven); the fork-for-fixed-ports choices and leaving jbang `ListTest`/`CommandParityTest` unpinned are unverified on real workers. Not implemented: a NACK when a worker rejects an assignment (the lease expires instead) and a capability check that the coordinator understands workspace fields (a new host with an old coordinator silently loses inputs/outputs).
+- Acceptance criteria not verified by automated tests: AC-1 (child JVM arguments via `RuntimeMXBean`), AC-2 at >10,000 work units (tested with 25), AC-24 (fork start-up p95, zero-fork share), AC-25 (distributed-mode `verify` of the Citrus build). A real-worker smoke run is needed before enabling distribution in Citrus CI.
 
 ## 1. Intent and Why
 

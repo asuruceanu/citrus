@@ -203,10 +203,8 @@ public final class IsolatedPartitionRunner implements PartitionRunner {
      * relative to) the workspace.
      */
     static Map<String, String> partitionOverrides(Map<String, String> assigned, Path workspaceDir) {
-        Map<String, String> overrides = PathRewriter.expandWorkspaceProperties(
-                assigned != null ? assigned : Map.of(), workspaceDir);
+        Map<String, String> overrides = workspaceOverrides(assigned, workspaceDir);
         Path workspace = workspaceDir.toAbsolutePath().normalize();
-        overrides.put("basedir", workspace.toString());
         overrides.put(REPORT_DIRECTORY_PROPERTY,
                 workspaceRelative(workspace, overrides.get(REPORT_DIRECTORY_PROPERTY), "target/citrus-reports"));
         overrides.put(MESSAGE_TRACE_DIRECTORY_PROPERTY,
@@ -218,6 +216,18 @@ public final class IsolatedPartitionRunner implements PartitionRunner {
      * {@code configured} if absolute (or rooted, on Windows); otherwise resolved against the workspace, falling back
      * to {@code defaultRelative} when unset or when the relative path would leave the workspace.
      */
+    /**
+     * The assignment's properties with {@code ${citrus.dist.workspace}} expanded and {@code basedir} set to the
+     * workspace. Forked partitions use exactly this: they run in the local working directory, so Citrus' relative
+     * report defaults already resolve as they do locally.
+     */
+    static Map<String, String> workspaceOverrides(Map<String, String> assigned, Path workspaceDir) {
+        Map<String, String> overrides = PathRewriter.expandWorkspaceProperties(
+                assigned != null ? assigned : Map.of(), workspaceDir);
+        overrides.put("basedir", workspaceDir.toAbsolutePath().normalize().toString());
+        return overrides;
+    }
+
     private static String workspaceRelative(Path workspace, String configured, String defaultRelative) {
         Path fallback = workspace.resolve(defaultRelative);
         if (configured == null || configured.isBlank()) {
@@ -305,11 +315,20 @@ public final class IsolatedPartitionRunner implements PartitionRunner {
         }
 
         /**
-         * Entries of {@code after} that are new or whose size or modification time changed, sorted.
+         * Entries of {@code after} that are new, or that changed below {@code target/} or {@code src/}, sorted.
+         * Changes to entries that already existed at the top level are ignored: the worker daemon itself may append to
+         * files there (its own log, {@code nohup.out}) while a partition runs.
          */
         List<String> changedEntries(WorkingDirectorySnapshot after) {
             return after.entries().entrySet().stream()
-                    .filter(e -> !e.getValue().equals(entries.get(e.getKey())))
+                    .filter(e -> {
+                        String previous = entries.get(e.getKey());
+                        if (previous == null) {
+                            return true;
+                        }
+                        boolean topLevel = !e.getKey().contains("/") && !e.getKey().contains(java.io.File.separator);
+                        return !topLevel && !e.getValue().equals(previous);
+                    })
                     .map(Map.Entry::getKey)
                     .toList();
         }
