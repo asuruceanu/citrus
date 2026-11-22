@@ -26,6 +26,49 @@ public record SubmitWorkRequest(
         Map<String, String> systemProperties,
         List<WorkUnitSpec> workUnits,
         int cachedBlobs,
-        int uploadedBlobs
+        int uploadedBlobs,
+        List<WorkspaceFileSet> inputArtifacts,
+        List<String> outputPaths,
+        boolean forkWorkspace,
+        PartitionPolicy partitionPolicy,
+        String workingDirectory
 ) {
+
+    /**
+     * Normalizes absent values. {@code workingDirectory} is the host test JVM's working directory relative to the
+     * module directory ({@code /}-separated, empty for the module root), which forked workers reproduce inside the
+     * workspace.
+     */
+    public SubmitWorkRequest {
+        inputArtifacts = inputArtifacts == null ? List.of() : List.copyOf(inputArtifacts);
+        outputPaths = outputPaths == null ? List.of() : List.copyOf(outputPaths);
+        partitionPolicy = partitionPolicy == null ? PartitionPolicy.LPT : partitionPolicy;
+        workingDirectory = workingDirectory == null ? "" : workingDirectory;
+    }
+
+    public SubmitWorkRequest(String submissionId,
+                             String moduleName,
+                             List<ArtifactRef> classpathArtifacts,
+                             Map<String, String> systemProperties,
+                             List<WorkUnitSpec> workUnits,
+                             int cachedBlobs,
+                             int uploadedBlobs,
+                             List<WorkspaceFileSet> inputArtifacts,
+                             List<String> outputPaths,
+                             boolean forkWorkspace,
+                             PartitionPolicy partitionPolicy) {
+        this(submissionId, moduleName, classpathArtifacts, systemProperties, workUnits, cachedBlobs, uploadedBlobs,
+                inputArtifacts, outputPaths, forkWorkspace, partitionPolicy, "");
+    }
+
+    public SubmitWorkRequest(String submissionId,
+                             String moduleName,
+                             List<ArtifactRef> classpathArtifacts,
+                             Map<String, String> systemProperties,
+                             List<WorkUnitSpec> workUnits,
+                             int cachedBlobs,
+                             int uploadedBlobs) {
+        this(submissionId, moduleName, classpathArtifacts, systemProperties, workUnits, cachedBlobs, uploadedBlobs,
+                List.of(), List.of(), false, PartitionPolicy.LPT, "");
+    }
 }

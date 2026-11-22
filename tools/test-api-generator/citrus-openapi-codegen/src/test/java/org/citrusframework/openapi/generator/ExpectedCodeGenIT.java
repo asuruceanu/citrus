@@ -82,7 +82,8 @@ class ExpectedCodeGenIT {
      * Get the absolute path to the project's target directory.
      */
     static String getAbsoluteTargetDirectoryPath(String pathToFileInTargetDirectory) {
-        String projectBaseDir = System.getProperty("user.dir"); // Base directory of the project
+        // Base directory of the project; set by Maven, and to the workspace on distribution workers.
+        String projectBaseDir = System.getProperty("basedir", System.getProperty("user.dir"));
         File outputDirFile = new File(projectBaseDir, "target/" + pathToFileInTargetDirectory);
         return outputDirFile.getAbsolutePath();
     }
@@ -103,26 +104,26 @@ class ExpectedCodeGenIT {
     @ParameterizedTest
     @MethodSource("getResourcesForRest")
     void testGeneratedFiles(Resource resource) throws IOException {
-        File classFile = resource.getFile();
-        String absolutePath = classFile.getAbsolutePath();
-        String javaFilePath = absolutePath
-                .replace("test-classes", "generated-test-sources")
-                .replace(".class", ".java");
-
-        assertFileContent(new File(javaFilePath), "rest");
+        String javaFile = packageRelativeJavaPath(resource);
+        assertFileContent(new File(getAbsoluteTargetDirectoryPath("generated-test-sources/" + javaFile)), javaFile);
     }
 
     @ParameterizedTest
     @MethodSource("getResourcesForSoap")
     void testGeneratedSoapFiles(Resource resource) throws IOException {
-        File classFile = resource.getFile();
-        String absolutePath = classFile.getAbsolutePath();
+        String javaFile = packageRelativeJavaPath(resource);
+        assertFileContent(new File(getAbsoluteTargetDirectoryPath("generated-test-sources/" + javaFile)), javaFile);
+    }
 
-        String javaFilePath = absolutePath
-                .replace("test-classes", "generated-test-sources")
-                .replace(".class", ".java");
-
-        assertFileContent(new File(javaFilePath), "soap");
+    /**
+     * Package-relative path of the source file of a compiled class, e.g.
+     * {@code org/citrusframework/openapi/generator/rest/petstore/Foo.java}. Independent of where the class
+     * directory lives (on distribution workers it is unpacked elsewhere).
+     */
+    private static String packageRelativeJavaPath(Resource resource) throws IOException {
+        String path = resource.getFile().getAbsolutePath().replace(File.separatorChar, '/');
+        String relative = path.substring(path.lastIndexOf(BASE_PACKAGE + "/"));
+        return relative.substring(0, relative.length() - ".class".length()) + ".java";
     }
 
     /*
@@ -130,10 +131,10 @@ class ExpectedCodeGenIT {
      * Be aware that file content may change according to IDE formatting rules if the files are copied via IDE.
      * Files should therefore be copied using a file explorer which ensures that content of files does not change.
      */
-    private void assertFileContent(File file, String apiDir) throws IOException {
+    private void assertFileContent(File file, String javaFile) throws IOException {
         assertThat(file).exists();
 
-        String expectedFilePath = BASE_PACKAGE + "/ExpectedCodeGenIT/expectedgen/" + file.getAbsolutePath().substring(file.getAbsolutePath().indexOf(apiDir));
+        String expectedFilePath = BASE_PACKAGE + "/ExpectedCodeGenIT/expectedgen/" + javaFile.substring(BASE_PACKAGE.length() + 1);
         ClassPathResource classPathResource = new ClassPathResource(expectedFilePath);
 
         String actualContent = readString(file.toPath());

@@ -13,6 +13,11 @@
   <name>Citrus :: Tools :: Schema Generator</name>
   <description>Citrus Schema Generator</description>
 
+  <properties>
+    <!-- Citrus Test Distribution: see the External Test Resources section of the user manual. -->
+    <citrus.test.distribution.fork>true</citrus.test.distribution.fork>
+  </properties>
+
   <dependencies>
     <dependency>
       <groupId>tools.jackson.core</groupId>

@@ -22,28 +22,26 @@ import java.io.OutputStream;
 import java.io.PrintStream;
 import java.io.PrintWriter;
 import java.io.Reader;
-import java.io.StringWriter;
+import java.io.UncheckedIOException;
 import java.io.Writer;
-import java.lang.reflect.Method;
-import java.net.URI;
 import java.net.URL;
 import java.net.URLClassLoader;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
 import java.nio.charset.Charset;
+import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
-import java.time.Duration;
+import java.nio.file.SimpleFileVisitor;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Enumeration;
-import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Properties;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.BiConsumer;
 import java.util.function.BiFunction;
@@ -53,27 +51,13 @@ import java.util.stream.Stream;
 
 import org.citrusframework.distribution.cache.BlobCacheDirectory;
 import org.citrusframework.distribution.config.DistributionSettings;
+import org.citrusframework.distribution.config.DistributionSettings.WorkerCwdCheckMode;
+import org.citrusframework.distribution.config.PathRewriter;
 import org.citrusframework.distribution.model.ArtifactRef;
 import org.citrusframework.distribution.model.PartitionAssignPayload;
-import org.citrusframework.distribution.model.PartitionCompletedPayload;
-import org.citrusframework.distribution.model.TestOutcomeStatus;
-import org.citrusframework.distribution.model.WorkUnitSpec;
 import org.citrusframework.distribution.model.WorkerTestEventPayload;
+import org.citrusframework.distribution.model.WorkspaceFileSet;
 import org.junit.platform.engine.CancellationToken;
-import org.junit.platform.engine.DiscoverySelector;
-import org.junit.platform.engine.TestExecutionResult;
-import org.junit.platform.engine.TestSource;
-import org.junit.platform.engine.discovery.DiscoverySelectors;
-import org.junit.platform.engine.support.descriptor.ClassSource;
-import org.junit.platform.engine.support.descriptor.MethodSource;
-import org.junit.platform.launcher.LauncherDiscoveryRequest;
-import org.junit.platform.launcher.LauncherExecutionRequest;
-import org.junit.platform.launcher.LauncherSession;
-import org.junit.platform.launcher.TestExecutionListener;
-import org.junit.platform.launcher.TestIdentifier;
-import org.junit.platform.launcher.core.LauncherDiscoveryRequestBuilder;
-import org.junit.platform.launcher.core.LauncherExecutionRequestBuilder;
-import org.junit.platform.launcher.core.LauncherFactory;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -81,78 +65,123 @@ import org.slf4j.LoggerFactory;
  * Downloads missing content-addressed blobs, materializes an isolated partition workspace and
  * child-first {@link URLClassLoader}, and executes assigned JUnit Platform work units.
  */
-public final class IsolatedPartitionRunner {
+public final class IsolatedPartitionRunner implements PartitionRunner {
 
     private static final Logger LOG = LoggerFactory.getLogger(IsolatedPartitionRunner.class);
     private static final Object WORKER_JVM_LOCK = new Object();
     private static final java.util.concurrent.atomic.AtomicInteger ACTIVE_WORKER_SCOPES = new java.util.concurrent.atomic.AtomicInteger();
 
+    static final String REPORT_DIRECTORY_PROPERTY = "citrus.report.directory";
+    static final String MESSAGE_TRACE_DIRECTORY_PROPERTY = "citrus.message.trace.directory";
+
     private final DistributionWorkerConfig config;
     private final BlobCacheDirectory blobCache;
-    private final HttpClient httpClient;
+    private final BrokerBlobClient blobs;
 
     public IsolatedPartitionRunner(DistributionWorkerConfig config) {
         this.config = config;
         this.blobCache = new BlobCacheDirectory(config.cacheDir());
-        this.httpClient = HttpClient.newBuilder()
-                .connectTimeout(Duration.ofSeconds(10))
-                .build();
+        this.blobs = new BrokerBlobClient(config, blobCache);
     }
 
-    public PartitionCompletedPayload execute(
+    /**
+     * Outcome of a partition run. {@code success} is {@code false} when the partition could not be executed or broke
+     * a worker rule (such as writing into the worker's working directory); failing tests are reported as test events.
+     */
+    public record PartitionExecutionResult(boolean success, String errorMessage, List<WorkspaceFileSet> outputArtifacts) {
+
+        public PartitionExecutionResult {
+            outputArtifacts = outputArtifacts == null ? List.of() : List.copyOf(outputArtifacts);
+        }
+
+        public PartitionExecutionResult(boolean success, String errorMessage) {
+            this(success, errorMessage, List.of());
+        }
+    }
+
+    /**
+     * Runs {@code assignment} in this JVM with thread-scoped system properties and a child-first class loader.
+     * <p>
+     * The partition gets a private root ({@code <tmp>/cdist-*}) with {@code extracted/} for classpath archives and
+     * {@code workspace/} (with {@code target/}) as its {@code basedir}. {@code ${citrus.dist.workspace}} in system
+     * properties expands to that workspace, and Citrus report and message-trace directories default to (or resolve
+     * relative to) it. Unless {@link DistributionWorkerConfig#cwdCheckMode()} is {@code OFF}, the worker's working
+     * directory is snapshotted before and after the run; new or modified entries fail ({@code FAIL}) or warn
+     * ({@code WARN}). Nothing in the working directory is ever deleted or modified.
+     */
+    @Override
+    public PartitionExecutionResult execute(
             PartitionAssignPayload assignment,
             CancellationToken cancellationToken,
             Consumer<WorkerTestEventPayload> eventSink) {
-        Path workspaceDir = null;
-        ClassLoader previousCl = Thread.currentThread().getContextClassLoader();
+        Path partitionRoot = null;
         ThreadScopedProperties systemProps = null;
         Properties previousScope = null;
         boolean workerScopeEntered = false;
 
         try {
-            workspaceDir = Files.createTempDirectory("citrus-dist-partition-" + assignment.partitionId() + "-");
+            partitionRoot = Files.createTempDirectory("cdist-");
+            Path workspaceDir = Files.createDirectories(partitionRoot.resolve("workspace"));
+            Files.createDirectories(workspaceDir.resolve("target"));
+
             List<URL> urls = new ArrayList<>();
-            if (assignment.classpathArtifacts() != null) {
-                for (ArtifactRef artifact : assignment.classpathArtifacts()) {
-                    ensureBlobCached(artifact.sha256());
-                    Path materialized = blobCache.materializeForClasspath(artifact, workspaceDir);
-                    urls.add(materialized.toUri().toURL());
-                }
+            for (ArtifactRef artifact : assignment.classpathArtifacts() != null ? assignment.classpathArtifacts() : List.<ArtifactRef>of()) {
+                blobs.ensureCached(artifact.sha256());
+                urls.add(blobCache.materializeForClasspath(artifact, partitionRoot).toUri().toURL());
             }
 
+            Map<String, String> overrides = partitionOverrides(assignment.systemProperties(), workspaceDir);
+            WorkingDirectorySnapshot before = null;
             synchronized (WORKER_JVM_LOCK) {
+                if (config.cwdCheckMode() != WorkerCwdCheckMode.OFF) {
+                    before = WorkingDirectorySnapshot.take(workingDirectory(), config.cacheDir());
+                }
                 systemProps = installThreadScopedProperties();
                 ACTIVE_WORKER_SCOPES.incrementAndGet();
                 workerScopeEntered = true;
                 systemProps.base().setProperty(DistributionSettings.ROLE_PROPERTY, DistributionSettings.ROLE_WORKER);
-                previousScope = systemProps.enterScope(assignment.systemProperties());
+                previousScope = systemProps.enterScope(overrides);
             }
 
+            PartitionJUnitLauncher.ExecutionSummary summary;
             ClassLoader parentCl = IsolatedPartitionRunner.class.getClassLoader();
             try (URLClassLoader partitionCl = urls.isEmpty()
                     ? new URLClassLoader(new URL[0], parentCl)
                     : new PartitionClassLoader(urls.toArray(new URL[0]), parentCl)) {
-                Thread.currentThread().setContextClassLoader(partitionCl);
-                resetCitrusExtensionIfPresent(partitionCl);
-
-                for (WorkUnitSpec unit : assignment.workUnits()) {
-                    if (cancellationToken != null && cancellationToken.isCancellationRequested()) {
-                        break;
-                    }
-                    executeWorkUnit(assignment, unit, partitionCl, cancellationToken, eventSink);
-                }
+                summary = PartitionJUnitLauncher.executeWorkUnits(assignment.partitionId(), assignment.sessionId(),
+                        assignment.attempt(), assignment.workUnits(), partitionCl, cancellationToken, eventSink);
+            }
+            if (!summary.success()) {
+                LOG.debug("Partition {} failed during execution: {}", assignment.partitionId(), summary.errorMessage());
+                return new PartitionExecutionResult(false, summary.errorMessage());
             }
 
-            return new PartitionCompletedPayload(assignment.partitionId(), assignment.sessionId(), true, null);
+            if (before != null && before.available()) {
+                List<String> changed;
+                synchronized (WORKER_JVM_LOCK) {
+                    WorkingDirectorySnapshot after = WorkingDirectorySnapshot.take(workingDirectory(), config.cacheDir());
+                    changed = after.available() ? before.changedEntries(after) : List.of();
+                }
+                if (!changed.isEmpty()) {
+                    String message = "Undeclared CWD write detected in worker user.dir " + workingDirectory() + ": "
+                            + String.join(", ", changed) + ". Tests of this module write relative to the working "
+                            + "directory; set citrus.test.distribution.fork=true or declare the paths in "
+                            + "citrus.test.distribution.outputs (or run each worker daemon in its own empty directory). "
+                            + "The files were left in place. Other processes writing to this directory during the run "
+                            + "also show up here; use citrus.test.distribution.worker.cwdCheck=WARN if the directory "
+                            + "is shared.";
+                    if (config.cwdCheckMode() == WorkerCwdCheckMode.FAIL) {
+                        LOG.warn("Partition {}: {}", assignment.partitionId(), message);
+                        return new PartitionExecutionResult(false, message);
+                    }
+                    LOG.warn("Partition {}: {}", assignment.partitionId(), message);
+                }
+            }
+            return new PartitionExecutionResult(true, null);
         } catch (Throwable t) {
             LOG.warn("Partition {} failed during execution", assignment.partitionId(), t);
-            return new PartitionCompletedPayload(
-                    assignment.partitionId(),
-                    assignment.sessionId(),
-                    false,
-                    t.getMessage() != null ? t.getMessage() : t.getClass().getName());
+            return new PartitionExecutionResult(false, t.getMessage() != null ? t.getMessage() : t.getClass().getName());
         } finally {
-            Thread.currentThread().setContextClassLoader(previousCl);
             if (systemProps != null) {
                 systemProps.exitScope(previousScope);
             }
@@ -164,185 +193,152 @@ public final class IsolatedPartitionRunner {
                     }
                 }
             }
-            deleteRecursivelyQuietly(workspaceDir);
+            deleteRecursivelyQuietly(partitionRoot);
         }
     }
 
-    private void executeWorkUnit(
-            PartitionAssignPayload assignment,
-            WorkUnitSpec unit,
-            ClassLoader partitionCl,
-            CancellationToken cancellationToken,
-            Consumer<WorkerTestEventPayload> eventSink) throws Exception {
-        Class<?> testClass = Class.forName(unit.className(), false, partitionCl);
-        List<DiscoverySelector> selectors = new ArrayList<>();
-        if (unit.methodName() != null && !unit.methodName().isBlank() && unit.dynamicSourceName() == null) {
-            selectors.add(selectMethodCompatible(testClass, unit.methodName()));
-        } else {
-            selectors.add(DiscoverySelectors.selectClass(testClass));
+    /**
+     * System properties for the partition: the assignment's properties with {@code ${citrus.dist.workspace}} expanded,
+     * {@code basedir} set to the workspace, and Citrus report and message-trace directories defaulted to (or resolved
+     * relative to) the workspace.
+     */
+    static Map<String, String> partitionOverrides(Map<String, String> assigned, Path workspaceDir) {
+        Map<String, String> overrides = workspaceOverrides(assigned, workspaceDir);
+        Path workspace = workspaceDir.toAbsolutePath().normalize();
+        overrides.put(REPORT_DIRECTORY_PROPERTY,
+                workspaceRelative(workspace, overrides.get(REPORT_DIRECTORY_PROPERTY), "target/citrus-reports"));
+        overrides.put(MESSAGE_TRACE_DIRECTORY_PROPERTY,
+                workspaceRelative(workspace, overrides.get(MESSAGE_TRACE_DIRECTORY_PROPERTY), "target/citrus-logs/trace/messages"));
+        return overrides;
+    }
+
+    /**
+     * The assignment's properties with {@code ${citrus.dist.workspace}} expanded and {@code basedir} set to the
+     * workspace. Forked partitions use exactly this: they run in the local working directory, so Citrus' relative
+     * report defaults already resolve as they do locally.
+     */
+    static Map<String, String> workspaceOverrides(Map<String, String> assigned, Path workspaceDir) {
+        Map<String, String> overrides = PathRewriter.expandWorkspaceProperties(
+                assigned != null ? assigned : Map.of(), workspaceDir);
+        overrides.put("basedir", workspaceDir.toAbsolutePath().normalize().toString());
+        return overrides;
+    }
+
+    /**
+     * {@code configured} if absolute (or rooted, on Windows); otherwise resolved against the workspace, falling back
+     * to {@code defaultRelative} when unset or when the relative path would leave the workspace.
+     */
+    private static String workspaceRelative(Path workspace, String configured, String defaultRelative) {
+        Path fallback = workspace.resolve(defaultRelative);
+        if (configured == null || configured.isBlank()) {
+            return fallback.toString();
         }
-
-        Set<String> allowedDynamicSources = null;
-        if (unit.dynamicSourceName() != null && !unit.dynamicSourceName().isBlank()) {
-            allowedDynamicSources = Set.of(unit.dynamicSourceName());
+        Path path = Path.of(configured);
+        if (path.isAbsolute() || path.getRoot() != null) {
+            return configured;
         }
-        setDynamicSourceFilterIfPresent(partitionCl, allowedDynamicSources);
+        Path resolved = workspace.resolve(path).normalize();
+        if (!resolved.startsWith(workspace)) {
+            LOG.warn("Ignoring '{}' for a partition report directory: it leaves the partition workspace", configured);
+            return fallback.toString();
+        }
+        return resolved.toString();
+    }
 
-        try (LauncherSession session = LauncherFactory.openSession()) {
-            LauncherDiscoveryRequest discoveryRequest = LauncherDiscoveryRequestBuilder.request()
-                    .selectors(selectors)
-                    .configurationParameter("junit.platform.launcher.interceptors.enabled", "false")
-                    .build();
+    private static Path workingDirectory() {
+        return Path.of(System.getProperty("user.dir")).toAbsolutePath().normalize();
+    }
 
-            Map<String, Long> startTimes = new ConcurrentHashMap<>();
-            TestExecutionListener listener = new TestExecutionListener() {
-                @Override
-                public void executionStarted(TestIdentifier testIdentifier) {
-                    if (testIdentifier.isTest()) {
-                        startTimes.put(testIdentifier.getUniqueId(), System.currentTimeMillis());
-                        eventSink.accept(new WorkerTestEventPayload(
-                                assignment.partitionId(),
-                                assignment.sessionId(),
-                                assignment.attempt(),
-                                unit.key(),
-                                resolveClassName(testIdentifier, unit.className()),
-                                testIdentifier.getDisplayName(),
-                                TestOutcomeStatus.STARTED,
-                                0L,
-                                null,
-                                null,
-                                List.of()));
+    /**
+     * Read-only snapshot of {@code (size, lastModified)} for the top-level entries of a directory and up to two levels
+     * below its {@code target/} and {@code src/} directories, excluding the worker cache directory.
+     */
+    record WorkingDirectorySnapshot(Map<String, String> entries, boolean available) {
+
+        /**
+         * Takes a snapshot; when the directory itself cannot be listed the snapshot is marked unavailable and no
+         * comparison is made. Unreadable sub-directories are skipped.
+         */
+        static WorkingDirectorySnapshot take(Path root, Path excluded) {
+            Map<String, String> entries = new TreeMap<>();
+            Path excludedDir = excluded != null ? excluded.toAbsolutePath().normalize() : null;
+            List<Path> topLevel;
+            try (Stream<Path> top = Files.list(root)) {
+                topLevel = top.toList();
+            } catch (IOException | UncheckedIOException e) {
+                LOG.warn("Could not snapshot worker working directory {}; skipping the CWD check", root, e);
+                return new WorkingDirectorySnapshot(Map.of(), false);
+            }
+            for (Path entry : topLevel) {
+                record(root, entry, entries, excludedDir);
+                String name = entry.getFileName().toString();
+                if ((name.equals("target") || name.equals("src")) && Files.isDirectory(entry, LinkOption.NOFOLLOW_LINKS)) {
+                    try {
+                        Files.walkFileTree(entry, Set.of(), 2, new SimpleFileVisitor<>() {
+                            @Override
+                            public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs) {
+                                if (!dir.equals(entry)) {
+                                    record(root, dir, entries, excludedDir);
+                                }
+                                return FileVisitResult.CONTINUE;
+                            }
+
+                            @Override
+                            public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
+                                record(root, file, entries, excludedDir);
+                                return FileVisitResult.CONTINUE;
+                            }
+
+                            @Override
+                            public FileVisitResult visitFileFailed(Path file, IOException exc) {
+                                return FileVisitResult.CONTINUE;
+                            }
+                        });
+                    } catch (IOException e) {
+                        LOG.debug("Could not snapshot {}", entry, e);
                     }
                 }
-
-                @Override
-                public void executionSkipped(TestIdentifier testIdentifier, String reason) {
-                    if (testIdentifier.isTest()) {
-                        eventSink.accept(new WorkerTestEventPayload(
-                                assignment.partitionId(),
-                                assignment.sessionId(),
-                                assignment.attempt(),
-                                unit.key(),
-                                resolveClassName(testIdentifier, unit.className()),
-                                testIdentifier.getDisplayName(),
-                                TestOutcomeStatus.SKIPPED,
-                                0L,
-                                reason,
-                                null,
-                                List.of()));
-                    }
-                }
-
-                @Override
-                public void executionFinished(TestIdentifier testIdentifier, TestExecutionResult result) {
-                    if (!testIdentifier.isTest()) {
-                        return;
-                    }
-                    long started = startTimes.getOrDefault(testIdentifier.getUniqueId(), System.currentTimeMillis());
-                    long durationMs = Math.max(0L, System.currentTimeMillis() - started);
-                    TestOutcomeStatus status = switch (result.getStatus()) {
-                        case SUCCESSFUL -> TestOutcomeStatus.PASSED;
-                        case ABORTED -> TestOutcomeStatus.SKIPPED;
-                        case FAILED -> TestOutcomeStatus.FAILED;
-                    };
-                    String errorMsg = result.getThrowable().map(Throwable::getMessage).orElse(null);
-                    String stackTrace = result.getThrowable().map(IsolatedPartitionRunner::formatStackTrace).orElse(null);
-
-                    eventSink.accept(new WorkerTestEventPayload(
-                            assignment.partitionId(),
-                            assignment.sessionId(),
-                            assignment.attempt(),
-                            unit.key(),
-                            resolveClassName(testIdentifier, unit.className()),
-                            testIdentifier.getDisplayName(),
-                            status,
-                            durationMs,
-                            errorMsg,
-                            stackTrace,
-                            List.of()));
-                }
-            };
-
-            LauncherExecutionRequestBuilder execBuilder = LauncherExecutionRequestBuilder.request(discoveryRequest)
-                    .listeners(listener);
-            if (cancellationToken != null) {
-                execBuilder.cancellationToken(cancellationToken);
             }
-            LauncherExecutionRequest executionRequest = execBuilder.build();
-            session.getLauncher().execute(executionRequest);
-        } finally {
-            setDynamicSourceFilterIfPresent(partitionCl, null);
+            return new WorkingDirectorySnapshot(entries, true);
         }
-    }
 
-    private DiscoverySelector selectMethodCompatible(Class<?> testClass, String methodName) {
-        for (Method method : testClass.getDeclaredMethods()) {
-            if (method.getName().equals(methodName)) {
-                return DiscoverySelectors.selectMethod(testClass, method);
+        private static void record(Path root, Path entry, Map<String, String> entries, Path excludedDir) {
+            if (excludedDir != null && entry.toAbsolutePath().normalize().startsWith(excludedDir)) {
+                return;
+            }
+            try {
+                BasicFileAttributes attrs = Files.readAttributes(entry, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+                entries.put(root.relativize(entry).toString(), (attrs.isDirectory() ? "d:" : "f:")
+                        + attrs.size() + "@" + attrs.lastModifiedTime().toMillis());
+            } catch (IOException e) {
+                // Vanished between listing and reading: not part of this snapshot.
             }
         }
-        return DiscoverySelectors.selectMethod(testClass, methodName);
-    }
 
-    private void ensureBlobCached(String sha256) throws IOException, InterruptedException {
-        if (blobCache.contains(sha256)) {
-            return;
-        }
-        HttpRequest.Builder reqBuilder = HttpRequest.newBuilder(
-                        URI.create(config.brokerUrl() + "/api/v1/cache/blobs/" + sha256))
-                .timeout(Duration.ofSeconds(60))
-                .GET();
-        if (config.authToken() != null && !config.authToken().isBlank()) {
-            reqBuilder.header("Authorization", "Bearer " + config.authToken());
-        }
-        HttpResponse<byte[]> response = httpClient.send(reqBuilder.build(), HttpResponse.BodyHandlers.ofByteArray());
-        if (response.statusCode() != 200) {
-            throw new IOException("Failed to download blob " + sha256 + " from broker: HTTP " + response.statusCode());
-        }
-        blobCache.put(sha256, response.body());
-    }
-
-    private static String resolveClassName(TestIdentifier identifier, String fallback) {
-        TestSource source = identifier.getSource().orElse(null);
-        if (source instanceof MethodSource ms) {
-            return ms.getClassName();
-        }
-        if (source instanceof ClassSource cs) {
-            return cs.getClassName();
-        }
-        return fallback;
-    }
-
-    private static String formatStackTrace(Throwable throwable) {
-        StringWriter sw = new StringWriter();
-        throwable.printStackTrace(new PrintWriter(sw));
-        return sw.toString();
-    }
-
-    private static void resetCitrusExtensionIfPresent(ClassLoader classLoader) {
-        try {
-            Class<?> citrusExt = Class.forName("org.citrusframework.junit.jupiter.CitrusExtension", false, classLoader);
-            Method resetMethod = citrusExt.getDeclaredMethod("reset");
-            resetMethod.setAccessible(true);
-            resetMethod.invoke(null);
-        } catch (Throwable ignored) {
-            // Optional if CitrusExtension is not on partition classpath
-        }
-    }
-
-    private static void setDynamicSourceFilterIfPresent(ClassLoader classLoader, Set<String> allowed) {
-        try {
-            Class<?> filterClass = Class.forName(
-                    "org.citrusframework.junit.jupiter.CitrusDynamicSourceFilter", false, classLoader);
-            if (allowed == null) {
-                Method clear = filterClass.getMethod("clear");
-                clear.invoke(null);
-            } else {
-                Method setAllowed = filterClass.getMethod("setAllowedSources", Set.class);
-                setAllowed.invoke(null, new LinkedHashSet<>(allowed));
-            }
-        } catch (Throwable ignored) {
-            // Optional if CitrusDynamicSourceFilter is not on partition classpath
+        /**
+         * Entries of {@code after} that are new or changed, sorted. Changes to regular files that already existed at the
+         * top level are ignored (the worker daemon itself may append to its log or {@code nohup.out} there), and so are
+         * the top-level {@code target/} and {@code src/} directories themselves, whose contents are compared directly.
+         */
+        List<String> changedEntries(WorkingDirectorySnapshot after) {
+            return after.entries().entrySet().stream()
+                    .filter(e -> {
+                        String previous = entries.get(e.getKey());
+                        if (previous == null) {
+                            return true;
+                        }
+                        if (e.getValue().equals(previous)) {
+                            return false;
+                        }
+                        String name = e.getKey();
+                        boolean topLevel = !name.contains("/") && !name.contains(java.io.File.separator);
+                        if (!topLevel) {
+                            return true;
+                        }
+                        return e.getValue().startsWith("d:") && !name.equals("target") && !name.equals("src");
+                    })
+                    .map(Map.Entry::getKey)
+                    .toList();
         }
     }
 

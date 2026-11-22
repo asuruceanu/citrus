@@ -19,6 +19,8 @@ package org.citrusframework.mvn.distribution;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
+import java.util.Properties;
+import java.util.function.Function;
 
 import org.apache.maven.model.Plugin;
 import org.apache.maven.model.PluginExecution;
@@ -38,21 +40,145 @@ public final class SurefirePluginMutator {
     private SurefirePluginMutator() {
     }
 
+    /**
+     * The workspace settings resolved per Surefire/Failsafe configuration, with the value written when the winning
+     * tier clears the setting.
+     */
+    private enum WorkspaceSetting {
+        INPUTS(DistributionSettings.INPUTS_PROPERTY, DistributionSettings.INPUTS_ENV, DistributionSettings.NONE_SENTINEL),
+        OUTPUTS(DistributionSettings.OUTPUTS_PROPERTY, DistributionSettings.OUTPUTS_ENV, DistributionSettings.NONE_SENTINEL),
+        FORK(DistributionSettings.FORK_PROPERTY, DistributionSettings.FORK_ENV, "false"),
+        PARTITION_POLICY(DistributionSettings.PARTITION_POLICY_PROPERTY, DistributionSettings.PARTITION_POLICY_ENV, "LPT");
+
+        private final String property;
+        private final String env;
+        private final String clearedValue;
+
+        WorkspaceSetting(String property, String env, String clearedValue) {
+            this.property = property;
+            this.env = env;
+            this.clearedValue = clearedValue;
+        }
+
+        /**
+         * The value to pass to the test JVM for a winning raw value; fork and policy are validated and normalized.
+         */
+        String normalize(String raw) {
+            String value = raw.trim();
+            if (value.isEmpty() || DistributionSettings.NONE_SENTINEL.equalsIgnoreCase(value)) {
+                return clearedValue;
+            }
+            return switch (this) {
+                case FORK -> Boolean.toString(DistributionSettings.parseForkWorkspace(value));
+                case PARTITION_POLICY -> DistributionSettings.parsePartitionPolicy(value).name();
+                default -> value;
+            };
+        }
+    }
+
+    private record Resolution(Properties cliUserProperties, Function<String, String> environment) {
+    }
+
+    /** The winning raw value of a setting and the tier it came from. */
+    private record Winner(String raw, String tier) {
+    }
+
     public static void configureProject(MavenProject project,
                                         String sessionId,
                                         List<Path> extraClasspathJars,
                                         Map<String, String> sharedProperties) {
+        configureProject(project, sessionId, extraClasspathJars, sharedProperties, new Properties(), System::getenv);
+    }
+
+    /**
+     * Configures Surefire and Failsafe of {@code project}, resolving the workspace settings (inputs, outputs, fork,
+     * partition policy) per configuration with single-winner precedence: CLI user property (present wins, even empty)
+     * &gt; explicit {@code <systemPropertyVariables>} value (blank or unexpanded {@code ${...}} ignored) &gt; module
+     * property (blank ignored) &gt; {@code CITRUS_DIST_*} environment variable &gt; unset. A winning empty or
+     * {@code none} value clears the setting. The resolved value is always written explicitly ({@code none} for cleared
+     * lists, the default for fork and policy), and nothing is written when no tier defines the setting.
+     *
+     * @throws IllegalArgumentException for an invalid fork or partition policy value
+     */
+    public static void configureProject(MavenProject project,
+                                        String sessionId,
+                                        List<Path> extraClasspathJars,
+                                        Map<String, String> sharedProperties,
+                                        Properties cliUserProperties,
+                                        Function<String, String> environment) {
         if (project == null || project.getBuild() == null || project.getBuild().getPluginsAsMap() == null) {
             return;
         }
+        Resolution resolution = new Resolution(cliUserProperties != null ? cliUserProperties : new Properties(),
+                environment != null ? environment : key -> null);
+        normalizeCliUserProperties(project, resolution);
         Map<String, Plugin> plugins = project.getBuild().getPluginsAsMap();
         Plugin surefire = plugins.get(SUREFIRE_KEY);
         if (surefire != null) {
-            mutatePlugin(project, surefire, sessionId, extraClasspathJars, sharedProperties, "surefire-reports");
+            mutatePlugin(project, surefire, sessionId, extraClasspathJars, sharedProperties, "surefire-reports", resolution);
         }
         Plugin failsafe = plugins.get(FAILSAFE_KEY);
         if (failsafe != null) {
-            mutatePlugin(project, failsafe, sessionId, extraClasspathJars, sharedProperties, "failsafe-reports");
+            mutatePlugin(project, failsafe, sessionId, extraClasspathJars, sharedProperties, "failsafe-reports", resolution);
+        }
+    }
+
+    /**
+     * Checks the workspace settings of every Surefire/Failsafe configuration of {@code project} without changing
+     * anything, so invalid values fail the build before a reactor session is opened.
+     *
+     * @throws IllegalArgumentException naming the module, the setting, the value and the tier it came from
+     */
+    public static void validateProject(MavenProject project, Properties cliUserProperties, Function<String, String> environment) {
+        if (project == null || project.getBuild() == null || project.getBuild().getPluginsAsMap() == null) {
+            return;
+        }
+        Resolution resolution = new Resolution(cliUserProperties != null ? cliUserProperties : new Properties(),
+                environment != null ? environment : key -> null);
+        for (String key : List.of(SUREFIRE_KEY, FAILSAFE_KEY)) {
+            Plugin plugin = project.getBuild().getPluginsAsMap().get(key);
+            if (plugin == null) {
+                continue;
+            }
+            List<Object> configs = new java.util.ArrayList<>();
+            configs.add(plugin.getConfiguration());
+            if (plugin.getExecutions() != null) {
+                plugin.getExecutions().forEach(execution -> configs.add(execution.getConfiguration()));
+            }
+            for (Object config : configs) {
+                Xpp3Dom dom = config instanceof Xpp3Dom existing ? existing : new Xpp3Dom("configuration");
+                Xpp3Dom sysProps = dom.getChild("systemPropertyVariables");
+                for (WorkspaceSetting setting : WorkspaceSetting.values()) {
+                    Winner winner = winningValue(setting, project, sysProps != null ? sysProps : new Xpp3Dom("systemPropertyVariables"), resolution);
+                    if (winner != null) {
+                        normalized(setting, winner, project);
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Surefire copies the session's user properties into the test JVM after {@code systemPropertyVariables}, so a raw
+     * CLI value (say an empty one meaning "clear") would replace the resolved value. Normalize it in place; the result
+     * is the same for every module, so this is idempotent across the reactor.
+     */
+    private static void normalizeCliUserProperties(MavenProject project, Resolution resolution) {
+        for (WorkspaceSetting setting : WorkspaceSetting.values()) {
+            if (resolution.cliUserProperties().containsKey(setting.property)) {
+                String raw = resolution.cliUserProperties().getProperty(setting.property);
+                resolution.cliUserProperties().setProperty(setting.property,
+                        normalized(setting, new Winner(raw != null ? raw : "", "command line"), project));
+            }
+        }
+    }
+
+    private static String normalized(WorkspaceSetting setting, Winner winner, MavenProject project) {
+        try {
+            return setting.normalize(winner.raw());
+        } catch (IllegalArgumentException e) {
+            throw new IllegalArgumentException("Invalid Citrus Test Distribution setting in module " + project.getId()
+                    + " (from " + winner.tier() + "): " + e.getMessage(), e);
         }
     }
 
@@ -61,16 +187,18 @@ public final class SurefirePluginMutator {
                                      String sessionId,
                                      List<Path> extraClasspathJars,
                                      Map<String, String> sharedProperties,
-                                     String defaultReportFolder) {
+                                     String defaultReportFolder,
+                                     Resolution resolution) {
         Xpp3Dom config = ensureDom(plugin.getConfiguration());
-        applyDomMutations(project, config, sessionId, extraClasspathJars, sharedProperties, defaultReportFolder);
+        applyDomMutations(project, config, sessionId, extraClasspathJars, sharedProperties, defaultReportFolder, resolution);
         plugin.setConfiguration(config);
 
         if (plugin.getExecutions() != null) {
             for (PluginExecution execution : plugin.getExecutions()) {
                 if (execution.getConfiguration() != null) {
                     Xpp3Dom execDom = ensureDom(execution.getConfiguration());
-                    applyDomMutations(project, execDom, sessionId, extraClasspathJars, sharedProperties, defaultReportFolder);
+                    applyDomMutations(project, execDom, sessionId, extraClasspathJars, sharedProperties,
+                            defaultReportFolder, resolution);
                     execution.setConfiguration(execDom);
                 }
             }
@@ -82,7 +210,8 @@ public final class SurefirePluginMutator {
                                           String sessionId,
                                           List<Path> extraClasspathJars,
                                           Map<String, String> sharedProperties,
-                                          String defaultReportFolder) {
+                                          String defaultReportFolder,
+                                          Resolution resolution) {
         Xpp3Dom additionalCp = getOrCreateChild(config, "additionalClasspathElements");
         for (Path jar : extraClasspathJars) {
             String absPath = jar.toAbsolutePath().toString();
@@ -110,6 +239,55 @@ public final class SurefirePluginMutator {
                     setChildValue(sysProps, k, v);
                 }
             });
+        }
+
+        if (!resolution.cliUserProperties().containsKey(DistributionSettings.BASEDIR_PROPERTY) && project.getBasedir() != null) {
+            setChildValue(sysProps, DistributionSettings.BASEDIR_PROPERTY,
+                    project.getBasedir().toPath().toAbsolutePath().normalize().toString());
+        }
+        for (WorkspaceSetting setting : WorkspaceSetting.values()) {
+            Winner winner = winningValue(setting, project, sysProps, resolution);
+            if (winner != null) {
+                setChildValue(sysProps, setting.property, normalized(setting, winner, project));
+            } else {
+                removeChild(sysProps, setting.property);
+            }
+        }
+    }
+
+    /**
+     * The raw value of the highest tier that defines {@code setting}, or {@code null}.
+     */
+    private static Winner winningValue(WorkspaceSetting setting, MavenProject project, Xpp3Dom sysProps, Resolution resolution) {
+        if (resolution.cliUserProperties().containsKey(setting.property)) {
+            String cli = resolution.cliUserProperties().getProperty(setting.property);
+            return new Winner(cli != null ? cli : "", "command line");
+        }
+        Xpp3Dom explicit = sysProps.getChild(setting.property);
+        if (explicit != null && isDefined(explicit.getValue())) {
+            return new Winner(explicit.getValue(), "systemPropertyVariables");
+        }
+        String module = project.getProperties() != null ? project.getProperties().getProperty(setting.property) : null;
+        if (isDefined(module)) {
+            return new Winner(module, "module property");
+        }
+        String env = resolution.environment().apply(setting.env);
+        return isDefined(env) ? new Winner(env, "environment variable " + setting.env) : null;
+    }
+
+    private static boolean isDefined(String value) {
+        if (value == null || value.isBlank()) {
+            return false;
+        }
+        String trimmed = value.trim();
+        return !(trimmed.startsWith("${") && trimmed.endsWith("}"));
+    }
+
+    private static void removeChild(Xpp3Dom parent, String name) {
+        for (int i = parent.getChildCount() - 1; i >= 0; i--) {
+            if (name.equals(parent.getChild(i).getName())) {
+                parent.removeChild(i);
+            }
         }
     }
 

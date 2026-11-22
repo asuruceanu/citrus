@@ -19,10 +19,13 @@ package org.citrusframework.distribution.worker;
 import java.nio.file.Path;
 import java.util.Collections;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
 import org.citrusframework.distribution.config.DistributionSettings;
+import org.citrusframework.distribution.config.DistributionSettings.WorkerCwdCheckMode;
+import org.citrusframework.distribution.config.DistributionSettings.WorkerForkMode;
 
 /**
  * Configuration for a Citrus Test Distribution worker node.
@@ -37,6 +40,9 @@ public final class DistributionWorkerConfig {
     private final Map<String, String> capabilities;
     private final long heartbeatIntervalMs;
     private final long reconnectDelayMs;
+    private final WorkerForkMode forkMode;
+    private final List<String> forkJvmArgs;
+    private final WorkerCwdCheckMode cwdCheckMode;
 
     private DistributionWorkerConfig(Builder builder) {
         this.workerId = builder.workerId;
@@ -44,9 +50,14 @@ public final class DistributionWorkerConfig {
         this.brokerUrl = builder.brokerUrl;
         this.authToken = builder.authToken;
         this.cacheDir = builder.cacheDir;
-        this.capabilities = Collections.unmodifiableMap(new LinkedHashMap<>(builder.capabilities));
+        Map<String, String> caps = new LinkedHashMap<>(builder.capabilities);
+        caps.putIfAbsent(DistributionSettings.WORKSPACE_CAPABILITY_KEY, "true");
+        this.capabilities = Collections.unmodifiableMap(caps);
         this.heartbeatIntervalMs = builder.heartbeatIntervalMs;
         this.reconnectDelayMs = builder.reconnectDelayMs;
+        this.forkMode = builder.forkMode;
+        this.forkJvmArgs = List.copyOf(builder.forkJvmArgs);
+        this.cwdCheckMode = builder.cwdCheckMode;
     }
 
     public static Builder builder() {
@@ -89,6 +100,28 @@ public final class DistributionWorkerConfig {
         return reconnectDelayMs;
     }
 
+    /**
+     * Whether partitions always run in a forked child JVM ({@link WorkerForkMode#ALWAYS}) or only when they need a
+     * workspace ({@link WorkerForkMode#AUTO}, default).
+     */
+    public WorkerForkMode forkMode() {
+        return forkMode;
+    }
+
+    /**
+     * JVM arguments for forked partition JVMs.
+     */
+    public List<String> forkJvmArgs() {
+        return forkJvmArgs;
+    }
+
+    /**
+     * How in-process partitions react to writes into the worker's working directory.
+     */
+    public WorkerCwdCheckMode cwdCheckMode() {
+        return cwdCheckMode;
+    }
+
     public static final class Builder {
         private String workerId = "worker-" + UUID.randomUUID().toString().substring(0, 8);
         private String hostName = resolveHostName();
@@ -98,6 +131,12 @@ public final class DistributionWorkerConfig {
         private Map<String, String> capabilities = new LinkedHashMap<>(DistributionSettings.detectHostCapabilities(null));
         private long heartbeatIntervalMs = 5_000L;
         private long reconnectDelayMs = 1_000L;
+        private WorkerForkMode forkMode = DistributionSettings.parseWorkerForkMode(DistributionSettings.getString(
+                DistributionSettings.WORKER_FORK_MODE_PROPERTY, DistributionSettings.WORKER_FORK_MODE_ENV, null));
+        private List<String> forkJvmArgs = DistributionSettings.parseForkJvmArgs(DistributionSettings.getString(
+                DistributionSettings.WORKER_FORK_JVM_ARGS_PROPERTY, DistributionSettings.WORKER_FORK_JVM_ARGS_ENV, null));
+        private WorkerCwdCheckMode cwdCheckMode = DistributionSettings.parseWorkerCwdCheckMode(DistributionSettings.getString(
+                DistributionSettings.WORKER_CWD_CHECK_PROPERTY, DistributionSettings.WORKER_CWD_CHECK_ENV, null));
 
         private Builder() {
         }
@@ -157,6 +196,31 @@ public final class DistributionWorkerConfig {
             return this;
         }
 
+        public Builder forkMode(WorkerForkMode forkMode) {
+            if (forkMode != null) {
+                this.forkMode = forkMode;
+            }
+            return this;
+        }
+
+        public Builder forkJvmArgs(List<String> forkJvmArgs) {
+            if (forkJvmArgs != null) {
+                this.forkJvmArgs = List.copyOf(forkJvmArgs);
+            }
+            return this;
+        }
+
+        public Builder cwdCheckMode(WorkerCwdCheckMode cwdCheckMode) {
+            if (cwdCheckMode != null) {
+                this.cwdCheckMode = cwdCheckMode;
+            }
+            return this;
+        }
+
+        /**
+         * Builds the configuration. Workers advertise {@code citrus.workspace.v1=true} unless the capabilities
+         * explicitly set it (for example to {@code false}).
+         */
         public DistributionWorkerConfig build() {
             return new DistributionWorkerConfig(this);
         }

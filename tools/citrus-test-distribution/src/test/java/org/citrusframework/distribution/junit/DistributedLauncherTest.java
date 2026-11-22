@@ -16,17 +16,24 @@
 
 package org.citrusframework.distribution.junit;
 
+import java.net.http.HttpResponse;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Stream;
 
 import org.citrusframework.distribution.annotations.LocalOnly;
 import org.citrusframework.distribution.annotations.RemoteOnly;
 import org.citrusframework.distribution.broker.DistributionBrokerConfig;
 import org.citrusframework.distribution.broker.DistributionBrokerServer;
 import org.citrusframework.distribution.config.DistributionSettings;
+import org.citrusframework.distribution.model.CreateSessionRequest;
+import org.citrusframework.distribution.model.PartitionPolicy;
+import org.citrusframework.distribution.model.SubmitWorkRequest;
+import org.citrusframework.distribution.model.WorkUnitSpec;
 import org.citrusframework.distribution.worker.DistributionWorkerClient;
 import org.citrusframework.distribution.worker.DistributionWorkerConfig;
 import org.junit.jupiter.api.AfterEach;
@@ -56,6 +63,227 @@ class DistributedLauncherTest {
         System.clearProperty(DistributionSettings.FALLBACK_LOCAL_PROPERTY);
         System.clearProperty(DistributionSettings.REPORT_DIR_PROPERTY);
         System.clearProperty(DistributionSettings.CONNECT_TIMEOUT_MS_PROPERTY);
+        System.clearProperty(DistributionSettings.SESSION_ID_PROPERTY);
+        System.clearProperty(DistributionSettings.BASEDIR_PROPERTY);
+        System.clearProperty(DistributionSettings.INPUTS_PROPERTY);
+        System.clearProperty(DistributionSettings.OUTPUTS_PROPERTY);
+        System.clearProperty(DistributionSettings.MAX_PARTITION_SIZE_PROPERTY);
+        System.clearProperty("custom.data.dir");
+    }
+
+    @Test
+    void shouldExecuteEndToEndWithDeclaredInputsOutputsBasedirRewriteAndSiblingSessionIsolation() throws Exception {
+        try (Cluster cluster = Cluster.start(tempDir)) {
+            Path module = Files.createDirectories(tempDir.resolve("module"));
+            Files.createDirectories(module.resolve("src/test/resources"));
+            Files.writeString(module.resolve("src/test/resources/data.txt"), "remote-data");
+
+            String sessionId = cluster.createSession();
+            // A sibling module on the same reactor session: a failing in-process test and a crashing forked partition.
+            cluster.client.submitWork(sessionId, new SubmitWorkRequest("sibling-1", "sibling", List.of(), Map.of(),
+                    List.of(unit(SiblingFailingFixture.class)), 0, 0));
+            cluster.client.submitWork(sessionId, new SubmitWorkRequest("sibling-2", "sibling", List.of(), Map.of(),
+                    List.of(new WorkUnitSpec("missing", "org.example.Missing", null, null, Map.of(), 0L)), 0, 0,
+                    List.of(), List.of("target/citrus-docs"), true, PartitionPolicy.LPT));
+            // A succeeding sibling partition that writes a different file under the same output path.
+            cluster.client.submitWork(sessionId, cluster.siblingWithOutputs(sessionId, SiblingOutputFixture.class));
+
+            System.setProperty(DistributionSettings.ENABLED_PROPERTY, "true");
+            System.setProperty(DistributionSettings.BROKER_URL_PROPERTY, cluster.broker.baseUrl());
+            System.setProperty(DistributionSettings.SESSION_ID_PROPERTY, sessionId);
+            System.setProperty(DistributionSettings.BASEDIR_PROPERTY, module.toString());
+            System.setProperty(DistributionSettings.INPUTS_PROPERTY, "src/test/resources");
+            System.setProperty(DistributionSettings.OUTPUTS_PROPERTY, "target/citrus-docs");
+            System.setProperty("custom.data.dir", module.resolve("src/test/resources").toString());
+
+            Outcome outcome = run(RemoteWorkspaceFixture.class);
+
+            assertThat(outcome.failed()).as("sibling module events are ignored").isZero();
+            assertThat(outcome.passed()).isEqualTo(1);
+            assertThat(module.resolve("target/citrus-docs/snippet.adoc")).hasContent("snippet from remote-data");
+            try (Stream<Path> root = Files.list(module)) {
+                assertThat(root.map(p -> p.getFileName().toString())).containsExactlyInAnyOrder("src", "target");
+            }
+            assertThat(module.resolve("target/citrus-docs/sibling.txt")).as("sibling outputs are not collected").doesNotExist();
+            try (Stream<Path> outputs = Files.list(module.resolve("target/.citrus-dist-outputs"))) {
+                assertThat(outputs.map(p -> p.getFileName().toString())).noneMatch(name -> name.startsWith("tx-"));
+            }
+        }
+    }
+
+    @Test
+    void shouldFailRunWhenRemotePartitionCrashesWithoutTestEvents() throws Exception {
+        try (Cluster cluster = Cluster.start(tempDir)) {
+            Path module = Files.createDirectories(tempDir.resolve("module-crash"));
+            System.setProperty(DistributionSettings.ENABLED_PROPERTY, "true");
+            System.setProperty(DistributionSettings.BROKER_URL_PROPERTY, cluster.broker.baseUrl());
+            System.setProperty(DistributionSettings.BASEDIR_PROPERTY, module.toString());
+            System.setProperty(DistributionSettings.OUTPUTS_PROPERTY, "target/citrus-docs");
+
+            assertThatThrownBy(() -> run(RemoteCrashingFixture.class))
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining("failed")
+                    .hasMessageContaining("exited with code 7");
+        }
+    }
+
+    @Test
+    void shouldFailRunAndWriteNothingWhenPartitionsProduceConflictingOutputs() throws Exception {
+        try (Cluster cluster = Cluster.start(tempDir)) {
+            Path module = Files.createDirectories(tempDir.resolve("module-conflict"));
+            System.setProperty(DistributionSettings.ENABLED_PROPERTY, "true");
+            System.setProperty(DistributionSettings.BROKER_URL_PROPERTY, cluster.broker.baseUrl());
+            System.setProperty(DistributionSettings.BASEDIR_PROPERTY, module.toString());
+            System.setProperty(DistributionSettings.OUTPUTS_PROPERTY, "target/citrus-docs");
+            System.setProperty(DistributionSettings.MAX_PARTITION_SIZE_PROPERTY, "1");
+
+            assertThatThrownBy(() -> run(ConflictingOutputFixtureA.class, ConflictingOutputFixtureB.class))
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining("target/citrus-docs/conflict.txt");
+            assertThat(module.resolve("target/citrus-docs/conflict.txt")).doesNotExist();
+        }
+    }
+
+    @Test
+    void shouldFailBeforeSubmittingWhenRequiredInputIsMissing() throws Exception {
+        try (Cluster cluster = Cluster.start(tempDir)) {
+            Path module = Files.createDirectories(tempDir.resolve("module-missing"));
+            System.setProperty(DistributionSettings.ENABLED_PROPERTY, "true");
+            System.setProperty(DistributionSettings.BROKER_URL_PROPERTY, cluster.broker.baseUrl());
+            System.setProperty(DistributionSettings.BASEDIR_PROPERTY, module.toString());
+            System.setProperty(DistributionSettings.INPUTS_PROPERTY, "src/test/resources,?optional/dir");
+
+            assertThatThrownBy(() -> run(RemoteWorkspaceFixture.class))
+                    .hasMessageContaining("src/test/resources");
+            HttpResponse<String> sessions = java.net.http.HttpClient.newHttpClient().send(
+                    java.net.http.HttpRequest.newBuilder(java.net.URI.create(cluster.broker.baseUrl() + "/api/v1/sessions")).GET().build(),
+                    HttpResponse.BodyHandlers.ofString());
+            assertThat(sessions.body()).as("nothing reached the coordinator").isEqualTo("[]");
+        }
+    }
+
+    @Test
+    void shouldTreatBlankAndPlaceholderSettingsAsUnsetAndNoneAsClear() {
+        System.setProperty(DistributionSettings.INPUTS_PROPERTY, "");
+        assertThat(DistributedLauncher.WorkspaceSettings.setting(DistributionSettings.INPUTS_PROPERTY, null))
+                .as("the root POM passes undefined settings through as empty values").isNull();
+        System.setProperty(DistributionSettings.INPUTS_PROPERTY, "${citrus.test.distribution.inputs}");
+        assertThat(DistributedLauncher.WorkspaceSettings.setting(DistributionSettings.INPUTS_PROPERTY, null)).isNull();
+        assertThat(DistributedLauncher.WorkspaceSettings.setting(DistributionSettings.INPUTS_PROPERTY, "PATH"))
+                .as("a blank property falls back to the environment variable").isEqualTo(System.getenv("PATH"));
+        System.setProperty(DistributionSettings.INPUTS_PROPERTY, "none");
+        assertThat(DistributionSettings.parseDeclaredPaths(
+                DistributedLauncher.WorkspaceSettings.setting(DistributionSettings.INPUTS_PROPERTY, null))).isEmpty();
+    }
+
+    @Test
+    void shouldSendTheWorkingDirectoryRelativeToTheModule() {
+        Path module = tempDir.resolve("mod");
+        assertThat(DistributedLauncher.WorkspaceSettings.relativeWorkingDirectory(module, module.resolve("target")))
+                .as("Surefire runs in target/ in this repository").isEqualTo("target");
+        assertThat(DistributedLauncher.WorkspaceSettings.relativeWorkingDirectory(module, module)).as("Failsafe: module root").isEmpty();
+        assertThat(DistributedLauncher.WorkspaceSettings.relativeWorkingDirectory(module, tempDir.resolve("elsewhere")))
+                .as("outside the module: workspace root").isEmpty();
+        assertThat(DistributedLauncher.WorkspaceSettings.relativeWorkingDirectory(module, module.resolve("target/sub")))
+                .isEqualTo("target/sub");
+    }
+
+    @Test
+    void shouldResolveTheWorkingDirectoryThroughSymlinks() throws Exception {
+        Path real = Files.createDirectories(tempDir.resolve("real-module/target"));
+        Path link = Files.createSymbolicLink(tempDir.resolve("linked-module"), real.getParent());
+        assertThat(DistributedLauncher.WorkspaceSettings.relativeWorkingDirectory(link, real)).isEqualTo("target");
+    }
+
+    @Test
+    void shouldForkWhenOnlyMissingOptionalInputsAreDeclared() {
+        Path module = tempDir.resolve("module-optional");
+        System.setProperty(DistributionSettings.BASEDIR_PROPERTY, module.toString());
+        System.setProperty(DistributionSettings.INPUTS_PROPERTY, "?not/there");
+        DistributedLauncher.WorkspaceSettings settings = DistributedLauncher.WorkspaceSettings.resolve();
+        assertThat(settings.inputArtifacts()).isEmpty();
+        assertThat(settings.forkWorkspace()).as("declaring inputs implies a forked JVM").isTrue();
+    }
+
+    private record Outcome(int passed, int failed) {
+    }
+
+    private static Outcome run(Class<?>... fixtures) {
+        AtomicInteger passed = new AtomicInteger();
+        AtomicInteger failed = new AtomicInteger();
+        DistributedLauncher distributed = new DistributedLauncher(LauncherFactory.create());
+        LauncherDiscoveryRequest request = LauncherDiscoveryRequestBuilder.request()
+                .selectors(java.util.Arrays.stream(fixtures).map(DiscoverySelectors::selectClass).toList())
+                .build();
+        distributed.execute(request, new TestExecutionListener() {
+            @Override
+            public void executionFinished(TestIdentifier id, TestExecutionResult result) {
+                if (id.isTest()) {
+                    (result.getStatus() == TestExecutionResult.Status.SUCCESSFUL ? passed : failed).incrementAndGet();
+                }
+            }
+        });
+        return new Outcome(passed.get(), failed.get());
+    }
+
+    private static WorkUnitSpec unit(Class<?> fixture) {
+        return new WorkUnitSpec(fixture.getName(), fixture.getName(), null, null, Map.of(), 0L);
+    }
+
+    /** An embedded broker with two workers. */
+    private record Cluster(DistributionBrokerServer broker, List<DistributionWorkerClient> workers, BrokerHttpClient client)
+            implements AutoCloseable {
+
+        static Cluster start(Path tempDir) throws Exception {
+            DistributionBrokerServer broker = new DistributionBrokerServer(DistributionBrokerConfig.builder()
+                    .port(0)
+                    .cacheDir(tempDir.resolve("broker-cache"))
+                    .jdbcUrl("jdbc:hsqldb:mem:launcher_ws_" + System.nanoTime())
+                    .build());
+            broker.start();
+            List<DistributionWorkerClient> workers = new java.util.ArrayList<>();
+            for (int i = 0; i < 2; i++) {
+                DistributionWorkerClient worker = new DistributionWorkerClient(DistributionWorkerConfig.builder()
+                        .workerId("ws-worker-" + i)
+                        .brokerUrl(broker.baseUrl())
+                        .cacheDir(tempDir.resolve("worker-cache-" + i))
+                        .forkJvmArgs(List.of("-Xmx384m"))
+                        .build());
+                worker.start();
+                assertThat(worker.awaitRegistration(5, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+                workers.add(worker);
+            }
+            return new Cluster(broker, workers, new BrokerHttpClient(broker.baseUrl(), "", 3_000L));
+        }
+
+        /**
+         * A sibling submission running {@code fixture} in a forked JVM from this test JVM's classpath, uploaded first.
+         */
+        SubmitWorkRequest siblingWithOutputs(String sessionId, Class<?> fixture) throws Exception {
+            List<org.citrusframework.distribution.model.ArtifactRef> classpath = new java.util.ArrayList<>();
+            for (String entry : System.getProperty("java.class.path").split(java.io.File.pathSeparator)) {
+                Path path = Path.of(entry);
+                if (!Files.exists(path)) {
+                    continue;
+                }
+                org.citrusframework.distribution.cache.ClasspathPackager.PackagedArtifact packaged =
+                        org.citrusframework.distribution.cache.ClasspathPackager.packagePath(path);
+                client.uploadArtifact(packaged);
+                classpath.add(packaged.ref());
+            }
+            return new SubmitWorkRequest("sibling-3", "sibling", classpath, Map.of(), List.of(unit(fixture)), 0, 0,
+                    List.of(), List.of("target/citrus-docs"), true, PartitionPolicy.LPT);
+        }
+
+        String createSession() throws Exception {
+            return client.createSession(new CreateSessionRequest("citrus", "main", "abc", List.of(), 5, 0)).sessionId();
+        }
+
+        @Override
+        public void close() {
+            workers.forEach(DistributionWorkerClient::close);
+            broker.close();
+        }
     }
 
     @Test
@@ -173,6 +401,65 @@ class DistributedLauncherTest {
                         "maven.multiModuleProjectDirectory",
                         "basedir",
                         "localRepository");
+    }
+
+    /** Runs in a forked worker JVM with the module workspace as working directory. */
+    public static class RemoteWorkspaceFixture {
+        @Test
+        void readInputWriteOutput() throws Exception {
+            if (!DistributionSettings.isWorkerRole()) {
+                throw new AssertionError("must run on a worker");
+            }
+            String data = Files.readString(Path.of("src/test/resources/data.txt"));
+            String rewritten = System.getProperty("custom.data.dir");
+            if (!Path.of(rewritten).toRealPath().equals(Path.of("src/test/resources").toRealPath())) {
+                throw new AssertionError("host path not rewritten to the workspace: " + rewritten);
+            }
+            Files.createDirectories(Path.of("target/citrus-docs"));
+            Files.writeString(Path.of("target/citrus-docs/snippet.adoc"), "snippet from " + data);
+        }
+    }
+
+    public static class SiblingFailingFixture {
+        @Test
+        void failsInAnotherModule() {
+            throw new AssertionError("sibling failure must not leak");
+        }
+    }
+
+    public static class RemoteCrashingFixture {
+        @Test
+        void crash() {
+            // Only ever exit inside a forked partition JVM (its working directory is the partition workspace).
+            if (!"workspace".equals(Path.of("").toAbsolutePath().getFileName().toString())) {
+                throw new AssertionError("expected to run in a forked partition JVM");
+            }
+            System.exit(7);
+        }
+    }
+
+    public static class SiblingOutputFixture {
+        @Test
+        void writeSiblingOutput() throws Exception {
+            Files.createDirectories(Path.of("target/citrus-docs"));
+            Files.writeString(Path.of("target/citrus-docs/sibling.txt"), "from another module");
+        }
+    }
+
+    public static class ConflictingOutputFixtureA {
+        @Test
+        void write() throws Exception {
+            Files.createDirectories(Path.of("target/citrus-docs"));
+            Files.writeString(Path.of("target/citrus-docs/conflict.txt"), "A");
+        }
+    }
+
+    public static class ConflictingOutputFixtureB {
+        @Test
+        void write() throws Exception {
+            Files.createDirectories(Path.of("target/citrus-docs"));
+            Files.writeString(Path.of("target/citrus-docs/conflict.txt"), "B");
+        }
     }
 
     public static class RemoteSampleFixture {

@@ -30,6 +30,12 @@
   </dependencyManagement>
 
   <dependencies>
+    <dependency>
+      <groupId>org.citrusframework</groupId>
+      <artifactId>citrus-test-distribution-protocol</artifactId>
+      <version>${project.version}</version>
+      <scope>test</scope>
+    </dependency>
     <!-- Quarkus platform -->
     <dependency>
       <groupId>io.quarkus</groupId>

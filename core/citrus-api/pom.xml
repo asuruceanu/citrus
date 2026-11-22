@@ -13,6 +13,11 @@
   <name>Citrus :: Core :: API</name>
   <description>Citrus API and basic interfaces</description>
 
+  <properties>
+    <!-- Citrus Test Distribution: see the External Test Resources section of the user manual. -->
+    <citrus.test.distribution.fork>true</citrus.test.distribution.fork>
+  </properties>
+
   <dependencies>
     <dependency>
       <groupId>jakarta.annotation</groupId>

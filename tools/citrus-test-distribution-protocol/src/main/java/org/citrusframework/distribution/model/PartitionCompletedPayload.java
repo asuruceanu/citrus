@@ -16,10 +16,27 @@
 
 package org.citrusframework.distribution.model;
 
+import java.util.List;
+
+/**
+ * Reports the outcome of one partition attempt. {@code attempt == 0} means the sender did not report an
+ * attempt (legacy worker); negative values are normalized to {@code 0}.
+ */
 public record PartitionCompletedPayload(
         String partitionId,
         String sessionId,
+        int attempt,
         boolean success,
-        String errorMessage
+        String errorMessage,
+        List<WorkspaceFileSet> outputArtifacts
 ) {
+
+    public PartitionCompletedPayload {
+        attempt = Math.max(0, attempt);
+        outputArtifacts = outputArtifacts == null ? List.of() : List.copyOf(outputArtifacts);
+    }
+
+    public PartitionCompletedPayload(String partitionId, String sessionId, boolean success, String errorMessage) {
+        this(partitionId, sessionId, 0, success, errorMessage, List.of());
+    }
 }

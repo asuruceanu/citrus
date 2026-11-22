@@ -29,7 +29,10 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CopyOnWriteArrayList;
 
+import org.citrusframework.distribution.cache.BlobCacheDirectory;
 import org.citrusframework.distribution.cache.ClasspathPackager;
+import org.citrusframework.distribution.cache.WorkspacePackager;
+import org.citrusframework.distribution.config.PathRewriter;
 import org.citrusframework.distribution.config.DistributionJson;
 import org.citrusframework.distribution.config.DistributionSettings;
 import org.citrusframework.distribution.model.ArtifactRef;
@@ -37,11 +40,13 @@ import org.citrusframework.distribution.model.BrokerEvent;
 import org.citrusframework.distribution.model.BuildSessionResponse;
 import org.citrusframework.distribution.model.CompleteSessionRequest;
 import org.citrusframework.distribution.model.CreateSessionRequest;
+import org.citrusframework.distribution.model.PartitionPolicy;
 import org.citrusframework.distribution.model.SubmitWorkRequest;
 import org.citrusframework.distribution.model.SubmitWorkResponse;
 import org.citrusframework.distribution.model.TestOutcomeStatus;
 import org.citrusframework.distribution.model.WorkUnitSpec;
 import org.citrusframework.distribution.model.WorkerTestEventPayload;
+import org.citrusframework.distribution.model.WorkspaceFileSet;
 import org.junit.platform.engine.TestDescriptor;
 import org.junit.platform.engine.TestExecutionResult;
 import org.junit.platform.engine.UniqueId;
@@ -125,6 +130,9 @@ public class DistributedLauncher implements Launcher {
             return;
         }
 
+        // Inputs are packaged before the coordinator is contacted, so a missing required input fails fast.
+        WorkspaceSettings workspace = WorkspaceSettings.resolve();
+
         String brokerUrl = DistributionSettings.getBrokerUrl();
         String authToken = DistributionSettings.getAuthToken();
         boolean fallbackLocal = DistributionSettings.isFallbackLocal();
@@ -168,12 +176,17 @@ public class DistributedLauncher implements Launcher {
 
         try {
             PackagedClasspath packaged = packageCurrentClasspath();
-            List<String> allDigests = packaged.artifacts().stream().map(ArtifactRef::sha256).distinct().toList();
+            Map<String, ClasspathPackager.PackagedArtifact> uploadable = new LinkedHashMap<>(packaged.byDigest());
+            for (WorkspaceFileSet input : workspace.inputArtifacts()) {
+                uploadable.putIfAbsent(input.artifact().sha256(), new ClasspathPackager.PackagedArtifact(
+                        input.artifact(), workspace.cache().resolveBlobPath(input.artifact().sha256()), null));
+            }
+            List<String> allDigests = List.copyOf(uploadable.keySet());
             List<String> missing = client.findMissingDigests(allDigests);
             Set<String> missingSet = new HashSet<>(missing);
 
             for (String sha : missing) {
-                ClasspathPackager.PackagedArtifact artifact = packaged.byDigest().get(sha);
+                ClasspathPackager.PackagedArtifact artifact = uploadable.get(sha);
                 if (artifact != null) {
                     client.uploadArtifact(artifact);
                 }
@@ -187,48 +200,67 @@ public class DistributedLauncher implements Launcher {
                     UUID.randomUUID().toString(),
                     moduleName,
                     packaged.artifacts(),
-                    collectPropagatedProperties(),
+                    PathRewriter.rewriteHostProperties(collectPropagatedProperties(), workspace.hostBaseDir()),
                     extracted.remoteUnits(),
                     cachedCount,
-                    uploadedCount));
+                    uploadedCount,
+                    workspace.inputArtifacts(),
+                    workspace.outputPaths(),
+                    workspace.forkWorkspace(),
+                    workspace.partitionPolicy(),
+                    workspace.workingDirectory()));
 
+            Set<String> submittedPartitions = Set.copyOf(submitted.partitionIds());
             Set<String> pendingPartitions = new HashSet<>(submitted.partitionIds());
             List<WorkUnitSpec> lostUnits = new ArrayList<>();
-
-            notifyTestPlanExecutionStarted(allListeners, testPlan);
+            PartitionOutcomes outcomes = new PartitionOutcomes(new HostOutputCommitter(workspace.hostBaseDir(),
+                    workspace.outputPaths(), workspace.cacheExclusion()), workspace.cache());
+            Map<String, WorkUnitSpec> unitsByKey = new LinkedHashMap<>();
+            extracted.remoteUnits().forEach(unit -> unitsByKey.putIfAbsent(unit.key(), unit));
             try {
-                if (!pendingPartitions.isEmpty()) {
-                    client.streamSessionEvents(
-                            sessionId,
-                            0L,
-                            DistributionSettings.getSessionTimeoutMs(),
-                            event -> handleBrokerEvent(
-                                    event, testPlan, allListeners, reportWriter, pendingPartitions, lostUnits));
+                notifyTestPlanExecutionStarted(allListeners, testPlan);
+                try {
+                    if (!pendingPartitions.isEmpty()) {
+                        client.streamSessionEvents(
+                                sessionId,
+                                0L,
+                                DistributionSettings.getSessionTimeoutMs(),
+                                event -> handleBrokerEvent(event, testPlan, allListeners, reportWriter, submittedPartitions,
+                                        pendingPartitions, lostUnits, unitsByKey, outcomes, client));
+                    }
+                } finally {
+                    notifyTestPlanExecutionFinished(allListeners, testPlan);
+                }
+
+                LocalFallbackExecutor.LocalExecutionStats lostStats = new LocalFallbackExecutor.LocalExecutionStats(0, 0, 0, 0L);
+                if (!lostUnits.isEmpty()) {
+                    if (!fallbackLocal || extracted.hasRemoteOnlyUnits()) {
+                        throw new IllegalStateException("Remote partitions were lost: " + lostUnits.size());
+                    }
+                    LOG.warn("Executing {} lost remote work unit(s) locally", lostUnits.size());
+                    lostStats = LocalFallbackExecutor.executeLocally(delegate, lostUnits, callListeners);
+                }
+
+                String reportDirProp = System.getProperty(DistributionSettings.REPORT_DIR_PROPERTY);
+                if (reportDirProp != null && !reportDirProp.isBlank()) {
+                    reportWriter.writeReports(Path.of(reportDirProp));
+                }
+
+                RuntimeException outputFailure = outcomes.finish();
+
+                if (ownsSession) {
+                    client.completeSession(sessionId, new CompleteSessionRequest(
+                            localStats.passed() + lostStats.passed(),
+                            localStats.failed() + lostStats.failed(),
+                            localStats.skipped() + lostStats.skipped(),
+                            localStats.serialDurationMs() + lostStats.serialDurationMs()));
+                }
+                if (outputFailure != null) {
+                    throw outputFailure;
                 }
             } finally {
-                notifyTestPlanExecutionFinished(allListeners, testPlan);
-            }
-
-            LocalFallbackExecutor.LocalExecutionStats lostStats = new LocalFallbackExecutor.LocalExecutionStats(0, 0, 0, 0L);
-            if (!lostUnits.isEmpty()) {
-                if (!fallbackLocal || extracted.hasRemoteOnlyUnits()) {
-                    throw new IllegalStateException("Remote partitions were lost: " + lostUnits.size());
-                }
-                LOG.warn("Executing {} lost remote work unit(s) locally", lostUnits.size());
-                lostStats = LocalFallbackExecutor.executeLocally(delegate, lostUnits, callListeners);
-            }
-
-            String reportDirProp = System.getProperty(DistributionSettings.REPORT_DIR_PROPERTY);
-            if (reportDirProp != null && !reportDirProp.isBlank()) {
-                reportWriter.writeReports(Path.of(reportDirProp));
-            }
-
-            if (ownsSession) {
-                client.completeSession(sessionId, new CompleteSessionRequest(
-                        localStats.passed() + lostStats.passed(),
-                        localStats.failed() + lostStats.failed(),
-                        localStats.skipped() + lostStats.skipped(),
-                        localStats.serialDurationMs() + lostStats.serialDurationMs()));
+                // Every abort path (lost partitions, stream errors, failures in the event handler) drops staged outputs.
+                outcomes.committer().discardStaging();
             }
         } catch (RuntimeException re) {
             throw re;
@@ -237,32 +269,53 @@ public class DistributedLauncher implements Launcher {
         }
     }
 
-    @SuppressWarnings("unchecked")
+    /**
+     * Handles one session event. Events of partitions this launcher did not submit (sibling modules sharing a reactor
+     * session) are ignored, and each partition's completion is processed once even if replayed.
+     */
     private boolean handleBrokerEvent(BrokerEvent event,
                                       TestPlan testPlan,
                                       List<TestExecutionListener> listeners,
                                       SurefireReportWriter reportWriter,
+                                      Set<String> submittedPartitions,
                                       Set<String> pendingPartitions,
-                                      List<WorkUnitSpec> lostUnits) {
+                                      List<WorkUnitSpec> lostUnits,
+                                      Map<String, WorkUnitSpec> unitsByKey,
+                                      PartitionOutcomes outcomes,
+                                      BrokerHttpClient client) {
+        boolean ownEvent = event.partitionId() != null && submittedPartitions.contains(event.partitionId());
         switch (event.type()) {
             case "test.event" -> {
-                WorkerTestEventPayload payload = DistributionJson.convert(event.data(), WorkerTestEventPayload.class);
-                reportWriter.record(payload);
-                replayToJUnitListeners(testPlan, listeners, payload);
+                if (ownEvent) {
+                    WorkerTestEventPayload payload = DistributionJson.convert(event.data(), WorkerTestEventPayload.class);
+                    reportWriter.record(payload);
+                    replayToJUnitListeners(testPlan, listeners, payload);
+                }
             }
             case "partition.completed" -> {
-                if (event.partitionId() != null) {
-                    pendingPartitions.remove(event.partitionId());
+                if (ownEvent && pendingPartitions.remove(event.partitionId())) {
+                    outcomes.completed(event, client);
                 }
             }
             case "partition.lost" -> {
-                if (event.partitionId() != null) {
-                    pendingPartitions.remove(event.partitionId());
+                if (!ownEvent || !pendingPartitions.remove(event.partitionId())) {
+                    return pendingPartitions.isEmpty();
                 }
-                if (event.data() != null && event.data().get("workUnits") instanceof List<?> rawUnits) {
-                    for (Object item : rawUnits) {
-                        lostUnits.add(DistributionJson.convert(item, WorkUnitSpec.class));
+                List<?> rawUnits = event.data() != null && event.data().get("workUnits") instanceof List<?> list ? list : List.of();
+                int mapped = 0;
+                for (Object item : rawUnits) {
+                    // The coordinator reports lost work units by key.
+                    WorkUnitSpec unit = item instanceof String key ? unitsByKey.get(key)
+                            : DistributionJson.convert(item, WorkUnitSpec.class);
+                    if (unit != null) {
+                        lostUnits.add(unit);
+                        mapped++;
                     }
+                }
+                if (rawUnits.isEmpty() || mapped < rawUnits.size()) {
+                    // Fail closed: tests of this partition could not be identified for a local re-run.
+                    outcomes.failures().add("Partition " + event.partitionId() + " was lost and not all of its work units "
+                            + "could be identified for a local re-run");
                 }
             }
             default -> {
@@ -408,6 +461,192 @@ public class DistributedLauncher implements Launcher {
                 }
             });
         } catch (IOException ignored) {
+        }
+    }
+
+    /**
+     * Workspace settings of this module run: the module base directory, declared inputs (already packaged into the
+     * host cache), declared outputs, fork flag and partition policy.
+     */
+    record WorkspaceSettings(Path hostBaseDir, BlobCacheDirectory cache, List<WorkspaceFileSet> inputArtifacts,
+                             List<String> outputPaths, boolean forkWorkspace, PartitionPolicy partitionPolicy,
+                             String workingDirectory) {
+
+        /**
+         * {@code userDir} relative to {@code hostBaseDir} ({@code /}-separated), or empty when it is the module directory
+         * or lies outside it. In Citrus, Surefire runs tests in {@code target/} and Failsafe in the module directory;
+         * forked workers reproduce this inside the workspace so relative paths resolve as they do locally.
+         */
+        static String relativeWorkingDirectory(Path hostBaseDir, Path userDir) {
+            Path base = hostBaseDir.toAbsolutePath().normalize();
+            Path cwd = userDir.toAbsolutePath().normalize();
+            if (!cwd.startsWith(base)) {
+                // The two may differ only by a symbolic link (e.g. /var vs /private/var on macOS).
+                try {
+                    base = base.toRealPath();
+                    cwd = cwd.toRealPath();
+                } catch (IOException | SecurityException e) {
+                    return "";
+                }
+            }
+            if (!cwd.startsWith(base) || cwd.equals(base)) {
+                return "";
+            }
+            return base.relativize(cwd).toString().replace('\\', '/');
+        }
+
+        /**
+         * The host cache directory relative to the module, when it lies inside it, so remote outputs cannot target it.
+         */
+        List<String> cacheExclusion() {
+            return cacheExclusion(hostBaseDir, cache);
+        }
+
+        private static List<String> cacheExclusion(Path hostBaseDir, BlobCacheDirectory cache) {
+            Path cacheRoot = cache.getRootDir();
+            return cacheRoot.startsWith(hostBaseDir) && !cacheRoot.equals(hostBaseDir)
+                    ? List.of(hostBaseDir.relativize(cacheRoot).toString().replace('\\', '/'))
+                    : List.of();
+        }
+
+        static WorkspaceSettings resolve() {
+            Path hostBaseDir = resolveHostBaseDir();
+            String cacheDir = setting(DistributionSettings.CACHE_DIR_PROPERTY, DistributionSettings.CACHE_DIR_ENV);
+            // A relative cache directory lives under target/, keeping the module root free of tool directories.
+            BlobCacheDirectory cache = new BlobCacheDirectory(cacheDir != null && !cacheDir.isBlank()
+                    ? hostBaseDir.resolve("target").resolve(cacheDir)
+                    : hostBaseDir.resolve("target").resolve(".citrus-dist").resolve("cache"));
+            List<String> internal = new ArrayList<>(List.of("target/.citrus-dist-outputs", "target/.citrus-dist"));
+            internal.addAll(cacheExclusion(hostBaseDir, cache));
+
+            List<DistributionSettings.DeclaredPathSpec> declaredInputs = DistributionSettings.parseDeclaredPaths(
+                    setting(DistributionSettings.INPUTS_PROPERTY, DistributionSettings.INPUTS_ENV));
+            List<WorkspaceFileSet> inputs = new ArrayList<>();
+            for (DistributionSettings.DeclaredPathSpec input : declaredInputs) {
+                try {
+                    WorkspacePackager.packageInputToCache(cache, hostBaseDir, input.relativePath(), input.optional(), internal)
+                            .ifPresent(inputs::add);
+                } catch (IOException e) {
+                    throw new java.io.UncheckedIOException("Failed to package declared input '" + input.relativePath() + "'", e);
+                }
+            }
+            List<String> outputs = DistributionSettings.parseDeclaredOutputPaths(
+                            setting(DistributionSettings.OUTPUTS_PROPERTY, DistributionSettings.OUTPUTS_ENV)).stream()
+                    .map(spec -> WorkspacePackager.validateRelativePath(spec.relativePath()))
+                    .toList();
+            for (String output : outputs) {
+                // Outputs are never written through links; fail now rather than after the remote run.
+                Path link = BlobCacheDirectory.findSymlinkComponent(hostBaseDir, hostBaseDir.resolve(output));
+                if (link != null) {
+                    throw new IllegalArgumentException("Declared output '" + output
+                            + "' passes through a symbolic link or junction: " + link);
+                }
+            }
+            boolean fork = DistributionSettings.parseForkWorkspace(
+                    setting(DistributionSettings.FORK_PROPERTY, DistributionSettings.FORK_ENV));
+            PartitionPolicy policy = DistributionSettings.parsePartitionPolicy(
+                    setting(DistributionSettings.PARTITION_POLICY_PROPERTY, DistributionSettings.PARTITION_POLICY_ENV));
+            // Declaring inputs implies a forked JVM, even when only optional inputs were declared and none exist.
+            return new WorkspaceSettings(hostBaseDir, cache, List.copyOf(inputs), outputs,
+                    fork || !declaredInputs.isEmpty() || !outputs.isEmpty(), policy,
+                    relativeWorkingDirectory(hostBaseDir, Path.of(System.getProperty("user.dir", ""))));
+        }
+
+        /**
+         * {@code citrus.test.distribution.basedir}, else {@code basedir}, else {@code user.dir}.
+         */
+        static Path resolveHostBaseDir() {
+            for (String key : List.of(DistributionSettings.BASEDIR_PROPERTY, "basedir", "user.dir")) {
+                String value = System.getProperty(key);
+                if (value != null && !value.isBlank() && !isPlaceholder(value)) {
+                    return Path.of(value).toAbsolutePath().normalize();
+                }
+            }
+            return Path.of("").toAbsolutePath();
+        }
+
+        /**
+         * The value of a setting: the system property when set to a non-blank value, otherwise the environment
+         * variable. Blank values and unresolved {@code ${...}} placeholders count as unset (the root POM passes the
+         * properties through to Surefire even when undefined); {@code none} clears a path list explicitly, and the
+         * Maven extension writes the resolved winner, including {@code none} for a cleared list.
+         */
+        static String setting(String property, String env) {
+            String value = System.getProperty(property);
+            if (value != null && !value.isBlank() && !isPlaceholder(value.trim())) {
+                return value;
+            }
+            String fromEnv = env != null ? System.getenv(env) : null;
+            return fromEnv == null || fromEnv.isBlank() ? null : fromEnv;
+        }
+
+        private static boolean isPlaceholder(String value) {
+            return value.startsWith("${") && value.endsWith("}");
+        }
+    }
+
+    /**
+     * Results of this launcher's partitions: runner failures and staged outputs, finished once all partitions ended.
+     */
+    private record PartitionOutcomes(HostOutputCommitter committer, BlobCacheDirectory cache, List<String> failures) {
+
+        PartitionOutcomes(HostOutputCommitter committer, BlobCacheDirectory cache) {
+            this(committer, cache, new ArrayList<>());
+        }
+
+        void completed(BrokerEvent event, BrokerHttpClient client) {
+            Map<String, Object> data = event.data() != null ? event.data() : Map.of();
+            if (!"COMPLETED".equals(String.valueOf(data.get("state")))) {
+                failures.add("Partition " + event.partitionId() + " failed: " + data.getOrDefault("errorMessage", "no details"));
+                return;
+            }
+            Object rawOutputs = data.get("outputArtifacts");
+            if (rawOutputs == null) {
+                return;
+            }
+            try {
+                List<WorkspaceFileSet> outputs = DistributionJson.mapper().convertValue(rawOutputs,
+                        new tools.jackson.core.type.TypeReference<List<WorkspaceFileSet>>() { });
+                for (WorkspaceFileSet output : outputs) {
+                    String sha256 = output.artifact().sha256();
+                    if (cache.getVerifiedPath(sha256) == null) {
+                        Path download = cache.newTempFile("output-");
+                        try {
+                            client.downloadBlobToFile(sha256, download);
+                            cache.putFromFile(sha256, download);
+                        } finally {
+                            Files.deleteIfExists(download);
+                        }
+                    }
+                }
+                committer.recordPartitionOutputs(event.partitionId(), outputs, cache);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                failures.add("Interrupted while collecting outputs of partition " + event.partitionId());
+            } catch (IOException | RuntimeException e) {
+                failures.add("Failed to collect outputs of partition " + event.partitionId() + ": " + e.getMessage());
+            }
+        }
+
+        /**
+         * Commits the staged outputs when every partition succeeded and no outputs conflict; otherwise writes nothing.
+         *
+         * @return the failure to report, or {@code null}
+         */
+        RuntimeException finish() {
+            List<String> problems = new ArrayList<>(failures);
+            committer.conflictError().ifPresent(problems::add);
+            if (!problems.isEmpty()) {
+                committer.discardStaging();
+                return new IllegalStateException("Distributed test execution failed; no outputs were written to the module:"
+                        + System.lineSeparator() + String.join(System.lineSeparator(), problems));
+            }
+            try {
+                committer.commitOrRollback();
+                return null;
+            } catch (IOException | RuntimeException e) {
+                return new IllegalStateException("Failed to write remote outputs into the module: " + e.getMessage(), e);
+            }
         }
     }
 

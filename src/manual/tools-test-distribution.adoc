@@ -38,7 +38,7 @@ citrus dist worker start --broker-url=ws://127.0.0.1:18080/ws/v1/worker --capabi
 
 ./mvnw verify \
   -Dcitrus.test.distribution.enabled=true \
-  -Dcitrus.test.distribution.broker.url=http://127.0.0.1:18080
+  -Dcitrus.test.distribution.brokerUrl=http://127.0.0.1:18080
 ----
 
 Normal Maven builds without `-Dcitrus.test.distribution.enabled=true` execute locally with zero coordinator traffic.
@@ -49,3 +49,171 @@ Normal Maven builds without `-Dcitrus.test.distribution.enabled=true` execute lo
 * `@LocalOnly` — Pins a test class or method to the local build host JVM.
 * `@RemoteOnly` — Requires execution on a remote worker and fails fast when the coordinator is unreachable.
 * `@AgentRequirement(key = "docker", value = "true")` — Repeatable capability filter matched against registered worker capabilities (supports exact match and `>=` numeric thresholds).
+
+[[tools-test-distribution-external-resources]]
+== External Test Resources
+
+Remote workers receive the module's test classpath (compiled classes, copied test resources, and dependency jars).
+Tests that read or write files outside the classpath, or that change JVM-wide state, need a few module settings so they
+behave on a worker exactly as they do locally.
+
+[[tools-test-distribution-external-resources-settings]]
+=== Module settings
+
+All settings are plain Maven properties, so `./mvnw test` behaves the same with and without the distribution extension.
+
+[cols="2,4,1",options="header"]
+|===
+|Property |Meaning |Default
+|`citrus.test.distribution.inputs`
+|Comma-separated paths, relative to the module directory, copied into the worker workspace before the tests run.
+A `?` before or after a path marks it optional (skipped when absent); a missing required path fails the build before
+anything is submitted.
+|none
+|`citrus.test.distribution.outputs`
+|Comma-separated paths, relative to the module directory. Files the tests create or change under them on the worker
+are copied back into the module afterwards (see <<tools-test-distribution-external-resources-outputs>>). The optional
+marker `?` is not allowed here.
+|none
+|`citrus.test.distribution.fork`
+|`true` runs the module's partitions in a short-lived JVM on the worker instead of the shared worker JVM. Declaring
+inputs or outputs implies a forked JVM.
+|`false`
+|`citrus.test.distribution.partitionPolicy`
+|`LPT` splits the module's tests into several partitions by historical duration; `SINGLE` runs all of them in one
+partition and workspace (for tests that depend on files written by other test classes). Under `SINGLE`, tests requiring
+different values for the same capability are rejected.
+|`LPT`
+|===
+
+[source,xml]
+----
+<properties>
+  <citrus.test.distribution.inputs>target/generated-test-sources,?src/test/data</citrus.test.distribution.inputs>
+  <citrus.test.distribution.fork>true</citrus.test.distribution.fork>
+</properties>
+----
+
+Paths use `/` (a `\` is converted); a leading `./` and a trailing `/` are dropped, and a path below another declared
+path is covered by it.
+
+Each setting is taken from the first of these that defines it; lower levels are replaced, never merged (levels 2 and 3
+are applied by the Maven extension; without it, the test JVM sees the system property and the environment variable):
+
+. The Maven command line (`-Dcitrus.test.distribution.inputs=...`).
+. An explicit `<systemPropertyVariables>` value of the Surefire or Failsafe configuration.
+. The module's `<properties>` (inherited from parent POMs as usual).
+. The environment variables `CITRUS_DIST_INPUTS`, `CITRUS_DIST_OUTPUTS`, `CITRUS_DIST_FORK`, `CITRUS_DIST_PARTITION_POLICY`.
+. The default.
+
+The value `none` clears a path list at any level, for example to drop paths inherited from a parent POM. Empty values
+count as unset. With the Maven extension, an empty command-line value (`-Dcitrus.test.distribution.inputs=`) also
+clears the setting; without it, use `none`. Invalid `fork` or `partitionPolicy` values fail the build at startup with
+the module and the source of the value.
+
+[[tools-test-distribution-external-resources-when]]
+=== Choosing settings
+
+* *Files read from disk, not from the classpath:* declare them as `inputs`. Anything under `src/test/resources` is
+copied to `target/test-classes`, which is on the classpath, and needs no declaration when read through the classpath.
+On a worker, classpath directories are unpacked to a different location than locally: tests must not derive file paths
+from a class or resource location (for example `getResource(...).getFile()` followed by string replacements). Use
+`System.getProperty("basedir")` to locate module files instead.
+* *Files written relative to the working directory, temporary files with fixed names, JVM-wide changes* (Log4j levels,
+default locale or time zone, static caches) *or servers on fixed ports:* set `fork=true`. In the shared worker JVM a
+read-only check of the worker's working directory fails the partition when a test wrote there (see `cwdCheck` below);
+nothing is ever deleted.
+* *Generated files needed on the developer machine after the tests:* declare them as `outputs`.
+* *Tests that depend on the developer machine itself* (installed tools, the local Maven repository, an application
+started locally): annotate them with `@LocalOnly` (test-scoped dependency
+`org.citrusframework:citrus-test-distribution-protocol`).
+
+[[tools-test-distribution-external-resources-workspace]]
+=== Working directory, basedir and path rewriting
+
+A forked partition runs in a private workspace that mirrors the module directory: inputs are materialized at their
+module-relative paths and `target/` exists from the start. The test JVM starts in the same relative working directory as
+the local one — `target/` for Surefire tests in the Citrus build, the module directory for Failsafe tests — and the
+`basedir` system property points at the workspace root.
+
+System properties forwarded to workers that contain the module path (for example `project.build.directory` or a
+configured file path) are rewritten to the workspace: the module path is replaced by the token `${citrus.dist.workspace}`
+on the host and expanded on the worker. Only whole path segments are replaced (a sibling such as `/work/app-other` stays
+untouched), including inside `file:` URIs, JDBC URLs, path lists and `@argument` files. URL-encoded or otherwise escaped
+paths are not rewritten.
+
+[[tools-test-distribution-external-resources-outputs]]
+=== Outputs
+
+Output files are collected from every partition and written into the module only after all partitions finished:
+
+* Only files new or changed during the run are copied; unchanged inputs are not.
+* Files outside the declared output paths, and files under `target/.citrus-dist-outputs` or the host cache, are rejected.
+* The same file produced with identical content by several partitions is written once. Different content, or names that
+differ only in letter case, is a conflict: the build fails and nothing is written.
+* Before writing, every destination is checked (no symbolic links or junctions, no directory in the way). Replaced files
+are backed up and their permissions kept; if any step fails, all changes are rolled back. Commits to the same module are
+serialized within the JVM and across JVMs (lock file `target/.citrus-dist-outputs/commit.lock`).
+* A partition that crashed or did not complete fails the build, even when it reported no test results.
+
+Staging happens in `target/.citrus-dist-outputs/tx-*` and is removed afterwards; downloaded blobs are kept in
+`target/.citrus-dist/cache` (configurable with `citrus.test.distribution.cacheDir`; a relative value is resolved below
+the module's `target/`) and are not evicted automatically. Workers keep their own cache in `<cacheDir>/worker`, relative to the worker's working directory
+(default `.citrus-dist/cache/worker`).
+
+[[tools-test-distribution-external-resources-worker]]
+=== Worker settings
+
+[cols="2,4,1",options="header"]
+|===
+|Property / environment variable |Meaning |Default
+|`citrus.test.distribution.worker.forkMode` / `CITRUS_DIST_WORKER_FORK_MODE`
+|`AUTO` forks only partitions that need it; `ALWAYS` forks every partition.
+|`AUTO`
+|`citrus.test.distribution.worker.forkJvmArgs` / `CITRUS_DIST_WORKER_FORK_JVM_ARGS`
+|Whitespace-separated JVM arguments for forked partitions (quoting is not interpreted).
+|`-Xmx768m -XX:ActiveProcessorCount=2`
+|`citrus.test.distribution.worker.cwdCheck` / `CITRUS_DIST_WORKER_CWD_CHECK`
+|For partitions in the shared worker JVM: `FAIL` the partition, only `WARN`, or turn the check `OFF` when tests write
+into the worker's working directory (new entries, writes into existing top-level directories, and new or changed files below
+`target/` and `src/`; changes to files that already existed at the top level, such as the worker's own log, are
+ignored). Use `WARN` when several
+daemons share a directory.
+|`FAIL`
+|`citrus.test.distribution.worker.handshakeTimeoutMs`
+|How long a forked JVM may take to connect back to its worker.
+|`15000`
+|===
+
+A worker runs one partition at a time; run several worker daemons per machine for more parallelism (tests that bind
+fixed ports can then still collide across daemons on the same machine; use capabilities or separate hosts for them). Cancelling a
+partition (lease expiry, lost connection, worker shutdown) kills the forked JVM and every process it started; nothing is
+uploaded from a cancelled or crashed run. The forked JVM's `java.io.tmpdir` is a short `/tmp/cdtmp-*` directory on POSIX
+systems so Unix domain socket paths stay within platform limits.
+
+[[tools-test-distribution-external-resources-compat]]
+=== Requirements and caveats
+
+* Partitions with inputs, outputs or `fork=true`, and partitions whose forwarded system properties contain the module
+path, are only assigned to workers of this version (capability `citrus.workspace.v1`). With only older workers they wait
+until the session times out.
+* Forked JVMs get `forkJvmArgs`, not Surefire's `argLine` or `environmentVariables`; set what the tests need through
+`forkJvmArgs` or system properties.
+* A local working directory outside the module (unusual) maps to the workspace root.
+* Without the Maven extension, invalid `fork` or `partitionPolicy` values are reported when the module runs distributed
+rather than at build start.
+* The forked JVM uses the worker's copy of the distribution protocol classes; keep hosts and workers on the same Citrus
+version.
+* Tests of a partition that crashed are missing from the Surefire reports; the build fails with the crash diagnostic.
+* Worker caches are not evicted automatically.
+
+[[tools-test-distribution-external-resources-limits]]
+=== Limits
+
+* The same limits apply to classpath directories such as `target/test-classes` (packaged for every distributed module):
+no symbolic links or special files, valid names, at most 50,000 entries.
+* Each blob (a file, or a directory packaged as ZIP) is at most 256 MiB compressed; an archive holds at most 50,000
+entries, 256 MiB per entry and 2 GiB uncompressed in total.
+* Symbolic links and Windows junctions in inputs or outputs are rejected, as are absolute paths, `..`, `:` and Windows
+reserved names such as `CON` or `aux.json` (on every operating system, so workspaces stay portable).
+* Forked partitions require JUnit Platform 6 on the module's test classpath.

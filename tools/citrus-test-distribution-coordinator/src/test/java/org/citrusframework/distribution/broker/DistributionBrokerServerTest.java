@@ -42,6 +42,7 @@ import org.citrusframework.distribution.model.MissingDigestsRequest;
 import org.citrusframework.distribution.model.MissingDigestsResponse;
 import org.citrusframework.distribution.model.PartitionAssignPayload;
 import org.citrusframework.distribution.model.PartitionCompletedPayload;
+import org.citrusframework.distribution.model.PartitionPolicy;
 import org.citrusframework.distribution.model.PartitionState;
 import org.citrusframework.distribution.model.SessionDetailResponse;
 import org.citrusframework.distribution.model.SessionStatus;
@@ -260,7 +261,8 @@ class DistributionBrokerServerTest {
                     List.of("httpClient")), Map.class));
 
             sendWs(dockerWs2, WorkerWsMessage.PARTITION_COMPLETED, DistributionJson.convert(
-                    new PartitionCompletedPayload(assignPayload2.partitionId(), session.sessionId(), true, null),
+                    new PartitionCompletedPayload(assignPayload2.partitionId(), session.sessionId(),
+                            assignPayload2.attempt(), true, null, List.of()),
                     Map.class));
 
             HttpResponse<String> completeResp = postJson(
@@ -294,6 +296,31 @@ class DistributionBrokerServerTest {
 
             nonDockerWs.sendClose(WebSocket.NORMAL_CLOSURE, "bye").join();
             dockerWs2.sendClose(WebSocket.NORMAL_CLOSURE, "bye").join();
+        }
+    }
+
+    @Test
+    void shouldRejectConflictingCapabilitiesUnderSinglePolicyWithBadRequest() throws Exception {
+        DistributionBrokerConfig config = DistributionBrokerConfig.builder()
+                .port(0)
+                .cacheDir(tempDir.resolve("single-cache"))
+                .jdbcUrl("jdbc:hsqldb:mem:broker_single_" + System.nanoTime())
+                .build();
+
+        try (DistributionBrokerServer server = new DistributionBrokerServer(config)) {
+            server.start();
+            BuildSessionResponse session = DistributionJson.fromJson(postJson(server.baseUrl() + "/api/v1/sessions",
+                    new CreateSessionRequest("citrus", "main", "abc", List.of(), 5, 1)).body(), BuildSessionResponse.class);
+
+            SubmitWorkRequest conflicting = new SubmitWorkRequest("sub-single", "citrus-http", List.of(), Map.of(),
+                    List.of(new WorkUnitSpec("u1", "pkg.A", "m", null, Map.of("os", "linux"), 0L),
+                            new WorkUnitSpec("u2", "pkg.B", "m", null, Map.of("os", "windows"), 0L)),
+                    0, 0, List.of(), List.of(), false, PartitionPolicy.SINGLE);
+            HttpResponse<String> response = postJson(
+                    server.baseUrl() + "/api/v1/sessions/" + session.sessionId() + "/work", conflicting);
+
+            assertThat(response.statusCode()).isEqualTo(400);
+            assertThat(response.body()).contains("\"error\"").contains("os");
         }
     }
 

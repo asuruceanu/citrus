@@ -18,5 +18,6 @@ package org.citrusframework.distribution.model;
 
 public enum ArtifactKind {
     JAR,
-    DIRECTORY_ZIP
+    DIRECTORY_ZIP,
+    REGULAR_FILE
 }

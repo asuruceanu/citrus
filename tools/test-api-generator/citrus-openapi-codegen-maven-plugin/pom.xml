@@ -59,6 +59,11 @@
     </plugins>
   </build>
 
+  <properties>
+    <!-- Citrus Test Distribution: see the External Test Resources section of the user manual. -->
+    <citrus.test.distribution.inputs>pom.xml,src/test/resources,target/test-classes/SpringMetaFileGeneratorTest</citrus.test.distribution.inputs>
+  </properties>
+
   <dependencies>
     <dependency>
       <groupId>org.citrusframework</groupId>

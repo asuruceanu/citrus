@@ -25,6 +25,42 @@ public record PartitionAssignPayload(
         int attempt,
         List<ArtifactRef> classpathArtifacts,
         Map<String, String> systemProperties,
-        List<WorkUnitSpec> workUnits
+        List<WorkUnitSpec> workUnits,
+        List<WorkspaceFileSet> inputArtifacts,
+        List<String> outputPaths,
+        boolean forkWorkspace,
+        String workingDirectory
 ) {
+
+    /**
+     * Normalizes absent values; {@code workingDirectory} is relative to the workspace, empty for its root.
+     */
+    public PartitionAssignPayload {
+        inputArtifacts = inputArtifacts == null ? List.of() : List.copyOf(inputArtifacts);
+        outputPaths = outputPaths == null ? List.of() : List.copyOf(outputPaths);
+        workingDirectory = workingDirectory == null ? "" : workingDirectory;
+    }
+
+    public PartitionAssignPayload(String partitionId,
+                                  String sessionId,
+                                  int attempt,
+                                  List<ArtifactRef> classpathArtifacts,
+                                  Map<String, String> systemProperties,
+                                  List<WorkUnitSpec> workUnits,
+                                  List<WorkspaceFileSet> inputArtifacts,
+                                  List<String> outputPaths,
+                                  boolean forkWorkspace) {
+        this(partitionId, sessionId, attempt, classpathArtifacts, systemProperties, workUnits,
+                inputArtifacts, outputPaths, forkWorkspace, "");
+    }
+
+    public PartitionAssignPayload(String partitionId,
+                                  String sessionId,
+                                  int attempt,
+                                  List<ArtifactRef> classpathArtifacts,
+                                  Map<String, String> systemProperties,
+                                  List<WorkUnitSpec> workUnits) {
+        this(partitionId, sessionId, attempt, classpathArtifacts, systemProperties, workUnits,
+                List.of(), List.of(), false, "");
+    }
 }

@@ -25,6 +25,7 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.List;
@@ -83,6 +84,39 @@ public class BrokerHttpClient {
                 .PUT(publisher);
         HttpResponse<String> resp = httpClient.send(req.build(), HttpResponse.BodyHandlers.ofString());
         ensureSuccess(resp, "uploadBlob(" + artifact.ref().sha256() + ")");
+    }
+
+    /**
+     * Streams a blob from the coordinator into {@code target} (created or truncated), without holding it in memory.
+     */
+    public void downloadBlobToFile(String sha256, Path target) throws IOException, InterruptedException {
+        HttpResponse<InputStream> resp = httpClient.send(requestBuilder("/api/v1/cache/blobs/" + sha256)
+                        .timeout(Duration.ofMinutes(5))
+                        .GET()
+                        .build(),
+                HttpResponse.BodyHandlers.ofInputStream());
+        try (InputStream body = resp.body()) {
+            if (resp.statusCode() != 200) {
+                throw new IOException("Broker HTTP " + resp.statusCode() + " during downloadBlob " + sha256);
+            }
+            long limit = ClasspathPackager.MAX_BLOB_BYTES;
+            if (resp.headers().firstValueAsLong("Content-Length").orElse(0L) > limit) {
+                throw new IOException("Blob " + sha256 + " exceeds the maximum of " + limit + " bytes");
+            }
+            // Bounded while streaming: a misbehaving coordinator cannot fill the disk.
+            try (java.io.OutputStream out = Files.newOutputStream(target)) {
+                byte[] buffer = new byte[64 * 1024];
+                long total = 0;
+                int read;
+                while ((read = body.read(buffer)) != -1) {
+                    total += read;
+                    if (total > limit) {
+                        throw new IOException("Blob " + sha256 + " exceeds the maximum of " + limit + " bytes");
+                    }
+                    out.write(buffer, 0, read);
+                }
+            }
+        }
     }
 
     public SubmitWorkResponse submitWork(String sessionId, SubmitWorkRequest request)

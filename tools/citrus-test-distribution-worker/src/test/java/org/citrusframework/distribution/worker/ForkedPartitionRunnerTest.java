@@ -1,0 +1,450 @@
+/*
+ * Copyright the original author or authors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.citrusframework.distribution.worker;
+
+import java.io.File;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.TimeUnit;
+
+import org.citrusframework.distribution.broker.DistributionBrokerConfig;
+import org.citrusframework.distribution.broker.DistributionBrokerServer;
+import org.citrusframework.distribution.cache.BlobCacheDirectory;
+import org.citrusframework.distribution.cache.ClasspathPackager;
+import org.citrusframework.distribution.cache.WorkspacePackager;
+import org.citrusframework.distribution.config.DistributionSettings;
+import org.citrusframework.distribution.config.DistributionSettings.WorkerForkMode;
+import org.citrusframework.distribution.model.ArtifactRef;
+import org.citrusframework.distribution.model.PartitionAssignPayload;
+import org.citrusframework.distribution.model.TestOutcomeStatus;
+import org.citrusframework.distribution.model.WorkUnitSpec;
+import org.citrusframework.distribution.model.WorkerTestEventPayload;
+import org.citrusframework.distribution.model.WorkspaceFileSet;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.condition.DisabledOnOs;
+import org.junit.jupiter.api.condition.OS;
+import org.junit.jupiter.api.io.TempDir;
+import org.junit.platform.engine.CancellationToken;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+class ForkedPartitionRunnerTest {
+
+    @TempDir
+    Path tempDir;
+
+    /** Runs in the child JVM; plain JUnit so the child needs no assertion library. */
+    public static class WorkspaceFixture {
+        @Test
+        void readInputsAndWriteOutputs() throws Exception {
+            String greeting = Files.readString(new File("src/test/resources/greeting.txt").toPath());
+            check("hello".equals(greeting.trim()), "relative input readable from CWD, got " + greeting);
+            Path basedir = Path.of(System.getProperty("basedir"));
+            check(Path.of("").toRealPath().equals(basedir.toRealPath()), "CWD is the workspace");
+            check(System.getProperty("custom.dir").equals(basedir + File.separator + "conf"), "token expanded: "
+                    + System.getProperty("custom.dir"));
+            String tmp = System.getProperty("java.io.tmpdir");
+            check(File.separatorChar == '\\' || tmp.length() <= 40, "short tmpdir: " + tmp);
+            check(System.getProperty("citrus.report.directory") == null,
+                    "forked JVMs keep Citrus' default report directory (relative to the working directory, as locally)");
+            check(DistributionSettings.ROLE_WORKER.equals(System.getProperty(DistributionSettings.ROLE_PROPERTY)), "role");
+            Files.createDirectories(Path.of("target/docs"));
+            Files.writeString(Path.of("target/docs/report.html"), "<html>report</html>");
+        }
+
+        @Test
+        void failingAssertion() {
+            throw new AssertionError("expected failure");
+        }
+    }
+
+    /** Expects the module's Surefire working directory (target/) inside the workspace. */
+    public static class WorkingDirectoryFixture {
+        @Test
+        void runInTargetDirectory() throws Exception {
+            Path basedir = Path.of(System.getProperty("basedir")).toRealPath();
+            check(Path.of("").toRealPath().equals(basedir.resolve("target")), "CWD is <workspace>/target: " + Path.of("").toRealPath());
+            Files.writeString(Path.of("relative-output.txt"), "written relative to the working directory");
+        }
+    }
+
+    public static class PlainFixture {
+        @Test
+        void passes() {
+        }
+    }
+
+    public static class BlockingFixture {
+        @Test
+        void spawnGrandchildAndBlock() throws Exception {
+            Process grandchild = new ProcessBuilder("sleep", "300").start();
+            Files.createDirectories(Path.of("target/docs"));
+            Files.writeString(Path.of("target/docs/out.txt"), "partial");
+            Path info = Path.of(System.getProperty("fixture.info"));
+            Files.writeString(info.resolveSibling(info.getFileName() + ".tmp"), ProcessHandle.current().pid() + "\n"
+                    + grandchild.pid() + "\n" + System.getProperty("basedir") + "\n" + System.getProperty("java.io.tmpdir"));
+            Files.move(info.resolveSibling(info.getFileName() + ".tmp"), info);
+            Thread.sleep(300_000);
+        }
+    }
+
+    /** Leaves a background process behind and passes. */
+    public static class LeakingFixture {
+        @Test
+        void leaveProcessBehind() throws Exception {
+            Process leaked = new ProcessBuilder("sleep", "300").start();
+            Files.writeString(Path.of(System.getProperty("fixture.info")), String.valueOf(leaked.pid()));
+        }
+    }
+
+    /** Writes a declared output from a JVM shutdown hook, the way coverage agents and log flushers do. */
+    public static class ShutdownHookFixture {
+        @Test
+        void registerHook() {
+            Path out = Path.of("target/docs/hook.txt").toAbsolutePath();
+            Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+                try {
+                    Thread.sleep(200);
+                    Files.createDirectories(out.getParent());
+                    Files.writeString(out, "written on exit");
+                } catch (Exception e) {
+                    throw new IllegalStateException(e);
+                }
+            }));
+        }
+    }
+
+    public static class CrashingFixture {
+        @Test
+        void exitAbruptly() {
+            System.err.println("FATAL BOOM");
+            System.exit(42);
+        }
+    }
+
+    private static void check(boolean condition, String message) {
+        if (!condition) {
+            throw new AssertionError(message);
+        }
+    }
+
+    @Test
+    void shouldMaterializeRelativeCwdInputsRewriteBasedirAndExportDifferentialOutputs() throws Exception {
+        DistributionBrokerConfig brokerConfig = DistributionBrokerConfig.builder()
+                .port(0)
+                .cacheDir(tempDir.resolve("broker-cache"))
+                .jdbcUrl("jdbc:hsqldb:mem:forked_" + System.nanoTime())
+                .build();
+        try (DistributionBrokerServer broker = new DistributionBrokerServer(brokerConfig)) {
+            broker.start();
+            DistributionWorkerConfig config = workerConfig(tempDir.resolve("worker-cache"), broker.baseUrl());
+            BlobCacheDirectory cache = new BlobCacheDirectory(config.cacheDir());
+
+            Path module = Files.createDirectories(tempDir.resolve("module"));
+            Files.createDirectories(module.resolve("src/test/resources"));
+            Files.writeString(module.resolve("src/test/resources/greeting.txt"), "hello");
+            Files.createDirectories(module.resolve("target/docs"));
+            Files.writeString(module.resolve("target/docs/preexisting.txt"), "kept");
+            List<WorkspaceFileSet> inputs = List.of(
+                    WorkspacePackager.packageInputToCache(cache, module, "src/test/resources", false).orElseThrow(),
+                    WorkspacePackager.packageInputToCache(cache, module, "target/docs", false).orElseThrow());
+
+            List<WorkerTestEventPayload> events = new CopyOnWriteArrayList<>();
+            IsolatedPartitionRunner.PartitionExecutionResult result = new ForkedPartitionRunner(config).execute(
+                    assignment(cache, Map.of("custom.dir", DistributionSettings.WORKSPACE_TOKEN + "/conf"), inputs,
+                            List.of("target/docs"), unit(WorkspaceFixture.class, "readInputsAndWriteOutputs"),
+                            unit(WorkspaceFixture.class, "failingAssertion")),
+                    CancellationToken.create(), events::add);
+
+            assertThat(result.success()).as(result.errorMessage()).isTrue();
+            assertThat(finished(events)).extracting(WorkerTestEventPayload::testName, WorkerTestEventPayload::status)
+                    .containsExactly(
+                            org.assertj.core.groups.Tuple.tuple("readInputsAndWriteOutputs()", TestOutcomeStatus.PASSED),
+                            org.assertj.core.groups.Tuple.tuple("failingAssertion()", TestOutcomeStatus.FAILED));
+            assertThat(finished(events).getFirst().errorMessage()).isNull();
+
+            assertThat(result.outputArtifacts()).singleElement().satisfies(out -> assertThat(out.relativePath()).isEqualTo("target/docs"));
+            Path materialized = Files.createDirectories(tempDir.resolve("host"));
+            List<WorkspacePackager.MaterializedEntry> files = WorkspacePackager.materializeIntoDirectory(
+                    cache, result.outputArtifacts().getFirst(), materialized);
+            assertThat(files).extracting(WorkspacePackager.MaterializedEntry::workspaceRelativePath)
+                    .as("only the new file, not the unchanged input")
+                    .containsExactly("target/docs/report.html");
+
+            HttpResponse<Void> uploaded = HttpClient.newHttpClient().send(HttpRequest.newBuilder(URI.create(
+                    broker.baseUrl() + "/api/v1/cache/blobs/" + result.outputArtifacts().getFirst().artifact().sha256())).GET().build(),
+                    HttpResponse.BodyHandlers.discarding());
+            assertThat(uploaded.statusCode()).as("output blob uploaded to the coordinator").isEqualTo(200);
+        }
+    }
+
+    @Test
+    void shouldRunTestsInTheRequestedWorkingDirectoryInsideTheWorkspace() throws Exception {
+        DistributionBrokerConfig brokerConfig = DistributionBrokerConfig.builder()
+                .port(0)
+                .cacheDir(tempDir.resolve("broker-cache"))
+                .jdbcUrl("jdbc:hsqldb:mem:forked_wd_" + System.nanoTime())
+                .build();
+        try (DistributionBrokerServer broker = new DistributionBrokerServer(brokerConfig)) {
+            broker.start();
+            DistributionWorkerConfig config = workerConfig(tempDir.resolve("worker-cache"), broker.baseUrl());
+            BlobCacheDirectory cache = new BlobCacheDirectory(config.cacheDir());
+            PartitionAssignPayload base = assignment(cache, Map.of(), List.of(), List.of("target"),
+                    unit(WorkingDirectoryFixture.class, "runInTargetDirectory"));
+            PartitionAssignPayload inTarget = new PartitionAssignPayload(base.partitionId(), base.sessionId(), base.attempt(),
+                    base.classpathArtifacts(), base.systemProperties(), base.workUnits(), base.inputArtifacts(),
+                    base.outputPaths(), true, "target");
+
+            List<WorkerTestEventPayload> events = new CopyOnWriteArrayList<>();
+            IsolatedPartitionRunner.PartitionExecutionResult result = new ForkedPartitionRunner(config).execute(
+                    inTarget, CancellationToken.create(), events::add);
+
+            assertThat(result.success()).as(result.errorMessage()).isTrue();
+            assertThat(finished(events)).singleElement().satisfies(e -> assertThat(e.status()).as(e.errorMessage())
+                    .isEqualTo(TestOutcomeStatus.PASSED));
+            Path host = Files.createDirectories(tempDir.resolve("host-wd"));
+            assertThat(WorkspacePackager.materializeIntoDirectory(cache, result.outputArtifacts().getFirst(), host))
+                    .extracting(WorkspacePackager.MaterializedEntry::workspaceRelativePath)
+                    .containsExactly("target/relative-output.txt");
+        }
+    }
+
+    @Test
+    void shouldRejectWorkingDirectoriesOutsideTheWorkspace() throws Exception {
+        DistributionWorkerConfig config = workerConfig(tempDir.resolve("worker-cache"), "http://127.0.0.1:9");
+        BlobCacheDirectory cache = new BlobCacheDirectory(config.cacheDir());
+        PartitionAssignPayload base = assignment(cache, Map.of(), List.of(), List.of(), unit(PlainFixture.class, "passes"));
+        PartitionAssignPayload escaping = new PartitionAssignPayload(base.partitionId(), base.sessionId(), base.attempt(),
+                base.classpathArtifacts(), base.systemProperties(), base.workUnits(), List.of(), List.of(), true, "../outside");
+
+        IsolatedPartitionRunner.PartitionExecutionResult result = new ForkedPartitionRunner(config).execute(
+                escaping, CancellationToken.create(), e -> { });
+        assertThat(result.success()).isFalse();
+        assertThat(result.errorMessage()).contains("../outside");
+    }
+
+    @Test
+    void shouldLaunchChildJvmWhenWorkspaceAndClasspathContainSpacesAndHash() throws Exception {
+        DistributionWorkerConfig config = workerConfig(tempDir.resolve("dir #1 with spaces/cache \"q\""), "http://127.0.0.1:9");
+        BlobCacheDirectory cache = new BlobCacheDirectory(config.cacheDir());
+        List<WorkerTestEventPayload> events = new CopyOnWriteArrayList<>();
+
+        IsolatedPartitionRunner.PartitionExecutionResult result = new ForkedPartitionRunner(config).execute(
+                assignment(cache, Map.of(), List.of(), List.of(), unit(PlainFixture.class, "passes")),
+                CancellationToken.create(), events::add);
+
+        assertThat(result.success()).as(result.errorMessage()).isTrue();
+        assertThat(finished(events)).singleElement().satisfies(e -> assertThat(e.status()).isEqualTo(TestOutcomeStatus.PASSED));
+    }
+
+    @Test
+    @DisabledOnOs(OS.WINDOWS)
+    void shouldKillChildAndDescendantProcessesOnCancellationAndSkipOutputUpload() throws Exception {
+        DistributionWorkerConfig config = workerConfig(tempDir.resolve("worker-cache"), "http://127.0.0.1:9");
+        BlobCacheDirectory cache = new BlobCacheDirectory(config.cacheDir());
+        Path info = tempDir.resolve("fixture-info.txt");
+        CancellationToken token = CancellationToken.create();
+
+        PartitionAssignPayload blocking = assignment(cache, Map.of("fixture.info", info.toString()), List.of(),
+                List.of("target/docs"), unit(BlockingFixture.class, "spawnGrandchildAndBlock"));
+        CompletableFuture<IsolatedPartitionRunner.PartitionExecutionResult> running = CompletableFuture.supplyAsync(() ->
+                new ForkedPartitionRunner(config).execute(blocking, token, e -> { }));
+
+        long deadline = System.currentTimeMillis() + 30_000;
+        while (!Files.exists(info) && System.currentTimeMillis() < deadline) {
+            Thread.sleep(50);
+        }
+        assertThat(info).as("fixture started").exists();
+        List<String> lines = Files.readAllLines(info);
+        ProcessHandle child = ProcessHandle.of(Long.parseLong(lines.get(0))).orElseThrow();
+        ProcessHandle grandchild = ProcessHandle.of(Long.parseLong(lines.get(1))).orElseThrow();
+        Path partitionRoot = Path.of(lines.get(2)).getParent();
+        Path partitionTmp = Path.of(lines.get(3));
+
+        token.cancel();
+        IsolatedPartitionRunner.PartitionExecutionResult result = running.get(20, TimeUnit.SECONDS);
+
+        assertThat(result.success()).isFalse();
+        assertThat(result.outputArtifacts()).isEmpty();
+        assertThat(child.isAlive()).isFalse();
+        long until = System.currentTimeMillis() + 5_000;
+        while (grandchild.isAlive() && System.currentTimeMillis() < until) {
+            Thread.sleep(50);
+        }
+        assertThat(grandchild.isAlive()).as("grandchild process terminated").isFalse();
+        assertThat(partitionRoot).doesNotExist();
+        assertThat(partitionTmp).doesNotExist();
+    }
+
+    @Test
+    @DisabledOnOs(OS.WINDOWS)
+    void shouldKillProcessesLeftBehindByPassingTests() throws Exception {
+        DistributionWorkerConfig config = workerConfig(tempDir.resolve("worker-cache"), "http://127.0.0.1:9");
+        BlobCacheDirectory cache = new BlobCacheDirectory(config.cacheDir());
+        Path info = tempDir.resolve("leaked.pid");
+
+        IsolatedPartitionRunner.PartitionExecutionResult result = new ForkedPartitionRunner(config).execute(
+                assignment(cache, Map.of("fixture.info", info.toString()), List.of(), List.of(),
+                        unit(LeakingFixture.class, "leaveProcessBehind")),
+                CancellationToken.create(), e -> { });
+
+        assertThat(result.success()).as(result.errorMessage()).isTrue();
+        Optional<ProcessHandle> leaked = ProcessHandle.of(Long.parseLong(Files.readString(info).trim()));
+        long until = System.currentTimeMillis() + 5_000;
+        while (leaked.map(ProcessHandle::isAlive).orElse(false) && System.currentTimeMillis() < until) {
+            Thread.sleep(50);
+        }
+        assertThat(leaked.map(ProcessHandle::isAlive).orElse(false)).as("process left behind by the test is killed").isFalse();
+    }
+
+    @Test
+    void shouldRunChildShutdownHooksBeforePackagingOutputs() throws Exception {
+        DistributionBrokerConfig brokerConfig = DistributionBrokerConfig.builder()
+                .port(0)
+                .cacheDir(tempDir.resolve("broker-cache"))
+                .jdbcUrl("jdbc:hsqldb:mem:forked_hook_" + System.nanoTime())
+                .build();
+        try (DistributionBrokerServer broker = new DistributionBrokerServer(brokerConfig)) {
+            broker.start();
+            DistributionWorkerConfig config = workerConfig(tempDir.resolve("worker-cache"), broker.baseUrl());
+            BlobCacheDirectory cache = new BlobCacheDirectory(config.cacheDir());
+
+            IsolatedPartitionRunner.PartitionExecutionResult result = new ForkedPartitionRunner(config).execute(
+                    assignment(cache, Map.of(), List.of(), List.of("target/docs"), unit(ShutdownHookFixture.class, "registerHook")),
+                    CancellationToken.create(), e -> { });
+
+            assertThat(result.success()).as(result.errorMessage()).isTrue();
+            assertThat(result.outputArtifacts()).as("file written by a shutdown hook is packaged").singleElement();
+            Path host = Files.createDirectories(tempDir.resolve("host"));
+            assertThat(WorkspacePackager.materializeIntoDirectory(cache, result.outputArtifacts().getFirst(), host))
+                    .extracting(WorkspacePackager.MaterializedEntry::workspaceRelativePath)
+                    .containsExactly("target/docs/hook.txt");
+        }
+    }
+
+    @Test
+    void shouldRejectPartitionClasspathWithOldJUnitPlatform() throws Exception {
+        Path oldPlatform = Files.createDirectories(tempDir.resolve("old/org/junit/platform/engine"));
+        Files.writeString(oldPlatform.resolve("TestEngine.class"), "x");
+        org.assertj.core.api.Assertions.assertThatThrownBy(() ->
+                        ForkedPartitionRunner.verifyJUnitPlatform(List.of(tempDir.resolve("old"))))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("JUnit Platform");
+        Files.writeString(oldPlatform.resolve("CancellationToken.class"), "x");
+        ForkedPartitionRunner.verifyJUnitPlatform(List.of(tempDir.resolve("old")));
+        ForkedPartitionRunner.verifyJUnitPlatform(List.of());
+    }
+
+    @Test
+    void shouldPutWorkerRuntimeBeforeThePartitionClasspath() throws Exception {
+        Path partitionEntry = Files.createDirectories(tempDir.resolve("module-classes"));
+        List<Path> classpath = ForkedPartitionRunner.childClasspath(List.of(partitionEntry));
+        Path workerClasses = Path.of(ForkedPartitionMain.class.getProtectionDomain().getCodeSource().getLocation().toURI());
+        Path protocolClasses = Path.of(DistributionSettings.class.getProtectionDomain().getCodeSource().getLocation().toURI());
+        assertThat(classpath.indexOf(workerClasses)).isLessThan(classpath.indexOf(partitionEntry));
+        assertThat(classpath.indexOf(protocolClasses)).isLessThan(classpath.indexOf(partitionEntry));
+        assertThat(classpath).doesNotHaveDuplicates();
+    }
+
+    @Test
+    void shouldReportCrashDiagnosticsWhenChildCallsSystemExit() throws Exception {
+        DistributionWorkerConfig config = workerConfig(tempDir.resolve("worker-cache"), "http://127.0.0.1:9");
+        BlobCacheDirectory cache = new BlobCacheDirectory(config.cacheDir());
+
+        IsolatedPartitionRunner.PartitionExecutionResult result = new ForkedPartitionRunner(config).execute(
+                assignment(cache, Map.of(), List.of(), List.of("target/docs"), unit(CrashingFixture.class, "exitAbruptly")),
+                CancellationToken.create(), e -> { });
+
+        assertThat(result.success()).isFalse();
+        assertThat(result.errorMessage()).contains("42").contains("FATAL BOOM");
+        assertThat(result.outputArtifacts()).isEmpty();
+    }
+
+    @Test
+    void shouldQuoteArgfileClasspathAndRejectLineBreaks() {
+        assertThat(ForkedPartitionRunner.argfileClasspathLine(List.of(Path.of("/a b/#1"), Path.of("/c\\d/\"e\""))))
+                .isEqualTo("-cp \"/a b/#1" + File.pathSeparator + "/c\\\\d/\\\"e\\\"\"");
+        org.assertj.core.api.Assertions.assertThatThrownBy(() ->
+                        ForkedPartitionRunner.argfileClasspathLine(List.of(Path.of("/a\nb"))))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void shouldRouteWorkspaceAndForcedPartitionsToTheForkedRunner() {
+        DistributionWorkerConfig auto = DistributionWorkerConfig.builder().cacheDir(tempDir).build();
+        DistributionWorkerConfig always = DistributionWorkerConfig.builder().cacheDir(tempDir).forkMode(WorkerForkMode.ALWAYS).build();
+        PartitionAssignPayload plain = new PartitionAssignPayload("p", "s", 1, List.of(), Map.of(), List.of());
+        PartitionAssignPayload forked = new PartitionAssignPayload("p", "s", 1, List.of(), Map.of(), List.of(), List.of(), List.of(), true);
+        PartitionAssignPayload outputs = new PartitionAssignPayload("p", "s", 1, List.of(), Map.of(), List.of(), List.of(),
+                List.of("target/docs"), false);
+
+        assertThat(DistributionWorkerClient.requiresFork(auto, plain)).isFalse();
+        assertThat(DistributionWorkerClient.requiresFork(always, plain)).isTrue();
+        assertThat(DistributionWorkerClient.requiresFork(auto, forked)).isTrue();
+        assertThat(DistributionWorkerClient.requiresFork(auto, outputs)).isTrue();
+    }
+
+    private static DistributionWorkerConfig workerConfig(Path cacheDir, String brokerUrl) {
+        return DistributionWorkerConfig.builder()
+                .workerId("forked-" + UUID.randomUUID().toString().substring(0, 6))
+                .cacheDir(cacheDir)
+                .brokerUrl(brokerUrl)
+                .forkJvmArgs(List.of("-Xmx256m"))
+                .build();
+    }
+
+    /**
+     * Builds an assignment whose classpath (test classes plus the JUnit Jupiter jars) is already in the worker cache.
+     */
+    private static PartitionAssignPayload assignment(BlobCacheDirectory cache, Map<String, String> props,
+                                                     List<WorkspaceFileSet> inputs, List<String> outputs,
+                                                     WorkUnitSpec... units) throws Exception {
+        List<ArtifactRef> classpath = new ArrayList<>();
+        for (Class<?> anchor : List.of(ForkedPartitionRunnerTest.class, Test.class,
+                Class.forName("org.junit.jupiter.engine.JupiterTestEngine"))) {
+            Path location = Path.of(anchor.getProtectionDomain().getCodeSource().getLocation().toURI());
+            ClasspathPackager.PackagedArtifact packaged = ClasspathPackager.packagePath(location);
+            if (packaged.sourceFile() != null) {
+                cache.putFromFile(packaged.ref().sha256(), packaged.sourceFile());
+            } else {
+                cache.put(packaged.ref().sha256(), packaged.bytes());
+            }
+            classpath.add(packaged.ref());
+        }
+        return new PartitionAssignPayload("p-" + UUID.randomUUID(), "s1", 1, classpath, props, List.of(units),
+                inputs, outputs, !inputs.isEmpty() || !outputs.isEmpty());
+    }
+
+    private static WorkUnitSpec unit(Class<?> fixture, String method) {
+        return new WorkUnitSpec(fixture.getName() + "#" + method, fixture.getName(), method, null, Map.of(), 0L);
+    }
+
+    private static List<WorkerTestEventPayload> finished(List<WorkerTestEventPayload> events) {
+        return events.stream().filter(e -> e.status() != TestOutcomeStatus.STARTED).toList();
+    }
+}

@@ -79,6 +79,16 @@ public class TestDistributionLifecycleParticipant extends AbstractMavenLifecycle
                 ? Path.of(session.getExecutionRootDirectory())
                 : (topProject != null && topProject.getBasedir() != null ? topProject.getBasedir().toPath() : null);
 
+        if (session.getProjects() != null) {
+            try {
+                for (MavenProject project : session.getProjects()) {
+                    SurefirePluginMutator.validateProject(project, session.getUserProperties(), System::getenv);
+                }
+            } catch (IllegalArgumentException e) {
+                throw new MavenExecutionException(e.getMessage(), e);
+            }
+        }
+
         GitDiffDetector.GitWorkspaceInfo gitInfo = GitDiffDetector.inspect(rootDir);
         BrokerHttpClient client = new BrokerHttpClient(
                 brokerUrl, authToken, DistributionSettings.getConnectTimeoutMs());
@@ -119,7 +129,8 @@ public class TestDistributionLifecycleParticipant extends AbstractMavenLifecycle
 
         if (session.getProjects() != null) {
             for (MavenProject project : session.getProjects()) {
-                SurefirePluginMutator.configureProject(project, sessionId, runtimeJars, sharedProps);
+                SurefirePluginMutator.configureProject(project, sessionId, runtimeJars, sharedProps,
+                        session.getUserProperties(), System::getenv);
             }
         }
     }

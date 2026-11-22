@@ -13,6 +13,11 @@
   <name>Citrus :: Tools :: Test Generator</name>
   <description>Citrus Test Generator</description>
 
+  <properties>
+    <!-- Citrus Test Distribution: see the External Test Resources section of the user manual. -->
+    <citrus.test.distribution.fork>true</citrus.test.distribution.fork>
+  </properties>
+
   <dependencies>
     <dependency>
       <groupId>org.citrusframework</groupId>
