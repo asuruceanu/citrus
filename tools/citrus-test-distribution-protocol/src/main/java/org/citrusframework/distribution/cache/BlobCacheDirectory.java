@@ -357,7 +357,7 @@ public class BlobCacheDirectory {
      * True for symbolic links and for other non-regular, non-directory entries such as Windows junctions,
      * which are not reported as symbolic links but redirect like them.
      */
-    static boolean isLinkLike(Path path) {
+    public static boolean isLinkLike(Path path) {
         if (Files.isSymbolicLink(path)) {
             return true;
         }

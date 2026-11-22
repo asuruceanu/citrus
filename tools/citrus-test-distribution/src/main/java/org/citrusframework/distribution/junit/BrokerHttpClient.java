@@ -85,6 +85,35 @@ public class BrokerHttpClient {
         ensureSuccess(resp, "uploadBlob(" + artifact.ref().sha256() + ")");
     }
 
+    /**
+     * Downloads a blob from the coordinator's content-addressed store.
+     */
+    public byte[] downloadBlob(String sha256) throws IOException, InterruptedException {
+        HttpResponse<byte[]> resp = httpClient.send(requestBuilder("/api/v1/cache/blobs/" + sha256)
+                        .timeout(Duration.ofMinutes(5))
+                        .GET()
+                        .build(),
+                HttpResponse.BodyHandlers.ofByteArray());
+        if (resp.statusCode() != 200) {
+            throw new IOException("Broker HTTP " + resp.statusCode() + " during downloadBlob " + sha256);
+        }
+        return resp.body();
+    }
+
+    /**
+     * Streams a blob from the coordinator into {@code target} (created or truncated), without holding it in memory.
+     */
+    public void downloadBlobToFile(String sha256, Path target) throws IOException, InterruptedException {
+        HttpResponse<Path> resp = httpClient.send(requestBuilder("/api/v1/cache/blobs/" + sha256)
+                        .timeout(Duration.ofMinutes(5))
+                        .GET()
+                        .build(),
+                HttpResponse.BodyHandlers.ofFile(target));
+        if (resp.statusCode() != 200) {
+            throw new IOException("Broker HTTP " + resp.statusCode() + " during downloadBlob " + sha256);
+        }
+    }
+
     public SubmitWorkResponse submitWork(String sessionId, SubmitWorkRequest request)
             throws IOException, InterruptedException {
         HttpResponse<String> resp = sendJsonPost("/api/v1/sessions/" + sessionId + "/work", request);
