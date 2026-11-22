@@ -131,16 +131,24 @@ public class JdbcDistributionStore implements DistributionStore {
                         "last_heartbeat_at BIGINT, " +
                         "registered_at BIGINT)",
                 "CREATE TABLE IF NOT EXISTS dist_partitions (" +
-                        "partition_id VARCHAR(64) PRIMARY KEY, " +
+                        "partition_id VARCHAR(64) NOT NULL, " +
                         "session_id VARCHAR(64), " +
                         "worker_id VARCHAR(128), " +
                         "state VARCHAR(32), " +
-                        "attempt INT, " +
+                        "attempt INT NOT NULL, " +
                         "estimated_duration_ms BIGINT, " +
                         "started_at BIGINT, " +
                         "finished_at BIGINT, " +
                         "required_caps_json VARCHAR(4096), " +
-                        "work_units_json " + longText + ")",
+                        "work_units_json " + longText + ", " +
+                        "module_name VARCHAR(255), " +
+                        "fork_workspace BOOLEAN, " +
+                        "working_directory VARCHAR(1024), " +
+                        "inputs_json " + longText + ", " +
+                        "outputs_json " + longText + ", " +
+                        "produced_outputs_json " + longText + ", " +
+                        "error_message VARCHAR(4096), " +
+                        "PRIMARY KEY (partition_id, attempt))",
                 "CREATE TABLE IF NOT EXISTS dist_work_submissions (" +
                         "session_id VARCHAR(64) NOT NULL, " +
                         "submission_id VARCHAR(128) NOT NULL, " +
@@ -170,8 +178,62 @@ public class JdbcDistributionStore implements DistributionStore {
             for (String sql : ddl) {
                 stmt.execute(sql);
             }
+            ensurePartitionColumns(conn, stmt, longText);
         } catch (SQLException e) {
             throw new IllegalStateException("Failed to initialize distribution schema on " + jdbcUrl, e);
+        }
+    }
+
+    private static void ensurePartitionColumns(Connection conn, Statement stmt, String longText) throws SQLException {
+        java.util.Set<String> existing = new java.util.HashSet<>();
+        String actualTableName = null;
+        try (ResultSet rs = conn.getMetaData().getColumns(conn.getCatalog(), conn.getSchema(), null, null)) {
+            while (rs.next()) {
+                String table = rs.getString("TABLE_NAME");
+                String col = rs.getString("COLUMN_NAME");
+                if (table != null && col != null && "dist_partitions".equalsIgnoreCase(table)) {
+                    actualTableName = table;
+                    existing.add(col.toLowerCase(Locale.ROOT));
+                }
+            }
+        }
+        Map<String, String> additions = new LinkedHashMap<>();
+        additions.put("module_name", "VARCHAR(255)");
+        additions.put("fork_workspace", "BOOLEAN");
+        additions.put("working_directory", "VARCHAR(1024)");
+        additions.put("inputs_json", longText);
+        additions.put("outputs_json", longText);
+        additions.put("produced_outputs_json", longText);
+        additions.put("error_message", "VARCHAR(4096)");
+        for (Map.Entry<String, String> entry : additions.entrySet()) {
+            if (!existing.contains(entry.getKey())) {
+                stmt.execute("ALTER TABLE dist_partitions ADD COLUMN " + entry.getKey() + " " + entry.getValue());
+            }
+        }
+        if (actualTableName != null) {
+            java.util.Set<String> pkCols = new java.util.HashSet<>();
+            String pkName = null;
+            try (ResultSet pkRs = conn.getMetaData().getPrimaryKeys(conn.getCatalog(), conn.getSchema(), actualTableName)) {
+                while (pkRs.next()) {
+                    String col = pkRs.getString("COLUMN_NAME");
+                    if (col != null) {
+                        pkCols.add(col.toLowerCase(Locale.ROOT));
+                    }
+                    if (pkName == null) {
+                        pkName = pkRs.getString("PK_NAME");
+                    }
+                }
+            }
+            if (!pkCols.isEmpty() && !pkCols.contains("attempt")) {
+                stmt.execute("UPDATE dist_partitions SET attempt = 1 WHERE attempt IS NULL");
+                stmt.execute("ALTER TABLE dist_partitions ALTER COLUMN attempt SET NOT NULL");
+                if (pkName != null && pkName.matches("[A-Za-z0-9_]+")) {
+                    stmt.execute("ALTER TABLE dist_partitions DROP CONSTRAINT " + pkName);
+                } else {
+                    stmt.execute("ALTER TABLE dist_partitions DROP PRIMARY KEY");
+                }
+                stmt.execute("ALTER TABLE dist_partitions ADD PRIMARY KEY (partition_id, attempt)");
+            }
         }
     }
 
@@ -402,24 +464,37 @@ public class JdbcDistributionStore implements DistributionStore {
     public synchronized void savePartition(PartitionRecord p) {
         String capsJson = truncate(DistributionJson.toJson(p.requiredCapabilities() != null ? p.requiredCapabilities() : Map.of()), 4096);
         String unitsJson = DistributionJson.toJson(p.workUnits() != null ? p.workUnits() : List.of());
-        String updateSql = "UPDATE dist_partitions SET session_id=?, worker_id=?, state=?, attempt=?, " +
-                "estimated_duration_ms=?, started_at=?, finished_at=?, required_caps_json=?, work_units_json=? " +
-                "WHERE partition_id=?";
+        String inputsJson = DistributionJson.toJson(p.inputPaths() != null ? p.inputPaths() : List.of());
+        String outputsJson = DistributionJson.toJson(p.outputPaths() != null ? p.outputPaths() : List.of());
+        String producedJson = DistributionJson.toJson(p.producedOutputs() != null ? p.producedOutputs() : List.of());
+        String updateSql = "UPDATE dist_partitions SET session_id=?, worker_id=?, state=?, " +
+                "estimated_duration_ms=?, started_at=?, finished_at=?, required_caps_json=?, work_units_json=?, " +
+                "module_name=?, fork_workspace=?, working_directory=?, inputs_json=?, outputs_json=?, " +
+                "produced_outputs_json=?, error_message=? " +
+                "WHERE partition_id=? AND attempt=?";
         String insertSql = "INSERT INTO dist_partitions (partition_id, session_id, worker_id, state, attempt, " +
-                "estimated_duration_ms, started_at, finished_at, required_caps_json, work_units_json) " +
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+                "estimated_duration_ms, started_at, finished_at, required_caps_json, work_units_json, " +
+                "module_name, fork_workspace, working_directory, inputs_json, outputs_json, produced_outputs_json, error_message) " +
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
         try (Connection conn = dataSource.getConnection()) {
             try (PreparedStatement ps = conn.prepareStatement(updateSql)) {
                 ps.setString(1, p.sessionId());
                 ps.setString(2, p.workerId());
                 ps.setString(3, p.state().name());
-                ps.setInt(4, p.attempt());
-                ps.setLong(5, p.estimatedDurationMs());
-                ps.setLong(6, p.startedAt());
-                ps.setLong(7, p.finishedAt());
-                ps.setString(8, capsJson);
-                ps.setString(9, unitsJson);
-                ps.setString(10, p.partitionId());
+                ps.setLong(4, p.estimatedDurationMs());
+                ps.setLong(5, p.startedAt());
+                ps.setLong(6, p.finishedAt());
+                ps.setString(7, capsJson);
+                ps.setString(8, unitsJson);
+                ps.setString(9, truncate(p.moduleName(), 255));
+                ps.setBoolean(10, p.forkWorkspace());
+                ps.setString(11, truncate(p.workingDirectory(), 1024));
+                ps.setString(12, inputsJson);
+                ps.setString(13, outputsJson);
+                ps.setString(14, producedJson);
+                ps.setString(15, truncate(p.errorMessage(), 4096));
+                ps.setString(16, p.partitionId());
+                ps.setInt(17, p.attempt());
                 if (ps.executeUpdate() > 0) {
                     return;
                 }
@@ -435,6 +510,13 @@ public class JdbcDistributionStore implements DistributionStore {
                 ps.setLong(8, p.finishedAt());
                 ps.setString(9, capsJson);
                 ps.setString(10, unitsJson);
+                ps.setString(11, truncate(p.moduleName(), 255));
+                ps.setBoolean(12, p.forkWorkspace());
+                ps.setString(13, truncate(p.workingDirectory(), 1024));
+                ps.setString(14, inputsJson);
+                ps.setString(15, outputsJson);
+                ps.setString(16, producedJson);
+                ps.setString(17, truncate(p.errorMessage(), 4096));
                 ps.executeUpdate();
             }
         } catch (SQLException e) {
@@ -445,8 +527,10 @@ public class JdbcDistributionStore implements DistributionStore {
     @Override
     public List<PartitionRecord> listPartitions(String sessionId) {
         String sql = "SELECT partition_id, session_id, worker_id, state, attempt, estimated_duration_ms, " +
-                "started_at, finished_at, required_caps_json, work_units_json FROM dist_partitions " +
-                "WHERE session_id=? ORDER BY started_at ASC, partition_id ASC";
+                "started_at, finished_at, required_caps_json, work_units_json, module_name, fork_workspace, " +
+                "working_directory, inputs_json, outputs_json, produced_outputs_json, error_message " +
+                "FROM dist_partitions WHERE session_id=? " +
+                "ORDER BY CASE WHEN started_at > 0 THEN 0 ELSE 1 END ASC, started_at ASC, partition_id ASC, attempt ASC";
         List<PartitionRecord> partitions = new ArrayList<>();
         try (Connection conn = dataSource.getConnection();
              PreparedStatement ps = conn.prepareStatement(sql)) {
@@ -455,6 +539,9 @@ public class JdbcDistributionStore implements DistributionStore {
                 while (rs.next()) {
                     String capsRaw = rs.getString("required_caps_json");
                     String unitsRaw = rs.getString("work_units_json");
+                    String inputsRaw = rs.getString("inputs_json");
+                    String outputsRaw = rs.getString("outputs_json");
+                    String producedRaw = rs.getString("produced_outputs_json");
                     partitions.add(new PartitionRecord(
                             rs.getString("partition_id"),
                             rs.getString("session_id"),
@@ -465,7 +552,14 @@ public class JdbcDistributionStore implements DistributionStore {
                             rs.getLong("started_at"),
                             rs.getLong("finished_at"),
                             capsRaw == null || capsRaw.isBlank() ? Map.of() : DistributionJson.fromJson(capsRaw, STRING_MAP_TYPE),
-                            unitsRaw == null || unitsRaw.isBlank() ? List.of() : DistributionJson.fromJson(unitsRaw, WORK_UNITS_TYPE)
+                            unitsRaw == null || unitsRaw.isBlank() ? List.of() : DistributionJson.fromJson(unitsRaw, WORK_UNITS_TYPE),
+                            rs.getString("module_name"),
+                            rs.getBoolean("fork_workspace"),
+                            rs.getString("working_directory"),
+                            inputsRaw == null || inputsRaw.isBlank() ? List.of() : DistributionJson.fromJson(inputsRaw, STRING_LIST_TYPE),
+                            outputsRaw == null || outputsRaw.isBlank() ? List.of() : DistributionJson.fromJson(outputsRaw, STRING_LIST_TYPE),
+                            producedRaw == null || producedRaw.isBlank() ? List.of() : DistributionJson.fromJson(producedRaw, STRING_LIST_TYPE),
+                            rs.getString("error_message")
                     ));
                 }
             }
@@ -658,25 +752,49 @@ public class JdbcDistributionStore implements DistributionStore {
 
     @Override
     public List<TestHistorySummary> listTestHistory(int limit) {
-        String sql = "SELECT work_unit_key, MAX(class_name) AS class_name, MAX(test_name) AS test_name, " +
-                "AVG(duration_ms) AS avg_ms, COUNT(*) AS total_runs, " +
+        String sql = "SELECT work_unit_key, class_name, test_name, " +
+                "AVG(duration_ms) AS avg_ms, MAX(duration_ms) AS max_ms, COUNT(*) AS total_runs, " +
+                "SUM(CASE WHEN status='PASSED' THEN 1 ELSE 0 END) AS passed_runs, " +
                 "SUM(CASE WHEN status='FAILED' THEN 1 ELSE 0 END) AS failed_runs, " +
                 "SUM(CASE WHEN flaky=TRUE THEN 1 ELSE 0 END) AS flaky_runs " +
-                "FROM dist_test_executions GROUP BY work_unit_key ORDER BY avg_ms DESC";
+                "FROM dist_test_executions GROUP BY work_unit_key, class_name, test_name ORDER BY avg_ms DESC";
+        String latestStatusSql = "SELECT status FROM dist_test_executions " +
+                "WHERE COALESCE(work_unit_key, '')=? AND COALESCE(class_name, '')=? AND COALESCE(test_name, '')=? " +
+                "ORDER BY recorded_at DESC, attempt DESC, id DESC";
         List<TestHistorySummary> history = new ArrayList<>();
         try (Connection conn = dataSource.getConnection();
-             PreparedStatement ps = conn.prepareStatement(sql)) {
+             PreparedStatement ps = conn.prepareStatement(sql);
+             PreparedStatement latestPs = conn.prepareStatement(latestStatusSql)) {
             ps.setMaxRows(Math.max(1, limit));
+            latestPs.setMaxRows(1);
             try (ResultSet rs = ps.executeQuery()) {
                 while (rs.next()) {
+                    String key = rs.getString("work_unit_key");
+                    String className = rs.getString("class_name");
+                    String testName = rs.getString("test_name");
+                    TestOutcomeStatus lastStatus = TestOutcomeStatus.PASSED;
+                    latestPs.setString(1, key != null ? key : "");
+                    latestPs.setString(2, className != null ? className : "");
+                    latestPs.setString(3, testName != null ? testName : "");
+                    try (ResultSet lrs = latestPs.executeQuery()) {
+                        if (lrs.next()) {
+                            String rawStatus = lrs.getString(1);
+                            if (rawStatus != null && !rawStatus.isBlank()) {
+                                lastStatus = TestOutcomeStatus.valueOf(rawStatus);
+                            }
+                        }
+                    }
                     history.add(new TestHistorySummary(
-                            rs.getString("work_unit_key"),
-                            rs.getString("class_name"),
-                            rs.getString("test_name"),
+                            key,
+                            className,
+                            testName,
                             rs.getLong("avg_ms"),
+                            rs.getLong("max_ms"),
                             rs.getInt("total_runs"),
+                            rs.getInt("passed_runs"),
                             rs.getInt("failed_runs"),
-                            rs.getInt("flaky_runs")
+                            rs.getInt("flaky_runs"),
+                            lastStatus
                     ));
                 }
             }

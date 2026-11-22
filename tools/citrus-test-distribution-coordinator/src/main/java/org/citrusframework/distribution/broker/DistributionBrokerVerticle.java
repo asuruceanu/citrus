@@ -44,6 +44,7 @@ import org.citrusframework.distribution.model.CompleteSessionRequest;
 import org.citrusframework.distribution.model.CreateSessionRequest;
 import org.citrusframework.distribution.model.MissingDigestsRequest;
 import org.citrusframework.distribution.model.MissingDigestsResponse;
+import org.citrusframework.distribution.model.ReportLocalTestsRequest;
 import org.citrusframework.distribution.model.SessionDetailResponse;
 import org.citrusframework.distribution.model.SubmitWorkRequest;
 import org.citrusframework.distribution.model.SubmitWorkResponse;
@@ -111,7 +112,9 @@ public final class DistributionBrokerVerticle extends AbstractVerticle {
         router.get("/api/v1/sessions").handler(this::handleListSessions);
         router.get("/api/v1/sessions/:sessionId").handler(this::handleGetSession);
         router.post("/api/v1/sessions/:sessionId/work").handler(this::handleSubmitWork);
+        router.post("/api/v1/sessions/:sessionId/local-tests").handler(this::handleReportLocalTests);
         router.post("/api/v1/sessions/:sessionId/complete").handler(this::handleCompleteSession);
+        router.post("/api/v1/sessions/:sessionId/abort").handler(this::handleAbortSession);
         router.get("/api/v1/sessions/:sessionId/events").handler(this::handleSessionEvents);
         router.get("/api/v1/events/stream").handler(this::handleGlobalEvents);
 
@@ -127,9 +130,16 @@ public final class DistributionBrokerVerticle extends AbstractVerticle {
 
         httpServer = vertx.createHttpServer();
         httpServer.requestHandler(router)
-                .listen(config.port(), config.host())
+                .listen(config.port(), resolveListenHost(config))
                 .<Void>mapEmpty()
                 .onComplete(startPromise);
+    }
+
+    static String resolveListenHost(DistributionBrokerConfig config) {
+        if (config.port() == 0 && "0.0.0.0".equals(config.host())) {
+            return "127.0.0.1";
+        }
+        return config.host();
     }
 
     @Override
@@ -218,6 +228,34 @@ public final class DistributionBrokerVerticle extends AbstractVerticle {
                     ? DistributionJson.fromJson(raw, CompleteSessionRequest.class)
                     : new CompleteSessionRequest(0, 0, 0, 0L);
             return coordinator.completeSession(sessionId, req);
+        }).onSuccess((BuildSessionRecord res) -> writeJson(ctx, 200, res))
+          .onFailure(err -> writeError(ctx, err));
+    }
+
+    private void handleReportLocalTests(RoutingContext ctx) {
+        String sessionId = ctx.pathParam("sessionId");
+        vertx.executeBlocking(() -> {
+            String raw = ctx.body().asString();
+            ReportLocalTestsRequest req = (raw != null && !raw.isBlank())
+                    ? DistributionJson.fromJson(raw, ReportLocalTestsRequest.class)
+                    : new ReportLocalTestsRequest(null, List.of());
+            return coordinator.reportLocalTests(sessionId, req);
+        }).onSuccess((Integer count) -> writeJson(ctx, 200, Map.of("recorded", count)))
+          .onFailure(err -> writeError(ctx, err));
+    }
+
+    private void handleAbortSession(RoutingContext ctx) {
+        String sessionId = ctx.pathParam("sessionId");
+        vertx.executeBlocking(() -> {
+            String raw = ctx.body().asString();
+            String reason = null;
+            if (raw != null && !raw.isBlank()) {
+                @SuppressWarnings("unchecked")
+                Map<String, Object> body = DistributionJson.fromJson(raw, Map.class);
+                Object r = body != null ? body.get("reason") : null;
+                reason = r != null ? r.toString() : null;
+            }
+            return coordinator.abortSession(sessionId, reason);
         }).onSuccess((BuildSessionRecord res) -> writeJson(ctx, 200, res))
           .onFailure(err -> writeError(ctx, err));
     }
