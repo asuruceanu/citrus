@@ -105,6 +105,85 @@ class TestDistributionMavenExtensionTest {
     }
 
     @Test
+    void shouldNotDoubleCountRemoteTestFailureAndShouldAbortOnInterruptedBuild() throws Exception {
+        DistributionBrokerConfig brokerConfig = DistributionBrokerConfig.builder()
+                .port(0)
+                .cacheDir(tempDir.resolve("broker-cache-outcomes"))
+                .jdbcUrl("jdbc:hsqldb:mem:mvn_ext_outcomes_" + System.nanoTime())
+                .build();
+
+        try (DistributionBrokerServer broker = new DistributionBrokerServer(brokerConfig)) {
+            broker.start();
+
+            Properties userProps = new Properties();
+            userProps.setProperty(DistributionSettings.ENABLED_PROPERTY, "true");
+            userProps.setProperty(DistributionSettings.BROKER_URL_PROPERTY, broker.baseUrl());
+
+            // 1. Reactor session with 1 recorded test failure + Surefire build exception -> failedTests stays 1
+            MavenProject modFail = createSampleProject("citrus-mod-fail", tempDir.resolve("mod-fail"));
+            MavenSession failSession = mockSessionWithExceptions(List.of(modFail), userProps,
+                    List.of(new RuntimeException("There are test failures")));
+            TestDistributionLifecycleParticipant p1 = new TestDistributionLifecycleParticipant();
+            p1.afterProjectsRead(failSession);
+            String sid1 = p1.getActiveSessionId();
+            java.net.http.HttpClient.newHttpClient().send(
+                    java.net.http.HttpRequest.newBuilder(java.net.URI.create(broker.baseUrl() + "/api/v1/sessions/" + sid1 + "/local-tests"))
+                            .header("Content-Type", "application/json")
+                            .POST(java.net.http.HttpRequest.BodyPublishers.ofString(
+                                    "{\"workerId\":\"local-host\",\"executions\":[{\"sessionId\":\"" + sid1
+                                            + "\",\"partitionId\":\"local\",\"attempt\":1,\"workUnitKey\":\"pkg.FailIT\","
+                                            + "\"className\":\"pkg.FailIT\",\"testName\":\"shouldFail\",\"status\":\"FAILED\","
+                                            + "\"durationMs\":45,\"errorMessage\":\"boom\",\"stackTrace\":\"trace\",\"endpoints\":[]}]}"))
+                            .build(),
+                    java.net.http.HttpResponse.BodyHandlers.discarding());
+            p1.afterSessionEnd(failSession);
+            BuildSessionRecord r1 = broker.store().findSession(sid1).orElseThrow();
+            assertThat(r1.status()).isEqualTo(SessionStatus.FAILED);
+            assertThat(r1.failedTests()).isEqualTo(1);
+
+            // 2. Reactor session with compilation failure (0 test failures) -> FAILED with failedTests == 0
+            MavenProject modCompile = createSampleProject("citrus-mod-compile", tempDir.resolve("mod-compile"));
+            MavenSession compileSession = mockSessionWithExceptions(List.of(modCompile), userProps,
+                    List.of(new RuntimeException("Compilation failure")));
+            TestDistributionLifecycleParticipant p2 = new TestDistributionLifecycleParticipant();
+            p2.afterProjectsRead(compileSession);
+            String sid2 = p2.getActiveSessionId();
+            p2.afterSessionEnd(compileSession);
+            BuildSessionRecord r2 = broker.store().findSession(sid2).orElseThrow();
+            assertThat(r2.status()).isEqualTo(SessionStatus.FAILED);
+            assertThat(r2.failedTests()).isZero();
+
+            // 3. Reactor session cancelled via InterruptedException -> ABORTED
+            MavenProject modCancel = createSampleProject("citrus-mod-cancel", tempDir.resolve("mod-cancel"));
+            MavenSession cancelSession = mockSessionWithExceptions(List.of(modCancel), userProps,
+                    List.of(new RuntimeException("Build interrupted", new InterruptedException("SIGINT"))));
+            TestDistributionLifecycleParticipant p3 = new TestDistributionLifecycleParticipant();
+            p3.afterProjectsRead(cancelSession);
+            String sid3 = p3.getActiveSessionId();
+            p3.afterSessionEnd(cancelSession);
+            BuildSessionRecord r3 = broker.store().findSession(sid3).orElseThrow();
+            assertThat(r3.status()).isEqualTo(SessionStatus.ABORTED);
+
+            // 4. Custom project.name property + JVM shutdown hook aborts active session on SIGINT/SIGTERM
+            Properties customProps = new Properties();
+            customProps.putAll(userProps);
+            customProps.setProperty(DistributionSettings.PROJECT_NAME_PROPERTY, "custom-citrus-suite");
+            MavenProject modSignal = createSampleProject("citrus-mod-signal", tempDir.resolve("mod-signal"));
+            MavenSession signalSession = mockSession(List.of(modSignal), customProps);
+            TestDistributionLifecycleParticipant p4 = new TestDistributionLifecycleParticipant();
+            p4.afterProjectsRead(signalSession);
+            String sid4 = p4.getActiveSessionId();
+            assertThat(broker.store().findSession(sid4).orElseThrow().projectName()).isEqualTo("custom-citrus-suite");
+            assertThat(p4.getShutdownHook()).isNotNull();
+            p4.getShutdownHook().run();
+            p4.afterSessionEnd(signalSession);
+            assertThat(p4.getShutdownHook()).isNull();
+            BuildSessionRecord r4 = broker.store().findSession(sid4).orElseThrow();
+            assertThat(r4.status()).isEqualTo(SessionStatus.ABORTED);
+        }
+    }
+
+    @Test
     void shouldFallbackLocallyWithoutFailingBuildWhenBrokerUnreachable() throws Exception {
         MavenProject project = createSampleProject("module-fallback", tempDir.resolve("mod-fb"));
         Properties userProps = new Properties();
@@ -343,9 +422,14 @@ class TestDistributionMavenExtensionTest {
     }
 
     private MavenSession mockSession(List<MavenProject> projects, Properties userProps) {
+        return mockSessionWithExceptions(projects, userProps, List.of());
+    }
+
+    private MavenSession mockSessionWithExceptions(List<MavenProject> projects, Properties userProps, List<Throwable> exceptions) {
         MavenSession session = Mockito.mock(MavenSession.class);
         MavenExecutionResult result = Mockito.mock(MavenExecutionResult.class);
-        when(result.hasExceptions()).thenReturn(false);
+        when(result.hasExceptions()).thenReturn(!exceptions.isEmpty());
+        when(result.getExceptions()).thenReturn(exceptions);
         when(session.getProjects()).thenReturn(projects);
         when(session.getTopLevelProject()).thenReturn(projects.get(0));
         when(session.getUserProperties()).thenReturn(userProps);

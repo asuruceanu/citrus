@@ -41,6 +41,7 @@ import org.citrusframework.distribution.model.BuildSessionResponse;
 import org.citrusframework.distribution.model.CompleteSessionRequest;
 import org.citrusframework.distribution.model.CreateSessionRequest;
 import org.citrusframework.distribution.model.PartitionPolicy;
+import org.citrusframework.distribution.model.ReportLocalTestsRequest;
 import org.citrusframework.distribution.model.SubmitWorkRequest;
 import org.citrusframework.distribution.model.SubmitWorkResponse;
 import org.citrusframework.distribution.model.TestOutcomeStatus;
@@ -126,7 +127,23 @@ public class DistributedLauncher implements Launcher {
         }
 
         if (extracted.remoteUnits().isEmpty()) {
-            LocalFallbackExecutor.executeLocally(delegate, extracted.localUnits(), callListeners);
+            LocalFallbackExecutor.LocalExecutionStats onlyLocal =
+                    LocalFallbackExecutor.executeLocally(delegate, extracted.localUnits(), callListeners);
+            String sharedSessionId = System.getProperty(DistributionSettings.SESSION_ID_PROPERTY);
+            if (sharedSessionId != null && !sharedSessionId.isBlank() && !onlyLocal.executions().isEmpty()) {
+                try {
+                    BrokerHttpClient sharedClient = new BrokerHttpClient(
+                            DistributionSettings.getBrokerUrl(),
+                            DistributionSettings.getAuthToken(),
+                            DistributionSettings.getConnectTimeoutMs());
+                    sharedClient.reportLocalTests(
+                            sharedSessionId,
+                            new ReportLocalTestsRequest("local-host", onlyLocal.executions()));
+                } catch (Exception e) {
+                    LOG.warn("Failed to report @LocalOnly test executions to session {}: {}",
+                            sharedSessionId, e.getMessage());
+                }
+            }
             return;
         }
 
@@ -173,6 +190,17 @@ public class DistributedLauncher implements Launcher {
 
         LocalFallbackExecutor.LocalExecutionStats localStats =
                 LocalFallbackExecutor.executeLocally(delegate, extracted.localUnits(), callListeners);
+        if (!localStats.executions().isEmpty()) {
+            try {
+                client.reportLocalTests(sessionId, new ReportLocalTestsRequest("local-host", localStats.executions()));
+            } catch (Exception e) {
+                LOG.warn("Failed to report @LocalOnly test executions to session {}: {}", sessionId, e.getMessage());
+            }
+        }
+
+        boolean sessionCompleted = false;
+        LocalFallbackExecutor.LocalExecutionStats lostStats =
+                new LocalFallbackExecutor.LocalExecutionStats(0, 0, 0, 0L);
 
         try {
             PackagedClasspath packaged = packageCurrentClasspath();
@@ -232,13 +260,22 @@ public class DistributedLauncher implements Launcher {
                     notifyTestPlanExecutionFinished(allListeners, testPlan);
                 }
 
-                LocalFallbackExecutor.LocalExecutionStats lostStats = new LocalFallbackExecutor.LocalExecutionStats(0, 0, 0, 0L);
                 if (!lostUnits.isEmpty()) {
                     if (!fallbackLocal || extracted.hasRemoteOnlyUnits()) {
                         throw new IllegalStateException("Remote partitions were lost: " + lostUnits.size());
                     }
                     LOG.warn("Executing {} lost remote work unit(s) locally", lostUnits.size());
                     lostStats = LocalFallbackExecutor.executeLocally(delegate, lostUnits, callListeners);
+                    if (!lostStats.executions().isEmpty()) {
+                        try {
+                            client.reportLocalTests(
+                                    sessionId,
+                                    new ReportLocalTestsRequest("local-fallback", lostStats.executions()));
+                        } catch (Exception e) {
+                            LOG.warn("Failed to report fallback test executions to session {}: {}",
+                                    sessionId, e.getMessage());
+                        }
+                    }
                 }
 
                 String reportDirProp = System.getProperty(DistributionSettings.REPORT_DIR_PROPERTY);
@@ -253,7 +290,9 @@ public class DistributedLauncher implements Launcher {
                             localStats.passed() + lostStats.passed(),
                             localStats.failed() + lostStats.failed(),
                             localStats.skipped() + lostStats.skipped(),
-                            localStats.serialDurationMs() + lostStats.serialDurationMs()));
+                            localStats.serialDurationMs() + lostStats.serialDurationMs(),
+                            outputFailure != null));
+                    sessionCompleted = true;
                 }
                 if (outputFailure != null) {
                     throw outputFailure;
@@ -263,9 +302,32 @@ public class DistributedLauncher implements Launcher {
                 outcomes.committer().discardStaging();
             }
         } catch (RuntimeException re) {
+            if (ownsSession && !sessionCompleted) {
+                completeOwnedSessionOnFailure(client, sessionId, localStats, lostStats);
+            }
             throw re;
         } catch (Exception e) {
+            if (ownsSession && !sessionCompleted) {
+                completeOwnedSessionOnFailure(client, sessionId, localStats, lostStats);
+            }
             throw new IllegalStateException("Distributed test execution failed for session " + sessionId, e);
+        }
+    }
+
+    private static void completeOwnedSessionOnFailure(
+            BrokerHttpClient client,
+            String sessionId,
+            LocalFallbackExecutor.LocalExecutionStats localStats,
+            LocalFallbackExecutor.LocalExecutionStats lostStats) {
+        try {
+            client.completeSession(sessionId, new CompleteSessionRequest(
+                    localStats.passed() + lostStats.passed(),
+                    localStats.failed() + lostStats.failed(),
+                    localStats.skipped() + lostStats.skipped(),
+                    localStats.serialDurationMs() + lostStats.serialDurationMs(),
+                    true));
+        } catch (Exception e) {
+            LOG.warn("Failed to mark failed session {} as completed on broker: {}", sessionId, e.getMessage());
         }
     }
 

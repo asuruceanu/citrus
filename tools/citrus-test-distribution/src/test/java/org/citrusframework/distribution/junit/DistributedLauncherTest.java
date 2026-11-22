@@ -141,6 +141,8 @@ class DistributedLauncherTest {
                     .isInstanceOf(IllegalStateException.class)
                     .hasMessageContaining("target/citrus-docs/conflict.txt");
             assertThat(module.resolve("target/citrus-docs/conflict.txt")).doesNotExist();
+            assertThat(cluster.broker.store().listSessions(1).getFirst().status())
+                    .isEqualTo(org.citrusframework.distribution.model.SessionStatus.FAILED);
         }
     }
 
@@ -342,8 +344,72 @@ class DistributedLauncherTest {
                 Path xmlReport = reportDir.resolve("TEST-" + RemoteSampleFixture.class.getName() + ".xml");
                 assertThat(Files.exists(xmlReport)).isTrue();
                 assertThat(Files.readString(xmlReport)).contains("shouldRunOnRemoteWorker");
+
+                String sid = broker.store().listSessions(1).getFirst().sessionId();
+                assertThat(broker.store().listTestExecutions(sid))
+                        .extracting(e -> e.className() + "#" + e.testName() + "@" + e.partitionId())
+                        .anyMatch(s -> s.startsWith(RemoteSampleFixture.class.getName() + "#shouldRunOnRemoteWorker"))
+                        .anyMatch(s -> s.startsWith(LocalPinnedFixture.class.getName() + "#shouldStayOnCoordinator") && s.endsWith("@local"));
             }
         }
+    }
+
+    @Test
+    void shouldReportLocalOnlyModuleExecutionsInSharedReactorSession() throws Exception {
+        try (Cluster cluster = Cluster.start(tempDir)) {
+            String sessionId = cluster.createSession();
+            System.setProperty(DistributionSettings.ENABLED_PROPERTY, "true");
+            System.setProperty(DistributionSettings.BROKER_URL_PROPERTY, cluster.broker.baseUrl());
+            System.setProperty(DistributionSettings.SESSION_ID_PROPERTY, sessionId);
+
+            Outcome outcome = run(LocalPinnedFixture.class);
+            assertThat(outcome.passed()).isEqualTo(1);
+
+            cluster.client.completeSession(sessionId,
+                    new org.citrusframework.distribution.model.CompleteSessionRequest(0, 0, 0, 0L));
+
+            var session = cluster.broker.store().findSession(sessionId).orElseThrow();
+            assertThat(session.status()).isEqualTo(org.citrusframework.distribution.model.SessionStatus.PASSED);
+            assertThat(session.totalTests()).isEqualTo(1);
+            assertThat(session.passedTests()).isEqualTo(1);
+            assertThat(cluster.broker.store().listTestExecutions(sessionId))
+                    .singleElement()
+                    .satisfies(exec -> {
+                        assertThat(exec.className()).isEqualTo(LocalPinnedFixture.class.getName());
+                        assertThat(exec.testName()).isEqualTo("shouldStayOnCoordinator()");
+                        assertThat(exec.partitionId()).isEqualTo("local");
+                    });
+        }
+    }
+
+    @Test
+    void shouldCaptureBeforeAllFailureDisabledClassAndOverloadedMethodKeysInLocalFallback() {
+        Launcher launcher = LauncherFactory.create();
+        WorkUnitSpec disabledUnit = new WorkUnitSpec(
+                DisabledLocalClassFixture.class.getName(), DisabledLocalClassFixture.class.getName(), null, null, Map.of(), 0L);
+        WorkUnitSpec beforeAllUnit = new WorkUnitSpec(
+                BeforeAllFailingLocalFixture.class.getName(), BeforeAllFailingLocalFixture.class.getName(), null, null, Map.of(), 0L);
+        WorkUnitSpec noArgUnit = new WorkUnitSpec(
+                "key-no-arg", OverloadedLocalFixture.class.getName(), "verify()", null, Map.of(), 0L);
+        WorkUnitSpec parameterizedUnit = new WorkUnitSpec(
+                "key-with-info", OverloadedLocalFixture.class.getName(),
+                "verify(org.junit.jupiter.api.TestInfo)", null, Map.of(), 0L);
+
+        LocalFallbackExecutor.LocalExecutionStats stats = LocalFallbackExecutor.executeLocally(
+                launcher,
+                List.of(disabledUnit, beforeAllUnit, noArgUnit, parameterizedUnit),
+                new TestExecutionListener[0]);
+
+        assertThat(stats.passed()).isEqualTo(2);
+        assertThat(stats.failed()).isEqualTo(1);
+        assertThat(stats.skipped()).isEqualTo(1);
+        assertThat(stats.executions())
+                .extracting(e -> e.workUnitKey() + ":" + e.status())
+                .containsExactlyInAnyOrder(
+                        DisabledLocalClassFixture.class.getName() + ":SKIPPED",
+                        BeforeAllFailingLocalFixture.class.getName() + ":FAILED",
+                        "key-no-arg:PASSED",
+                        "key-with-info:PASSED");
     }
 
     @Test
@@ -489,6 +555,40 @@ class DistributedLauncherTest {
     public static class StrictRemoteOnlyFixture {
         @Test
         void mustRunRemotely() {
+        }
+    }
+
+    @LocalOnly
+    @org.junit.jupiter.api.Disabled("class-level disabled")
+    public static class DisabledLocalClassFixture {
+        @Test
+        void neverRuns() {
+        }
+    }
+
+    @LocalOnly
+    public static class BeforeAllFailingLocalFixture {
+        @org.junit.jupiter.api.BeforeAll
+        static void failBeforeAll() {
+            if ("true".equals(System.getProperty("citrus.test.local.beforeall.arm", "true"))) {
+                throw new IllegalStateException("beforeAll failure");
+            }
+        }
+
+        @Test
+        void neverReached() {
+        }
+    }
+
+    @LocalOnly
+    public static class OverloadedLocalFixture {
+        @Test
+        void verify() {
+        }
+
+        @Test
+        void verify(org.junit.jupiter.api.TestInfo info) {
+            assertThat(info.getDisplayName()).isNotBlank();
         }
     }
 }

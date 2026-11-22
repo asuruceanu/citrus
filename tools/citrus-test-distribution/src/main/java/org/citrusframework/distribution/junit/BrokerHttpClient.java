@@ -39,6 +39,7 @@ import org.citrusframework.distribution.model.CompleteSessionRequest;
 import org.citrusframework.distribution.model.CreateSessionRequest;
 import org.citrusframework.distribution.model.MissingDigestsRequest;
 import org.citrusframework.distribution.model.MissingDigestsResponse;
+import org.citrusframework.distribution.model.ReportLocalTestsRequest;
 import org.citrusframework.distribution.model.SubmitWorkRequest;
 import org.citrusframework.distribution.model.SubmitWorkResponse;
 
@@ -131,6 +132,22 @@ public class BrokerHttpClient {
         HttpResponse<String> resp = sendJsonPost("/api/v1/sessions/" + sessionId + "/complete", request);
         ensureSuccess(resp, "completeSession");
         return DistributionJson.fromJson(resp.body(), BuildSessionResponse.class);
+    }
+
+    public void reportLocalTests(String sessionId, ReportLocalTestsRequest request)
+            throws IOException, InterruptedException {
+        if (request == null || request.executions() == null || request.executions().isEmpty()) {
+            return;
+        }
+        HttpResponse<String> resp = sendJsonPost("/api/v1/sessions/" + sessionId + "/local-tests", request);
+        ensureSuccess(resp, "reportLocalTests");
+    }
+
+    public void abortSession(String sessionId, String reason) throws IOException, InterruptedException {
+        HttpResponse<String> resp = sendJsonPost(
+                "/api/v1/sessions/" + sessionId + "/abort",
+                java.util.Map.of("reason", reason != null ? reason : "Aborted"));
+        ensureSuccess(resp, "abortSession");
     }
 
     /**

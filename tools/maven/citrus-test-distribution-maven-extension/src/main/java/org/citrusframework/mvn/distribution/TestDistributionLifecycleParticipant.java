@@ -52,6 +52,7 @@ public class TestDistributionLifecycleParticipant extends AbstractMavenLifecycle
 
     private volatile String activeSessionId;
     private volatile BrokerHttpClient activeBrokerClient;
+    private volatile Thread shutdownHook;
 
     @Override
     public void afterProjectsRead(MavenSession session) throws MavenExecutionException {
@@ -74,7 +75,11 @@ public class TestDistributionLifecycleParticipant extends AbstractMavenLifecycle
                 Integer.toString(DistributionSettings.getMaxRetries())));
 
         MavenProject topProject = session.getTopLevelProject();
-        String projectName = topProject != null ? topProject.getArtifactId() : "maven-reactor";
+        String defaultProjectName = topProject != null ? topProject.getArtifactId() : "maven-reactor";
+        String projectName = resolveProperty(session, DistributionSettings.PROJECT_NAME_PROPERTY, defaultProjectName);
+        if (projectName == null || projectName.isBlank()) {
+            projectName = defaultProjectName;
+        }
         Path rootDir = session.getExecutionRootDirectory() != null
                 ? Path.of(session.getExecutionRootDirectory())
                 : (topProject != null && topProject.getBasedir() != null ? topProject.getBasedir().toPath() : null);
@@ -105,6 +110,7 @@ public class TestDistributionLifecycleParticipant extends AbstractMavenLifecycle
             sessionId = created.sessionId();
             this.activeSessionId = sessionId;
             this.activeBrokerClient = client;
+            registerAbortShutdownHook(sessionId, client);
             LOG.info("Opened Citrus Test Distribution reactor session {} on broker {}", sessionId, brokerUrl);
         } catch (Exception e) {
             if (!fallbackLocal) {
@@ -137,6 +143,7 @@ public class TestDistributionLifecycleParticipant extends AbstractMavenLifecycle
 
     @Override
     public void afterSessionEnd(MavenSession session) {
+        unregisterAbortShutdownHook();
         String sessionId = this.activeSessionId;
         BrokerHttpClient client = this.activeBrokerClient;
         this.activeSessionId = null;
@@ -145,12 +152,69 @@ public class TestDistributionLifecycleParticipant extends AbstractMavenLifecycle
             return;
         }
         try {
-            int buildFailures = session.getResult() != null && session.getResult().hasExceptions() ? 1 : 0;
-            client.completeSession(sessionId, new CompleteSessionRequest(0, buildFailures, 0, 0L));
+            if (isInterruptedBuild(session)) {
+                client.abortSession(sessionId, "Maven build interrupted");
+                LOG.info("Aborted Citrus Test Distribution reactor session {}", sessionId);
+                return;
+            }
+            boolean buildFailed = session.getResult() != null && session.getResult().hasExceptions();
+            client.completeSession(sessionId, new CompleteSessionRequest(0, 0, 0, 0L, buildFailed));
             LOG.info("Completed Citrus Test Distribution reactor session {}", sessionId);
         } catch (Exception e) {
             LOG.warn("Failed to complete Citrus Test Distribution session {}: {}", sessionId, e.getMessage());
         }
+    }
+
+    private void registerAbortShutdownHook(String sessionId, BrokerHttpClient client) {
+        Thread hook = new Thread(() -> {
+            if (sessionId.equals(this.activeSessionId)) {
+                this.activeSessionId = null;
+                this.activeBrokerClient = null;
+                try {
+                    client.abortSession(sessionId, "Maven build process terminated");
+                } catch (Exception ignored) {
+                    // Best-effort abort during JVM shutdown
+                }
+            }
+        }, "citrus-dist-abort-hook");
+        this.shutdownHook = hook;
+        try {
+            Runtime.getRuntime().addShutdownHook(hook);
+        } catch (IllegalStateException | SecurityException ignored) {
+            // Ignore if JVM is already shutting down
+        }
+    }
+
+    private void unregisterAbortShutdownHook() {
+        Thread hook = this.shutdownHook;
+        this.shutdownHook = null;
+        if (hook != null) {
+            try {
+                Runtime.getRuntime().removeShutdownHook(hook);
+            } catch (IllegalStateException | SecurityException ignored) {
+                // Ignore if JVM is already shutting down
+            }
+        }
+    }
+
+    Thread getShutdownHook() {
+        return shutdownHook;
+    }
+
+    private static boolean isInterruptedBuild(MavenSession session) {
+        if (session == null || session.getResult() == null || session.getResult().getExceptions() == null) {
+            return false;
+        }
+        for (Throwable t : session.getResult().getExceptions()) {
+            Throwable cur = t;
+            while (cur != null) {
+                if (cur instanceof InterruptedException) {
+                    return true;
+                }
+                cur = cur.getCause() != cur ? cur.getCause() : null;
+            }
+        }
+        return false;
     }
 
     String getActiveSessionId() {
