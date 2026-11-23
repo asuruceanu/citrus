@@ -21,6 +21,7 @@ import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.UUID;
 
 import org.citrusframework.distribution.config.DistributionSettings;
@@ -51,9 +52,13 @@ public final class DistributionWorkerConfig {
         this.hostName = builder.hostName;
         this.brokerUrl = builder.brokerUrl;
         this.authToken = builder.authToken;
-        this.cacheDir = builder.cacheDir;
-        this.cacheCleanup = builder.cacheCleanup;
-        this.cacheFreeSpaceBufferBytes = builder.cacheFreeSpaceBufferBytes;
+        // Cache settings fall back to system property / environment / default only when not set explicitly, so an
+        // invalid lower-tier value cannot break a configuration whose explicit option overrides it.
+        this.cacheDir = builder.cacheDir != null ? builder.cacheDir : DistributionSettings.getWorkerCacheDir();
+        this.cacheCleanup = builder.cacheCleanup != null ? builder.cacheCleanup
+                : DistributionSettings.isWorkerCacheCleanupEnabled();
+        this.cacheFreeSpaceBufferBytes = builder.cacheFreeSpaceBufferBytes != null
+                ? builder.cacheFreeSpaceBufferBytes : DistributionSettings.getWorkerCacheFreeSpaceBufferBytes();
         Map<String, String> caps = new LinkedHashMap<>(builder.capabilities);
         caps.putIfAbsent(DistributionSettings.WORKSPACE_CAPABILITY_KEY, "true");
         this.capabilities = Collections.unmodifiableMap(caps);
@@ -145,9 +150,10 @@ public final class DistributionWorkerConfig {
         private String hostName = resolveHostName();
         private String brokerUrl = normalizeBrokerBaseUrl(DistributionSettings.getBrokerUrl());
         private String authToken = DistributionSettings.getAuthToken();
-        private Path cacheDir = DistributionSettings.getWorkerCacheDir();
-        private boolean cacheCleanup = DistributionSettings.isWorkerCacheCleanupEnabled();
-        private long cacheFreeSpaceBufferBytes = DistributionSettings.getWorkerCacheFreeSpaceBufferBytes();
+        /** Explicit cache settings; {@code null} means "resolve from settings in {@link #build()}". */
+        private Path cacheDir;
+        private Boolean cacheCleanup;
+        private Long cacheFreeSpaceBufferBytes;
         private Map<String, String> capabilities = new LinkedHashMap<>(DistributionSettings.detectHostCapabilities(null));
         private long heartbeatIntervalMs = 5_000L;
         private long reconnectDelayMs = 1_000L;
@@ -203,10 +209,11 @@ public final class DistributionWorkerConfig {
             return this;
         }
 
+        /**
+         * @throws NullPointerException if {@code cacheDir} is {@code null}
+         */
         public Builder cacheDir(Path cacheDir) {
-            if (cacheDir != null) {
-                this.cacheDir = cacheDir;
-            }
+            this.cacheDir = Objects.requireNonNull(cacheDir, "cacheDir must not be null");
             return this;
         }
 
@@ -271,7 +278,9 @@ public final class DistributionWorkerConfig {
         }
 
         /**
-         * Builds the configuration. Workers advertise {@code citrus.workspace.v1=true} unless the capabilities
+         * Builds the configuration. Cache settings not set on this builder are resolved now from system properties,
+         * environment variables and defaults; an invalid value in the tier that is used throws
+         * {@link IllegalArgumentException}. Workers advertise {@code citrus.workspace.v1=true} unless the capabilities
          * explicitly set it (for example to {@code false}).
          */
         public DistributionWorkerConfig build() {
