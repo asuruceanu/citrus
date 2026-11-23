@@ -21,6 +21,7 @@ import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.io.UncheckedIOException;
 import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
@@ -49,6 +50,8 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.Consumer;
 import java.util.jar.JarFile;
 import java.util.stream.Stream;
@@ -103,7 +106,9 @@ final class ForkedPartitionRunner implements PartitionRunner {
             "org.slf4j.LoggerFactory");
 
     private static final Set<ActiveFork> ACTIVE_FORKS = ConcurrentHashMap.newKeySet();
-    private static final Thread SHUTDOWN_HOOK = new Thread(() -> ACTIVE_FORKS.forEach(ActiveFork::cleanUp),
+    private static final ReentrantReadWriteLock JVM_FORK_START_FENCE = new ReentrantReadWriteLock();
+    private static volatile boolean jvmStopping;
+    private static final Thread SHUTDOWN_HOOK = new Thread(ForkedPartitionRunner::cleanUpOnJvmShutdown,
             "citrus-dist-fork-cleanup");
 
     static {
@@ -148,7 +153,7 @@ final class ForkedPartitionRunner implements PartitionRunner {
     public IsolatedPartitionRunner.PartitionExecutionResult execute(PartitionAssignPayload assignment,
                                                                     CancellationToken cancellationToken,
                                                                     Consumer<WorkerTestEventPayload> eventSink) {
-        if (stopping || cancelled(cancellationToken)) {
+        if (jvmStopping || stopping || cancelled(cancellationToken)) {
             return cancelledResult();
         }
         if (sharedCache != null) {
@@ -225,15 +230,21 @@ final class ForkedPartitionRunner implements PartitionRunner {
 
             ForkedPartitionMain.ForkedExecutionSummary summary;
             try (ServerSocket server = new ServerSocket(0, 50, InetAddress.getLoopbackAddress())) {
-                // Publish the child before shutdown can snapshot the active forks. Classpath preparation remains
-                // outside the monitor so shutdown can prevent a delayed preparation from launching at all.
+                // Publish the child before either worker close or JVM shutdown can collect it for cleanup.
+                // Keep classpath preparation outside both launch guards so shutdown can fence delayed forks.
                 synchronized (forkStartMonitor) {
-                    if (stopping || cancelled(cancellationToken)) {
-                        return cancelledResult();
+                    Lock launchLock = JVM_FORK_START_FENCE.readLock();
+                    launchLock.lock();
+                    try {
+                        if (jvmStopping || stopping || cancelled(cancellationToken)) {
+                            return cancelledResult();
+                        }
+                        fork.process = launch(argfile, request, server.getLocalPort(), workspace, workingDirectory, fork.tmpDir);
+                        fork.watcher = processWatcher(fork, cancellationToken);
+                    } finally {
+                        launchLock.unlock();
                     }
-                    fork.process = launch(argfile, request, server.getLocalPort(), workspace, workingDirectory, fork.tmpDir);
                 }
-                fork.watcher = processWatcher(fork, cancellationToken);
                 summary = runProtocol(server, fork, token, cancellationToken, eventSink);
             }
 
@@ -294,6 +305,20 @@ final class ForkedPartitionRunner implements PartitionRunner {
         for (ActiveFork fork : forks) {
             fork.killAll();
         }
+    }
+
+    private static void cleanUpOnJvmShutdown() {
+        jvmStopping = true;
+        List<ActiveFork> active;
+        Lock shutdownLock = JVM_FORK_START_FENCE.writeLock();
+        shutdownLock.lock();
+        try {
+            // Every launch that passed the shutdown check has now published its process.
+            active = List.copyOf(ACTIVE_FORKS);
+        } finally {
+            shutdownLock.unlock();
+        }
+        active.forEach(ActiveFork::cleanUp);
     }
 
     private static boolean cancelled(CancellationToken cancellationToken) {
@@ -689,6 +714,7 @@ final class ForkedPartitionRunner implements PartitionRunner {
         private final Set<ProcessHandle> seen = ConcurrentHashMap.newKeySet();
         private final List<Thread> drains = new CopyOnWriteArrayList<>();
         private final Deque<String> tail = new ArrayDeque<>();
+        private final Object cleanupMonitor = new Object();
 
         synchronized void remember(String line) {
             tail.addLast(line);
@@ -723,13 +749,16 @@ final class ForkedPartitionRunner implements PartitionRunner {
         }
 
         void cleanUp() {
-            Thread watching = watcher;
-            if (watching != null) {
-                watching.interrupt();
+            synchronized (cleanupMonitor) {
+                Thread watching = watcher;
+                if (watching != null) {
+                    watching.interrupt();
+                }
+                killAll();
+                // A preparation that was still in flight during shutdown may have created these paths since.
+                deleteRecursively(tmpDir);
+                deleteRecursively(partitionRoot);
             }
-            killAll();
-            deleteRecursively(tmpDir);
-            deleteRecursively(partitionRoot);
         }
 
         /**
@@ -759,7 +788,7 @@ final class ForkedPartitionRunner implements PartitionRunner {
                         LOG.debug("Could not delete {}", path, e);
                     }
                 });
-            } catch (IOException e) {
+            } catch (IOException | UncheckedIOException e) {
                 LOG.debug("Could not delete {}", root, e);
             }
         }

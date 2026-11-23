@@ -18,6 +18,7 @@ package org.citrusframework.distribution.worker;
 
 import java.io.File;
 import java.io.IOException;
+import java.lang.reflect.Field;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -26,6 +27,7 @@ import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Clock;
+import java.util.AbstractList;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -142,6 +144,82 @@ class ForkedPartitionRunnerTest {
                     throw new IllegalStateException(e);
                 }
             }));
+        }
+    }
+
+    /** Invokes the worker's real callback in a separate JVM because it permanently fences fork launches. */
+    public static class WorkerShutdownProbe {
+        public static void main(String[] args) throws Exception {
+            Path root = Path.of(args[0]);
+            Path info = root.resolve("shutdown-info.txt");
+            DistributionWorkerConfig activeConfig = workerConfig(root.resolve("active-cache"), "http://127.0.0.1:9");
+            PartitionAssignPayload blocking = assignment(new BlobCacheDirectory(activeConfig.cacheDir()),
+                    Map.of("fixture.info", info.toString()), List.of(), List.of(),
+                    unit(BlockingFixture.class, "spawnGrandchildAndBlock"));
+            ForkedPartitionRunner activeRunner = new ForkedPartitionRunner(activeConfig);
+            CompletableFuture<IsolatedPartitionRunner.PartitionExecutionResult> running =
+                    CompletableFuture.supplyAsync(() -> activeRunner.execute(blocking, CancellationToken.create(), e -> { }));
+
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
+            while (!Files.exists(info) && System.nanoTime() < deadline) {
+                Thread.sleep(50);
+            }
+            assertThat(info).as("forked JVM started").exists();
+            List<String> lines = Files.readAllLines(info);
+            ProcessHandle child = ProcessHandle.of(Long.parseLong(lines.get(0))).orElseThrow();
+            ProcessHandle grandchild = ProcessHandle.of(Long.parseLong(lines.get(1))).orElseThrow();
+
+            DistributionWorkerConfig lateConfig = workerConfig(root.resolve("late-cache"), "http://127.0.0.1:9");
+            PartitionAssignPayload late = assignment(new BlobCacheDirectory(lateConfig.cacheDir()),
+                    Map.of(), List.of(), List.of(), unit(PlainFixture.class, "passes"));
+            CountDownLatch preparingClasspath = new CountDownLatch(1);
+            CountDownLatch resumePreparation = new CountDownLatch(1);
+            List<ArtifactRef> delayedClasspath = new AbstractList<>() {
+                @Override
+                public ArtifactRef get(int index) {
+                    preparingClasspath.countDown();
+                    try {
+                        assertThat(resumePreparation.await(20, TimeUnit.SECONDS)).isTrue();
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        throw new IllegalStateException(e);
+                    }
+                    return late.classpathArtifacts().get(index);
+                }
+
+                @Override
+                public int size() {
+                    return late.classpathArtifacts().size();
+                }
+            };
+            PartitionAssignPayload pending = new PartitionAssignPayload(late.partitionId(), late.sessionId(),
+                    late.attempt(), delayedClasspath, late.systemProperties(), late.workUnits());
+            ForkedPartitionRunner lateRunner = new ForkedPartitionRunner(lateConfig);
+            CompletableFuture<IsolatedPartitionRunner.PartitionExecutionResult> preparing =
+                    CompletableFuture.supplyAsync(() -> lateRunner.execute(pending, CancellationToken.create(), e -> { }));
+            try {
+                assertThat(preparingClasspath.await(10, TimeUnit.SECONDS)).isTrue();
+                Field field = ForkedPartitionRunner.class.getDeclaredField("SHUTDOWN_HOOK");
+                field.setAccessible(true);
+                ((Thread) field.get(null)).run();
+            } finally {
+                resumePreparation.countDown();
+            }
+
+            assertThat(running.get(10, TimeUnit.SECONDS).success()).isFalse();
+            assertThat(child.isAlive()).as("forked JVM terminated").isFalse();
+            assertThat(grandchild.isAlive()).as("grandchild process terminated").isFalse();
+            assertThat(Path.of(lines.get(3))).as("active fork temp directory").doesNotExist();
+
+            IsolatedPartitionRunner.PartitionExecutionResult pendingResult = preparing.get(20, TimeUnit.SECONDS);
+            assertThat(pendingResult.success()).as("fork prepared before shutdown").isFalse();
+            assertThat(pendingResult.errorMessage()).containsIgnoringCase("cancelled");
+            IsolatedPartitionRunner.PartitionExecutionResult lateResult =
+                    lateRunner.execute(late, CancellationToken.create(), e -> { });
+            assertThat(lateResult.success()).as("fork requested after shutdown").isFalse();
+            assertThat(lateResult.errorMessage()).containsIgnoringCase("cancelled");
+            assertThat(root.toFile().list((directory, name) -> name.startsWith("cdist-")))
+                    .as("active and delayed fork workspaces").isEmpty();
         }
     }
 
@@ -420,6 +498,29 @@ class ForkedPartitionRunnerTest {
         }
         assertThat(grandchild.isAlive()).as("grandchild process terminated").isFalse();
         assertThatNoException().as("nothing left to kill").isThrownBy(runner::killActiveForks);
+    }
+
+    @Test
+    @DisabledOnOs(OS.WINDOWS)
+    void shouldReapActiveForksAndPreventLaterLaunchesOnJvmShutdown() throws Exception {
+        Path java = Path.of(System.getProperty("java.home"), "bin", "java");
+        Path log = tempDir.resolve("shutdown-probe.log");
+        Process probe = new ProcessBuilder(java.toString(), "-Djava.io.tmpdir=" + tempDir,
+                "-cp", System.getProperty("java.class.path"),
+                WorkerShutdownProbe.class.getName(), tempDir.toString())
+                .redirectErrorStream(true)
+                .redirectOutput(log.toFile())
+                .start();
+        try {
+            assertThat(probe.waitFor(60, TimeUnit.SECONDS)).as("worker shutdown probe finished").isTrue();
+            assertThat(probe.exitValue()).as(Files.readString(log)).isZero();
+        } finally {
+            if (probe.isAlive()) {
+                List<ProcessHandle> handles = new ArrayList<>(probe.descendants().toList());
+                handles.add(probe.toHandle());
+                ForkedPartitionRunner.destroyAll(handles);
+            }
+        }
     }
 
     @Test
