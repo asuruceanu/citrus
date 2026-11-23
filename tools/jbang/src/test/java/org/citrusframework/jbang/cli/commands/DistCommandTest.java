@@ -40,6 +40,8 @@ import org.citrusframework.distribution.model.CreateSessionRequest;
 import org.citrusframework.jbang.cli.CitrusJBangMain;
 import org.citrusframework.jbang.cli.StringPrinter;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.condition.DisabledOnOs;
+import org.junit.jupiter.api.condition.OS;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.api.parallel.ResourceLock;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -302,6 +304,15 @@ class DistCommandTest extends CommandTest {
         assertThat(config.cacheDir()).isEqualTo(tempDir.resolve("bound-cache"));
         assertThat(config.cacheCleanup()).isEqualTo(expectedCleanup);
         assertThat(config.cacheFreeSpaceBufferBytes()).isEqualTo(67_108_864L);
+    }
+
+    @Test
+    @DisabledOnOs(OS.WINDOWS)
+    void shouldPreserveWhitespaceInBoundCacheDirectory() {
+        Path cacheDir = tempDir.resolve(" worker cache ");
+        DistributionWorkerConfig config = bindWorkerStart(List.of(), List.of("--cache-dir", cacheDir.toString()));
+
+        assertThat(config.cacheDir()).isEqualTo(cacheDir);
     }
 
     @Test

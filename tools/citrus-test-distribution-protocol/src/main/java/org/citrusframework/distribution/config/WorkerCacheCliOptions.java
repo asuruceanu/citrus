@@ -66,7 +66,7 @@ public final class WorkerCacheCliOptions {
     /**
      * Extracted worker cache settings plus all non-cache arguments in their original order.
      *
-     * @param cacheDir trimmed cache directory or {@code null} when not given
+     * @param cacheDir cache directory exactly as given or {@code null} when not given
      * @param cacheCleanup resolved cleanup flag or {@code null} when not given
      * @param cacheFreeSpaceBufferSize trimmed buffer size expression or {@code null} when not given
      * @param cacheFreeSpaceBufferBytes parsed buffer size in bytes or {@code null} when not given
@@ -141,7 +141,7 @@ public final class WorkerCacheCliOptions {
                     i++;
                 }
             } else if (matches(arg, CACHE_FREE_SPACE_BUFFER_SIZE)) {
-                bufferSize = value(args, i, CACHE_FREE_SPACE_BUFFER_SIZE);
+                bufferSize = value(args, i, CACHE_FREE_SPACE_BUFFER_SIZE).trim();
                 bufferBytes = DistributionSettings.parseByteSize(bufferSize, CACHE_FREE_SPACE_BUFFER_SIZE);
                 if (arg.equals(CACHE_FREE_SPACE_BUFFER_SIZE)) {
                     i++;
@@ -160,7 +160,7 @@ public final class WorkerCacheCliOptions {
         return arg.equals(name) || arg.startsWith(name + "=");
     }
 
-    /** Returns the trimmed value of the value option at {@code index}, given as separate token or after {@code =}. */
+    /** Returns the raw value of the value option at {@code index}, given as separate token or after {@code =}. */
     private static String value(List<String> args, int index, String name) {
         String arg = args.get(index);
         String value;
@@ -175,6 +175,6 @@ public final class WorkerCacheCliOptions {
         if (value == null || value.isBlank()) {
             throw new IllegalArgumentException("Missing parameter value for " + name + " option");
         }
-        return value.trim();
+        return value;
     }
 }

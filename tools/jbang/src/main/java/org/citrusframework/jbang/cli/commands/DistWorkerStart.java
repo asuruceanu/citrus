@@ -175,7 +175,7 @@ public class DistWorkerStart extends CitrusCommand {
             builder.authToken(authToken);
         }
         if (cacheDir != null && !cacheDir.isBlank()) {
-            builder.cacheDir(Paths.get(cacheDir.trim()));
+            builder.cacheDir(Paths.get(cacheDir));
         }
         if (cacheCleanup != null) {
             builder.cacheCleanup(DistributionSettings.parseBooleanStrict(cacheCleanup,

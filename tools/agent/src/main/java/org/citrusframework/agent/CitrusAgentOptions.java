@@ -20,6 +20,7 @@ import java.util.Arrays;
 import java.util.HashSet;
 import java.util.LinkedList;
 import java.util.Set;
+import java.util.stream.Collectors;
 
 import org.citrusframework.api.agent.CitrusAgentConfiguration;
 import org.citrusframework.distribution.config.WorkerCacheCliOptions;
@@ -29,8 +30,12 @@ import org.citrusframework.util.StringUtils;
 
 public class CitrusAgentOptions extends CitrusAppOptions<CitrusAgentConfiguration> {
 
+    private final CliOption<CitrusAgentConfiguration> helpOption;
+
     protected CitrusAgentOptions() {
         super();
+        this.helpOption = options.stream().filter(option -> "--help".equals(option.getFullName()))
+                .findFirst().orElseThrow();
 
         options.add(new CliOption<>("P", "port", "Server port") {
             @Override
@@ -100,15 +105,30 @@ public class CitrusAgentOptions extends CitrusAppOptions<CitrusAgentConfiguratio
      *
      * @throws IllegalArgumentException on malformed, blank or unknown cache options
      */
+    @Override
     public CitrusAgentConfiguration apply(CitrusAgentConfiguration configuration, String[] arguments) {
+        ParsedOptions parsed = parse(configuration, arguments);
+        if (parsed.usage() != null) {
+            // Keep the inherited help and configuration behavior for direct callers of apply().
+            helpOption.processOption(configuration, "--help", new LinkedList<>());
+        }
+        return parsed.configuration();
+    }
+
+    ParsedOptions parse(CitrusAgentConfiguration configuration, String[] arguments) {
         WorkerCacheCliOptions.Result cache = WorkerCacheCliOptions.parse(Arrays.asList(arguments), hostValueOptions());
         LinkedList<String> args = new LinkedList<>(cache.remainingArgs());
+        boolean helpRequested = false;
 
         while (!args.isEmpty()) {
             String arg = args.removeFirst();
+            if ("--help".equals(arg) || "-h".equals(arg)) {
+                helpRequested = true;
+                continue;
+            }
 
             for (CliOption<CitrusAgentConfiguration> option : options) {
-                if (option.processOption(configuration, arg, args)) {
+                if (option != helpOption && option.processOption(configuration, arg, args)) {
                     break;
                 }
             }
@@ -123,7 +143,17 @@ public class CitrusAgentOptions extends CitrusAppOptions<CitrusAgentConfiguratio
         if (cache.cacheFreeSpaceBufferSize() != null) {
             configuration.setCacheFreeSpaceBufferSize(cache.cacheFreeSpaceBufferSize());
         }
-        return configuration;
+        return new ParsedOptions(configuration, helpRequested ? usage() : null);
+    }
+
+    private String usage() {
+        return options.stream()
+                .map(CliOption::getInformation)
+                .collect(Collectors.joining(System.lineSeparator(),
+                        "Citrus application option usage:" + System.lineSeparator(), ""));
+    }
+
+    record ParsedOptions(CitrusAgentConfiguration configuration, String usage) {
     }
 
     /**
@@ -133,7 +163,7 @@ public class CitrusAgentOptions extends CitrusAppOptions<CitrusAgentConfiguratio
     private Set<String> hostValueOptions() {
         Set<String> names = new HashSet<>();
         for (CliOption<CitrusAgentConfiguration> option : options) {
-            if (option instanceof CacheOption || "--help".equals(option.getFullName())) {
+            if (option instanceof CacheOption || option == helpOption) {
                 continue;
             }
             names.add(option.getFullName());

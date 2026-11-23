@@ -20,6 +20,7 @@ import io.netty.handler.codec.http.HttpResponseStatus;
 import io.vertx.core.AbstractVerticle;
 import io.vertx.core.Future;
 import io.vertx.core.Handler;
+import io.vertx.core.Promise;
 import io.vertx.core.Vertx;
 import io.vertx.core.http.HttpHeaders;
 import io.vertx.core.http.HttpMethod;
@@ -110,9 +111,7 @@ public class CitrusAgentApplication extends AbstractVerticle implements CitrusIn
     }
 
     @Override
-    public void start() {
-        CitrusInstanceManager.addInstanceProcessor(this);
-
+    public void start(Promise<Void> startPromise) {
         Router router = Router.router(getVertx());
         router.route().handler(CorsHandler.create()
                 .addOriginWithRegex(CitrusAgentSettings.getCorsAllowedOrigin())
@@ -144,10 +143,12 @@ public class CitrusAgentApplication extends AbstractVerticle implements CitrusIn
         getVertx().createHttpServer()
                 .requestHandler(router)
                 .listen(configuration.getPort())
-                .onFailure(handler ->
-                        logger.info("Failed to start server on port {} - error message is {}", configuration.getPort(), handler.getMessage()))
-                .onSuccess(unused ->
-                        logger.info("Server started, listening on port {}", configuration.getPort()));
+                .<Void>map(server -> {
+                    CitrusInstanceManager.addInstanceProcessor(this);
+                    logger.info("Server started, listening on port {}", server.actualPort());
+                    return null;
+                })
+                .onComplete(startPromise);
     }
 
     @Override
@@ -422,6 +423,7 @@ public class CitrusAgentApplication extends AbstractVerticle implements CitrusIn
 
     @Override
     public void stop() {
+        CitrusInstanceManager.removeInstanceProcessor(this);
         CitrusInstanceManager.get().ifPresent(citrus -> {
             logger.info("Closing Citrus and its application context");
             citrus.close();

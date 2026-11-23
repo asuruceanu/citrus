@@ -52,7 +52,6 @@ class WorkerCacheCliOptionsTest {
         return Stream.of(
                         List.of("--cache-dir", "/tmp/c1"),
                         List.of("--cache-dir=/tmp/c1"),
-                        List.of("--cache-dir", " /tmp/c1 "),
                         List.of("--cache-dir=/tmp/other", "--cache-dir", "/tmp/c1"))
                 .map(args -> DynamicTest.dynamicTest(String.join(" ", args), () -> {
                     Result result = parse(args.toArray(String[]::new));
@@ -60,6 +59,12 @@ class WorkerCacheCliOptionsTest {
                     assertThat(result.remainingArgs()).isEmpty();
                     assertThat(result.canonicalArgs()).containsExactly("--cache-dir=/tmp/c1");
                 }));
+    }
+
+    @Test
+    void shouldPreserveWhitespaceInCacheDir() {
+        assertThat(parse("--cache-dir", " /tmp/c1 ").cacheDir()).isEqualTo(" /tmp/c1 ");
+        assertThat(parse("--cache-dir= /tmp/c1 ").canonicalArgs()).containsExactly("--cache-dir= /tmp/c1 ");
     }
 
     @TestFactory

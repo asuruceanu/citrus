@@ -18,25 +18,39 @@ package org.citrusframework.agent;
 
 import java.io.ByteArrayOutputStream;
 import java.io.PrintStream;
+import java.net.InetAddress;
+import java.net.ServerSocket;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Stream;
 
 import org.citrusframework.api.agent.CitrusAgentConfiguration;
 import org.citrusframework.distribution.config.DistributionSettings;
+import org.citrusframework.distribution.worker.DistributionWorkerClient;
 import org.citrusframework.distribution.worker.DistributionWorkerConfig;
+import org.citrusframework.exceptions.CitrusRuntimeException;
 import org.junit.jupiter.api.DynamicTest;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestFactory;
+import org.junit.jupiter.api.condition.DisabledOnOs;
+import org.junit.jupiter.api.condition.OS;
+import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.api.parallel.ResourceLock;
+import org.junit.jupiter.api.parallel.Resources;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 @ResourceLock("citrus-agent-worker-cache-settings")
 class CitrusAgentWorkerOptionsTest {
+
+    @TempDir
+    Path tempDir;
 
     private static CitrusAgentConfiguration parse(String... args) {
         return new CitrusAgentOptions().apply(args);
@@ -53,6 +67,14 @@ class CitrusAgentWorkerOptionsTest {
                     assertThat(DistributionWorkerBridge.buildWorkerConfig(configuration).cacheDir())
                             .isEqualTo(Paths.get("/tmp/c1"));
                 }));
+    }
+
+    @Test
+    @DisabledOnOs(OS.WINDOWS)
+    void shouldPreserveWhitespaceInCacheDirectory() {
+        Path cacheDir = tempDir.resolve(" worker cache ");
+        assertThat(DistributionWorkerBridge.buildWorkerConfig(parse("--cache-dir", cacheDir.toString())).cacheDir())
+                .isEqualTo(cacheDir);
     }
 
     @TestFactory
@@ -207,7 +229,7 @@ class CitrusAgentWorkerOptionsTest {
         PrintStream err = new PrintStream(errors, true, StandardCharsets.UTF_8);
 
         assertThat(CitrusAgentServer.parseOptions(new String[] {"--mode", "worker", "--no-cache-cleanup"}, err))
-                .hasValueSatisfying(configuration -> assertThat(configuration.getCacheCleanup()).isFalse());
+                .hasValueSatisfying(options -> assertThat(options.configuration().getCacheCleanup()).isFalse());
         assertThat(errors.toString(StandardCharsets.UTF_8)).isEmpty();
     }
 
@@ -217,13 +239,132 @@ class CitrusAgentWorkerOptionsTest {
         PrintStream err = new PrintStream(errors, true, StandardCharsets.UTF_8);
         List<Integer> exitCodes = new ArrayList<>();
 
-        CitrusAgentServer.entrypoint(new String[] {"--cache-cleanup", "flase"}, List.of(), err, exitCodes::add);
+        CitrusAgentServer.entrypoint(new String[] {"--cache-cleanup", "flase"}, List.of(), System.out, err, exitCodes::add);
 
-        assertThat(exitCodes).containsExactly(CitrusAgentServer.INVALID_OPTIONS_EXIT_CODE);
-        assertThat(CitrusAgentServer.INVALID_OPTIONS_EXIT_CODE).isNotZero();
+        assertThat(exitCodes).containsExactly(CitrusAgentServer.STARTUP_FAILURE_EXIT_CODE);
+        assertThat(CitrusAgentServer.STARTUP_FAILURE_EXIT_CODE).isNotZero();
         assertThat(errors.toString(StandardCharsets.UTF_8))
                 .startsWith("Invalid Citrus agent options: Invalid value 'flase' for --[no-]cache-cleanup")
                 .doesNotContain("\tat ")
                 .hasLineCount(1);
+    }
+
+    @Test
+    void shouldParseHelpWithoutConsumingTheNextOption() {
+        CitrusAgentOptions options = new CitrusAgentOptions();
+        assertThat(options.parse(new CitrusAgentConfiguration(), new String[] {"-h", "--mode", "worker"})
+                .configuration().getMode()).isEqualTo("worker");
+        assertThat(options.parse(new CitrusAgentConfiguration(), new String[] {"--auth-token", "--help"}))
+                .satisfies(parsed -> {
+                    assertThat(parsed.configuration().getAuthToken()).isEqualTo("--help");
+                    assertThat(parsed.usage()).isNull();
+                });
+    }
+
+    @Test
+    void shouldKeepHelpConfigurationBehaviorForDirectOptionsCallers() {
+        CitrusAgentConfiguration configuration = parse("-h", "--mode", "worker");
+        assertThat(configuration.getMode()).isEqualTo("worker");
+        assertThat(configuration.isSkipTests()).isTrue();
+        assertThat(configuration.getTimeToLive()).isEqualTo(1000L);
+    }
+
+    @Test
+    void shouldPrintWorkerHelpWithoutStartingServer() {
+        Path cacheDir = tempDir.resolve("help-cache");
+        List<String[]> cases = List.of(
+                new String[] {"--help", "--mode", "worker", "--port", "0", "--cache-dir", cacheDir.toString()},
+                new String[] {"--mode", "worker", "--port", "0", "--cache-dir", cacheDir.toString(), "-h"});
+
+        for (String[] args : cases) {
+            ByteArrayOutputStream output = new ByteArrayOutputStream();
+            ByteArrayOutputStream errors = new ByteArrayOutputStream();
+            List<Integer> exitCodes = new ArrayList<>();
+            CitrusAgentServer.entrypoint(args, List.of(router -> {
+                throw new AssertionError("Help should not start the HTTP application");
+            }), new PrintStream(output, true, StandardCharsets.UTF_8),
+                    new PrintStream(errors, true, StandardCharsets.UTF_8), exitCodes::add);
+
+            assertThat(output.toString(StandardCharsets.UTF_8)).contains("Citrus application option usage:",
+                    "--cache-dir", "--cache-cleanup", "--no-cache-cleanup", "--cache-free-space-buffer-size");
+            assertThat(errors.toString(StandardCharsets.UTF_8)).isEmpty();
+            assertThat(exitCodes).isEmpty();
+            assertThat(cacheDir).doesNotExist();
+        }
+    }
+
+    @Test
+    void shouldExitWithoutDeployingHttpWhenWorkerCacheSettingIsInvalid() throws InterruptedException {
+        String key = DistributionSettings.WORKER_CACHE_CLEANUP_PROPERTY;
+        String previous = System.getProperty(key);
+        System.setProperty(key, "flase");
+        try {
+            assertWorkerStartupFails(tempDir.resolve("invalid-settings-cache"), key);
+        } finally {
+            if (previous == null) {
+                System.clearProperty(key);
+            } else {
+                System.setProperty(key, previous);
+            }
+        }
+    }
+
+    @Test
+    void shouldExitWithoutDeployingHttpWhenWorkerCacheIsLocked() throws InterruptedException {
+        Path cacheDir = tempDir.resolve("shared-cache");
+        DistributionWorkerConfig config = DistributionWorkerConfig.builder()
+                .brokerUrl("http://127.0.0.1:1")
+                .cacheDir(cacheDir)
+                .cacheCleanup(false)
+                .cacheFreeSpaceBufferBytes(0)
+                .build();
+        try (DistributionWorkerClient owner = new DistributionWorkerClient(config)) {
+            owner.start();
+            assertWorkerStartupFails(cacheDir, "--cache-dir");
+        }
+    }
+
+    @Test
+    @ResourceLock(Resources.SYSTEM_OUT)
+    void shouldReleaseWorkerCacheWhenHttpListenerCannotBind() throws Exception {
+        Path cacheDir = tempDir.resolve("failed-http-cache");
+        String brokerUrl = "http://127.0.0.1:1";
+        PrintStream originalOutput = System.out;
+
+        try (ServerSocket occupiedPort = new ServerSocket(0, 1, InetAddress.getByName("0.0.0.0"))) {
+            CitrusAgentConfiguration configuration = parse("--mode", "worker", "--broker-url", brokerUrl,
+                    "--port", Integer.toString(occupiedPort.getLocalPort()), "--cache-dir", cacheDir.toString());
+            CitrusAgentServer server = new CitrusAgentServer(configuration);
+            try {
+                assertThatThrownBy(server::start).isInstanceOf(CitrusRuntimeException.class)
+                        .hasMessageContaining("Could not start HTTP listener on port " + occupiedPort.getLocalPort());
+                assertThat(server.isRunning()).isFalse();
+
+                try (DistributionWorkerClient worker = new DistributionWorkerClient(
+                        DistributionWorkerBridge.buildWorkerConfig(configuration))) {
+                    worker.start();
+                }
+            } finally {
+                server.stop();
+            }
+        } finally {
+            System.setOut(originalOutput);
+        }
+    }
+
+    private static void assertWorkerStartupFails(Path cacheDir, String expectedMessage) throws InterruptedException {
+        ByteArrayOutputStream errors = new ByteArrayOutputStream();
+        List<Integer> exitCodes = new ArrayList<>();
+        CountDownLatch deployed = new CountDownLatch(1);
+
+        CitrusAgentServer.entrypoint(new String[] {"--mode", "worker", "--port", "0", "--duration", "1000",
+                        "--broker-url", "http://127.0.0.1:1", "--cache-dir", cacheDir.toString()},
+                List.of(router -> deployed.countDown()), System.out,
+                new PrintStream(errors, true, StandardCharsets.UTF_8), exitCodes::add);
+
+        assertThat(exitCodes).containsExactly(CitrusAgentServer.STARTUP_FAILURE_EXIT_CODE);
+        assertThat(errors.toString(StandardCharsets.UTF_8)).startsWith("Failed to start Citrus agent:")
+                .contains(expectedMessage).hasLineCount(1);
+        assertThat(deployed.await(200, TimeUnit.MILLISECONDS)).isFalse();
     }
 }
