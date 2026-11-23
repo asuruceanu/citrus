@@ -29,7 +29,9 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Predicate;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
@@ -87,33 +89,49 @@ final class WorkspaceReferences {
             if (containsUnixSocket(roots)) {
                 return true;
             }
-            List<Long> postLaunchPids;
+            List<SurvivorProcess> survivors;
             try {
-                postLaunchPids = postLaunchPids(macOsBaselineProcesses, allProcesses);
+                survivors = postLaunchProcesses(macOsBaselineProcesses, allProcesses);
             } catch (SecurityException | UnsupportedOperationException e) {
                 return macOsReferences(roots, commandRunner);
             }
-            return macOsProcessReferences(roots, postLaunchPids, commandRunner);
+            return macOsProcessReferences(roots, survivors.stream().map(SurvivorProcess::pid).toList(), commandRunner,
+                    output -> hasUnverifiedSurvivors(survivors, postLaunchProcesses(macOsBaselineProcesses, allProcesses),
+                            output));
         }
         // An orphan on a platform without an inspection backend has no owner left to vouch for it.
         return recovering;
     }
 
-    private static List<Long> postLaunchPids(Map<Long, Instant> baseline, Supplier<Stream<ProcessHandle>> allProcesses) {
+    private static List<SurvivorProcess> postLaunchProcesses(Map<Long, Instant> baseline,
+                                                            Supplier<Stream<ProcessHandle>> allProcesses) {
         ProcessHandle current = ProcessHandle.current();
         String currentUser = current.info().user().orElse(null);
         try (var processes = allProcesses.get()) {
             return processes.filter(process -> process.pid() != current.pid() && process.isAlive())
-                    .filter(process -> {
+                    .map(process -> {
                         ProcessHandle.Info info = process.info();
                         Instant startedAt = info.startInstant().orElse(null);
-                        return (currentUser == null || currentUser.equals(info.user().orElse(currentUser)))
-                                && (startedAt == null || !Objects.equals(baseline.get(process.pid()), startedAt));
+                        if ((currentUser == null || currentUser.equals(info.user().orElse(currentUser)))
+                                && (startedAt == null || !Objects.equals(baseline.get(process.pid()), startedAt))) {
+                            return new SurvivorProcess(process.pid(), startedAt);
+                        }
+                        return null;
                     })
-                    .map(ProcessHandle::pid)
+                    .filter(Objects::nonNull)
                     .limit(MAX_TARGETED_PIDS + 1L)
                     .toList();
         }
+    }
+
+    private static boolean hasUnverifiedSurvivors(List<SurvivorProcess> before, List<SurvivorProcess> after,
+                                                  String output) {
+        // A selected process can hand off its references to a new process while lsof runs. A still-live PID
+        // missing from the output or without comparable start metadata also makes the targeted scan inconclusive.
+        Set<SurvivorProcess> selected = Set.copyOf(before);
+        Set<String> inspected = output.lines().filter(line -> line.startsWith("p")).collect(Collectors.toSet());
+        return after.stream().anyMatch(process -> process.startedAt() == null || !selected.contains(process)
+                || !inspected.contains("p" + process.pid()));
     }
 
     private static String osName() {
@@ -140,7 +158,33 @@ final class WorkspaceReferences {
         return false;
     }
 
+    private static boolean containsMultiplyLinkedRegularFile(List<Path> roots) throws IOException {
+        for (Path root : roots) {
+            try (var entries = Files.find(root.toRealPath(), Integer.MAX_VALUE,
+                    (path, attributes) -> attributes.isRegularFile())) {
+                var regularFiles = entries.iterator();
+                while (regularFiles.hasNext()) {
+                    checkInterrupted();
+                    Path path = regularFiles.next();
+                    int linkCount = (int) Files.getAttribute(path, "unix:nlink", LinkOption.NOFOLLOW_LINKS);
+                    if (linkCount > 1) {
+                        return true;
+                    }
+                }
+            } catch (UncheckedIOException e) {
+                throw e.getCause();
+            }
+        }
+        return false;
+    }
+
     static boolean macOsProcessReferences(List<Path> roots, List<Long> postLaunchPids, CommandRunner commandRunner)
+            throws IOException {
+        return macOsProcessReferences(roots, postLaunchPids, commandRunner, output -> false);
+    }
+
+    private static boolean macOsProcessReferences(List<Path> roots, List<Long> postLaunchPids,
+                                                   CommandRunner commandRunner, Predicate<String> hasUnverifiedSurvivors)
             throws IOException {
         checkInterrupted();
         if (postLaunchPids.isEmpty()) {
@@ -162,14 +206,20 @@ final class WorkspaceReferences {
             Optional<Boolean> references =
                     parseMacOsProcessLsofOutput(result.output(), result.exitCode(), normalizedRoots);
             checkInterrupted();
-            if (references.isPresent()) {
-                return references.get();
+            if (references.orElse(false)) {
+                return true;
             }
-        } catch (IOException e) {
+            // A process can open a workspace file through an outside hard link. The full scan matches its inode.
+            if (references.isPresent() && !containsMultiplyLinkedRegularFile(roots)
+                    && !hasUnverifiedSurvivors.test(result.output())) {
+                checkInterrupted();
+                return false;
+            }
+        } catch (IOException | SecurityException | UnsupportedOperationException e) {
             if (Thread.currentThread().isInterrupted()) {
                 throw e;
             }
-            // A failed targeted inspection still permits the full directory scan.
+            // A failed targeted inspection or verification still permits the full directory scan.
         }
         checkInterrupted();
         return macOsReferences(roots, commandRunner);
@@ -246,7 +296,7 @@ final class WorkspaceReferences {
         }
     }
 
-    private static LsofResult runLsof(List<String> command) throws IOException {
+    static LsofResult runLsof(List<String> command) throws IOException {
         checkInterrupted();
         // Field output can exceed the pipe buffer while we wait for lsof to exit.
         Path output = Files.createTempFile("citrus-lsof-", ".log");
@@ -289,5 +339,8 @@ final class WorkspaceReferences {
     }
 
     record LsofResult(String output, int exitCode) {
+    }
+
+    private record SurvivorProcess(long pid, Instant startedAt) {
     }
 }
