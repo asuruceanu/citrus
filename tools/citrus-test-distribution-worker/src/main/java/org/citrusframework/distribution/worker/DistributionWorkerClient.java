@@ -38,6 +38,7 @@ import org.citrusframework.distribution.config.DistributionJson;
 import org.citrusframework.distribution.config.DistributionSettings;
 import org.citrusframework.distribution.model.PartitionAssignPayload;
 import org.citrusframework.distribution.model.PartitionCompletedPayload;
+import org.citrusframework.distribution.model.WorkerCacheStats;
 import org.citrusframework.distribution.model.WorkerHeartbeatPayload;
 import org.citrusframework.distribution.model.WorkerRegisterPayload;
 import org.citrusframework.distribution.model.WorkerWsMessage;
@@ -48,28 +49,36 @@ import org.slf4j.LoggerFactory;
 /**
  * Persistent WebSocket worker client that registers host capabilities with the Citrus Test
  * Distribution Broker, executes assigned partitions, and supports graceful SIGTERM draining.
+ * <p>
+ * The client owns the worker's exclusive {@link WorkerFileCache} and one {@link BrokerBlobClient}, shared by the
+ * in-process and forked runners. {@link #start()} locks the cache directory before connecting (failing fast when
+ * another worker holds it); {@link #close()} releases it after in-flight partitions have ended. Cache statistics are
+ * attached to registration and heartbeats.
  */
 public final class DistributionWorkerClient implements AutoCloseable {
 
     private static final Logger LOG = LoggerFactory.getLogger(DistributionWorkerClient.class);
 
     private final DistributionWorkerConfig config;
-    private final IsolatedPartitionRunner inProcessRunner;
-    private final ForkedPartitionRunner forkedRunner;
     private final HttpClient httpClient;
     private final ExecutorService partitionExecutor;
     private final ScheduledExecutorService scheduler;
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final AtomicBoolean draining = new AtomicBoolean(false);
+    private final AtomicBoolean closed = new AtomicBoolean(false);
     private final AtomicReference<WebSocket> activeWebSocket = new AtomicReference<>();
     private final ActiveAssignmentTracker assignments = new ActiveAssignmentTracker();
     private volatile CountDownLatch registeredLatch = new CountDownLatch(1);
     private volatile CompletableFuture<Void> currentExecution = CompletableFuture.completedFuture(null);
 
+    // Opened by the first start(), released by close(); partitions only run while they are set.
+    private volatile WorkerFileCache workerCache;
+    private volatile BrokerBlobClient blobClient;
+    private volatile IsolatedPartitionRunner inProcessRunner;
+    private volatile ForkedPartitionRunner forkedRunner;
+
     public DistributionWorkerClient(DistributionWorkerConfig config) {
         this.config = config;
-        this.inProcessRunner = new IsolatedPartitionRunner(config);
-        this.forkedRunner = new ForkedPartitionRunner(config);
         this.httpClient = HttpClient.newBuilder()
                 .connectTimeout(Duration.ofSeconds(10))
                 .build();
@@ -85,9 +94,21 @@ public final class DistributionWorkerClient implements AutoCloseable {
         });
     }
 
+    /**
+     * Locks the worker cache (on the first call), connects to the broker and starts heartbeats.
+     *
+     * @throws IllegalStateException if the cache directory cannot be locked, for example because another worker uses
+     *                               it, or if this client is closed
+     */
     public void start() {
         if (!running.compareAndSet(false, true)) {
             return;
+        }
+        try {
+            openCache();
+        } catch (RuntimeException | Error e) {
+            running.set(false);
+            throw e;
         }
         connectInternal();
         scheduler.scheduleAtFixedRate(
@@ -95,6 +116,28 @@ public final class DistributionWorkerClient implements AutoCloseable {
                 config.heartbeatIntervalMs(),
                 config.heartbeatIntervalMs(),
                 TimeUnit.MILLISECONDS);
+    }
+
+    /** Synchronized with {@link #closeResources()}, so a cache is never opened after it released the last one. */
+    private synchronized void openCache() {
+        if (closed.get()) {
+            throw new IllegalStateException("Worker " + config.workerId() + " is closed");
+        }
+        if (workerCache != null) {
+            return;
+        }
+        WorkerFileCache cache = WorkerFileCache.open(config.cacheDir(), config.cacheCleanup(),
+                config.cacheFreeSpaceBufferBytes());
+        try {
+            BrokerBlobClient blobs = new BrokerBlobClient(config, cache);
+            inProcessRunner = new IsolatedPartitionRunner(config, cache, blobs);
+            forkedRunner = new ForkedPartitionRunner(config, cache, blobs);
+            blobClient = blobs;
+            workerCache = cache;
+        } catch (RuntimeException | Error e) {
+            cache.close();
+            throw e;
+        }
     }
 
     public boolean awaitRegistration(long timeout, TimeUnit unit) throws InterruptedException {
@@ -133,21 +176,57 @@ public final class DistributionWorkerClient implements AutoCloseable {
         }
     }
 
+    /**
+     * Cancels and drains in-flight work, disconnects, waits (bounded) for the partition thread to finish, then closes
+     * the blob client, the HTTP client and finally the worker cache. Idempotent.
+     */
     @Override
     public void close() {
-        assignments.cancel(null, 0);
-        drain(10, TimeUnit.SECONDS);
-        running.set(false);
-        WebSocket ws = activeWebSocket.getAndSet(null);
-        if (ws != null) {
+        if (!closed.compareAndSet(false, true)) {
+            return;
+        }
+        try {
+            assignments.cancel(null, 0);
+            drain(10, TimeUnit.SECONDS);
+            running.set(false);
+            WebSocket ws = activeWebSocket.getAndSet(null);
+            if (ws != null) {
+                try {
+                    ws.sendClose(WebSocket.NORMAL_CLOSURE, "shutdown").get(2, TimeUnit.SECONDS);
+                } catch (Exception ignored) {
+                    ws.abort();
+                }
+            }
+            scheduler.shutdownNow();
+            partitionExecutor.shutdownNow();
             try {
-                ws.sendClose(WebSocket.NORMAL_CLOSURE, "shutdown").get(2, TimeUnit.SECONDS);
-            } catch (Exception ignored) {
-                ws.abort();
+                if (!partitionExecutor.awaitTermination(5, TimeUnit.SECONDS)) {
+                    LOG.warn("Partition thread of worker {} did not stop within 5 seconds; releasing its cache anyway",
+                            config.workerId());
+                }
+                scheduler.awaitTermination(1, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        } finally {
+            closeResources();
+        }
+    }
+
+    private synchronized void closeResources() {
+        try {
+            if (blobClient != null) {
+                blobClient.close();
+            }
+        } finally {
+            try {
+                httpClient.shutdownNow();
+            } finally {
+                if (workerCache != null) {
+                    workerCache.close();
+                }
             }
         }
-        scheduler.shutdownNow();
-        partitionExecutor.shutdownNow();
     }
 
     private void connectInternal() {
@@ -173,7 +252,7 @@ public final class DistributionWorkerClient implements AutoCloseable {
                     Map<String, String> caps = new LinkedHashMap<>(config.capabilities());
                     caps.put("citrus-worker", "true");
                     WorkerRegisterPayload registerPayload = new WorkerRegisterPayload(
-                            config.workerId(), config.hostName(), caps);
+                            config.workerId(), config.hostName(), caps, cacheStats());
                     @SuppressWarnings("unchecked")
                     Map<String, Object> payloadMap = DistributionJson.convert(registerPayload, Map.class);
                     sendMessageSafe(WorkerWsMessage.WORKER_REGISTER, payloadMap);
@@ -219,10 +298,41 @@ public final class DistributionWorkerClient implements AutoCloseable {
         if (!running.get() || !isConnected()) {
             return;
         }
-        WorkerHeartbeatPayload hb = new WorkerHeartbeatPayload(config.workerId(), assignments.executingPartitionId());
+        WorkerHeartbeatPayload hb = new WorkerHeartbeatPayload(config.workerId(), assignments.executingPartitionId(),
+                cacheStats());
         @SuppressWarnings("unchecked")
         Map<String, Object> map = DistributionJson.convert(hb, Map.class);
         sendMessageSafe(WorkerWsMessage.WORKER_HEARTBEAT, map);
+    }
+
+    /** Lock-free cache statistics, or {@code null} before the cache is open. */
+    private WorkerCacheStats cacheStats() {
+        WorkerFileCache cache = workerCache;
+        if (cache == null) {
+            return null;
+        }
+        try {
+            return cache.statsSnapshot();
+        } catch (RuntimeException e) {
+            LOG.debug("Could not read cache statistics of worker {}", config.workerId(), e);
+            return null;
+        }
+    }
+
+    /**
+     * Evicts down to the free space buffer now that the partition's pins are released, and reports the new cache
+     * statistics. Runs on the partition thread, so eviction never overlaps with a partition pinning its blobs.
+     */
+    private void afterPartition() {
+        WorkerFileCache cache = workerCache;
+        if (cache != null) {
+            try {
+                cache.evictAfterPartition();
+            } catch (RuntimeException e) {
+                LOG.warn("Post-partition cache eviction failed on worker {}", config.workerId(), e);
+            }
+        }
+        sendHeartbeatSafe();
     }
 
     private synchronized void sendMessageSafe(String type, Map<String, Object> payload) {
@@ -256,6 +366,11 @@ public final class DistributionWorkerClient implements AutoCloseable {
                 ActiveAssignmentTracker.Assignment assignment = assignments.start(assign.partitionId(), assign.attempt());
                 CancellationToken token = assignment.token();
                 PartitionRunner runner = requiresFork(config, assign) ? forkedRunner : inProcessRunner;
+                if (runner == null) {
+                    LOG.warn("Worker {} rejects partition {}: not started", config.workerId(), assign.partitionId());
+                    assignments.finish(assignment);
+                    return;
+                }
                 currentExecution = CompletableFuture.runAsync(() -> {
                     boolean finished = false;
                     assignments.markExecuting(assignment);
@@ -284,6 +399,7 @@ public final class DistributionWorkerClient implements AutoCloseable {
                         if (!finished) {
                             assignments.finish(assignment);
                         }
+                        afterPartition();
                     }
                 }, partitionExecutor);
             }

@@ -43,6 +43,7 @@ import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -110,14 +111,30 @@ final class ForkedPartitionRunner implements PartitionRunner {
     }
 
     private final DistributionWorkerConfig config;
-    private final BlobCacheDirectory blobCache;
-    private final BrokerBlobClient blobs;
+    private final WorkerFileCache sharedCache;
+    private final BrokerBlobClient sharedBlobs;
     private final long handshakeTimeoutMs;
 
+    /**
+     * Runs partitions against the worker's shared cache and blob client, both owned by the caller.
+     */
+    ForkedPartitionRunner(DistributionWorkerConfig config, WorkerFileCache cache, BrokerBlobClient blobs) {
+        this(config, Objects.requireNonNull(cache, "cache"), Objects.requireNonNull(blobs, "blobs"), true);
+    }
+
+    /**
+     * Test convenience: every {@link #execute} locks the configured cache directory and creates its own blob client,
+     * releasing both when the partition ends.
+     */
     ForkedPartitionRunner(DistributionWorkerConfig config) {
-        this.config = config;
-        this.blobCache = new BlobCacheDirectory(config.cacheDir());
-        this.blobs = new BrokerBlobClient(config, blobCache);
+        this(config, null, null, false);
+    }
+
+    private ForkedPartitionRunner(DistributionWorkerConfig config, WorkerFileCache cache, BrokerBlobClient blobs,
+                                  boolean shared) {
+        this.config = Objects.requireNonNull(config, "config");
+        this.sharedCache = shared ? cache : null;
+        this.sharedBlobs = shared ? blobs : null;
         this.handshakeTimeoutMs = Math.max(1_000L, DistributionSettings.getLong(
                 DistributionSettings.WORKER_HANDSHAKE_TIMEOUT_PROPERTY, null,
                 DistributionSettings.DEFAULT_WORKER_HANDSHAKE_TIMEOUT_MS));
@@ -127,22 +144,56 @@ final class ForkedPartitionRunner implements PartitionRunner {
     public IsolatedPartitionRunner.PartitionExecutionResult execute(PartitionAssignPayload assignment,
                                                                     CancellationToken cancellationToken,
                                                                     Consumer<WorkerTestEventPayload> eventSink) {
+        if (sharedCache != null) {
+            return execute(assignment, cancellationToken, eventSink, sharedCache, sharedBlobs);
+        }
+        WorkerFileCache cache;
+        try {
+            cache = WorkerFileCache.open(config.cacheDir(), config.cacheCleanup(), config.cacheFreeSpaceBufferBytes());
+        } catch (RuntimeException e) {
+            LOG.warn("Forked partition {} failed: cannot open the worker cache", assignment.partitionId(), e);
+            return new IsolatedPartitionRunner.PartitionExecutionResult(false,
+                    e.getMessage() != null ? e.getMessage() : e.getClass().getName());
+        }
+        try (cache; BrokerBlobClient blobs = new BrokerBlobClient(config, cache)) {
+            return execute(assignment, cancellationToken, eventSink, cache, blobs);
+        }
+    }
+
+    /**
+     * Runs the partition. Classpath and input digests are pinned before the first download, output digests as they
+     * are staged; all pins are held until the child's process tree is gone and the outputs are uploaded.
+     */
+    private IsolatedPartitionRunner.PartitionExecutionResult execute(PartitionAssignPayload assignment,
+                                                                     CancellationToken cancellationToken,
+                                                                     Consumer<WorkerTestEventPayload> eventSink,
+                                                                     WorkerFileCache cache,
+                                                                     BrokerBlobClient blobs) {
         ActiveFork fork = new ActiveFork();
         ACTIVE_FORKS.add(fork);
+        WorkerFileCache.PinLease pins = null;
         try {
+            List<ArtifactRef> classpathArtifacts = assignment.classpathArtifacts() != null
+                    ? assignment.classpathArtifacts() : List.of();
+            List<String> pinned = new ArrayList<>();
+            classpathArtifacts.forEach(artifact -> pinned.add(artifact.sha256()));
+            assignment.inputArtifacts().forEach(input -> pinned.add(input.artifact().sha256()));
+            pins = cache.pinAll(pinned);
+
             fork.partitionRoot = Files.createTempDirectory("cdist-");
             Path workspace = Files.createDirectories(fork.partitionRoot.resolve("workspace"));
             Files.createDirectories(workspace.resolve("target"));
             Path ipc = createOwnerOnlyDirectory(fork.partitionRoot.resolve("ipc"));
             fork.tmpDir = createChildTmpDir(fork.partitionRoot);
 
+            BlobCacheDirectory blobCache = cache.blobCache();
             List<Path> classpath = new ArrayList<>();
-            for (ArtifactRef artifact : assignment.classpathArtifacts() != null ? assignment.classpathArtifacts() : List.<ArtifactRef>of()) {
-                blobs.ensureCached(artifact.sha256());
+            for (ArtifactRef artifact : classpathArtifacts) {
+                blobs.ensureCached(artifact);
                 classpath.add(blobCache.materializeForClasspath(artifact, fork.partitionRoot));
             }
             for (WorkspaceFileSet input : assignment.inputArtifacts()) {
-                blobs.ensureCached(input.artifact().sha256());
+                blobs.ensureCached(input.artifact());
                 WorkspacePackager.materializeIntoDirectory(blobCache, input, workspace);
             }
             Map<String, String> baseline = WorkspacePackager.snapshotBaselineHashes(workspace, assignment.outputPaths());
@@ -189,7 +240,7 @@ final class ForkedPartitionRunner implements PartitionRunner {
                 if (cancelled(cancellationToken)) {
                     return cancelledResult();
                 }
-                WorkspacePackager.packageModifiedOutputToCache(blobCache, workspace, outputPath, baseline).ifPresent(outputs::add);
+                cache.stageAndPinOutput(workspace, outputPath, baseline, pins::pin).ifPresent(outputs::add);
             }
             if (cancelled(cancellationToken)) {
                 return cancelledResult();
@@ -204,8 +255,15 @@ final class ForkedPartitionRunner implements PartitionRunner {
             return new IsolatedPartitionRunner.PartitionExecutionResult(false,
                     t.getMessage() != null ? t.getMessage() : t.getClass().getName());
         } finally {
-            fork.cleanUp();
-            ACTIVE_FORKS.remove(fork);
+            try {
+                fork.cleanUp();
+                ACTIVE_FORKS.remove(fork);
+            } finally {
+                if (pins != null) {
+                    // The child's process tree is gone and the outputs are uploaded: the blobs may be evicted again.
+                    pins.close();
+                }
+            }
         }
     }
 

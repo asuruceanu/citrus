@@ -50,7 +50,6 @@ import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.stream.Stream;
 
-import org.citrusframework.distribution.cache.BlobCacheDirectory;
 import org.citrusframework.distribution.config.DistributionSettings;
 import org.citrusframework.distribution.config.DistributionSettings.WorkerCwdCheckMode;
 import org.citrusframework.distribution.config.PathRewriter;
@@ -76,13 +75,26 @@ public final class IsolatedPartitionRunner implements PartitionRunner {
     static final String MESSAGE_TRACE_DIRECTORY_PROPERTY = "citrus.message.trace.directory";
 
     private final DistributionWorkerConfig config;
-    private final BlobCacheDirectory blobCache;
-    private final BrokerBlobClient blobs;
+    private final WorkerFileCache sharedCache;
+    private final BrokerBlobClient sharedBlobs;
 
-    public IsolatedPartitionRunner(DistributionWorkerConfig config) {
-        this.config = config;
-        this.blobCache = new BlobCacheDirectory(config.cacheDir());
-        this.blobs = new BrokerBlobClient(config, blobCache);
+    /**
+     * Runs partitions against the worker's shared cache and blob client, both owned by the caller.
+     */
+    IsolatedPartitionRunner(DistributionWorkerConfig config, WorkerFileCache cache, BrokerBlobClient blobs) {
+        this.config = Objects.requireNonNull(config, "config");
+        this.sharedCache = Objects.requireNonNull(cache, "cache");
+        this.sharedBlobs = Objects.requireNonNull(blobs, "blobs");
+    }
+
+    /**
+     * Test convenience: every {@link #execute} locks the configured cache directory and creates its own blob client,
+     * releasing both when the partition ends.
+     */
+    IsolatedPartitionRunner(DistributionWorkerConfig config) {
+        this.config = Objects.requireNonNull(config, "config");
+        this.sharedCache = null;
+        this.sharedBlobs = null;
     }
 
     /**
@@ -115,27 +127,57 @@ public final class IsolatedPartitionRunner implements PartitionRunner {
             PartitionAssignPayload assignment,
             CancellationToken cancellationToken,
             Consumer<WorkerTestEventPayload> eventSink) {
+        if (sharedCache != null) {
+            return execute(assignment, cancellationToken, eventSink, sharedCache, sharedBlobs);
+        }
+        WorkerFileCache cache;
+        try {
+            cache = WorkerFileCache.open(config.cacheDir(), config.cacheCleanup(), config.cacheFreeSpaceBufferBytes());
+        } catch (RuntimeException e) {
+            LOG.warn("Partition {} failed: cannot open the worker cache", assignment.partitionId(), e);
+            return new PartitionExecutionResult(false, e.getMessage() != null ? e.getMessage() : e.getClass().getName());
+        }
+        try (cache; BrokerBlobClient blobs = new BrokerBlobClient(config, cache)) {
+            return execute(assignment, cancellationToken, eventSink, cache, blobs);
+        }
+    }
+
+    /**
+     * Runs the partition. All classpath digests are pinned before the first download and stay pinned until the
+     * partition class loader is closed.
+     */
+    private PartitionExecutionResult execute(
+            PartitionAssignPayload assignment,
+            CancellationToken cancellationToken,
+            Consumer<WorkerTestEventPayload> eventSink,
+            WorkerFileCache cache,
+            BrokerBlobClient blobs) {
         Path partitionRoot = null;
         ThreadScopedProperties systemProps = null;
         Properties previousScope = null;
         boolean workerScopeEntered = false;
+        WorkerFileCache.PinLease pins = null;
 
         try {
+            List<ArtifactRef> classpathArtifacts = assignment.classpathArtifacts() != null
+                    ? assignment.classpathArtifacts() : List.of();
+            pins = cache.pinAll(classpathArtifacts.stream().map(ArtifactRef::sha256).toList());
+
             partitionRoot = Files.createTempDirectory("cdist-");
             Path workspaceDir = Files.createDirectories(partitionRoot.resolve("workspace"));
             Files.createDirectories(workspaceDir.resolve("target"));
 
             List<URL> urls = new ArrayList<>();
-            for (ArtifactRef artifact : assignment.classpathArtifacts() != null ? assignment.classpathArtifacts() : List.<ArtifactRef>of()) {
-                blobs.ensureCached(artifact.sha256());
-                urls.add(blobCache.materializeForClasspath(artifact, partitionRoot).toUri().toURL());
+            for (ArtifactRef artifact : classpathArtifacts) {
+                blobs.ensureCached(artifact);
+                urls.add(cache.blobCache().materializeForClasspath(artifact, partitionRoot).toUri().toURL());
             }
 
             Map<String, String> overrides = partitionOverrides(assignment.systemProperties(), workspaceDir);
             WorkingDirectorySnapshot before = null;
             synchronized (WORKER_JVM_LOCK) {
                 if (config.cwdCheckMode() != WorkerCwdCheckMode.OFF) {
-                    before = WorkingDirectorySnapshot.take(workingDirectory(), config.cacheDir());
+                    before = WorkingDirectorySnapshot.take(workingDirectory(), config.cacheDir(), cache.rootDir());
                 }
                 systemProps = installThreadScopedProperties();
                 ACTIVE_WORKER_SCOPES.incrementAndGet();
@@ -160,7 +202,8 @@ public final class IsolatedPartitionRunner implements PartitionRunner {
             if (before != null && before.available()) {
                 List<String> changed;
                 synchronized (WORKER_JVM_LOCK) {
-                    WorkingDirectorySnapshot after = WorkingDirectorySnapshot.take(workingDirectory(), config.cacheDir());
+                    WorkingDirectorySnapshot after = WorkingDirectorySnapshot.take(workingDirectory(), config.cacheDir(),
+                            cache.rootDir());
                     changed = after.available() ? before.changedEntries(after) : List.of();
                 }
                 if (!changed.isEmpty()) {
@@ -180,21 +223,31 @@ public final class IsolatedPartitionRunner implements PartitionRunner {
             }
             return new PartitionExecutionResult(true, null);
         } catch (Throwable t) {
+            if (t instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+            }
             LOG.warn("Partition {} failed during execution", assignment.partitionId(), t);
             return new PartitionExecutionResult(false, t.getMessage() != null ? t.getMessage() : t.getClass().getName());
         } finally {
-            if (systemProps != null) {
-                systemProps.exitScope(previousScope);
-            }
-            if (workerScopeEntered) {
-                synchronized (WORKER_JVM_LOCK) {
-                    if (ACTIVE_WORKER_SCOPES.decrementAndGet() <= 0) {
-                        ACTIVE_WORKER_SCOPES.set(0);
-                        systemProps.base().remove(DistributionSettings.ROLE_PROPERTY);
+            try {
+                if (systemProps != null) {
+                    systemProps.exitScope(previousScope);
+                }
+                if (workerScopeEntered) {
+                    synchronized (WORKER_JVM_LOCK) {
+                        if (ACTIVE_WORKER_SCOPES.decrementAndGet() <= 0) {
+                            ACTIVE_WORKER_SCOPES.set(0);
+                            systemProps.base().remove(DistributionSettings.ROLE_PROPERTY);
+                        }
                     }
                 }
+                deleteRecursivelyQuietly(partitionRoot);
+            } finally {
+                if (pins != null) {
+                    // The partition class loader is closed by now: its named jars may be evicted again.
+                    pins.close();
+                }
             }
-            deleteRecursivelyQuietly(partitionRoot);
         }
     }
 
@@ -258,11 +311,13 @@ public final class IsolatedPartitionRunner implements PartitionRunner {
 
         /**
          * Takes a snapshot; when the directory itself cannot be listed the snapshot is marked unavailable and no
-         * comparison is made. Unreadable sub-directories are skipped.
+         * comparison is made. Unreadable sub-directories are skipped. Entries at or below any of {@code excluded}
+         * (the worker cache, as configured and canonical) are left out, also when an excluded directory is reached
+         * through a link or {@code root} itself is a link.
          */
-        static WorkingDirectorySnapshot take(Path root, Path excluded) {
+        static WorkingDirectorySnapshot take(Path root, Path... excluded) {
             Map<String, String> entries = new TreeMap<>();
-            Path excludedDir = excluded != null ? excluded.toAbsolutePath().normalize() : null;
+            List<Path> excludedDir = excludedDirectories(root, excluded);
             List<Path> topLevel;
             try (Stream<Path> top = Files.list(root)) {
                 topLevel = top.toList();
@@ -303,9 +358,46 @@ public final class IsolatedPartitionRunner implements PartitionRunner {
             return new WorkingDirectorySnapshot(entries, true);
         }
 
-        private static void record(Path root, Path entry, Map<String, String> entries, Path excludedDir) {
-            if (excludedDir != null && entry.toAbsolutePath().normalize().startsWith(excludedDir)) {
-                return;
+        /**
+         * The excluded directories as absolute paths in the namespace of {@code root}: each as given, and, when its
+         * real location lies inside the real location of {@code root}, also as the corresponding path below
+         * {@code root}.
+         */
+        static List<Path> excludedDirectories(Path root, Path... excluded) {
+            List<Path> result = new ArrayList<>();
+            if (excluded == null) {
+                return result;
+            }
+            Path absoluteRoot = root.toAbsolutePath().normalize();
+            Path realRoot = realPathOrNull(absoluteRoot);
+            for (Path path : excluded) {
+                if (path == null) {
+                    continue;
+                }
+                Path absolute = path.toAbsolutePath().normalize();
+                result.add(absolute);
+                Path real = realPathOrNull(absolute);
+                if (realRoot != null && real != null && real.startsWith(realRoot)) {
+                    result.add(absoluteRoot.resolve(realRoot.relativize(real)).normalize());
+                }
+            }
+            return result;
+        }
+
+        private static Path realPathOrNull(Path path) {
+            try {
+                return path.toRealPath();
+            } catch (IOException e) {
+                return null;
+            }
+        }
+
+        private static void record(Path root, Path entry, Map<String, String> entries, List<Path> excludedDirs) {
+            Path absolute = entry.toAbsolutePath().normalize();
+            for (Path excludedDir : excludedDirs) {
+                if (absolute.startsWith(excludedDir)) {
+                    return;
+                }
             }
             try {
                 BasicFileAttributes attrs = Files.readAttributes(entry, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);

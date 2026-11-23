@@ -17,63 +17,103 @@
 package org.citrusframework.distribution.worker;
 
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.LinkedHashSet;
 import java.util.List;
-import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.Objects;
+import java.util.OptionalLong;
 
 import org.citrusframework.distribution.cache.BlobCacheDirectory;
 import org.citrusframework.distribution.cache.ClasspathPackager;
 import org.citrusframework.distribution.config.DistributionJson;
+import org.citrusframework.distribution.model.ArtifactRef;
 import org.citrusframework.distribution.model.MissingDigestsRequest;
 import org.citrusframework.distribution.model.MissingDigestsResponse;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * Moves content-addressed blobs between the worker's {@link BlobCacheDirectory} and the coordinator's blob store.
+ * Moves content-addressed blobs between the worker's {@link WorkerFileCache} and the coordinator's blob store.
+ * <p>
+ * Downloads stream in {@value #CHUNK_BYTES}-byte chunks into a temporary file under the cache's {@code tmp/}, never
+ * exceed {@link ClasspathPackager#MAX_BLOB_BYTES}, make room on the cache volume first (from the declared artifact
+ * size, and again from a larger {@code Content-Length}), and are verified while promoted into the blob store. A
+ * download that fails verification is retried once. Temporary files are removed on every outcome.
  */
-final class BrokerBlobClient {
+final class BrokerBlobClient implements AutoCloseable {
 
     private static final Logger LOG = LoggerFactory.getLogger(BrokerBlobClient.class);
 
-    private final DistributionWorkerConfig config;
-    private final BlobCacheDirectory blobCache;
-    private final HttpClient httpClient;
-    private final Set<String> verifiedBlobs = ConcurrentHashMap.newKeySet();
+    static final int CHUNK_BYTES = 64 * 1024;
 
-    BrokerBlobClient(DistributionWorkerConfig config, BlobCacheDirectory blobCache) {
+    /** Opens the output stream for a download's temporary file; a test seam for write failures. */
+    @FunctionalInterface
+    interface TempFileOpener {
+        OutputStream open(Path tempFile) throws IOException;
+    }
+
+    private final DistributionWorkerConfig config;
+    private final WorkerFileCache cache;
+    private final HttpClient httpClient;
+    private volatile TempFileOpener tempFileOpener = Files::newOutputStream;
+
+    BrokerBlobClient(DistributionWorkerConfig config, WorkerFileCache cache) {
         this.config = config;
-        this.blobCache = blobCache;
+        this.cache = Objects.requireNonNull(cache, "cache");
         this.httpClient = HttpClient.newBuilder()
                 .connectTimeout(Duration.ofSeconds(10))
                 .build();
     }
 
     /**
-     * Makes sure {@code sha256} is in the local cache with verified content, downloading it from the coordinator if
-     * absent or corrupted (once more if the download fails verification). Digests verified in this JVM are not hashed
-     * again.
+     * Makes sure the blob of {@code artifact} is in the local cache with verified content and returns its path.
+     *
+     * @throws IOException if the declared size exceeds {@link ClasspathPackager#MAX_BLOB_BYTES}, or the blob cannot be
+     *                     downloaded, stored or verified
      */
-    void ensureCached(String sha256) throws IOException, InterruptedException {
-        if (verifiedBlobs.contains(sha256) && blobCache.contains(sha256)) {
-            return;
+    Path ensureCached(ArtifactRef artifact) throws IOException, InterruptedException {
+        return ensureCached(artifact.sha256(), artifact.sizeBytes());
+    }
+
+    /**
+     * Makes sure {@code sha256} is in the local cache with verified content and returns its path. The size is taken
+     * from the response.
+     */
+    Path ensureCached(String sha256) throws IOException, InterruptedException {
+        return ensureCached(sha256, 0L);
+    }
+
+    private Path ensureCached(String sha256, long sizeBytes) throws IOException, InterruptedException {
+        BlobCacheDirectory.validateDigest(sha256);
+        if (sizeBytes > ClasspathPackager.MAX_BLOB_BYTES) {
+            throw new IOException("Blob " + sha256 + " declares " + sizeBytes + " bytes, more than the maximum of "
+                    + ClasspathPackager.MAX_BLOB_BYTES);
         }
-        if (blobCache.getVerifiedPath(sha256) == null) {
-            byte[] content = download(sha256);
-            if (!sha256.equals(ClasspathPackager.sha256Hex(content))) {
-                LOG.warn("Blob {} failed verification after download, retrying once", sha256);
-                content = download(sha256);
+        Path cached = cache.verifyOrInvalidate(sha256);
+        if (cached != null) {
+            return cached;
+        }
+        long expectedBytes = Math.clamp(sizeBytes, 0L, ClasspathPackager.MAX_BLOB_BYTES);
+        cache.ensureFreeSpaceForDownload(expectedBytes);
+        try {
+            return download(sha256, expectedBytes);
+        } catch (DigestMismatchException first) {
+            LOG.warn("Blob {} failed verification after download, retrying once", sha256);
+            try {
+                return download(sha256, expectedBytes);
+            } catch (DigestMismatchException second) {
+                second.addSuppressed(first);
+                throw new IOException("Blob " + sha256 + " failed verification twice after download", second);
             }
-            blobCache.put(sha256, content);
         }
-        verifiedBlobs.add(sha256);
     }
 
     /**
@@ -94,7 +134,7 @@ final class BrokerBlobClient {
         }
         MissingDigestsResponse missing = DistributionJson.fromJson(missingResponse.body(), MissingDigestsResponse.class);
         for (String sha256 : missing.missing() != null ? missing.missing() : List.<String>of()) {
-            Path blob = blobCache.getVerifiedPath(sha256);
+            Path blob = cache.verifyOrInvalidate(sha256);
             if (blob == null) {
                 throw new IOException("Output blob " + sha256 + " is missing from the worker cache");
             }
@@ -109,16 +149,57 @@ final class BrokerBlobClient {
         }
     }
 
-    private byte[] download(String sha256) throws IOException, InterruptedException {
-        HttpResponse<byte[]> response = httpClient.send(request("/api/v1/cache/blobs/" + sha256)
+    /**
+     * Streams the blob into a temporary file and promotes it into the cache.
+     *
+     * @throws DigestMismatchException if the downloaded content does not match {@code sha256}
+     */
+    private Path download(String sha256, long expectedBytes) throws IOException, InterruptedException {
+        HttpResponse<InputStream> response = httpClient.send(request("/api/v1/cache/blobs/" + sha256)
                         .timeout(Duration.ofSeconds(60))
                         .GET()
                         .build(),
-                HttpResponse.BodyHandlers.ofByteArray());
-        if (response.statusCode() != 200) {
-            throw new IOException("Failed to download blob " + sha256 + " from broker: HTTP " + response.statusCode());
+                HttpResponse.BodyHandlers.ofInputStream());
+        try (InputStream body = response.body()) {
+            if (response.statusCode() != 200) {
+                throw new IOException("Failed to download blob " + sha256 + " from broker: HTTP " + response.statusCode());
+            }
+            OptionalLong contentLength = response.headers().firstValueAsLong("Content-Length");
+            if (contentLength.isPresent()) {
+                long declared = contentLength.getAsLong();
+                if (declared > ClasspathPackager.MAX_BLOB_BYTES) {
+                    throw new IOException("Blob " + sha256 + " has a Content-Length of " + declared
+                            + " bytes, more than the maximum of " + ClasspathPackager.MAX_BLOB_BYTES);
+                }
+                if (declared > expectedBytes) {
+                    cache.ensureFreeSpaceForDownload(declared);
+                }
+            }
+
+            Path tmp = cache.newDownloadTempFile();
+            try {
+                long total = 0;
+                try (OutputStream out = tempFileOpener.open(tmp)) {
+                    byte[] buffer = new byte[CHUNK_BYTES];
+                    int read;
+                    while ((read = body.read(buffer)) != -1) {
+                        total += read;
+                        if (total > ClasspathPackager.MAX_BLOB_BYTES) {
+                            throw new IOException("Blob " + sha256 + " exceeds the maximum of "
+                                    + ClasspathPackager.MAX_BLOB_BYTES + " bytes");
+                        }
+                        out.write(buffer, 0, read);
+                    }
+                }
+                try {
+                    return cache.promoteDownload(sha256, tmp);
+                } catch (IllegalArgumentException e) {
+                    throw new DigestMismatchException(e);
+                }
+            } finally {
+                Files.deleteIfExists(tmp);
+            }
         }
-        return response.body();
     }
 
     private HttpRequest.Builder request(String path) {
@@ -127,5 +208,22 @@ final class BrokerBlobClient {
             builder.header("Authorization", "Bearer " + config.authToken());
         }
         return builder;
+    }
+
+    void tempFileOpener(TempFileOpener opener) {
+        this.tempFileOpener = Objects.requireNonNull(opener);
+    }
+
+    /** Aborts outstanding exchanges and releases the HTTP client. Idempotent. */
+    @Override
+    public void close() {
+        httpClient.shutdownNow();
+    }
+
+    /** A downloaded blob whose content does not match its digest. */
+    private static final class DigestMismatchException extends IOException {
+        DigestMismatchException(IllegalArgumentException cause) {
+            super(cause.getMessage(), cause);
+        }
     }
 }

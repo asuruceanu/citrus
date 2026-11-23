@@ -21,9 +21,13 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.file.attribute.BasicFileAttributes;
+import java.nio.file.attribute.FileTime;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
@@ -31,22 +35,29 @@ import java.util.concurrent.atomic.AtomicReference;
 
 import org.citrusframework.distribution.broker.DistributionBrokerConfig;
 import org.citrusframework.distribution.broker.DistributionBrokerServer;
+import org.citrusframework.distribution.cache.BlobCacheDirectory;
 import org.citrusframework.distribution.cache.ClasspathPackager;
+import org.citrusframework.distribution.cache.WorkspacePackager;
 import org.citrusframework.distribution.config.DistributionJson;
 import org.citrusframework.distribution.config.DistributionSettings;
 import org.citrusframework.distribution.model.BuildSessionResponse;
 import org.citrusframework.distribution.model.CompleteSessionRequest;
+import org.citrusframework.distribution.model.ArtifactKind;
+import org.citrusframework.distribution.model.ArtifactRef;
 import org.citrusframework.distribution.model.CreateSessionRequest;
+import org.citrusframework.distribution.model.PartitionPolicy;
 import org.citrusframework.distribution.model.PartitionState;
 import org.citrusframework.distribution.model.SessionDetailResponse;
 import org.citrusframework.distribution.model.SessionStatus;
 import org.citrusframework.distribution.model.SubmitWorkRequest;
 import org.citrusframework.distribution.model.TestOutcomeStatus;
 import org.citrusframework.distribution.model.WorkUnitSpec;
+import org.citrusframework.distribution.model.WorkspaceFileSet;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
 class DistributionWorkerClientTest {
@@ -286,6 +297,209 @@ class DistributionWorkerClientTest {
                 workerBeta.drain(5, TimeUnit.SECONDS);
             }
         }
+    }
+
+    /** Runs in a forked partition JVM; plain JUnit so the child needs no assertion library. */
+    public static class PinnedForkFixture {
+        @Test
+        void readInputAndWriteOutput() throws Exception {
+            String greeting = Files.readString(Path.of("src/test/resources/greeting.txt"));
+            if (!"hello".equals(greeting.trim())) {
+                throw new AssertionError("input not materialized: " + greeting);
+            }
+            Files.createDirectories(Path.of("target/docs"));
+            Files.writeString(Path.of("target/docs/report.html"), "<html>report</html>");
+        }
+    }
+
+    @Test
+    void shouldFailFastWhenSecondWorkerClientSharesCacheDirAndAllowReuseAfterClose() throws Exception {
+        try (DistributionBrokerServer broker = startBroker("worker_shared_cache_")) {
+            Path sharedCache = tempDir.resolve("shared-worker-cache");
+            ClasspathPackager.PackagedArtifact packaged = upload(broker, packageClassesOf(SampleRemoteTest.class));
+            WorkUnitSpec unit = unit(SampleRemoteTest.class, "shouldPassOnWorker");
+
+            DistributionWorkerClient worker2 = new DistributionWorkerClient(workerConfig("worker-two", broker, sharedCache).build());
+            try {
+                try (DistributionWorkerClient worker1 = new DistributionWorkerClient(workerConfig("worker-one", broker, sharedCache).build())) {
+                    worker1.start();
+                    assertThat(worker1.awaitRegistration(5, TimeUnit.SECONDS)).isTrue();
+                    assertCompleted(runPartition(broker, List.of(packaged.ref()), unit, List.of(), List.of()));
+
+                    assertThatThrownBy(worker2::start)
+                            .isInstanceOf(IllegalStateException.class)
+                            .hasMessageContaining("--cache-dir");
+                    assertThat(worker2.isConnected()).isFalse();
+                    assertThat(worker1.isConnected()).as("the running worker keeps its cache").isTrue();
+                }
+
+                Path blob = new BlobCacheDirectory(sharedCache).resolveBlobPath(packaged.ref().sha256());
+                Object warmFileKey = Files.readAttributes(blob, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS).fileKey();
+
+                worker2.start();
+                assertThat(worker2.awaitRegistration(5, TimeUnit.SECONDS)).isTrue();
+                assertCompleted(runPartition(broker, List.of(packaged.ref()), unit, List.of(), List.of()));
+                assertThat(Files.readAttributes(blob, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS).fileKey())
+                        .as("warm blob reused, not downloaded again").isEqualTo(warmFileKey);
+            } finally {
+                worker2.close();
+            }
+        }
+    }
+
+    @Test
+    void shouldKeepClasspathInputsAndOutputsPinnedUnderZeroFreeSpaceAndAllowCacheInsideUserDir() throws Exception {
+        try (DistributionBrokerServer broker = startBroker("worker_pinned_")) {
+            Path cacheDir = tempDir.resolve("pressure-cache");
+            BlobCacheDirectory seededStore = new BlobCacheDirectory(cacheDir);
+            List<Path> seeded = new ArrayList<>();
+            for (String content : List.of("older unpinned blob one", "older unpinned blob two")) {
+                byte[] bytes = content.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                seeded.add(seededStore.put(ClasspathPackager.sha256Hex(bytes), bytes));
+            }
+
+            // Test classes (archive) and the JUnit Jupiter jars (named jars): without pins, each download would evict
+            // the previously published classpath entries.
+            List<ArtifactRef> classpath = new ArrayList<>();
+            classpath.add(upload(broker, packageClassesOf(DistributionWorkerClientTest.class)).ref());
+            classpath.add(upload(broker, packageClassesOf(Test.class)).ref());
+            classpath.add(upload(broker, packageClassesOf(Class.forName("org.junit.jupiter.engine.JupiterTestEngine"))).ref());
+            assertThat(classpath).extracting(ArtifactRef::kind).contains(ArtifactKind.JAR);
+
+            BlobCacheDirectory hostCache = new BlobCacheDirectory(tempDir.resolve("host-cache"));
+            Path module = Files.createDirectories(tempDir.resolve("module/src/test/resources")).getParent().getParent().getParent();
+            Files.writeString(module.resolve("src/test/resources/greeting.txt"), "hello");
+            WorkspaceFileSet input = WorkspacePackager.packageInputToCache(hostCache, module, "src/test/resources", false).orElseThrow();
+            uploadBytes(broker, input.artifact().sha256(), hostCache.readBytes(input.artifact().sha256()));
+
+            DistributionWorkerConfig config = workerConfig("worker-pressure", broker, cacheDir)
+                    .cacheFreeSpaceBufferBytes(Long.MAX_VALUE / 2)
+                    .forkJvmArgs(List.of("-Xmx256m"))
+                    .build();
+            try (DistributionWorkerClient worker = new DistributionWorkerClient(config)) {
+                worker.start();
+                assertThat(worker.awaitRegistration(5, TimeUnit.SECONDS)).isTrue();
+                assertThat(seeded).as("unpinned blobs evicted under disk pressure").allSatisfy(p -> assertThat(p).doesNotExist());
+
+                assertCompleted(runPartition(broker, classpath, unit(SampleRemoteTest.class, "shouldPassOnWorker"),
+                        List.of(), List.of()));
+                assertCompleted(runPartition(broker, classpath, unit(PinnedForkFixture.class, "readInputAndWriteOutput"),
+                        List.of(input), List.of("target/docs")));
+
+                long deadline = System.currentTimeMillis() + 10_000L;
+                while (!seededStore.listBlobs().isEmpty() && System.currentTimeMillis() < deadline) {
+                    Thread.sleep(50L);
+                }
+                assertThat(seededStore.listBlobs()).as("pins released after the partitions, blobs evicted").isEmpty();
+                worker.drain(5, TimeUnit.SECONDS);
+            }
+        }
+
+        // A cache inside the worker's working directory, directly or through a link, is not a CWD violation.
+        Path cwd = Files.createDirectories(tempDir.resolve("worker-cwd"));
+        Path realCache = Files.createDirectories(cwd.resolve("cache"));
+        Path link = tempDir.resolve("cache-link");
+        Files.createSymbolicLink(link, realCache);
+        Path plainCacheDir = cwd.resolve("plain-cache");
+        for (Path configured : List.of(link, plainCacheDir)) {
+            try (WorkerFileCache cache = WorkerFileCache.open(configured, true, 0L)) {
+                Files.setLastModifiedTime(cache.rootDir(), FileTime.fromMillis(System.currentTimeMillis() - 60_000L));
+                IsolatedPartitionRunner.WorkingDirectorySnapshot before =
+                        IsolatedPartitionRunner.WorkingDirectorySnapshot.take(cwd, configured, cache.rootDir());
+                IsolatedPartitionRunner.WorkingDirectorySnapshot unexcluded =
+                        IsolatedPartitionRunner.WorkingDirectorySnapshot.take(cwd);
+
+                byte[] jar = ("jar for " + configured).getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                String sha = ClasspathPackager.sha256Hex(jar);
+                Path tmp = cache.newDownloadTempFile();
+                Files.write(tmp, jar);
+                cache.promoteDownload(sha, tmp);
+                cache.blobCache().materializeForClasspath(new ArtifactRef("lib.jar", sha, ArtifactKind.JAR, jar.length),
+                        tempDir.resolve("partition"));
+
+                assertThat(unexcluded.changedEntries(IsolatedPartitionRunner.WorkingDirectorySnapshot.take(cwd)))
+                        .as("the cache write is visible without exclusion").isNotEmpty();
+                assertThat(before.changedEntries(
+                        IsolatedPartitionRunner.WorkingDirectorySnapshot.take(cwd, configured, cache.rootDir())))
+                        .as("cache writes are excluded for %s", configured).isEmpty();
+            }
+        }
+    }
+
+    private DistributionBrokerServer startBroker(String dbPrefix) {
+        DistributionBrokerServer broker = new DistributionBrokerServer(DistributionBrokerConfig.builder()
+                .port(0)
+                .authToken("worker-secret")
+                .cacheDir(tempDir.resolve("broker-" + dbPrefix + "cache"))
+                .jdbcUrl("jdbc:hsqldb:mem:" + dbPrefix + System.nanoTime())
+                .build());
+        broker.start();
+        return broker;
+    }
+
+    private static DistributionWorkerConfig.Builder workerConfig(String workerId, DistributionBrokerServer broker, Path cacheDir) {
+        return DistributionWorkerConfig.builder()
+                .workerId(workerId)
+                .brokerUrl(broker.baseUrl())
+                .authToken("worker-secret")
+                .cacheDir(cacheDir)
+                .cacheCleanup(true)
+                .cacheFreeSpaceBufferBytes(0L)
+                .cwdCheckMode(DistributionSettings.WorkerCwdCheckMode.OFF)
+                .forkMode(DistributionSettings.WorkerForkMode.AUTO);
+    }
+
+    private static ClasspathPackager.PackagedArtifact packageClassesOf(Class<?> anchor) throws Exception {
+        return ClasspathPackager.packagePath(Paths.get(anchor.getProtectionDomain().getCodeSource().getLocation().toURI()));
+    }
+
+    private ClasspathPackager.PackagedArtifact upload(DistributionBrokerServer broker, ClasspathPackager.PackagedArtifact packaged)
+            throws Exception {
+        uploadBytes(broker, packaged.ref().sha256(), packaged.bytes());
+        return packaged;
+    }
+
+    private void uploadBytes(DistributionBrokerServer broker, String sha256, byte[] bytes) throws Exception {
+        HttpResponse<String> response = httpClient.send(
+                HttpRequest.newBuilder(URI.create(broker.baseUrl() + "/api/v1/cache/blobs/" + sha256))
+                        .header("Authorization", "Bearer worker-secret")
+                        .PUT(HttpRequest.BodyPublishers.ofByteArray(bytes))
+                        .build(),
+                HttpResponse.BodyHandlers.ofString());
+        assertThat(response.statusCode()).isIn(200, 201);
+    }
+
+    private SessionDetailResponse runPartition(DistributionBrokerServer broker, List<ArtifactRef> classpath, WorkUnitSpec unit,
+                                               List<WorkspaceFileSet> inputs, List<String> outputs) throws Exception {
+        BuildSessionResponse session = DistributionJson.fromJson(postJson(broker.baseUrl() + "/api/v1/sessions",
+                "worker-secret", new CreateSessionRequest("citrus", "main", "1234567", List.of(), 4, 1)).body(),
+                BuildSessionResponse.class);
+        HttpResponse<String> submit = postJson(broker.baseUrl() + "/api/v1/sessions/" + session.sessionId() + "/work",
+                "worker-secret", new SubmitWorkRequest("sub-" + System.nanoTime(), "cache-module", classpath, Map.of(),
+                        List.of(unit), 0, classpath.size(), inputs, outputs, !inputs.isEmpty() || !outputs.isEmpty(),
+                        PartitionPolicy.LPT));
+        assertThat(submit.statusCode()).isEqualTo(200);
+        long deadline = System.currentTimeMillis() + 60_000L;
+        while (System.currentTimeMillis() < deadline) {
+            SessionDetailResponse detail = fetchDetail(broker.baseUrl(), "worker-secret", session.sessionId());
+            if (!detail.partitions().isEmpty() && detail.partitions().stream().allMatch(p ->
+                    p.state() == PartitionState.COMPLETED || p.state() == PartitionState.FAILED)) {
+                return detail;
+            }
+            Thread.sleep(100L);
+        }
+        return fetchDetail(broker.baseUrl(), "worker-secret", session.sessionId());
+    }
+
+    private static void assertCompleted(SessionDetailResponse detail) {
+        assertThat(detail.partitions()).allSatisfy(p -> assertThat(p.state()).as(p.errorMessage())
+                .isEqualTo(PartitionState.COMPLETED));
+        assertThat(detail.tests()).isNotEmpty().allSatisfy(rec -> assertThat(rec.status())
+                .as("Test %s failed: %s", rec.className(), rec.errorMessage()).isEqualTo(TestOutcomeStatus.PASSED));
+    }
+
+    private static WorkUnitSpec unit(Class<?> fixture, String method) {
+        return new WorkUnitSpec(fixture.getName() + "#" + method, fixture.getName(), method, null, Map.of(), 500L);
     }
 
     @Test

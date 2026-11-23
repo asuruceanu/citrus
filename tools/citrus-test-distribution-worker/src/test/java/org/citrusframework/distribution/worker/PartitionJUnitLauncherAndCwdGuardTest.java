@@ -362,14 +362,14 @@ class PartitionJUnitLauncherAndCwdGuardTest {
         Path root = Files.createDirectories(tempDir.resolve("worker-cwd"));
         Path log = Files.writeString(root.resolve("worker.log"), "start\n");
         Files.createDirectories(root.resolve("target"));
-        IsolatedPartitionRunner.WorkingDirectorySnapshot before = IsolatedPartitionRunner.WorkingDirectorySnapshot.take(root, null);
+        IsolatedPartitionRunner.WorkingDirectorySnapshot before = IsolatedPartitionRunner.WorkingDirectorySnapshot.take(root);
 
         Files.writeString(log, "more log lines\n", java.nio.file.StandardOpenOption.APPEND);
         log.toFile().setLastModified(System.currentTimeMillis() + 5_000);
         Files.writeString(root.resolve("new-file.txt"), "x");
         Files.writeString(root.resolve("target/written.txt"), "x");
 
-        assertThat(before.changedEntries(IsolatedPartitionRunner.WorkingDirectorySnapshot.take(root, null)))
+        assertThat(before.changedEntries(IsolatedPartitionRunner.WorkingDirectorySnapshot.take(root)))
                 .containsExactly("new-file.txt", "target" + java.io.File.separator + "written.txt");
     }
 
@@ -378,11 +378,11 @@ class PartitionJUnitLauncherAndCwdGuardTest {
         Path root = Files.createDirectories(tempDir.resolve("worker-cwd-dirs"));
         Path scratch = Files.createDirectories(root.resolve(".citrus-jbang"));
         scratch.toFile().setLastModified(System.currentTimeMillis() - 60_000);
-        IsolatedPartitionRunner.WorkingDirectorySnapshot before = IsolatedPartitionRunner.WorkingDirectorySnapshot.take(root, null);
+        IsolatedPartitionRunner.WorkingDirectorySnapshot before = IsolatedPartitionRunner.WorkingDirectorySnapshot.take(root);
 
         Files.writeString(scratch.resolve("run.log"), "x");
 
-        assertThat(before.changedEntries(IsolatedPartitionRunner.WorkingDirectorySnapshot.take(root, null)))
+        assertThat(before.changedEntries(IsolatedPartitionRunner.WorkingDirectorySnapshot.take(root)))
                 .containsExactly(".citrus-jbang");
     }
 
