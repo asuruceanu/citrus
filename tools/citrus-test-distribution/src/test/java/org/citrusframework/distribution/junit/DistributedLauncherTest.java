@@ -395,6 +395,7 @@ class DistributedLauncherTest {
         System.setProperty(DistributionSettings.INPUTS_PROPERTY, "?not/there");
         DistributedLauncher.WorkspaceSettings settings = DistributedLauncher.WorkspaceSettings.resolve();
         assertThat(settings.inputArtifacts()).isEmpty();
+        assertThat(settings.cache().getRootDir()).doesNotExist();
         assertThat(settings.forkWorkspace()).as("declaring inputs implies a forked JVM").isTrue();
     }
 

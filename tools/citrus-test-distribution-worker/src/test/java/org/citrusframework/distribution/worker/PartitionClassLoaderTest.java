@@ -250,12 +250,15 @@ class PartitionClassLoaderTest {
             URL nested = loader.getResource("probe/sub/nested.txt");
             URL jdkNested = plain.getResource("probe/sub/nested.txt");
 
-            for (String spec : List.of("/abs.txt", "../data.txt", "./nested.txt", "../with space.txt", "../with%20space.txt")) {
+            for (String spec : List.of("/abs.txt", "../data.txt", "./nested.txt", "../with space.txt",
+                    "../with%20space.txt", "#fragment", jdkNested.toExternalForm())) {
                 URL resolved = new URL(nested, spec);
                 URL jdkResolved = new URL(jdkNested, spec);
                 assertThat(resolved.toExternalForm()).as(spec).isEqualTo(jdkResolved.toExternalForm());
                 assertThat(resolved.openConnection().getUseCaches()).as(spec).isFalse();
-                try (InputStream in = resolved.openStream(); InputStream jdkIn = jdkResolved.openStream()) {
+                URLConnection jdkConnection = jdkResolved.openConnection();
+                jdkConnection.setUseCaches(false);
+                try (InputStream in = resolved.openStream(); InputStream jdkIn = jdkConnection.getInputStream()) {
                     assertThat(in.readAllBytes()).as(spec).isEqualTo(jdkIn.readAllBytes());
                 }
             }

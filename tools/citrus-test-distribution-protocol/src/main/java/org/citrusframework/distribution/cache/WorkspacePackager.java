@@ -33,6 +33,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.TreeMap;
+import java.util.function.Supplier;
 
 import org.citrusframework.distribution.model.ArtifactKind;
 import org.citrusframework.distribution.model.ArtifactRef;
@@ -124,6 +125,16 @@ public final class WorkspacePackager {
     public static Optional<WorkspaceFileSet> packageInputToCache(BlobCacheDirectory cache, Path baseDir,
                                                                  String rawRelativePath, boolean optional,
                                                                  List<String> excludedPaths) throws IOException {
+        return packageInputToCacheLazily(() -> cache, baseDir, rawRelativePath, optional, excludedPaths);
+    }
+
+    /**
+     * Like {@link #packageInputToCache(BlobCacheDirectory, Path, String, boolean, List)}, but obtains the cache
+     * only when an existing input is about to be stored.
+     */
+    public static Optional<WorkspaceFileSet> packageInputToCacheLazily(Supplier<BlobCacheDirectory> cache, Path baseDir,
+                                                                 String rawRelativePath, boolean optional,
+                                                                 List<String> excludedPaths) throws IOException {
         String relative = validateRelativePath(rawRelativePath);
         Path base = baseDir.toAbsolutePath().normalize();
         Path target = resolveWithoutSymlinks(base, relative, "declared input");
@@ -136,13 +147,13 @@ public final class WorkspacePackager {
 
         BasicFileAttributes attrs = Files.readAttributes(target, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
         if (attrs.isRegularFile()) {
-            return Optional.of(packageRegularFile(cache, relative, target));
+            return Optional.of(packageRegularFile(cache.get(), relative, target));
         }
         if (attrs.isDirectory()) {
             List<String> entries = ClasspathPackager.listEntries(target).stream()
                     .filter(entry -> !isExcluded(relative + "/" + stripSlash(entry), excludedPaths))
                     .toList();
-            return Optional.of(packageEntries(cache, relative, target, entries));
+            return Optional.of(packageEntries(cache.get(), relative, target, entries));
         }
         throw new IllegalArgumentException("Declared input path '" + relative + "' is not a regular file or directory");
     }

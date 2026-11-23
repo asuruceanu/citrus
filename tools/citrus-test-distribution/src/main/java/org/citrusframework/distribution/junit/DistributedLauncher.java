@@ -593,14 +593,13 @@ public class DistributedLauncher implements Launcher {
 
             List<DistributionSettings.DeclaredPathSpec> declaredInputs = DistributionSettings.parseDeclaredPaths(
                     setting(DistributionSettings.INPUTS_PROPERTY, DistributionSettings.INPUTS_ENV));
-            if (!declaredInputs.isEmpty()) {
-                markLauncherOwned(cache);
-            }
             List<WorkspaceFileSet> inputs = new ArrayList<>();
             for (DistributionSettings.DeclaredPathSpec input : declaredInputs) {
                 try {
-                    WorkspacePackager.packageInputToCache(cache, hostBaseDir, input.relativePath(), input.optional(), internal)
-                            .ifPresent(inputs::add);
+                    WorkspacePackager.packageInputToCacheLazily(() -> {
+                        markLauncherOwned(cache);
+                        return cache;
+                    }, hostBaseDir, input.relativePath(), input.optional(), internal).ifPresent(inputs::add);
                 } catch (IOException e) {
                     throw new java.io.UncheckedIOException("Failed to package declared input '" + input.relativePath() + "'", e);
                 }
@@ -631,14 +630,18 @@ public class DistributedLauncher implements Launcher {
         }
 
         /**
-         * Records the launcher as owner of the host cache, which it only creates once inputs or outputs are declared,
-         * so a worker refuses the directory. An existing owner is kept and never makes the launcher refuse it.
+         * Claims the host cache before using it, so it cannot be shared with a worker.
          */
         private static void markLauncherOwned(BlobCacheDirectory cache) {
             try {
-                BlobCacheDirectory.recordOwnerIfAbsent(cache.getRootDir(), BlobCacheDirectory.OWNER_LAUNCHER);
+                String owner = BlobCacheDirectory.recordOwnerIfAbsent(cache.getRootDir(), BlobCacheDirectory.OWNER_LAUNCHER);
+                if (!BlobCacheDirectory.OWNER_LAUNCHER.equals(owner) && !BlobCacheDirectory.OWNER_COORDINATOR.equals(owner)) {
+                    throw new IllegalStateException("Host cache directory " + cache.getRootDir()
+                            + " is marked as owned by " + owner + ". Choose a separate launcher cache directory.");
+                }
             } catch (IOException e) {
-                LOG.warn("Could not mark host cache {} as owned by the launcher: {}", cache.getRootDir(), e.toString());
+                throw new java.io.UncheckedIOException("Could not mark host cache " + cache.getRootDir()
+                        + " as owned by the launcher", e);
             }
         }
 

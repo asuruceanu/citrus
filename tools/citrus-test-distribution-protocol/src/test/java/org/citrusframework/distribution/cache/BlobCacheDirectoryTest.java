@@ -30,6 +30,9 @@ import java.util.Map;
 import java.util.stream.Stream;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
 import org.citrusframework.distribution.config.DistributionJson;
 import org.citrusframework.distribution.model.ArtifactKind;
@@ -347,6 +350,29 @@ class BlobCacheDirectoryTest {
     }
 
     @Test
+    void shouldPublishOneCompleteOwnerAcrossConcurrentClaims() throws Exception {
+        Path root = tempDir.resolve("concurrent-owner");
+        try (var executor = Executors.newVirtualThreadPerTaskExecutor()) {
+            var start = new CountDownLatch(1);
+            var coordinator = executor.submit(() -> {
+                start.await();
+                return BlobCacheDirectory.recordOwnerIfAbsent(root, BlobCacheDirectory.OWNER_COORDINATOR);
+            });
+            var worker = executor.submit(() -> {
+                start.await();
+                return BlobCacheDirectory.recordOwnerIfAbsent(root, BlobCacheDirectory.OWNER_WORKER);
+            });
+            start.countDown();
+            String owner = coordinator.get(5, TimeUnit.SECONDS);
+            assertThat(worker.get(5, TimeUnit.SECONDS)).isEqualTo(owner);
+            assertThat(BlobCacheDirectory.readOwner(root)).contains(owner);
+        }
+        try (var members = Files.list(root)) {
+            assertThat(members).containsExactly(root.resolve(BlobCacheDirectory.OWNER_MARKER_FILE));
+        }
+    }
+
+    @Test
     void shouldRecordTheFirstCacheOwnerAndNeverOverwriteIt() throws Exception {
         Path root = tempDir.resolve("owned");
         assertThat(BlobCacheDirectory.readOwner(root)).isEmpty();
@@ -360,10 +386,9 @@ class BlobCacheDirectoryTest {
 
         Path blank = Files.createDirectories(tempDir.resolve("blank"));
         Files.writeString(blank.resolve(BlobCacheDirectory.OWNER_MARKER_FILE), " \n");
-        assertThat(BlobCacheDirectory.readOwner(blank)).as("a blank marker records no owner").isEmpty();
-        assertThat(BlobCacheDirectory.recordOwnerIfAbsent(blank, BlobCacheDirectory.OWNER_LAUNCHER))
-                .isEqualTo(BlobCacheDirectory.OWNER_LAUNCHER);
-        assertThat(BlobCacheDirectory.readOwner(blank)).contains(BlobCacheDirectory.OWNER_LAUNCHER);
+        assertThatThrownBy(() -> BlobCacheDirectory.recordOwnerIfAbsent(blank, BlobCacheDirectory.OWNER_LAUNCHER))
+                .isInstanceOf(IOException.class).hasMessageContaining("owner marker");
+        assertThat(blank.resolve(BlobCacheDirectory.OWNER_MARKER_FILE)).hasContent(" ");
     }
 
     private static List<Path> tmpFiles(BlobCacheDirectory cache) throws IOException {

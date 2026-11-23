@@ -45,6 +45,14 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
+import org.apache.logging.log4j.Level;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.core.LogEvent;
+import org.apache.logging.log4j.core.LoggerContext;
+import org.apache.logging.log4j.core.appender.AbstractAppender;
+import org.apache.logging.log4j.core.config.Configuration;
+import org.apache.logging.log4j.core.config.LoggerConfig;
+import org.apache.logging.log4j.core.config.Property;
 import org.citrusframework.distribution.cache.BlobCacheDirectory;
 import org.citrusframework.distribution.cache.BlobCacheDirectory.BlobEntry;
 import org.citrusframework.distribution.cache.ClasspathPackager;
@@ -206,6 +214,20 @@ class WorkerFileCacheTest {
             cache.ensureFreeSpaceForDownload(1024);
             cache.evictAfterPartition();
             assertThat(blob).as("no eviction without cache cleanup").exists();
+        }
+    }
+
+    @Test
+    void shouldVerifyAnExistingTargetBeforeReturningADownload() throws Exception {
+        byte[] content = "freshly downloaded".getBytes(StandardCharsets.UTF_8);
+        String digest = ClasspathPackager.sha256Hex(content);
+        try (WorkerFileCache cache = WorkerFileCache.open(tempDir, true, 0L, PLENTY, FIXED_CLOCK)) {
+            Path target = store(cache).resolveBlobPath(digest);
+            Files.createDirectories(target.getParent());
+            Files.writeString(target, "corrupt file that appeared during download");
+
+            assertThat(promote(cache, content)).hasBinaryContent(content);
+            assertThat(cache.statsSnapshot().cachedBytes()).isEqualTo(content.length);
         }
     }
 
@@ -623,8 +645,8 @@ class WorkerFileCacheTest {
         try (WorkerFileCache cache = WorkerFileCache.open(cacheDir, true, 0L, PLENTY, FIXED_CLOCK);
              WorkerFileCache.PinLease lease = cache.pinAll(List.of())) {
             assertThat(promote(cache, seededContent)).isEqualTo(seededBlob);
-            assertThat(cache.verifyOrInvalidate(seededSha)).as("promote must not stamp a corrupt existing blob").isNull();
-            assertThat(seededBlob).doesNotExist();
+            assertThat(seededBlob).as("promotion replaced the corrupt cached file").hasBinaryContent(seededContent);
+            assertThat(cache.verifyOrInvalidate(seededSha)).isEqualTo(seededBlob);
 
             Optional<WorkspaceFileSet> staged = cache.stageAndPinOutput(workspace, "target/report.txt", baseline, lease::pin);
             assertThat(staged).isPresent();
@@ -632,19 +654,18 @@ class WorkerFileCacheTest {
             assertThat(cache.verifyOrInvalidate(outputSha)).as("staging must not stamp a corrupt existing blob").isNull();
             assertThat(outputBlob).doesNotExist();
 
-            // A stamped blob changed on disk (mismatching stamp) is not re-stamped by a repeated promote.
+            // Promotion also replaces a previously stamped blob whose content changed on disk.
             Path stampedBlob = promote(cache, stampedContent);
             Files.write(stampedBlob, corrupt(stampedContent));
             Files.setLastModifiedTime(stampedBlob, FileTime.from(FIXED_CLOCK.instant().plusSeconds(5)));
             assertThat(promote(cache, stampedContent)).isEqualTo(stampedBlob);
-            assertThat(cache.verifyOrInvalidate(stampedSha)).isNull();
-            assertThat(stampedBlob).doesNotExist();
+            assertThat(stampedBlob).hasBinaryContent(stampedContent);
+            assertThat(cache.verifyOrInvalidate(stampedSha)).isEqualTo(stampedBlob);
 
-            // Freshly stored and still-matching blobs stay valid.
-            assertThat(promote(cache, stampedContent)).exists();
+            // A still-matching blob stays valid.
             assertThat(promote(cache, stampedContent)).exists();
             assertThat(cache.verifyOrInvalidate(stampedSha)).isEqualTo(stampedBlob);
-            assertThat(cache.statsSnapshot().blobCount()).isEqualTo(1);
+            assertThat(cache.statsSnapshot().blobCount()).isEqualTo(2);
         }
     }
 
@@ -832,6 +853,51 @@ class WorkerFileCacheTest {
     }
 
     @Test
+    void shouldLogRepeatedProbeFailuresAtDebugLevel() {
+        String probeFailure = "simulated failure for log level test";
+        AtomicBoolean failing = new AtomicBoolean(true);
+        List<Level> levels = new ArrayList<>();
+        String loggerName = WorkerFileCache.class.getName();
+        LoggerContext context = (LoggerContext) LogManager.getContext(WorkerFileCache.class.getClassLoader(), false);
+        Configuration configuration = context.getConfiguration();
+        LoggerConfig previous = configuration.getLoggers().get(loggerName);
+        LoggerConfig logger = new LoggerConfig(loggerName, Level.DEBUG, false);
+        AbstractAppender capture = new AbstractAppender("worker-cache-probes", null, null, true, Property.EMPTY_ARRAY) {
+            @Override
+            public void append(LogEvent event) {
+                if (event.getMessage().getFormattedMessage().contains(probeFailure)) {
+                    levels.add(event.getLevel());
+                }
+            }
+        };
+        capture.start();
+        logger.addAppender(capture, Level.DEBUG, null);
+        configuration.removeLogger(loggerName);
+        configuration.addLogger(loggerName, logger);
+        context.updateLoggers();
+        try (WorkerFileCache cache = WorkerFileCache.open(tempDir, true, GIB, path -> {
+            if (failing.get()) {
+                throw new IOException(probeFailure);
+            }
+            return PLENTY.usableBytes(path);
+        }, FIXED_CLOCK)) {
+            assertThat(cache.statsSnapshot().usableDiskBytes()).isEqualTo(-1);
+            failing.set(false);
+            assertThat(cache.statsSnapshot().usableDiskBytes()).isPositive();
+            failing.set(true);
+            cache.evictAfterPartition();
+        } finally {
+            configuration.removeLogger(loggerName);
+            if (previous != null) {
+                configuration.addLogger(loggerName, previous);
+            }
+            context.updateLoggers();
+            capture.stop();
+        }
+        assertThat(levels).containsExactly(Level.WARN, Level.DEBUG, Level.WARN);
+    }
+
+    @Test
     void shouldWarnOncePerProbeFailureEpisodeAndTellWhyLowDiskSpaceRemains() throws Exception {
         AtomicReference<WorkerFileCache.DiskSpaceProbe> probe = new AtomicReference<>(PLENTY);
         WorkerFileCache.DiskSpaceProbe failing = p -> {
@@ -860,9 +926,7 @@ class WorkerFileCacheTest {
                 assertThat(lease).isNotNull();
             }
 
-            // Unpinned blobs whose deletes fail.
-            probe.set(PLENTY);
-            cache.evictAfterPartition();
+            // The same low-disk episode now has unpinned blobs whose deletes fail.
             String undeletable = "f".repeat(64);
             cache.blobIndex(new WorkerFileCache.BlobIndex() {
                 @Override

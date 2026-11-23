@@ -135,23 +135,29 @@ public class BlobCacheDirectory {
     }
 
     /**
-     * The owner recorded in {@code root}'s {@link #OWNER_MARKER_FILE}, or empty when there is no marker (a cache
-     * created before markers existed) or it is blank.
+     * The recorded owner, or empty when no marker exists (a cache created before markers existed).
+     * An incomplete or invalid marker cannot safely be treated as an unclaimed cache.
      */
     public static Optional<String> readOwner(Path root) throws IOException {
         Path marker = root.resolve(OWNER_MARKER_FILE);
-        if (!Files.isRegularFile(marker, LinkOption.NOFOLLOW_LINKS)) {
+        try {
+            if (!Files.readAttributes(marker, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS).isRegularFile()) {
+                throw new IOException("Invalid cache owner marker " + marker);
+            }
+            String owner = Files.readString(marker, StandardCharsets.UTF_8).strip();
+            if (owner.isEmpty()) {
+                throw new IOException("Empty cache owner marker " + marker);
+            }
+            return Optional.of(owner);
+        } catch (NoSuchFileException absent) {
             return Optional.empty();
         }
-        String owner = Files.readString(marker, StandardCharsets.UTF_8).strip();
-        return owner.isEmpty() ? Optional.empty() : Optional.of(owner);
     }
 
     /**
-     * Records {@code owner} in {@code root}'s {@link #OWNER_MARKER_FILE} (creating {@code root}) unless an owner is
-     * already recorded, which is never overwritten.
+     * Claims the cache unless an owner is already recorded, without ever replacing the marker.
      *
-     * @return the recorded owner: the existing one, or {@code owner}
+     * @return the winning owner
      */
     public static String recordOwnerIfAbsent(Path root, String owner) throws IOException {
         Optional<String> existing = readOwner(root);
@@ -159,19 +165,27 @@ public class BlobCacheDirectory {
             return existing.get();
         }
         Path marker = Files.createDirectories(root).resolve(OWNER_MARKER_FILE);
+        Path staged = Files.createTempFile(root, OWNER_MARKER_FILE + "-", ".tmp");
+        String content = owner + "\n";
         try {
-            if (Files.exists(marker, LinkOption.NOFOLLOW_LINKS)) {
-                // a blank marker, for example left by an interrupted write
-                Files.writeString(marker, owner + "\n", StandardCharsets.UTF_8, StandardOpenOption.TRUNCATE_EXISTING,
-                        StandardOpenOption.WRITE, LinkOption.NOFOLLOW_LINKS);
-            } else {
-                Files.writeString(marker, owner + "\n", StandardCharsets.UTF_8, StandardOpenOption.CREATE_NEW,
+            Files.writeString(staged, content, StandardCharsets.UTF_8);
+            try {
+                // A hard link publishes the entire marker atomically and fails if another owner won the claim.
+                Files.createLink(marker, staged);
+            } catch (FileAlreadyExistsException concurrent) {
+                throw concurrent;
+            } catch (IOException | UnsupportedOperationException noHardLink) {
+                // Filesystems without hard links still use an exclusive create. A reader seeing a partial write
+                // fails closed, and cannot overwrite it or assume that it owns the directory.
+                Files.writeString(marker, content, StandardCharsets.UTF_8, StandardOpenOption.CREATE_NEW,
                         StandardOpenOption.WRITE);
             }
+            return owner;
         } catch (FileAlreadyExistsException concurrent) {
-            return readOwner(root).orElse(owner);
+            return readOwner(root).orElseThrow(() -> new IOException("Cache owner marker disappeared: " + marker, concurrent));
+        } finally {
+            Files.deleteIfExists(staged);
         }
-        return owner;
     }
 
     public Path getRootDir() {
@@ -259,11 +273,8 @@ public class BlobCacheDirectory {
 
         Path source = sourceFile.toAbsolutePath().normalize();
         if (rootDir.resolve("tmp").equals(source.getParent())) {
-            verifyDigest(expectedSha256, ClasspathPackager.sha256Hex(source));
-            if (Files.isRegularFile(target)) {
+            if (!storeTempBlob(expectedSha256, source, target)) {
                 Files.deleteIfExists(source);
-            } else {
-                moveIntoPlace(source, target);
             }
             return target;
         }
@@ -292,6 +303,29 @@ public class BlobCacheDirectory {
             Files.deleteIfExists(tmp);
         }
         return target;
+    }
+
+    /**
+     * Verifies a staged cache download and moves it into place. If a regular blob already occupies the target,
+     * returns false and leaves the temporary file for the caller to keep or remove.
+     */
+    public boolean storeTempBlob(String expectedSha256, Path tempFile) throws IOException {
+        Path source = tempFile.toAbsolutePath().normalize();
+        if (!rootDir.resolve("tmp").equals(source.getParent()) || !Files.isRegularFile(source, LinkOption.NOFOLLOW_LINKS)) {
+            throw new IllegalArgumentException("Blob source is not a regular file in the cache temporary directory: " + source);
+        }
+        Path target = resolveBlobPath(expectedSha256);
+        checkBlobSize(Files.size(source), expectedSha256);
+        return storeTempBlob(expectedSha256, source, target);
+    }
+
+    private boolean storeTempBlob(String expectedSha256, Path source, Path target) throws IOException {
+        verifyDigest(expectedSha256, ClasspathPackager.sha256Hex(source));
+        if (Files.isRegularFile(target)) {
+            return false;
+        }
+        moveIntoPlace(source, target);
+        return true;
     }
 
     /**

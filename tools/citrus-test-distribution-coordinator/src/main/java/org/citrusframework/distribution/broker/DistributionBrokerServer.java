@@ -23,15 +23,11 @@ import io.vertx.core.Vertx;
 import org.citrusframework.distribution.cache.BlobCacheDirectory;
 import org.citrusframework.distribution.store.DistributionStore;
 import org.citrusframework.distribution.store.JdbcDistributionStore;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 /**
  * Embeddable and standalone lifecycle manager for the Citrus Test Distribution Broker.
  */
 public final class DistributionBrokerServer implements AutoCloseable {
-
-    private static final Logger LOG = LoggerFactory.getLogger(DistributionBrokerServer.class);
 
     private final DistributionBrokerConfig config;
     private Vertx vertx;
@@ -46,18 +42,21 @@ public final class DistributionBrokerServer implements AutoCloseable {
         if (vertx != null) {
             return;
         }
+        BlobCacheDirectory blobCache = new BlobCacheDirectory(config.cacheDir());
+        try {
+            String owner = BlobCacheDirectory.recordOwnerIfAbsent(blobCache.getRootDir(), BlobCacheDirectory.OWNER_COORDINATOR);
+            if (!BlobCacheDirectory.OWNER_COORDINATOR.equals(owner) && !BlobCacheDirectory.OWNER_LAUNCHER.equals(owner)) {
+                throw new IllegalStateException("Coordinator cache directory " + blobCache.getRootDir()
+                        + " is marked as owned by " + owner + ". Choose a separate --cache-dir.");
+            }
+        } catch (IOException e) {
+            throw new IllegalStateException("Could not mark blob cache " + blobCache.getRootDir() + " as owned by the coordinator", e);
+        }
+
         store = new JdbcDistributionStore(config.jdbcUrl(), config.jdbcUsername(), config.jdbcPassword());
         store.initialize();
         if (config.demoData()) {
             DemoDataSeeder.seed(store);
-        }
-
-        BlobCacheDirectory blobCache = new BlobCacheDirectory(config.cacheDir());
-        try {
-            // Lets a worker refuse this directory; an existing owner is kept and never makes the coordinator refuse it.
-            BlobCacheDirectory.recordOwnerIfAbsent(blobCache.getRootDir(), BlobCacheDirectory.OWNER_COORDINATOR);
-        } catch (IOException e) {
-            LOG.warn("Could not mark blob cache {} as owned by the coordinator: {}", blobCache.getRootDir(), e.toString());
         }
         BrokerEventStreamHub eventHub = new BrokerEventStreamHub();
         BrokerSessionCoordinator coordinator = new BrokerSessionCoordinator(config, store, eventHub);

@@ -172,10 +172,12 @@ final class WorkerFileCache implements AutoCloseable {
     private volatile boolean lowDiskWarningActive;
     private volatile int lowDiskWarningCount;
     private volatile LowDiskReason lowDiskWarningReason;
-    private volatile boolean probeFailureActive;
-    private volatile int probeFailureWarningCount;
     private volatile int evictionDeleteFailureCount;
     private volatile int corruptedBlobRemovals;
+
+    // Telemetry and eviction share the probe warning state without locking the heartbeat path.
+    private final AtomicBoolean probeFailureActive = new AtomicBoolean();
+    private final AtomicInteger probeFailureWarningCount = new AtomicInteger();
 
     private volatile BlobIndex blobIndex;
 
@@ -478,8 +480,13 @@ final class WorkerFileCache implements AutoCloseable {
 
     /** A new empty file under {@code tmp/} for a download; the caller deletes it when done. */
     Path newDownloadTempFile() throws IOException {
-        ensureOpen();
-        return blobCache.newTempFile("dl-");
+        evictionLock.lock();
+        try {
+            ensureOpen();
+            return blobCache.newTempFile("dl-");
+        } finally {
+            evictionLock.unlock();
+        }
     }
 
     /**
@@ -492,10 +499,20 @@ final class WorkerFileCache implements AutoCloseable {
         evictionLock.lock();
         try {
             ensureOpen();
-            boolean existed = Files.exists(blobCache.resolveBlobPath(expectedSha256), LinkOption.NOFOLLOW_LINKS);
-            Path stored = blobCache.putFromFile(expectedSha256, tempFile);
-            registerStored(expectedSha256, stored, !existed);
-            return stored;
+            Path target = blobCache.resolveBlobPath(expectedSha256);
+            if (!blobCache.storeTempBlob(expectedSha256, tempFile)) {
+                // A file that appeared during the download is independent of the bytes we just verified.
+                Path existing = verifyOrInvalidate(expectedSha256);
+                if (existing != null) {
+                    return existing;
+                }
+                if (!blobCache.storeTempBlob(expectedSha256, tempFile)) {
+                    throw new IOException("Blob " + expectedSha256 + " in worker cache " + canonicalDir
+                            + " changed during download and could not be verified");
+                }
+            }
+            registerStored(expectedSha256, target, true);
+            return target;
         } finally {
             evictionLock.unlock();
         }
@@ -637,16 +654,19 @@ final class WorkerFileCache implements AutoCloseable {
 
         if (deficit <= 0) {
             lowDiskWarningActive = false;
-        } else if (!lowDiskWarningActive) {
+        } else {
+            LowDiskReason reason = failedDeletes > 0 ? LowDiskReason.DELETES_FAILED : LowDiskReason.NO_UNPINNED_BLOBS;
+            if (lowDiskWarningActive && lowDiskWarningReason == reason) {
+                return;
+            }
             lowDiskWarningActive = true;
             lowDiskWarningCount++;
-            if (failedDeletes > 0) {
-                lowDiskWarningReason = LowDiskReason.DELETES_FAILED;
+            lowDiskWarningReason = reason;
+            if (reason == LowDiskReason.DELETES_FAILED) {
                 LOG.warn("Worker cache {} has {} usable bytes, {} short of the {} byte free space buffer plus {} required "
                                 + "bytes, because {} unpinned blobs could not be deleted (see the previous warnings)",
                         canonicalDir, usable, deficit, freeSpaceBufferBytes, additionalBytes, failedDeletes);
             } else {
-                lowDiskWarningReason = LowDiskReason.NO_UNPINNED_BLOBS;
                 LOG.warn("Worker cache {} has {} usable bytes, {} short of the {} byte free space buffer plus {} required "
                                 + "bytes, and no unpinned blobs are left to evict",
                         canonicalDir, usable, deficit, freeSpaceBufferBytes, additionalBytes);
@@ -658,14 +678,12 @@ final class WorkerFileCache implements AutoCloseable {
     private Long probeUsable() {
         try {
             long usable = spaceProbe.usableBytes(canonicalDir);
-            probeFailureActive = false;
+            probeFailureActive.set(false);
             return usable;
         } catch (IOException e) {
-            if (!probeFailureActive) {
-                probeFailureActive = true;
-                probeFailureWarningCount++;
-                LOG.warn("Cannot determine usable disk space of worker cache {}, skipping eviction until a probe succeeds: {}",
-                        canonicalDir, e.toString());
+            if (probeFailureActive.compareAndSet(false, true)) {
+                probeFailureWarningCount.incrementAndGet();
+                LOG.warn("Cannot determine usable disk space of worker cache {}: {}", canonicalDir, e.toString());
             } else {
                 LOG.debug("Cannot determine usable disk space of worker cache {}: {}", canonicalDir, e.toString());
             }
@@ -699,12 +717,8 @@ final class WorkerFileCache implements AutoCloseable {
      * ({@code -1} when the probe fails).
      */
     WorkerCacheStats statsSnapshot() {
-        long usable;
-        try {
-            usable = spaceProbe.usableBytes(canonicalDir);
-        } catch (IOException e) {
-            usable = -1L;
-        }
+        Long probed = probeUsable();
+        long usable = probed != null ? probed : -1L;
         boolean lowDiskSpace = usable >= 0 && freeSpaceBufferBytes > 0 && usable < freeSpaceBufferBytes;
         return new WorkerCacheStats(cacheCleanup, freeSpaceBufferBytes, blobCount.get(), cachedBytes.get(), usable,
                 evictedBlobsTotal.get(), lowDiskSpace);
@@ -725,7 +739,7 @@ final class WorkerFileCache implements AutoCloseable {
 
     /** Free space probe failures warned about: one per episode of consecutive failures. */
     int probeFailureWarningCount() {
-        return probeFailureWarningCount;
+        return probeFailureWarningCount.get();
     }
 
     /** Evictions whose delete failed and was warned about. */

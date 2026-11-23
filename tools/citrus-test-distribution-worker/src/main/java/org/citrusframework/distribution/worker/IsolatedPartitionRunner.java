@@ -765,14 +765,16 @@ public final class IsolatedPartitionRunner implements PartitionRunner {
      * connections differ: their JarFile belongs to the connection and is closed with its input stream instead of being
      * cached until the JVM exits.
      * <p>
-     * Cost: every connection opens (and closes) the jar file again instead of reusing a cached one; for signed jars
-     * this includes verifying the signature again on each open.
+     * Every connection opens a fresh JAR, which can repeat signature verification. A caller that uses a connection
+     * only for metadata without opening and closing its stream can leave the JAR open until JDK cleanup.
      */
     static final class UncachedJarHandler extends URLStreamHandler {
 
         @Override
         protected URLConnection openConnection(URL url) throws IOException {
-            return uncachedConnection(jdkUrl(url).openConnection());
+            URLConnection connection = jdkUrl(url).openConnection();
+            connection.setUseCaches(false);
+            return connection;
         }
 
         /**
@@ -784,29 +786,19 @@ public final class IsolatedPartitionRunner implements PartitionRunner {
             return openConnection(url);
         }
 
-        private static URLConnection uncachedConnection(URLConnection connection) {
-            connection.setUseCaches(false);
-            return connection;
-        }
-
         /** Parses {@code spec} like the JDK's jar handler, relative to {@code url}'s current (context) fields. */
         @Override
         @SuppressWarnings("deprecation") // URL(URL, String): resolves through the JDK's jar handler, accepts spaces
         protected void parseURL(URL url, String spec, int start, int limit) {
-            boolean absolute = spec.regionMatches(true, 0, "jar:", 0, 4);
-            URL resolved;
             try {
-                if (absolute) {
-                    resolved = new URL(spec.substring(0, limit));
-                } else {
-                    resolved = new URL(jdkUrl(url), spec.substring(start, limit));
-                }
+                URL context = url.getFile() == null || url.getFile().isEmpty() ? null : jdkUrl(url);
+                URL resolved = new URL(context, spec);
+                setURL(url, resolved.getProtocol(), resolved.getHost(), resolved.getPort(), resolved.getAuthority(),
+                        resolved.getUserInfo(), resolved.getPath(), resolved.getQuery(), resolved.getRef());
             } catch (MalformedURLException e) {
-                // URL's constructor reports this as a MalformedURLException
+                // URL's constructor reports this as a MalformedURLException.
                 throw new IllegalArgumentException(e.getMessage(), e);
             }
-            setURL(url, resolved.getProtocol(), resolved.getHost(), resolved.getPort(), resolved.getAuthority(),
-                    resolved.getUserInfo(), resolved.getPath(), resolved.getQuery(), url.getRef());
         }
 
         @Override
