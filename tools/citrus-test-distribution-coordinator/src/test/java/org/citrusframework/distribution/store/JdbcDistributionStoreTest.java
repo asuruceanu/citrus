@@ -69,6 +69,44 @@ class JdbcDistributionStoreTest {
     }
 
     @Test
+    void shouldKeepHighestRemoteAttemptAndRankSessionsBySelectedRunRecency() {
+        String key = "pkg.RetryTest";
+        try (JdbcDistributionStore store = new JdbcDistributionStore("jdbc:hsqldb:mem:retry_history", "SA", "")) {
+            store.initialize();
+            saveDuration(store, key, "sess-retry", 2, TestOutcomeStatus.PASSED, 600L, 2L);
+            saveDuration(store, key, "sess-new", 1, TestOutcomeStatus.PASSED, 800L, 3L);
+            saveDuration(store, key, "sess-retry", 1, TestOutcomeStatus.FAILED, 10L, 4L);
+            assertThat(store.findHistoricalDurationsMs(List.of(key), 1)).containsEntry(key, 800L);
+            assertThat(store.findHistoricalDurationsMs(List.of(key), 2)).containsEntry(key, 700L);
+        }
+    }
+
+    @Test
+    void shouldOnlySumLatestLocalResultsForDistinctTestIdentities() {
+        String key = "pkg.LocalHistoryTest";
+        try (JdbcDistributionStore store = new JdbcDistributionStore("jdbc:hsqldb:mem:local_history", "SA", "")) {
+            store.initialize();
+            saveLocalDuration(store, key, "same-name", null, 1, TestOutcomeStatus.FAILED, 20L, 1L);
+            saveLocalDuration(store, key, "same-name", "first-id", 2, TestOutcomeStatus.PASSED, 100L, 2L);
+            saveLocalDuration(store, key, "same-name", "second-id", 1, TestOutcomeStatus.PASSED, 200L, 3L);
+            saveLocalDuration(store, key, "skipped-later", null, 1, TestOutcomeStatus.PASSED, 30L, 4L);
+            saveLocalDuration(store, key, "skipped-later", null, 2, TestOutcomeStatus.SKIPPED, 0L, 5L);
+            saveDuration(store, key, "sess-local", 1, TestOutcomeStatus.PASSED, 500L, 4L);
+            assertThat(store.findHistoricalDurationsMs(List.of(key), 10)).containsEntry(key, 300L);
+
+            saveDuration(store, key, "sess-local", 2, TestOutcomeStatus.PASSED, 800L, 6L);
+            assertThat(store.findHistoricalDurationsMs(List.of(key), 10)).containsEntry(key, 800L);
+        }
+    }
+
+    private static void saveLocalDuration(JdbcDistributionStore store, String key, String test, String uniqueId,
+                                          int attempt, TestOutcomeStatus status, long duration, long recordedAt) {
+        store.saveTestExecution(new TestExecutionRecord(UUID.randomUUID().toString(), "sess-local", "local",
+                "local-host", key, key, test, status, duration, attempt, false, null, null, List.of(), recordedAt,
+                uniqueId));
+    }
+
+    @Test
     void shouldKeepLegacyRowsSeparateAndAverageLargeDurationsWithoutOverflow() {
         String key = "pkg.LegacyTest";
         try (JdbcDistributionStore store = new JdbcDistributionStore("jdbc:hsqldb:mem:legacy_history", "SA", "")) {

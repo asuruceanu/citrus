@@ -804,6 +804,30 @@ class BrokerSessionCoordinatorTest {
     }
 
     @Test
+    void shouldEstimateFullClassFromLocalFallbackWithDifferentPerTestAttempts() {
+        String testClass = "pkg.FallbackIT";
+        String sessionId = newSession(0);
+        Worker worker = register("conn-fallback", "worker-fallback", Map.of());
+        submit(sessionId, "sub-fallback", List.of(), List.of(), false, unit(testClass));
+        PartitionAssignPayload assignment = worker.lastAssignment();
+        worker.send(WorkerWsMessage.TEST_EVENT, DistributionJson.convert(new WorkerTestEventPayload(
+                assignment.partitionId(), sessionId, 1, testClass, testClass, "alpha", TestOutcomeStatus.PASSED,
+                100L, null, null, List.of(), "alpha-id"), Map.class));
+        coordinator.handleWorkerDisconnect("conn-fallback");
+        assertThat(partition(sessionId).state()).isEqualTo(PartitionState.LOST);
+
+        coordinator.reportLocalTests(sessionId, new ReportLocalTestsRequest("local-host", List.of(
+                new WorkerTestEventPayload("local", sessionId, 1, testClass, testClass, "alpha", TestOutcomeStatus.PASSED,
+                        300L, null, null, List.of(), "alpha-id"),
+                new WorkerTestEventPayload("local", sessionId, 1, testClass, testClass, "beta", TestOutcomeStatus.PASSED,
+                        700L, null, null, List.of(), "beta-id"))));
+        assertThat(store.listTestExecutions(sessionId)).filteredOn(test -> "local".equals(test.partitionId()))
+                .extracting(TestExecutionRecord::testName, TestExecutionRecord::attempt)
+                .containsExactlyInAnyOrder(tuple("alpha", 2), tuple("beta", 1));
+        assertThat(coordinator.findHistoricalDurations(List.of(testClass), 1)).containsEntry(testClass, 1_000L);
+    }
+
+    @Test
     void shouldRecordLocalTestExecutionsAndAbortRunningSession() {
         String sessionId = newSession(1);
         Worker worker = register("conn-abort", "worker-abort", Map.of());

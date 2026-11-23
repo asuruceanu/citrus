@@ -25,15 +25,15 @@ import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.Collection;
-import java.util.HashSet;
+import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
-import java.util.Set;
 
 import org.apache.commons.dbcp2.BasicDataSource;
+import org.citrusframework.distribution.TestExecutionIdentity;
 import org.citrusframework.distribution.config.DistributionJson;
 import org.citrusframework.distribution.model.BuildSessionRecord;
 import org.citrusframework.distribution.model.PartitionRecord;
@@ -822,36 +822,63 @@ public class JdbcDistributionStore implements DistributionStore {
         }
         int runLimit = Math.max(1, recentLimit);
         Map<String, Long> durations = new LinkedHashMap<>();
-        // Older records can lack a session ID. Treat each of those records as an independent run.
+        // Group worker results by partition attempt. Local attempts are per test, so keep local rows separate
+        // for identity matching. Legacy rows without a session also represent separate runs.
         String sql = """
                 SELECT session_id, COALESCE(attempt, 1) AS run_attempt,
-                       CASE WHEN TRIM(COALESCE(session_id, '')) = '' THEN id ELSE NULL END AS legacy_id,
+                       CASE WHEN partition_id = 'local' OR TRIM(COALESCE(session_id, '')) = '' THEN id END AS row_id,
+                       MAX(CASE WHEN TRIM(COALESCE(session_id, '')) = '' THEN 1 ELSE 0 END) AS legacy_run,
+                       MAX(CASE WHEN partition_id = 'local' THEN 1 ELSE 0 END) AS local_run,
+                       MAX(CASE WHEN partition_id = 'local' THEN unique_id END) AS unique_id,
+                       MAX(CASE WHEN partition_id = 'local' THEN class_name END) AS class_name,
+                       MAX(CASE WHEN partition_id = 'local' THEN test_name END) AS test_name,
+                       MAX(CASE WHEN status IN ('PASSED', 'FAILED') THEN 1 ELSE 0 END) AS timed_result,
                        SUM(CASE WHEN duration_ms > 0 THEN CAST(duration_ms AS DECIMAL(38, 0)) ELSE 0 END) AS total_ms,
                        MAX(recorded_at) AS last_recorded_at
                 FROM dist_test_executions
-                WHERE work_unit_key = ? AND status IN ('PASSED', 'FAILED')
+                WHERE work_unit_key = ?
+                  AND (status IN ('PASSED', 'FAILED') OR (partition_id = 'local' AND status = 'SKIPPED'))
                 GROUP BY session_id, COALESCE(attempt, 1),
-                         CASE WHEN TRIM(COALESCE(session_id, '')) = '' THEN id ELSE NULL END
-                ORDER BY last_recorded_at DESC NULLS LAST, run_attempt DESC, session_id, legacy_id
+                         CASE WHEN partition_id = 'local' OR TRIM(COALESCE(session_id, '')) = '' THEN id END
+                ORDER BY last_recorded_at ASC NULLS FIRST, run_attempt, row_id
                 """;
         try (Connection conn = dataSource.getConnection();
              PreparedStatement ps = conn.prepareStatement(sql)) {
             for (String key : workUnitKeys) {
                 ps.setString(1, key);
-                Set<String> seenSessions = new HashSet<>();
-                BigDecimal sum = BigDecimal.ZERO;
-                int count = 0;
+                List<DurationObservation> overallHistory = new ArrayList<>();
+                Map<String, SessionDurationHistory> sessions = new LinkedHashMap<>();
                 try (ResultSet rs = ps.executeQuery()) {
-                    while (count < runLimit && rs.next()) {
+                    while (rs.next()) {
                         String sessionId = rs.getString("session_id");
-                        if (sessionId != null && !sessionId.isBlank() && !seenSessions.add(sessionId)) {
+                        long recordedAt = rs.getLong("last_recorded_at");
+                        BigDecimal duration = rs.getBigDecimal("total_ms");
+                        boolean timed = rs.getInt("timed_result") == 1;
+                        if (rs.getInt("legacy_run") == 1) {
+                            if (timed) {
+                                overallHistory.add(new DurationObservation(rs.getString("row_id"), duration, recordedAt));
+                            }
                             continue;
                         }
-                        sum = sum.add(rs.getBigDecimal("total_ms").max(BigDecimal.ONE));
-                        count++;
+                        SessionDurationHistory session = sessions.computeIfAbsent(sessionId, SessionDurationHistory::new);
+                        int attempt = rs.getInt("run_attempt");
+                        if (rs.getInt("local_run") == 1) {
+                            session.addLocal(key, rs.getString("class_name"), rs.getString("test_name"),
+                                    rs.getString("unique_id"), new LocalTestDuration(attempt, timed, duration, recordedAt));
+                        } else {
+                            session.addRemote(attempt, duration, recordedAt);
+                        }
                     }
                 }
-                if (count > 0) {
+                sessions.values().forEach(session -> session.latest().ifPresent(overallHistory::add));
+                if (!overallHistory.isEmpty()) {
+                    overallHistory.sort(Comparator.comparingLong(DurationObservation::recordedAt).reversed()
+                            .thenComparing(DurationObservation::id));
+                    int count = Math.min(runLimit, overallHistory.size());
+                    BigDecimal sum = BigDecimal.ZERO;
+                    for (DurationObservation observation : overallHistory.subList(0, count)) {
+                        sum = sum.add(observation.duration().max(BigDecimal.ONE));
+                    }
                     BigDecimal average = sum.divide(BigDecimal.valueOf(count), 0, RoundingMode.HALF_UP);
                     durations.put(key, average.min(BigDecimal.valueOf(Long.MAX_VALUE)).longValueExact());
                 }
@@ -859,6 +886,58 @@ public class JdbcDistributionStore implements DistributionStore {
             return durations;
         } catch (SQLException e) {
             throw new IllegalStateException("Failed to query historical durations", e);
+        }
+    }
+
+    private record DurationObservation(String id, BigDecimal duration, long recordedAt) {
+    }
+
+    private record LocalTestDuration(int attempt, boolean timed, BigDecimal duration, long recordedAt) {
+    }
+
+    private static final class SessionDurationHistory {
+
+        private final String sessionId;
+        private final TestExecutionIdentity testIdentities = new TestExecutionIdentity();
+        private final Map<String, LocalTestDuration> localTests = new LinkedHashMap<>();
+        private DurationObservation remote;
+        private int remoteAttempt;
+
+        private SessionDurationHistory(String sessionId) {
+            this.sessionId = sessionId;
+        }
+
+        private void addRemote(int attempt, BigDecimal duration, long recordedAt) {
+            if (remote == null || attempt > remoteAttempt) {
+                remote = new DurationObservation(sessionId, duration, recordedAt);
+                remoteAttempt = attempt;
+            }
+        }
+
+        private void addLocal(String workUnitKey, String className, String testName, String uniqueId,
+                              LocalTestDuration observed) {
+            String identity = testIdentities.resolve(workUnitKey, className, testName, uniqueId, localTests::containsKey);
+            // Rows arrive in recording order. An old attempt can still arrive after a retry.
+            LocalTestDuration previous = localTests.get(identity);
+            if (previous == null || observed.attempt() >= previous.attempt()) {
+                localTests.put(identity, observed);
+            }
+        }
+
+        private Optional<DurationObservation> latest() {
+            BigDecimal localDuration = null;
+            long lastLocalResult = Long.MIN_VALUE;
+            for (LocalTestDuration test : localTests.values()) {
+                lastLocalResult = Math.max(lastLocalResult, test.recordedAt());
+                if (test.timed()) {
+                    localDuration = localDuration == null ? test.duration() : localDuration.add(test.duration());
+                }
+            }
+            // The local fallback can start in the same millisecond as the last remote observation.
+            if (localDuration != null && (remote == null || lastLocalResult >= remote.recordedAt())) {
+                return Optional.of(new DurationObservation(sessionId, localDuration, lastLocalResult));
+            }
+            return Optional.ofNullable(remote);
         }
     }
 

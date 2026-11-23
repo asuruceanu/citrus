@@ -28,6 +28,7 @@ import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Consumer;
 
+import org.citrusframework.distribution.TestExecutionIdentity;
 import org.citrusframework.distribution.config.DistributionJson;
 import org.citrusframework.distribution.config.DistributionSettings;
 import org.citrusframework.distribution.model.ArtifactRef;
@@ -623,7 +624,7 @@ public final class BrokerSessionCoordinator {
                     SessionRuntime session = getOrRehydrateSession(pr.record.sessionId());
                     String testKey = session != null
                             ? session.testKey(evt.workUnitKey(), evt.className(), evt.testName(), evt.uniqueId())
-                            : testIdentityKey(evt.workUnitKey(), evt.className(), evt.testName(), evt.uniqueId());
+                            : TestExecutionIdentity.key(evt.workUnitKey(), evt.className(), evt.testName(), evt.uniqueId());
                     if (evt.status() == TestOutcomeStatus.STARTED) {
                         pr.inFlightTestKey = testKey;
                     } else {
@@ -1105,26 +1106,6 @@ public final class BrokerSessionCoordinator {
         );
     }
 
-    /** Length the store keeps of a unique id; keys use the same prefix so live and rehydrated keys agree. */
-    private static final int UNIQUE_ID_KEY_LENGTH = 1024;
-
-    /**
-     * Identity of one test across attempts: work unit plus JUnit unique id when reported, otherwise work unit, class,
-     * and display name. The unique id keeps parameterized and dynamic invocations with equal display names apart; the
-     * work unit keeps Citrus factory sources apart, since each source runs in its own filtered JUnit run and so always
-     * reports the same {@code [dynamic-test:#1]} id.
-     */
-    private static String testIdentityKey(String workUnitKey, String className, String testName, String uniqueId) {
-        if (uniqueId != null && !uniqueId.isBlank()) {
-            String uid = uniqueId.length() > UNIQUE_ID_KEY_LENGTH ? uniqueId.substring(0, UNIQUE_ID_KEY_LENGTH) : uniqueId;
-            return "uid:" + (workUnitKey != null ? workUnitKey : "") + "|" + uid;
-        }
-        String keyPart = (workUnitKey != null && !workUnitKey.isBlank()) ? workUnitKey : "";
-        String cls = (className != null && !className.isBlank()) ? className : "";
-        String tst = (testName != null && !testName.isBlank()) ? testName : "";
-        return keyPart + "|" + cls + "#" + tst;
-    }
-
     private SessionRuntime getOrRehydrateSession(String sessionId) {
         SessionRuntime existing = sessions.get(sessionId);
         if (existing != null) {
@@ -1189,8 +1170,7 @@ public final class BrokerSessionCoordinator {
         private final List<String> partitionIds = new ArrayList<>();
         private final Set<String> failedOrInterruptedTests = new HashSet<>();
         private final Map<String, TestExecutionRecord> latestExecutionsByTest = new LinkedHashMap<>();
-        /** Legacy test key (no unique id) to the unique-id key that took it over. */
-        private final Map<String, String> legacyKeyOwners = new java.util.HashMap<>();
+        private final TestExecutionIdentity testIdentities = new TestExecutionIdentity();
         private final Set<String> locallyExecutedWorkUnitKeys = new HashSet<>();
         private int cachedBlobs;
         private int uploadedBlobs;
@@ -1204,24 +1184,8 @@ public final class BrokerSessionCoordinator {
             this.requestedMaxPartitionSize = requestedMaxPartitionSize;
         }
 
-        /**
-         * Identity key of a test in this session. A test first recorded without a unique id (older worker or launcher,
-         * or a row stored before the column existed) keeps that legacy key, so its retries with a unique id still
-         * count as the same test. Only the first unique id seen for a legacy key takes it over: invocations sharing a
-         * display name (parameterized, dynamic) stay separate tests.
-         */
         private String testKey(String workUnitKey, String className, String testName, String uniqueId) {
-            String key = testIdentityKey(workUnitKey, className, testName, uniqueId);
-            if (!latestExecutionsByTest.containsKey(key)) {
-                String legacy = testIdentityKey(workUnitKey, className, testName, null);
-                if (!legacy.equals(key) && latestExecutionsByTest.containsKey(legacy)) {
-                    String owner = legacyKeyOwners.putIfAbsent(legacy, key);
-                    if (owner == null || owner.equals(key)) {
-                        return legacy;
-                    }
-                }
-            }
-            return key;
+            return testIdentities.resolve(workUnitKey, className, testName, uniqueId, latestExecutionsByTest::containsKey);
         }
 
         private int nextAttemptFor(String key) {
