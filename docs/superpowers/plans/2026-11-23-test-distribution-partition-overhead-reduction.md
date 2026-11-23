@@ -4,7 +4,7 @@
 
 **Goal:** Eliminate repeated per-partition JAR scanning, full-host macOS `lsof +D` teardown stalls, excessive LPT partition fan-out on fast/multi-wave modules, and cold remote round-trip overhead on `<2s` modules.
 
-**Architecture:** Five self-contained changes aligned with Maven module boundaries: (1) protocol DTOs, settings, and adaptive `LptPartitionScheduler` bin-sizing in `citrus-test-distribution-protocol`; (2) bounded JAR resource and `codeSource` caching in `ForkedPartitionRunner`; (3) post-launch `ProcessHandle` survivor diffing with targeted `lsof -Fn -p` on macOS in `WorkerWorkspaceRegistry`/`WorkspaceReferences`; (4) session-summed historical durations, adaptive coordinator scheduling, and `POST /api/v1/history/durations` in `citrus-test-distribution-coordinator`; and (5) pre-packaging `<2s` local bypass in `DistributedLauncher` plus reactor property propagation in `citrus-test-distribution-maven-extension`.
+**Architecture:** Five self-contained changes aligned with Maven module boundaries: (1) protocol DTOs and client/reactor settings in `citrus-test-distribution-protocol`; (2) bounded JAR resource and `codeSource` caching in `ForkedPartitionRunner`; (3) post-launch `ProcessHandle` survivor diffing with targeted `lsof -Fn -p` on macOS in `WorkerWorkspaceRegistry`/`WorkspaceReferences`; (4) session-summed historical durations, adaptive `LptPartitionScheduler` + `BrokerSessionCoordinator` scheduling, and `POST /api/v1/history/durations` in `citrus-test-distribution-coordinator`; and (5) pre-packaging `<2s` local bypass in `DistributedLauncher` plus reactor property propagation in `citrus-test-distribution-maven-extension`.
 
 **Tech Stack:** Java 21, Maven 3.9+, JUnit Platform 1.x / Jupiter 5, Vert.x HTTP router, JDBC (H2 / PostgreSQL SQL-compatible), Jackson (`DistributionJson`).
 
@@ -30,18 +30,16 @@
 
 ---
 
-### Task 1: Protocol DTOs, Settings & Adaptive `LptPartitionScheduler`
+### Task 1: Protocol DTOs & Client Settings (`citrus-test-distribution-protocol`)
 
 **Files:**
 - Create: `tools/citrus-test-distribution-protocol/src/main/java/org/citrusframework/distribution/model/HistoricalDurationsRequest.java`
 - Create: `tools/citrus-test-distribution-protocol/src/main/java/org/citrusframework/distribution/model/HistoricalDurationsResponse.java`
 - Modify: `tools/citrus-test-distribution-protocol/src/main/java/org/citrusframework/distribution/config/DistributionSettings.java`
-- Modify: `tools/citrus-test-distribution-protocol/src/main/java/org/citrusframework/distribution/scheduler/LptPartitionScheduler.java`
 - Test: `tools/citrus-test-distribution-protocol/src/test/java/org/citrusframework/distribution/config/DistributionSettingsTest.java`
-- Test: `tools/citrus-test-distribution-protocol/src/test/java/org/citrusframework/distribution/scheduler/LptPartitionSchedulerTest.java`
 
 **Interfaces:**
-- Consumes: `DistributionJson`, `WorkUnitSpec`, `PartitionPolicy`, `PartitionRecord` in `citrus-test-distribution-protocol`.
+- Consumes: `DistributionJson` in `citrus-test-distribution-protocol`.
 - Produces:
   - `public record HistoricalDurationsRequest(List<String> testKeys, int limit)` in `org.citrusframework.distribution.model` (null `testKeys` normalized to `List.of()`).
   - `public record HistoricalDurationsResponse(Map<String, Long> durationsMs)` in `org.citrusframework.distribution.model` (null `durationsMs` normalized to `Map.of()` via `Collections.unmodifiableMap(new LinkedHashMap<>(...))`).
@@ -55,39 +53,23 @@
     - `public static OptionalInt findConfiguredMaxPartitionSize()` and `static OptionalInt findConfiguredMaxPartitionSize(UnaryOperator<String> prop, UnaryOperator<String> env)` (returns `OptionalInt.of(parsed)` when `> 0`, else `OptionalInt.empty()`)
     - `public static long getMinRemoteDurationMs()` and `static long getMinRemoteDurationMs(UnaryOperator<String> prop, UnaryOperator<String> env)` (returns `Math.max(0L, ...)` defaulting to `2_000L`)
     - `public static int getMinRemoteColdUnits()` and `static int getMinRemoteColdUnits(UnaryOperator<String> prop, UnaryOperator<String> env)` (returns `Math.max(0, ...)` defaulting to `0`)
-  - `LptPartitionScheduler.schedule(String sessionId, List<WorkUnitSpec> units, Map<String, Long> historicalDurationsMs, long defaultDurationMs, int maxPartitionSize, PartitionPolicy policy, long minPartitionDurationMs, int maxWavesPerWorker, ToIntFunction<Map<String, String>> eligibleWorkerCounter)`
 
-- [ ] **Step 1: Write failing tests for DTO JSON round-trip, new `DistributionSettings` lookups, and adaptive `LptPartitionScheduler` sizing**
+- [ ] **Step 1: Write failing tests for DTO JSON round-trip and new `DistributionSettings` lookups**
 
 Add tests in `DistributionSettingsTest.java`:
 - `shouldReturnEmptyConfiguredMaxPartitionSizeWhenUnsetAndPositiveValueWhenConfigured`: verifies `findConfiguredMaxPartitionSize` returns `OptionalInt.empty()` when unset/invalid/`<=0` and `OptionalInt.of(12)` when property or env is `"12"`, while `getMaxPartitionSize()` still returns `5`.
 - `shouldReadMinRemoteDurationMsAndColdUnitsWithClampedNonNegativeValues`: verifies defaults (`2_000L`, `0`), property/env overrides, and negative strings clamping to `0`.
 - `shouldRoundTripHistoricalDurationsDtos`: serializes/deserializes `HistoricalDurationsRequest(List.of("pkg.A"), 10)` and `HistoricalDurationsResponse(Map.of("pkg.A", 450L))` via `DistributionJson`, plus null normalization to empty collections.
 
-Add tests in `LptPartitionSchedulerTest.java`:
-- `shouldPackFastModuleIntoFewerPartitionsWhenMinPartitionDurationFloorApplies`: 19 units of `150ms` each (`2_850ms` total), `maxPartitionSize = 5`, `minPartitionDurationMs = 5_000L`, `maxWavesPerWorker = 2`, `eligibleWorkers = 6` -> produces `1` partition containing all 19 units.
-- `shouldCapColdMultiWaveExplosionUsingMaxWavesPerWorker`: 185 units with cold default `1_000ms` (`185_000ms` total), `maxPartitionSize = 5`, `minPartitionDurationMs = 5_000L`, `maxWavesPerWorker = 2`, `eligibleWorkers = 6` -> produces `12` partitions (`6 * 2`) with at most `16` units per partition (`ceil(185 / 12)`).
-- `shouldEvaluateEligibleWorkersPerCapabilityGroupIndependently`: 20 default-capability units (`W = 6`) + 20 `docker=true` units (`W = 1`) at `1_000ms` each, `maxPartitionSize = 5`, `minPartitionDurationMs = 5_000L`, `maxWavesPerWorker = 2` -> default group gets `4` bins (`min(4, 4, 12)`), `docker=true` group gets `2` bins (`min(4, 4, 2)`).
-- `shouldPreserveLegacyBehaviorWhenAdaptiveParametersAreDisabled`: `minPartitionDurationMs = 0L`, `maxWavesPerWorker = 0`, `eligibleWorkers = 0` -> 19 units at `maxPartitionSize = 5` produces `4` partitions.
-
 - [ ] **Step 2: Run protocol tests to verify RED**
 
-Run: `./mvnw test -pl tools/citrus-test-distribution-protocol -Dtest=DistributionSettingsTest,LptPartitionSchedulerTest -Dcitrus.test.distribution.enabled=false`
-Expected: FAIL to compile (`HistoricalDurationsRequest`, `findConfiguredMaxPartitionSize`, and 9-arg `schedule` not defined).
+Run: `./mvnw test -pl tools/citrus-test-distribution-protocol -Dtest=DistributionSettingsTest -Dcitrus.test.distribution.enabled=false`
+Expected: FAIL to compile (`HistoricalDurationsRequest` and `findConfiguredMaxPartitionSize` not defined).
 
-- [ ] **Step 3: Implement DTOs, `DistributionSettings` methods, and adaptive `LptPartitionScheduler`**
+- [ ] **Step 3: Implement DTOs and `DistributionSettings` methods**
 
 1. Create `HistoricalDurationsRequest` and `HistoricalDurationsResponse` in `org.citrusframework.distribution.model` with `@JsonCreator`/`@JsonProperty` or canonical record annotations matching `MissingDigestsRequest`/`MissingDigestsResponse`.
 2. Add the new constants and methods to `DistributionSettings` (note: guard `aliasEnvKey != null` in `resolveFirstNonBlank` if passing `null` when no secondary alias env exists).
-3. In `LptPartitionScheduler`, keep existing 5-arg and 6-arg `schedule` methods delegating to the 9-arg `schedule(..., 0L, 0, caps -> 0)`. In `lptPartitions`:
-   - `int maxBinsFromSize = Math.ceilDiv(n, capSize);`
-   - `long totalEstimatedMs = groupUnits.stream().mapToLong(EnrichedUnit::estimatedDurationMs).sum();`
-   - `int targetBinsByDuration = minPartitionDurationMs > 0 ? (int) Math.clamp(Math.ceilDiv(Math.max(1L, totalEstimatedMs), minPartitionDurationMs), 1L, n) : maxBinsFromSize;`
-   - `int eligibleWorkers = eligibleWorkerCounter == null ? 0 : Math.max(0, eligibleWorkerCounter.apply(groupCapabilities));`
-   - `int maxBinsByWorkers = (maxWavesPerWorker > 0 && eligibleWorkers > 0) ? (int) Math.min((long) n, (long) eligibleWorkers * maxWavesPerWorker) : maxBinsFromSize;`
-   - `int binCount = Math.max(1, Math.min(maxBinsFromSize, Math.min(targetBinsByDuration, maxBinsByWorkers)));`
-   - `int effectiveCapSize = Math.ceilDiv(n, binCount);`
-   - Place each unit (descending `estimatedDurationMs`, tie-broken by `key`) into the least-loaded bin with `bin.units.size() < effectiveCapSize`.
 
 - [ ] **Step 4: Run all protocol tests and install reactor artifact**
 
@@ -98,7 +80,7 @@ Expected: PASS (all protocol tests green; `citrus-test-distribution-protocol` in
 
 ```bash
 git add tools/citrus-test-distribution-protocol
-git commit -m "feat(distribution): add adaptive LPT bin sizing and history duration DTOs"
+git commit -m "feat(distribution): add history duration DTOs and client bypass settings"
 ```
 
 ---
@@ -210,29 +192,38 @@ git commit -m "perf(distribution): skip full-host macOS lsof when no post-launch
 
 ---
 
-### Task 4: Coordinator Session-Sum History Store, Adaptive Scheduling & `/api/v1/history/durations` (Bullet 3a + 3b Broker)
+### Task 4: Coordinator Session-Sum History Store, Adaptive `LptPartitionScheduler` & `/api/v1/history/durations` (Bullet 3a + 3b Broker)
 
 **Files:**
+- Modify: `tools/citrus-test-distribution-coordinator/src/main/java/org/citrusframework/distribution/scheduler/LptPartitionScheduler.java`
 - Modify: `tools/citrus-test-distribution-coordinator/src/main/java/org/citrusframework/distribution/store/JdbcDistributionStore.java`
 - Modify: `tools/citrus-test-distribution-coordinator/src/main/java/org/citrusframework/distribution/broker/DistributionBrokerConfig.java`
 - Modify: `tools/citrus-test-distribution-coordinator/src/main/java/org/citrusframework/distribution/broker/BrokerSessionCoordinator.java`
 - Modify: `tools/citrus-test-distribution-coordinator/src/main/java/org/citrusframework/distribution/broker/DistributionBrokerVerticle.java`
+- Test: `tools/citrus-test-distribution-coordinator/src/test/java/org/citrusframework/distribution/scheduler/LptPartitionSchedulerTest.java`
 - Test: `tools/citrus-test-distribution-coordinator/src/test/java/org/citrusframework/distribution/store/JdbcDistributionStoreTest.java`
 - Test: `tools/citrus-test-distribution-coordinator/src/test/java/org/citrusframework/distribution/broker/BrokerSessionCoordinatorTest.java`
 - Test: `tools/citrus-test-distribution-coordinator/src/test/java/org/citrusframework/distribution/broker/DistributionBrokerServerTest.java`
 
 **Interfaces:**
-- Consumes: `HistoricalDurationsRequest`, `HistoricalDurationsResponse`, 9-arg `LptPartitionScheduler.schedule(...)` from Task 1.
+- Consumes: `HistoricalDurationsRequest`, `HistoricalDurationsResponse` from Task 1.
 - Produces:
+  - `LptPartitionScheduler.schedule(String sessionId, List<WorkUnitSpec> units, Map<String, Long> historicalDurationsMs, long defaultDurationMs, int maxPartitionSize, PartitionPolicy policy, long minPartitionDurationMs, int maxWavesPerWorker, ToIntFunction<Map<String, String>> eligibleWorkerCounter)` (keeping existing 5-arg and 6-arg `schedule` overloads delegating with `(0L, 0, caps -> 0)`).
   - `DistributionBrokerConfig`:
     - `MIN_PARTITION_DURATION_MS_PROPERTY = "citrus.test.distribution.broker.minPartitionDurationMs"` / `CITRUS_DIST_BROKER_MIN_PARTITION_DURATION_MS` (default `5_000L`)
     - `MAX_WAVES_PER_WORKER_PROPERTY = "citrus.test.distribution.broker.maxWavesPerWorker"` / `CITRUS_DIST_BROKER_MAX_WAVES_PER_WORKER` (default `2`)
-    - `long minPartitionDurationMs()`, `int maxWavesPerWorker()`, and builder setters `.minPartitionDurationMs(long)` / `.maxWavesPerWorker(int)`.
+    - `long minPartitionDurationMs()`, `int maxWavesPerWorker()`, and builder setters `.minPartitionDurationMs(long)` / `.maxWavesPerWorker(int)` (initializing `Builder` defaults from system properties / env vars with fallback `5_000L` and `2` so `DistBrokerStart` honors property/env overrides automatically).
   - `BrokerSessionCoordinator.findHistoricalDurations(List<String> testKeys, int limit)` returning `Map<String, Long>` (clamping `limit <= 0 ? 10 : Math.min(limit, 100)`).
   - HTTP endpoint `POST /api/v1/history/durations` on `DistributionBrokerVerticle`:
     - Accepts `HistoricalDurationsRequest`, rejects `testKeys.size() > 10_000` or malformed JSON with `400`, returns `200` `HistoricalDurationsResponse` (`{"durationsMs":{}}` when `testKeys` is empty).
 
-- [ ] **Step 1: Write failing tests in `JdbcDistributionStoreTest`, `BrokerSessionCoordinatorTest`, and `DistributionBrokerServerTest`**
+- [ ] **Step 1: Write failing tests in `LptPartitionSchedulerTest`, `JdbcDistributionStoreTest`, `BrokerSessionCoordinatorTest`, and `DistributionBrokerServerTest`**
+
+Add to `LptPartitionSchedulerTest.java`:
+- `shouldPackFastModuleIntoFewerPartitionsWhenMinPartitionDurationFloorApplies`: 19 units of `150ms` each (`2_850ms` total), `maxPartitionSize = 5`, `minPartitionDurationMs = 5_000L`, `maxWavesPerWorker = 2`, `eligibleWorkers = 6` -> produces `1` partition containing all 19 units.
+- `shouldCapColdMultiWaveExplosionUsingMaxWavesPerWorker`: 185 units with cold default `1_000ms` (`185_000ms` total), `maxPartitionSize = 5`, `minPartitionDurationMs = 5_000L`, `maxWavesPerWorker = 2`, `eligibleWorkers = 6` -> produces `12` partitions (`6 * 2`) with at most `16` units per partition (`ceil(185 / 12)`).
+- `shouldEvaluateEligibleWorkersPerCapabilityGroupIndependently`: 20 default-capability units (`W = 6`) + 20 `docker=true` units (`W = 1`) at `1_000ms` each, `maxPartitionSize = 5`, `minPartitionDurationMs = 5_000L`, `maxWavesPerWorker = 2` -> default group gets `4` bins (`min(4, 4, 12)`), `docker=true` group gets `2` bins (`min(4, 4, 2)`).
+- `shouldPreserveLegacyBehaviorWhenAdaptiveParametersAreDisabled`: `minPartitionDurationMs = 0L`, `maxWavesPerWorker = 0`, `eligibleWorkers = 0` -> 19 units at `maxPartitionSize = 5` produces `4` partitions.
 
 Add to `JdbcDistributionStoreTest.java`:
 - `shouldSumMethodDurationsPerSessionAndKeepOnlyLatestAttemptWhenComputingHistoricalDurations`: records in `sess-1` `attempt=1` (`FAILED`, `100ms`) + `attempt=2` (`PASSED` methods `400ms` + `600ms` = `1_000ms`), and in `sess-2` `attempt=1` (`PASSED` methods `700ms` + `800ms` + `SKIPPED` `0ms` = `1_500ms`) for `workUnitKey = "pkg.MultiMethodTest"` -> asserts `findHistoricalDurationsMs(List.of("pkg.MultiMethodTest"), 10)` returns `1_250L` (`(1_000 + 1_500) / 2`), **not** `520L` (per-row average) and **not** `1_300L` (summing retry attempt 1).
@@ -246,12 +237,21 @@ Add to `DistributionBrokerServerTest.java`:
 
 - [ ] **Step 2: Run coordinator tests to verify RED**
 
-Run: `./mvnw test -pl tools/citrus-test-distribution-coordinator -Dtest=JdbcDistributionStoreTest,BrokerSessionCoordinatorTest,DistributionBrokerServerTest -Dcitrus.test.distribution.enabled=false`
-Expected: FAIL (`minPartitionDurationMs` / `/api/v1/history/durations` missing; `JdbcDistributionStoreTest` multi-method assertion fails).
+Run: `./mvnw test -pl tools/citrus-test-distribution-coordinator -Dtest=LptPartitionSchedulerTest,JdbcDistributionStoreTest,BrokerSessionCoordinatorTest,DistributionBrokerServerTest -Dcitrus.test.distribution.enabled=false`
+Expected: FAIL (9-arg `schedule`, `minPartitionDurationMs` / `/api/v1/history/durations` missing; `JdbcDistributionStoreTest` multi-method assertion fails).
 
-- [ ] **Step 3: Implement `JdbcDistributionStore` session-sum query, `DistributionBrokerConfig`, adaptive `BrokerSessionCoordinator`, and HTTP route**
+- [ ] **Step 3: Implement adaptive `LptPartitionScheduler`, `JdbcDistributionStore` session-sum query, `DistributionBrokerConfig`, adaptive `BrokerSessionCoordinator`, and HTTP route**
 
-1. In `JdbcDistributionStore.findHistoricalDurationsMs` (`lines 815-843`):
+1. In `LptPartitionScheduler`: keep existing 5-arg and 6-arg `schedule` methods delegating to the 9-arg `schedule(..., 0L, 0, caps -> 0)`. In `lptPartitions`:
+   - `int maxBinsFromSize = Math.ceilDiv(n, capSize);`
+   - `long totalEstimatedMs = groupUnits.stream().mapToLong(EnrichedUnit::estimatedDurationMs).sum();`
+   - `int targetBinsByDuration = minPartitionDurationMs > 0 ? (int) Math.clamp(Math.ceilDiv(Math.max(1L, totalEstimatedMs), minPartitionDurationMs), 1L, n) : maxBinsFromSize;`
+   - `int eligibleWorkers = eligibleWorkerCounter == null ? 0 : Math.max(0, eligibleWorkerCounter.apply(groupCapabilities));`
+   - `int maxBinsByWorkers = (maxWavesPerWorker > 0 && eligibleWorkers > 0) ? (int) Math.min((long) n, (long) eligibleWorkers * maxWavesPerWorker) : maxBinsFromSize;`
+   - `int binCount = Math.max(1, Math.min(maxBinsFromSize, Math.min(targetBinsByDuration, maxBinsByWorkers)));`
+   - `int effectiveCapSize = Math.ceilDiv(n, binCount);`
+   - Place each unit (descending `estimatedDurationMs`, tie-broken by `key`) into the least-loaded bin with `bin.units.size() < effectiveCapSize`.
+2. In `JdbcDistributionStore.findHistoricalDurationsMs` (`lines 815-843`):
    - Query:
      ```sql
      SELECT COALESCE(session_id, '') AS sess_key,
@@ -264,13 +264,13 @@ Expected: FAIL (`minPartitionDurationMs` / `/api/v1/history/durations` missing; 
      ORDER BY last_recorded_at DESC, run_attempt DESC
      ```
    - Iterate rows in order: for non-empty `sess_key`, skip if already seen in `seenSessions` (keeping only the latest attempt); include rows with `total_duration_ms > 0` (or floor positive runs at `1L` when row matched `PASSED`/`FAILED`) up to `Math.max(1, recentLimit)` session runs, and put `Math.max(1L, Math.round((double) sum / count))` into `result` when `count > 0`.
-2. In `DistributionBrokerConfig`: add `minPartitionDurationMs` (default `5_000L`, `Math.max(0L, ...)`) and `maxWavesPerWorker` (default `2`, `Math.max(0, ...)`), wired in `Builder` and `fromSettings()`.
-3. In `BrokerSessionCoordinator`:
+3. In `DistributionBrokerConfig`: add `minPartitionDurationMs` (default `5_000L`, `Math.max(0L, ...)`) and `maxWavesPerWorker` (default `2`, `Math.max(0, ...)`), wired in `Builder` and `fromSettings()`.
+4. In `BrokerSessionCoordinator`:
    - Track `final int requestedMaxPartitionSize` on `SessionRuntime` (`request.maxPartitionSize()`).
    - Add `countEligibleOnlineWorkers(Map<String, String> requiredCapabilities)` counting distinct `conn.workerId` in `workers.values()` where `(conn.state == WorkerState.IDLE || conn.state == WorkerState.BUSY) && conn.cancelledPartitionId == null && conn.lastHeartbeatAt >= (System.currentTimeMillis() - config.leaseTimeoutMs()) && CapabilityMatcher.matches(requiredCapabilities, conn.capabilities)`.
    - In `submitWork`, set `boolean adaptive = session.requestedMaxPartitionSize <= 0 && (request.outputPaths() == null || request.outputPaths().isEmpty());` and call 9-arg `scheduler.schedule(sessionId, enrichedUnits, historicalDurations, config.defaultDurationMs(), session.maxPartitionSize, policy, adaptive ? config.minPartitionDurationMs() : 0L, adaptive ? config.maxWavesPerWorker() : 0, adaptive ? this::countEligibleOnlineWorkers : caps -> 0)`.
    - Add `public Map<String, Long> findHistoricalDurations(List<String> testKeys, int limit)` returning `Map.of()` when `testKeys == null || testKeys.isEmpty()`, otherwise delegating to `store.findHistoricalDurationsMs(dedupedNonBlankKeys, limit <= 0 ? 10 : Math.min(limit, 100))`.
-4. In `DistributionBrokerVerticle`: mount `router.post("/api/v1/history/durations").handler(this::handleHistoricalDurations)` validating body & `testKeys.size() <= 10_000` (`400` on violation) and returning `200` JSON `HistoricalDurationsResponse`.
+5. In `DistributionBrokerVerticle`: mount `router.post("/api/v1/history/durations").handler(this::handleHistoricalDurations)` validating body & `testKeys.size() <= 10_000` (`400` on violation) and returning `200` JSON `HistoricalDurationsResponse`.
 
 - [ ] **Step 4: Run all coordinator tests and install reactor artifact**
 
