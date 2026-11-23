@@ -22,6 +22,7 @@ import java.sql.DriverManager;
 import java.sql.Statement;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 
 import org.citrusframework.distribution.model.BuildSessionRecord;
 import org.citrusframework.distribution.model.PartitionRecord;
@@ -45,6 +46,108 @@ class JdbcDistributionStoreTest {
 
     @TempDir
     Path tempDir;
+
+    @Test
+    void shouldSumMethodDurationsPerSessionAndKeepOnlyLatestAttemptWhenComputingHistoricalDurations() {
+        String key = "pkg.MultiMethodTest";
+        try (JdbcDistributionStore store = new JdbcDistributionStore("jdbc:hsqldb:mem:duration_history", "SA", "")) {
+            store.initialize();
+            saveDuration(store, key, "sess-1", 1, TestOutcomeStatus.FAILED, 100L, 1L);
+            saveDuration(store, key, "sess-1", 2, TestOutcomeStatus.PASSED, 400L, 2L);
+            saveDuration(store, key, "sess-1", 2, TestOutcomeStatus.PASSED, 600L, 3L);
+            saveDuration(store, key, "sess-2", 1, TestOutcomeStatus.PASSED, 700L, 4L);
+            saveDuration(store, key, "sess-2", 1, TestOutcomeStatus.PASSED, 800L, 5L);
+            saveDuration(store, key, "sess-2", 1, TestOutcomeStatus.SKIPPED, 0L, 6L);
+
+            assertThat(store.findHistoricalDurationsMs(List.of(key), 10)).containsEntry(key, 1_250L);
+            assertThat(store.findHistoricalDurationsMs(List.of(key), 1)).containsEntry(key, 1_500L);
+
+            // More attempts in the most recent session must not consume the sample limit.
+            saveDuration(store, key, "sess-2", 2, TestOutcomeStatus.PASSED, 3_000L, 5L);
+            assertThat(store.findHistoricalDurationsMs(List.of(key), 2)).containsEntry(key, 2_000L);
+        }
+    }
+
+    @Test
+    void shouldKeepHighestRemoteAttemptAndRankSessionsBySelectedRunRecency() {
+        String key = "pkg.RetryTest";
+        try (JdbcDistributionStore store = new JdbcDistributionStore("jdbc:hsqldb:mem:retry_history", "SA", "")) {
+            store.initialize();
+            saveDuration(store, key, "sess-retry", 2, TestOutcomeStatus.PASSED, 600L, 2L);
+            saveDuration(store, key, "sess-new", 1, TestOutcomeStatus.PASSED, 800L, 3L);
+            saveDuration(store, key, "sess-retry", 1, TestOutcomeStatus.FAILED, 10L, 4L);
+            assertThat(store.findHistoricalDurationsMs(List.of(key), 1)).containsEntry(key, 800L);
+            assertThat(store.findHistoricalDurationsMs(List.of(key), 2)).containsEntry(key, 700L);
+        }
+    }
+
+    @Test
+    void shouldFindRecentTimedSessionsBeyondTheFirstCandidatePageIncludingTies() {
+        String key = "pkg.PagedHistoryTest";
+        try (JdbcDistributionStore store = new JdbcDistributionStore("jdbc:hsqldb:mem:paged_history", "SA", "")) {
+            store.initialize();
+            // The stale attempts fill two pages with the same raw timestamp, but never enter the average.
+            for (int i = 0; i < 64; i++) {
+                String session = "sess-stale-" + i;
+                saveDuration(store, key, session, 2, TestOutcomeStatus.PASSED, 600L, 50L);
+                saveDuration(store, key, session, 1, TestOutcomeStatus.FAILED, 10L, 100L);
+            }
+            // This session's selected run ties on timestamp and wins on session ID.
+            saveDuration(store, key, "sess-first", 1, TestOutcomeStatus.PASSED, 800L, 50L);
+            saveDuration(store, key, null, 1, TestOutcomeStatus.PASSED, 80L, 49L);
+            assertThat(store.findHistoricalDurationsMs(List.of(key), 1)).containsEntry(key, 800L);
+            assertThat(store.findHistoricalDurationsMs(List.of(key), 2)).containsEntry(key, 700L);
+        }
+    }
+
+    @Test
+    void shouldOnlySumLatestLocalResultsForDistinctTestIdentities() {
+        String key = "pkg.LocalHistoryTest";
+        try (JdbcDistributionStore store = new JdbcDistributionStore("jdbc:hsqldb:mem:local_history", "SA", "")) {
+            store.initialize();
+            saveLocalDuration(store, key, "same-name", null, 1, TestOutcomeStatus.FAILED, 20L, 1L);
+            saveLocalDuration(store, key, "same-name", "first-id", 2, TestOutcomeStatus.PASSED, 100L, 2L);
+            saveLocalDuration(store, key, "same-name", "second-id", 1, TestOutcomeStatus.PASSED, 200L, 3L);
+            saveLocalDuration(store, key, "skipped-later", null, 1, TestOutcomeStatus.PASSED, 30L, 4L);
+            saveLocalDuration(store, key, "skipped-later", null, 2, TestOutcomeStatus.SKIPPED, 0L, 5L);
+            saveDuration(store, key, "sess-local", 1, TestOutcomeStatus.PASSED, 500L, 4L);
+            assertThat(store.findHistoricalDurationsMs(List.of(key), 10)).containsEntry(key, 300L);
+
+            saveDuration(store, key, "sess-local", 2, TestOutcomeStatus.PASSED, 800L, 6L);
+            assertThat(store.findHistoricalDurationsMs(List.of(key), 10)).containsEntry(key, 800L);
+        }
+    }
+
+    private static void saveLocalDuration(JdbcDistributionStore store, String key, String test, String uniqueId,
+                                          int attempt, TestOutcomeStatus status, long duration, long recordedAt) {
+        store.saveTestExecution(new TestExecutionRecord(UUID.randomUUID().toString(), "sess-local", "local",
+                "local-host", key, key, test, status, duration, attempt, false, null, null, List.of(), recordedAt,
+                uniqueId));
+    }
+
+    @Test
+    void shouldKeepLegacyRowsSeparateAndAverageLargeDurationsWithoutOverflow() {
+        String key = "pkg.LegacyTest";
+        try (JdbcDistributionStore store = new JdbcDistributionStore("jdbc:hsqldb:mem:legacy_history", "SA", "")) {
+            store.initialize();
+            saveDuration(store, key, null, 1, TestOutcomeStatus.PASSED, Long.MAX_VALUE, 1L);
+            saveDuration(store, key, "", 1, TestOutcomeStatus.PASSED, Long.MAX_VALUE - 2, 2L);
+            saveDuration(store, key, " ", 1, TestOutcomeStatus.PASSED, Long.MAX_VALUE - 4, 3L);
+            assertThat(store.findHistoricalDurationsMs(List.of(key), 2)).containsEntry(key, Long.MAX_VALUE - 3);
+
+            String sessionKey = "pkg.LargeTest";
+            saveDuration(store, sessionKey, "sess-1", 1, TestOutcomeStatus.PASSED, Long.MAX_VALUE, 1L);
+            saveDuration(store, sessionKey, "sess-1", 1, TestOutcomeStatus.PASSED, Long.MAX_VALUE, 2L);
+            saveDuration(store, sessionKey, "sess-2", 1, TestOutcomeStatus.PASSED, 3L, 3L);
+            assertThat(store.findHistoricalDurationsMs(List.of(sessionKey), 2)).containsEntry(sessionKey, Long.MAX_VALUE);
+        }
+    }
+
+    private static void saveDuration(JdbcDistributionStore store, String key, String session, int attempt,
+                                     TestOutcomeStatus status, long duration, long recordedAt) {
+        store.saveTestExecution(new TestExecutionRecord(UUID.randomUUID().toString(), session, "part",
+                "worker", key, key, "test", status, duration, attempt, false, null, null, List.of(), recordedAt));
+    }
 
     @Test
     void shouldPersistSessionsWorkersPartitionsAndTestDurationsAcrossRestart() {
@@ -225,7 +328,7 @@ class JdbcDistributionStoreTest {
     }
 
     @Test
-    void shouldAddFailureReasonColumnToLegacySessionTable() throws Exception {
+    void shouldAddMissingColumnsToLegacySessionTable() throws Exception {
         String jdbcUrl = "jdbc:hsqldb:file:" + tempDir.resolve("db/legacy-sessions").toAbsolutePath() + ";shutdown=true";
         try (java.sql.Connection conn = java.sql.DriverManager.getConnection(jdbcUrl, "SA", "");
              java.sql.Statement stmt = conn.createStatement()) {
@@ -239,6 +342,7 @@ class JdbcDistributionStoreTest {
         try (JdbcDistributionStore store = new JdbcDistributionStore(jdbcUrl, "SA", "")) {
             store.initialize();
             assertThat(store.findSession("sess-old").orElseThrow().failureReason()).isNull();
+            assertThat(store.findRequestedMaxPartitionSize("sess-old")).isEmpty();
         }
     }
 

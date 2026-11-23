@@ -21,12 +21,14 @@ import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Consumer;
 
+import org.citrusframework.distribution.TestExecutionIdentity;
 import org.citrusframework.distribution.config.DistributionJson;
 import org.citrusframework.distribution.config.DistributionSettings;
 import org.citrusframework.distribution.model.ArtifactRef;
@@ -102,12 +104,12 @@ public final class BrokerSessionCoordinator {
                 0L,
                 0, 0, 0, 0, 0, 0, 0L, 0L
         );
-        store.saveSession(record);
+        store.saveSession(record, request.maxPartitionSize());
         if (request.changedFiles() != null && !request.changedFiles().isEmpty()) {
             store.saveChangedFiles(sessionId, request.changedFiles());
         }
 
-        sessions.put(sessionId, new SessionRuntime(record, maxPartSize, maxRetries));
+        sessions.put(sessionId, new SessionRuntime(record, maxPartSize, maxRetries, request.maxPartitionSize()));
         eventHub.publish("session.created", sessionId, null, null, Map.of(
                 "projectName", record.projectName(),
                 "status", record.status().name()));
@@ -144,6 +146,8 @@ public final class BrokerSessionCoordinator {
         List<String> keys = units.stream().map(WorkUnitSpec::key).toList();
         Map<String, Long> historicalDurations = store.findHistoricalDurationsMs(keys, 10);
 
+        boolean adaptive = session.requestedMaxPartitionSize <= 0 && request.outputPaths().isEmpty();
+
         // Schedule before touching any state: an invalid SINGLE submission must leave no trace.
         List<PartitionRecord> scheduled = scheduler.schedule(
                 sessionId,
@@ -151,7 +155,10 @@ public final class BrokerSessionCoordinator {
                 historicalDurations,
                 config.defaultDurationMs(),
                 session.maxPartitionSize,
-                request.partitionPolicy());
+                request.partitionPolicy(),
+                adaptive ? config.minPartitionDurationMs() : 0L,
+                adaptive ? config.maxWavesPerWorker() : 0,
+                this::countEligibleOnlineWorkers);
 
         session.cachedBlobs += Math.max(0, request.cachedBlobs());
         session.uploadedBlobs += Math.max(0, request.uploadedBlobs());
@@ -493,6 +500,19 @@ public final class BrokerSessionCoordinator {
         return store.listTestHistory(limit);
     }
 
+    public Map<String, Long> findHistoricalDurations(List<String> testKeys, int limit) {
+        if (testKeys == null || testKeys.isEmpty()) {
+            return Map.of();
+        }
+        List<String> keys = testKeys.stream()
+                .filter(Objects::nonNull)
+                .filter(key -> !key.isBlank())
+                .distinct()
+                .toList();
+        int recentLimit = limit <= 0 ? 10 : Math.min(limit, 100);
+        return store.findHistoricalDurationsMs(keys, recentLimit);
+    }
+
     public int seedDemoData() {
         int count = DemoDataSeeder.seed(store);
         eventHub.publish("demo.seeded", null, null, null, Map.of("sessionsSeeded", count));
@@ -604,7 +624,7 @@ public final class BrokerSessionCoordinator {
                     SessionRuntime session = getOrRehydrateSession(pr.record.sessionId());
                     String testKey = session != null
                             ? session.testKey(evt.workUnitKey(), evt.className(), evt.testName(), evt.uniqueId())
-                            : testIdentityKey(evt.workUnitKey(), evt.className(), evt.testName(), evt.uniqueId());
+                            : TestExecutionIdentity.key(evt.workUnitKey(), evt.className(), evt.testName(), evt.uniqueId());
                     if (evt.status() == TestOutcomeStatus.STARTED) {
                         pr.inFlightTestKey = testKey;
                     } else {
@@ -935,6 +955,17 @@ public final class BrokerSessionCoordinator {
                 capabilities, unit.estimatedDurationMs(), unit.enclosingClassNames());
     }
 
+    private int countEligibleOnlineWorkers(Map<String, String> requiredCapabilities) {
+        long aliveSince = System.currentTimeMillis() - config.leaseTimeoutMs();
+        return (int) workers.values().stream()
+                .filter(conn -> conn.state == WorkerState.IDLE || conn.state == WorkerState.BUSY)
+                .filter(conn -> conn.cancelledPartitionId == null && conn.lastHeartbeatAt >= aliveSince)
+                .filter(conn -> CapabilityMatcher.matches(requiredCapabilities, conn.capabilities))
+                .map(conn -> conn.workerId)
+                .distinct()
+                .count();
+    }
+
     /**
      * An idle worker that is not finishing a cancelled attempt, has been heard from within the lease timeout, and
      * satisfies {@code requiredCapabilities}. Workers outside {@code preferAvoiding} (those that ran earlier attempts
@@ -1075,26 +1106,6 @@ public final class BrokerSessionCoordinator {
         );
     }
 
-    /** Length the store keeps of a unique id; keys use the same prefix so live and rehydrated keys agree. */
-    private static final int UNIQUE_ID_KEY_LENGTH = 1024;
-
-    /**
-     * Identity of one test across attempts: work unit plus JUnit unique id when reported, otherwise work unit, class,
-     * and display name. The unique id keeps parameterized and dynamic invocations with equal display names apart; the
-     * work unit keeps Citrus factory sources apart, since each source runs in its own filtered JUnit run and so always
-     * reports the same {@code [dynamic-test:#1]} id.
-     */
-    private static String testIdentityKey(String workUnitKey, String className, String testName, String uniqueId) {
-        if (uniqueId != null && !uniqueId.isBlank()) {
-            String uid = uniqueId.length() > UNIQUE_ID_KEY_LENGTH ? uniqueId.substring(0, UNIQUE_ID_KEY_LENGTH) : uniqueId;
-            return "uid:" + (workUnitKey != null ? workUnitKey : "") + "|" + uid;
-        }
-        String keyPart = (workUnitKey != null && !workUnitKey.isBlank()) ? workUnitKey : "";
-        String cls = (className != null && !className.isBlank()) ? className : "";
-        String tst = (testName != null && !testName.isBlank()) ? testName : "";
-        return keyPart + "|" + cls + "#" + tst;
-    }
-
     private SessionRuntime getOrRehydrateSession(String sessionId) {
         SessionRuntime existing = sessions.get(sessionId);
         if (existing != null) {
@@ -1105,10 +1116,13 @@ public final class BrokerSessionCoordinator {
             return null;
         }
         BuildSessionRecord record = stored.get();
+        int defaultPartitionSize = config.defaultMaxPartitionSize();
+        // Sessions created before the requested size was stored keep the fixed broker default.
+        int requestedMaxPartitionSize = store.findRequestedMaxPartitionSize(sessionId)
+                .orElse(Math.max(1, defaultPartitionSize));
+        int maxPartitionSize = requestedMaxPartitionSize > 0 ? requestedMaxPartitionSize : defaultPartitionSize;
         SessionRuntime rehydrated = new SessionRuntime(
-                record,
-                config.defaultMaxPartitionSize(),
-                config.defaultMaxRetries());
+                record, maxPartitionSize, config.defaultMaxRetries(), requestedMaxPartitionSize);
         rehydrated.cachedBlobs = Math.max(0, record.cachedBlobs());
         rehydrated.uploadedBlobs = Math.max(0, record.totalBlobs() - record.cachedBlobs());
         Set<String> seenPartitionIds = new HashSet<>();
@@ -1155,41 +1169,26 @@ public final class BrokerSessionCoordinator {
         private BuildSessionRecord record;
         private final int maxPartitionSize;
         private final int maxRetries;
+        private final int requestedMaxPartitionSize;
         private final List<String> partitionIds = new ArrayList<>();
         private final Set<String> failedOrInterruptedTests = new HashSet<>();
         private final Map<String, TestExecutionRecord> latestExecutionsByTest = new LinkedHashMap<>();
-        /** Legacy test key (no unique id) to the unique-id key that took it over. */
-        private final Map<String, String> legacyKeyOwners = new java.util.HashMap<>();
+        private final TestExecutionIdentity testIdentities = new TestExecutionIdentity();
         private final Set<String> locallyExecutedWorkUnitKeys = new HashSet<>();
         private int cachedBlobs;
         private int uploadedBlobs;
         private int submittedUnitCount;
         private int reportedLocalTestCount;
 
-        private SessionRuntime(BuildSessionRecord record, int maxPartitionSize, int maxRetries) {
+        private SessionRuntime(BuildSessionRecord record, int maxPartitionSize, int maxRetries, int requestedMaxPartitionSize) {
             this.record = record;
             this.maxPartitionSize = maxPartitionSize;
             this.maxRetries = maxRetries;
+            this.requestedMaxPartitionSize = requestedMaxPartitionSize;
         }
 
-        /**
-         * Identity key of a test in this session. A test first recorded without a unique id (older worker or launcher,
-         * or a row stored before the column existed) keeps that legacy key, so its retries with a unique id still
-         * count as the same test. Only the first unique id seen for a legacy key takes it over: invocations sharing a
-         * display name (parameterized, dynamic) stay separate tests.
-         */
         private String testKey(String workUnitKey, String className, String testName, String uniqueId) {
-            String key = testIdentityKey(workUnitKey, className, testName, uniqueId);
-            if (!latestExecutionsByTest.containsKey(key)) {
-                String legacy = testIdentityKey(workUnitKey, className, testName, null);
-                if (!legacy.equals(key) && latestExecutionsByTest.containsKey(legacy)) {
-                    String owner = legacyKeyOwners.putIfAbsent(legacy, key);
-                    if (owner == null || owner.equals(key)) {
-                        return legacy;
-                    }
-                }
-            }
-            return key;
+            return testIdentities.resolve(workUnitKey, className, testName, uniqueId, latestExecutionsByTest::containsKey);
         }
 
         private int nextAttemptFor(String key) {

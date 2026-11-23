@@ -20,6 +20,7 @@ import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.stream.IntStream;
 
 import org.citrusframework.distribution.config.DistributionJson;
 import org.citrusframework.distribution.config.DistributionSettings;
@@ -79,6 +80,127 @@ class BrokerSessionCoordinatorTest {
         store.initialize();
         hub = new BrokerEventStreamHub();
         coordinator = new BrokerSessionCoordinator(config, store, hub);
+    }
+
+    @Test
+    void shouldPackFastUnitsAdaptivelyWhenSessionMaxPartitionSizeIsDefaultZero() {
+        assertFastUnitsScheduled(0, List.of(), 12, 1);
+    }
+
+    @Test
+    void shouldHonorExplicitPositiveSessionMaxPartitionSizeWithoutAdaptivePacking() {
+        assertFastUnitsScheduled(2, List.of(), 6, 3);
+    }
+
+    @Test
+    void shouldHonorExplicitPartitionCapAfterRestart() {
+        assertPartitionSizingAfterRestart(2, 3, 2);
+    }
+
+    @Test
+    void shouldRetainAdaptivePartitionSizingAfterRestart() {
+        assertPartitionSizingAfterRestart(0, 1, 6);
+    }
+
+    private void assertPartitionSizingAfterRestart(int requestedSize, int partitionCount, int largestPartition) {
+        String jdbcUrl = "jdbc:hsqldb:file:" + tempDir.resolve("restart/session-store") + ";shutdown=true";
+        String sessionId;
+        try (JdbcDistributionStore before = new JdbcDistributionStore(jdbcUrl, "SA", "")) {
+            before.initialize();
+            BrokerSessionCoordinator running = new BrokerSessionCoordinator(
+                    DistributionBrokerConfig.builder().defaultMaxPartitionSize(10).build(),
+                    before, new BrokerEventStreamHub());
+            sessionId = running.createSession(
+                    new CreateSessionRequest("citrus", "main", "abc", List.of(), requestedSize, 1)).sessionId();
+        }
+
+        try (JdbcDistributionStore after = new JdbcDistributionStore(jdbcUrl, "SA", "")) {
+            after.initialize();
+            BrokerSessionCoordinator restarted = new BrokerSessionCoordinator(
+                    DistributionBrokerConfig.builder().defaultMaxPartitionSize(4).minPartitionDurationMs(5_000L).build(),
+                    after, new BrokerEventStreamHub());
+            List<WorkUnitSpec> units = IntStream.range(0, 6).mapToObj(i -> unit("pkg.RestartTest" + i)).toList();
+            restarted.submitWork(sessionId, new SubmitWorkRequest("sub-after-restart", "module", List.of(), Map.of(),
+                    units, 0, 0));
+
+            assertThat(after.listPartitions(sessionId)).hasSize(partitionCount)
+                    .allSatisfy(partition -> assertThat(partition.workUnits()).hasSize(largestPartition));
+        }
+    }
+
+    @Test
+    void shouldPreservePartitionSizeCapForDeclaredOutputs() {
+        assertFastUnitsScheduled(0, List.of("target/docs"), 12, 2);
+    }
+
+    @Test
+    void shouldCapWavesByDistinctEligibleOnlineWorkersIncludingBusyWorkers() {
+        coordinator = new BrokerSessionCoordinator(DistributionBrokerConfig.builder()
+                .defaultMaxPartitionSize(2)
+                .minPartitionDurationMs(0L)
+                .maxWavesPerWorker(2)
+                .build(), store, hub);
+        Map<String, String> docker = Map.of("docker", "true");
+        Worker busy = register("docker-one", "worker-one", docker);
+        String busySession = newSession(0);
+        submit(busySession, "sub-busy", List.of(), List.of(), false,
+                new WorkUnitSpec("pkg.BusyTest", "pkg.BusyTest", null, null, docker, 1_000L));
+        assertThat(busy.assignments()).hasSize(1);
+
+        register("docker-two", "worker-two", docker);
+        register("docker-duplicate", "worker-two", docker);
+        register("docker-draining", "worker-three", docker).send(WorkerWsMessage.WORKER_DRAINING, Map.of());
+        register("no-docker", "worker-four", Map.of());
+
+        String sessionId = coordinator.createSession(
+                new CreateSessionRequest("citrus", "main", "abc", List.of(), 0, 0)).sessionId();
+        WorkUnitSpec[] units = IntStream.range(0, 12).mapToObj(i -> {
+            String key = "pkg.DockerTest" + i;
+            return new WorkUnitSpec(key, key, null, null, docker, 1_000L);
+        }).toArray(WorkUnitSpec[]::new);
+        submit(sessionId, "sub-docker", List.of(), List.of(), false, units);
+
+        assertThat(store.listPartitions(sessionId)).hasSize(4)
+                .allSatisfy(partition -> assertThat(partition.workUnits()).hasSize(3));
+    }
+
+    @Test
+    void shouldResolveAdaptiveSettingsThroughBrokerConfigBuilder() {
+        String property = DistributionBrokerConfig.MIN_PARTITION_DURATION_MS_PROPERTY;
+        String previous = System.getProperty(property);
+        try {
+            System.setProperty(property, "4500");
+            assertThat(DistributionBrokerConfig.builder().build().minPartitionDurationMs()).isEqualTo(4_500L);
+            assertThat(DistributionBrokerConfig.fromSettings().minPartitionDurationMs()).isEqualTo(4_500L);
+            DistributionBrokerConfig disabled = DistributionBrokerConfig.builder()
+                    .minPartitionDurationMs(-1L).maxWavesPerWorker(-1).build();
+            assertThat(disabled.minPartitionDurationMs()).isZero();
+            assertThat(disabled.maxWavesPerWorker()).isZero();
+        } finally {
+            if (previous == null) {
+                System.clearProperty(property);
+            } else {
+                System.setProperty(property, previous);
+            }
+        }
+    }
+
+    private void assertFastUnitsScheduled(int requestedSize, List<String> outputs, int unitCount, int expectedPartitions) {
+        String sessionId = coordinator.createSession(
+                new CreateSessionRequest("citrus", "main", "abc", List.of(), requestedSize, 1)).sessionId();
+        register("one", "worker-one", WORKSPACE_CAPS);
+        register("two", "worker-two", WORKSPACE_CAPS);
+
+        WorkUnitSpec[] units = IntStream.range(0, unitCount).mapToObj(i -> {
+            WorkUnitSpec unit = unit("pkg.FastTest" + i);
+            store.saveTestExecution(new TestExecutionRecord("historical-" + i, "history", "part", "worker",
+                    unit.key(), unit.className(), "test", TestOutcomeStatus.PASSED, 200L, 1,
+                    false, null, null, List.of(), 1L));
+            return unit;
+        }).toArray(WorkUnitSpec[]::new);
+        submit(sessionId, "sub-fast", List.of(), outputs, false, units);
+
+        assertThat(store.listPartitions(sessionId)).hasSize(expectedPartitions);
     }
 
     @Test
@@ -715,6 +837,30 @@ class BrokerSessionCoordinatorTest {
 
         BuildSessionRecord completed = coordinator.completeSession(sessionId, new CompleteSessionRequest(0, 0, 0, 0L));
         assertThat(completed.status()).isEqualTo(SessionStatus.FAILED);
+    }
+
+    @Test
+    void shouldEstimateFullClassFromLocalFallbackWithDifferentPerTestAttempts() {
+        String testClass = "pkg.FallbackIT";
+        String sessionId = newSession(0);
+        Worker worker = register("conn-fallback", "worker-fallback", Map.of());
+        submit(sessionId, "sub-fallback", List.of(), List.of(), false, unit(testClass));
+        PartitionAssignPayload assignment = worker.lastAssignment();
+        worker.send(WorkerWsMessage.TEST_EVENT, DistributionJson.convert(new WorkerTestEventPayload(
+                assignment.partitionId(), sessionId, 1, testClass, testClass, "alpha", TestOutcomeStatus.PASSED,
+                100L, null, null, List.of(), "alpha-id"), Map.class));
+        coordinator.handleWorkerDisconnect("conn-fallback");
+        assertThat(partition(sessionId).state()).isEqualTo(PartitionState.LOST);
+
+        coordinator.reportLocalTests(sessionId, new ReportLocalTestsRequest("local-host", List.of(
+                new WorkerTestEventPayload("local", sessionId, 1, testClass, testClass, "alpha", TestOutcomeStatus.PASSED,
+                        300L, null, null, List.of(), "alpha-id"),
+                new WorkerTestEventPayload("local", sessionId, 1, testClass, testClass, "beta", TestOutcomeStatus.PASSED,
+                        700L, null, null, List.of(), "beta-id"))));
+        assertThat(store.listTestExecutions(sessionId)).filteredOn(test -> "local".equals(test.partitionId()))
+                .extracting(TestExecutionRecord::testName, TestExecutionRecord::attempt)
+                .containsExactlyInAnyOrder(tuple("alpha", 2), tuple("beta", 1));
+        assertThat(coordinator.findHistoricalDurations(List.of(testClass), 1)).containsEntry(testClass, 1_000L);
     }
 
     @Test

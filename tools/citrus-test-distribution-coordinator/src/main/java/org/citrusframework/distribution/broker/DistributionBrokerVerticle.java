@@ -42,6 +42,8 @@ import org.citrusframework.distribution.model.BuildSessionRecord;
 import org.citrusframework.distribution.model.BuildSessionResponse;
 import org.citrusframework.distribution.model.CompleteSessionRequest;
 import org.citrusframework.distribution.model.CreateSessionRequest;
+import org.citrusframework.distribution.model.HistoricalDurationsRequest;
+import org.citrusframework.distribution.model.HistoricalDurationsResponse;
 import org.citrusframework.distribution.model.MissingDigestsRequest;
 import org.citrusframework.distribution.model.MissingDigestsResponse;
 import org.citrusframework.distribution.model.ReportLocalTestsRequest;
@@ -52,6 +54,9 @@ import org.citrusframework.distribution.model.WorkerRegisterPayload;
 import org.citrusframework.distribution.model.WorkerWsMessage;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import tools.jackson.core.JacksonException;
+import tools.jackson.databind.DeserializationFeature;
+import tools.jackson.databind.ObjectReader;
 
 /**
  * Vert.x 5 HTTP/REST, SSE, Static Web UI, and Worker WebSocket verticle for the Test Distribution Broker.
@@ -59,6 +64,10 @@ import org.slf4j.LoggerFactory;
 public final class DistributionBrokerVerticle extends AbstractVerticle {
 
     private static final Logger LOG = LoggerFactory.getLogger(DistributionBrokerVerticle.class);
+    private static final int MAX_HISTORY_TEST_KEYS = 10_000;
+    private static final ObjectReader HISTORY_REQUEST_READER = DistributionJson.mapper()
+            .readerFor(HistoricalDurationsRequest.class)
+            .with(DeserializationFeature.FAIL_ON_TRAILING_TOKENS);
     private static final long MAX_BODY_BYTES = 256L * 1024L * 1024L;
 
     private final DistributionBrokerConfig config;
@@ -124,6 +133,7 @@ public final class DistributionBrokerVerticle extends AbstractVerticle {
 
         router.get("/api/v1/workers").handler(ctx -> writeJson(ctx, 200, coordinator.listWorkers()));
         router.get("/api/v1/tests/history").handler(this::handleTestHistory);
+        router.post("/api/v1/history/durations").handler(this::handleHistoricalDurations);
         router.post("/api/v1/demo/seed").handler(this::handleSeedDemo);
 
         leaseTimerId = vertx.setPeriodic(5_000L, id -> coordinator.sweepExpiredLeases());
@@ -323,6 +333,26 @@ public final class DistributionBrokerVerticle extends AbstractVerticle {
         int limit = parseIntParam(ctx.request().getParam("limit"), 100);
         vertx.executeBlocking(() -> coordinator.listTestHistory(limit))
                 .onSuccess(list -> writeJson(ctx, 200, list))
+                .onFailure(err -> writeError(ctx, err));
+    }
+
+    private void handleHistoricalDurations(RoutingContext ctx) {
+        vertx.executeBlocking(() -> {
+            String body = ctx.body().asString();
+            HistoricalDurationsRequest request;
+            try {
+                request = body == null ? null : HISTORY_REQUEST_READER.readValue(body);
+            } catch (JacksonException e) {
+                throw new IllegalArgumentException("Invalid historical durations request", e);
+            }
+            if (request == null) {
+                throw new IllegalArgumentException("Missing historical durations request");
+            }
+            if (request.testKeys().size() > MAX_HISTORY_TEST_KEYS) {
+                throw new IllegalArgumentException("At most " + MAX_HISTORY_TEST_KEYS + " test keys are allowed");
+            }
+            return new HistoricalDurationsResponse(coordinator.findHistoricalDurations(request.testKeys(), request.limit()));
+        }).onSuccess(response -> writeJson(ctx, 200, response))
                 .onFailure(err -> writeError(ctx, err));
     }
 

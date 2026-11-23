@@ -20,6 +20,7 @@ import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.OptionalInt;
 
 import org.citrusframework.distribution.model.BuildSessionRecord;
 import org.citrusframework.distribution.model.PartitionRecord;
@@ -39,6 +40,16 @@ public interface DistributionStore extends AutoCloseable {
     void initialize();
 
     void saveSession(BuildSessionRecord session);
+
+    /** Saves the session and its requested partition size. A non-positive size requests broker-managed sizing. */
+    default void saveSession(BuildSessionRecord session, int requestedMaxPartitionSize) {
+        saveSession(session);
+    }
+
+    /** Returns the original requested size when available, including zero for broker-managed sizing. */
+    default OptionalInt findRequestedMaxPartitionSize(String sessionId) {
+        return OptionalInt.empty();
+    }
 
     /** Updates status and totals and clears any failure reason. */
     default void updateSessionStatus(String sessionId, SessionStatus status, long finishedAt, SessionSummary summary) {

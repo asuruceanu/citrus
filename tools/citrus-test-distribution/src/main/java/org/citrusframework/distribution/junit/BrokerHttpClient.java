@@ -24,11 +24,17 @@ import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.net.http.HttpTimeoutException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.function.Predicate;
 
 import org.citrusframework.distribution.cache.ClasspathPackager;
@@ -37,26 +43,35 @@ import org.citrusframework.distribution.model.BrokerEvent;
 import org.citrusframework.distribution.model.BuildSessionResponse;
 import org.citrusframework.distribution.model.CompleteSessionRequest;
 import org.citrusframework.distribution.model.CreateSessionRequest;
+import org.citrusframework.distribution.model.HistoricalDurationsRequest;
+import org.citrusframework.distribution.model.HistoricalDurationsResponse;
 import org.citrusframework.distribution.model.MissingDigestsRequest;
 import org.citrusframework.distribution.model.MissingDigestsResponse;
 import org.citrusframework.distribution.model.ReportLocalTestsRequest;
 import org.citrusframework.distribution.model.SubmitWorkRequest;
 import org.citrusframework.distribution.model.SubmitWorkResponse;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import tools.jackson.core.JacksonException;
 
 /**
  * HTTP/SSE client used by the JUnit Platform coordinator and Maven extension to communicate with the broker.
  */
 public class BrokerHttpClient {
 
+    private static final Logger LOG = LoggerFactory.getLogger(BrokerHttpClient.class);
+
     private final String baseUrl;
     private final String authToken;
     private final HttpClient httpClient;
+    private final Duration optionalRequestTimeout;
 
     public BrokerHttpClient(String baseUrl, String authToken, long connectTimeoutMs) {
         this.baseUrl = baseUrl.endsWith("/") ? baseUrl.substring(0, baseUrl.length() - 1) : baseUrl;
         this.authToken = authToken;
+        this.optionalRequestTimeout = Duration.ofMillis(Math.max(500L, connectTimeoutMs));
         this.httpClient = HttpClient.newBuilder()
-                .connectTimeout(Duration.ofMillis(Math.max(500L, connectTimeoutMs)))
+                .connectTimeout(optionalRequestTimeout)
                 .build();
     }
 
@@ -64,6 +79,31 @@ public class BrokerHttpClient {
         HttpResponse<String> resp = sendJsonPost("/api/v1/sessions", request);
         ensureSuccess(resp, "createSession");
         return DistributionJson.fromJson(resp.body(), BuildSessionResponse.class);
+    }
+
+    public Optional<Map<String, Long>> findHistoricalDurations(List<String> workUnitKeys, int recentLimit) {
+        if (workUnitKeys == null || workUnitKeys.isEmpty()) {
+            return Optional.of(Map.of());
+        }
+        try {
+            var response = sendJsonPostWithDeadline("/api/v1/history/durations",
+                    new HistoricalDurationsRequest(workUnitKeys, recentLimit));
+            if (response.statusCode() == 200) {
+                var history = DistributionJson.fromJson(response.body(), HistoricalDurationsResponse.class);
+                if (history != null) {
+                    return Optional.of(history.durationsMs());
+                }
+                LOG.debug("Historical test durations unavailable (empty broker response)");
+            } else {
+                LOG.debug("Historical test durations unavailable (broker HTTP {})", response.statusCode());
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            LOG.debug("Historical test duration lookup interrupted", e);
+        } catch (IOException | JacksonException | IllegalArgumentException e) {
+            LOG.debug("Historical test durations unavailable", e);
+        }
+        return Optional.empty();
     }
 
     public List<String> findMissingDigests(List<String> digests) throws IOException, InterruptedException {
@@ -136,10 +176,21 @@ public class BrokerHttpClient {
 
     public void reportLocalTests(String sessionId, ReportLocalTestsRequest request)
             throws IOException, InterruptedException {
+        reportLocalTests(sessionId, request, false);
+    }
+
+    void reportLocalTestsWithDeadline(String sessionId, ReportLocalTestsRequest request)
+            throws IOException, InterruptedException {
+        reportLocalTests(sessionId, request, true);
+    }
+
+    private void reportLocalTests(String sessionId, ReportLocalTestsRequest request, boolean useDeadline)
+            throws IOException, InterruptedException {
         if (request == null || request.executions() == null || request.executions().isEmpty()) {
             return;
         }
-        HttpResponse<String> resp = sendJsonPost("/api/v1/sessions/" + sessionId + "/local-tests", request);
+        String path = "/api/v1/sessions/" + sessionId + "/local-tests";
+        HttpResponse<String> resp = useDeadline ? sendJsonPostWithDeadline(path, request) : sendJsonPost(path, request);
         ensureSuccess(resp, "reportLocalTests");
     }
 
@@ -209,12 +260,32 @@ public class BrokerHttpClient {
         throw new IOException("Timed out waiting for distributed partitions in session " + sessionId);
     }
 
+    private HttpResponse<String> sendJsonPostWithDeadline(String path, Object body)
+            throws IOException, InterruptedException {
+        var pending = httpClient.sendAsync(jsonPost(path, body), HttpResponse.BodyHandlers.ofString());
+        try {
+            // An HTTP request timeout alone does not bound the time spent reading the response body.
+            return pending.get(optionalRequestTimeout.toMillis(), TimeUnit.MILLISECONDS);
+        } catch (ExecutionException e) {
+            throw new IOException(e.getCause());
+        } catch (TimeoutException e) {
+            throw new HttpTimeoutException("Timed out waiting for broker response to " + path);
+        } finally {
+            if (!pending.isDone()) {
+                pending.cancel(true);
+            }
+        }
+    }
+
     private HttpResponse<String> sendJsonPost(String path, Object body) throws IOException, InterruptedException {
-        HttpRequest req = requestBuilder(path)
+        return httpClient.send(jsonPost(path, body), HttpResponse.BodyHandlers.ofString());
+    }
+
+    private HttpRequest jsonPost(String path, Object body) {
+        return requestBuilder(path)
                 .header("Content-Type", "application/json")
                 .POST(HttpRequest.BodyPublishers.ofString(DistributionJson.toJson(body)))
                 .build();
-        return httpClient.send(req, HttpResponse.BodyHandlers.ofString());
     }
 
     private HttpRequest.Builder requestBuilder(String path) {

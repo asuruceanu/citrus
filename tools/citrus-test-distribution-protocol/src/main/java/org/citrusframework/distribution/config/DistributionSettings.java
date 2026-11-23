@@ -24,6 +24,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.OptionalInt;
 import java.util.function.UnaryOperator;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -64,6 +65,23 @@ public final class DistributionSettings {
     public static final String MAX_PARTITION_SIZE_PROPERTY = "citrus.test.distribution.maxPartitionSize";
     public static final String MAX_PARTITION_SIZE_ENV = "CITRUS_DIST_MAX_PARTITION_SIZE";
     public static final int DEFAULT_MAX_PARTITION_SIZE = 5;
+
+    public static final String BROKER_MIN_PARTITION_DURATION_MS_PROPERTY =
+            "citrus.test.distribution.broker.minPartitionDurationMs";
+    public static final String BROKER_MIN_PARTITION_DURATION_MS_ENV = "CITRUS_DIST_BROKER_MIN_PARTITION_DURATION_MS";
+    public static final long DEFAULT_BROKER_MIN_PARTITION_DURATION_MS = 5_000L;
+
+    public static final String BROKER_MAX_WAVES_PER_WORKER_PROPERTY = "citrus.test.distribution.broker.maxWavesPerWorker";
+    public static final String BROKER_MAX_WAVES_PER_WORKER_ENV = "CITRUS_DIST_BROKER_MAX_WAVES_PER_WORKER";
+    public static final int DEFAULT_BROKER_MAX_WAVES_PER_WORKER = 2;
+
+    public static final String MIN_REMOTE_DURATION_MS_PROPERTY = "citrus.test.distribution.minRemoteDurationMs";
+    public static final String MIN_REMOTE_DURATION_MS_ENV = "CITRUS_DIST_MIN_REMOTE_DURATION_MS";
+    public static final long DEFAULT_MIN_REMOTE_DURATION_MS = 2_000L;
+
+    public static final String MIN_REMOTE_COLD_UNITS_PROPERTY = "citrus.test.distribution.minRemoteColdUnits";
+    public static final String MIN_REMOTE_COLD_UNITS_ENV = "CITRUS_DIST_MIN_REMOTE_COLD_UNITS";
+    public static final int DEFAULT_MIN_REMOTE_COLD_UNITS = 0;
 
     public static final String MAX_RETRIES_PROPERTY = "citrus.test.distribution.maxRetries";
     public static final String MAX_RETRIES_ENV = "CITRUS_DIST_MAX_RETRIES";
@@ -361,6 +379,44 @@ public final class DistributionSettings {
         return Math.max(1, getInt(MAX_PARTITION_SIZE_PROPERTY, MAX_PARTITION_SIZE_ENV, DEFAULT_MAX_PARTITION_SIZE));
     }
 
+    /** Returns an explicitly configured positive partition limit, or empty for broker-managed sizing. */
+    public static OptionalInt findConfiguredMaxPartitionSize() {
+        return findConfiguredMaxPartitionSize(System::getProperty, System::getenv);
+    }
+
+    public static OptionalInt findConfiguredMaxPartitionSize(UnaryOperator<String> prop, UnaryOperator<String> env) {
+        int configured = parseInt(getString(prop, env, MAX_PARTITION_SIZE_PROPERTY, MAX_PARTITION_SIZE_ENV, null), 0);
+        return configured > 0 ? OptionalInt.of(configured) : OptionalInt.empty();
+    }
+
+    public static long getMinRemoteDurationMs() {
+        return getMinRemoteDurationMs(System::getProperty, System::getenv);
+    }
+
+    public static long getMinRemoteDurationMs(UnaryOperator<String> prop, UnaryOperator<String> env) {
+        String raw = getString(prop, env, MIN_REMOTE_DURATION_MS_PROPERTY, MIN_REMOTE_DURATION_MS_ENV, null);
+        return Math.max(0L, parseLong(raw, DEFAULT_MIN_REMOTE_DURATION_MS));
+    }
+
+    public static int getMinRemoteColdUnits() {
+        return getMinRemoteColdUnits(System::getProperty, System::getenv);
+    }
+
+    public static int getMinRemoteColdUnits(UnaryOperator<String> prop, UnaryOperator<String> env) {
+        String raw = getString(prop, env, MIN_REMOTE_COLD_UNITS_PROPERTY, MIN_REMOTE_COLD_UNITS_ENV, null);
+        return Math.max(0, parseInt(raw, DEFAULT_MIN_REMOTE_COLD_UNITS));
+    }
+
+    public static long getBrokerMinPartitionDurationMs() {
+        return Math.max(0L, getLong(BROKER_MIN_PARTITION_DURATION_MS_PROPERTY, BROKER_MIN_PARTITION_DURATION_MS_ENV,
+                DEFAULT_BROKER_MIN_PARTITION_DURATION_MS));
+    }
+
+    public static int getBrokerMaxWavesPerWorker() {
+        return Math.max(0, getInt(BROKER_MAX_WAVES_PER_WORKER_PROPERTY, BROKER_MAX_WAVES_PER_WORKER_ENV,
+                DEFAULT_BROKER_MAX_WAVES_PER_WORKER));
+    }
+
     public static int getMaxRetries() {
         return Math.max(0, getInt(MAX_RETRIES_PROPERTY, MAX_RETRIES_ENV, DEFAULT_MAX_RETRIES));
     }
@@ -507,9 +563,14 @@ public final class DistributionSettings {
     }
 
     public static String getString(String prop, String env, String defaultValue) {
-        String value = System.getProperty(prop);
+        return getString(System::getProperty, System::getenv, prop, env, defaultValue);
+    }
+
+    private static String getString(UnaryOperator<String> prop, UnaryOperator<String> env,
+                                    String propKey, String envKey, String defaultValue) {
+        String value = prop.apply(propKey);
         if (value == null || value.isBlank()) {
-            value = env != null ? System.getenv(env) : null;
+            value = envKey != null ? env.apply(envKey) : null;
         }
         return (value == null || value.isBlank()) ? defaultValue : value.trim();
     }
@@ -520,7 +581,10 @@ public final class DistributionSettings {
     }
 
     public static int getInt(String prop, String env, int defaultValue) {
-        String raw = getString(prop, env, null);
+        return parseInt(getString(prop, env, null), defaultValue);
+    }
+
+    private static int parseInt(String raw, int defaultValue) {
         if (raw == null) {
             return defaultValue;
         }
@@ -532,7 +596,10 @@ public final class DistributionSettings {
     }
 
     public static long getLong(String prop, String env, long defaultValue) {
-        String raw = getString(prop, env, null);
+        return parseLong(getString(prop, env, null), defaultValue);
+    }
+
+    private static long parseLong(String raw, long defaultValue) {
         if (raw == null) {
             return defaultValue;
         }

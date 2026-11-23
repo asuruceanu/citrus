@@ -16,6 +16,7 @@
 
 package org.citrusframework.distribution.scheduler;
 
+import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
@@ -23,6 +24,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
 import java.util.UUID;
+import java.util.function.ToIntFunction;
 
 import org.citrusframework.distribution.model.PartitionPolicy;
 import org.citrusframework.distribution.model.PartitionRecord;
@@ -33,8 +35,9 @@ import org.citrusframework.distribution.model.WorkUnitSpec;
  * Splits submitted work units into partitions.
  * <ul>
  *     <li>{@link PartitionPolicy#LPT} (default): grouped by capability constraints; within a group, units are taken
- *     longest historical duration first and each is placed in the least loaded of {@code ceil(n / maxPartitionSize)}
- *     partitions that still has room, which balances the partitions instead of grouping the slowest units.</li>
+ *     longest historical duration first and each is placed in the least loaded partition that still has room.
+ *     Each group starts with {@code ceil(n / maxPartitionSize)} partitions, which optional duration and wave
+ *     limits can consolidate.</li>
  *     <li>{@link PartitionPolicy#SINGLE}: all units in exactly one partition, in submission order, requiring the
  *     union of their capabilities. Values for one key must be equal ignoring case; different thresholds such as
  *     {@code >=2048} and {@code >=4096} count as a conflict rather than being merged.</li>
@@ -64,6 +67,24 @@ public class LptPartitionScheduler {
             long defaultDurationMs,
             int maxPartitionSize,
             PartitionPolicy policy) {
+        return schedule(sessionId, units, historicalDurationsMs, defaultDurationMs, maxPartitionSize, policy, 0L, 0,
+                null);
+    }
+
+    /**
+     * Schedules units with optional duration and worker-wave limits on each LPT capability group.
+     * A non-positive duration or wave limit disables that limit.
+     */
+    public List<PartitionRecord> schedule(
+            String sessionId,
+            List<WorkUnitSpec> units,
+            Map<String, Long> historicalDurationsMs,
+            long defaultDurationMs,
+            int maxPartitionSize,
+            PartitionPolicy policy,
+            long minPartitionDurationMs,
+            int maxWavesPerWorker,
+            ToIntFunction<Map<String, String>> eligibleWorkerCounter) {
 
         if (units == null || units.isEmpty()) {
             return List.of();
@@ -78,14 +99,15 @@ public class LptPartitionScheduler {
         if (policy == PartitionPolicy.SINGLE) {
             return List.of(singlePartition(sessionId, enriched));
         }
-        return lptPartitions(sessionId, enriched, Math.max(1, maxPartitionSize));
+        return lptPartitions(sessionId, enriched, Math.max(1, maxPartitionSize), minPartitionDurationMs,
+                maxWavesPerWorker, eligibleWorkerCounter);
     }
 
     private static WorkUnitSpec withResolvedDuration(WorkUnitSpec raw, Map<String, Long> history, long fallbackDuration) {
-        long resolvedDuration = history.getOrDefault(
-                raw.key(),
-                raw.estimatedDurationMs() > 0 ? raw.estimatedDurationMs() : fallbackDuration
-        );
+        long defaultDuration = raw.estimatedDurationMs() > 0 ? raw.estimatedDurationMs() : fallbackDuration;
+        Long historicalDuration = history.get(raw.key());
+        long resolvedDuration = historicalDuration != null && historicalDuration >= 0
+                ? historicalDuration : defaultDuration;
         Map<String, String> normalizedCaps = raw.requiredCapabilities() == null || raw.requiredCapabilities().isEmpty()
                 ? Map.of()
                 : new TreeMap<>(raw.requiredCapabilities());
@@ -112,11 +134,14 @@ public class LptPartitionScheduler {
                 }
             }
         }
-        long sumDuration = units.stream().mapToLong(WorkUnitSpec::estimatedDurationMs).sum();
+        long sumDuration = units.stream().mapToLong(WorkUnitSpec::estimatedDurationMs)
+                .reduce(0L, LptPartitionScheduler::addDurations);
         return newPartition(sessionId, capabilities, List.copyOf(units), sumDuration);
     }
 
-    private static List<PartitionRecord> lptPartitions(String sessionId, List<WorkUnitSpec> units, int capSize) {
+    private static List<PartitionRecord> lptPartitions(String sessionId, List<WorkUnitSpec> units, int capSize,
+            long minPartitionDurationMs, int maxWavesPerWorker,
+            ToIntFunction<Map<String, String>> eligibleWorkerCounter) {
         Map<Map<String, String>, List<WorkUnitSpec>> byCapabilities = new LinkedHashMap<>();
         for (WorkUnitSpec unit : units) {
             byCapabilities.computeIfAbsent(unit.requiredCapabilities(), k -> new ArrayList<>()).add(unit);
@@ -128,9 +153,21 @@ public class LptPartitionScheduler {
             groupUnits.sort(Comparator.comparingLong(WorkUnitSpec::estimatedDurationMs).reversed()
                     .thenComparing(WorkUnitSpec::key));
 
-            // Longest-processing-time first: as few partitions as the size cap allows, each unit going to the
-            // partition with the least estimated work that still has room, so the slowest units run side by side.
-            int binCount = (groupUnits.size() + capSize - 1) / capSize;
+            int maxBinsFromSize = Math.ceilDiv(groupUnits.size(), capSize);
+            int binCount = maxBinsFromSize;
+            if (minPartitionDurationMs > 0) {
+                binCount = limitBinsByDuration(groupUnits, binCount, minPartitionDurationMs);
+            }
+            if (maxWavesPerWorker > 0 && eligibleWorkerCounter != null) {
+                int eligibleWorkers = eligibleWorkerCounter.applyAsInt(group.getKey());
+                if (eligibleWorkers > 0) {
+                    binCount = (int) Math.min(binCount, (long) eligibleWorkers * maxWavesPerWorker);
+                }
+            }
+
+            boolean packedAdaptively = binCount < maxBinsFromSize;
+            int effectiveCapSize = packedAdaptively ? Math.ceilDiv(groupUnits.size(), binCount) : capSize;
+            // Prefer an empty bin on a tie when packing adaptively, so zero-duration units use all planned bins.
             List<List<WorkUnitSpec>> bins = new ArrayList<>();
             long[] binDurations = new long[binCount];
             for (int i = 0; i < binCount; i++) {
@@ -139,12 +176,15 @@ public class LptPartitionScheduler {
             for (WorkUnitSpec unit : groupUnits) {
                 int target = -1;
                 for (int i = 0; i < binCount; i++) {
-                    if (bins.get(i).size() < capSize && (target < 0 || binDurations[i] < binDurations[target])) {
+                    List<WorkUnitSpec> bin = bins.get(i);
+                    if (bin.size() < effectiveCapSize && (target < 0 || binDurations[i] < binDurations[target]
+                            || (packedAdaptively && binDurations[i] == binDurations[target]
+                            && bin.isEmpty() && !bins.get(target).isEmpty()))) {
                         target = i;
                     }
                 }
                 bins.get(target).add(unit);
-                binDurations[target] += unit.estimatedDurationMs();
+                binDurations[target] = addDurations(binDurations[target], unit.estimatedDurationMs());
             }
             for (int i = 0; i < binCount; i++) {
                 partitions.add(newPartition(sessionId, group.getKey(), List.copyOf(bins.get(i)), binDurations[i]));
@@ -154,6 +194,27 @@ public class LptPartitionScheduler {
         partitions.sort(Comparator.comparingLong(PartitionRecord::estimatedDurationMs).reversed()
                 .thenComparing(p -> p.workUnits().get(0).key()));
         return partitions;
+    }
+
+    private static int limitBinsByDuration(List<WorkUnitSpec> units, int binCount, long minPartitionDurationMs) {
+        try {
+            long total = units.stream().mapToLong(WorkUnitSpec::estimatedDurationMs).reduce(0L, Math::addExact);
+            return (int) Math.min(binCount, Math.ceilDiv(Math.max(1L, total), minPartitionDurationMs));
+        } catch (ArithmeticException overflow) {
+            // A saturated total can underestimate the bin count when the minimum duration is also large.
+            BigInteger total = units.stream()
+                    .map(unit -> BigInteger.valueOf(unit.estimatedDurationMs()))
+                    .reduce(BigInteger.ZERO, BigInteger::add);
+            BigInteger durationBins = total.subtract(BigInteger.ONE)
+                    .divide(BigInteger.valueOf(minPartitionDurationMs))
+                    .add(BigInteger.ONE);
+            return durationBins.min(BigInteger.valueOf(binCount)).intValueExact();
+        }
+    }
+
+    /** Adds two non-negative durations while keeping the projected partition duration representable. */
+    private static long addDurations(long left, long right) {
+        return left > Long.MAX_VALUE - right ? Long.MAX_VALUE : left + right;
     }
 
     private static PartitionRecord newPartition(String sessionId, Map<String, String> capabilities,

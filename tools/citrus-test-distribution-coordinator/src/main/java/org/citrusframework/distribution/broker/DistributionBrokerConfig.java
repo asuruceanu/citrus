@@ -25,6 +25,13 @@ import org.citrusframework.distribution.config.DistributionSettings;
  */
 public final class DistributionBrokerConfig {
 
+    public static final String MIN_PARTITION_DURATION_MS_PROPERTY =
+            DistributionSettings.BROKER_MIN_PARTITION_DURATION_MS_PROPERTY;
+    public static final String MIN_PARTITION_DURATION_MS_ENV = DistributionSettings.BROKER_MIN_PARTITION_DURATION_MS_ENV;
+    public static final String MAX_WAVES_PER_WORKER_PROPERTY = DistributionSettings.BROKER_MAX_WAVES_PER_WORKER_PROPERTY;
+
+    public static final String MAX_WAVES_PER_WORKER_ENV = DistributionSettings.BROKER_MAX_WAVES_PER_WORKER_ENV;
+
     private final String host;
     private final int port;
     private final String authToken;
@@ -35,6 +42,8 @@ public final class DistributionBrokerConfig {
     private final int defaultMaxPartitionSize;
     private final int defaultMaxRetries;
     private final long defaultDurationMs;
+    private final long minPartitionDurationMs;
+    private final int maxWavesPerWorker;
     private final long leaseTimeoutMs;
     private final boolean demoData;
 
@@ -49,6 +58,8 @@ public final class DistributionBrokerConfig {
         this.defaultMaxPartitionSize = builder.defaultMaxPartitionSize;
         this.defaultMaxRetries = builder.defaultMaxRetries;
         this.defaultDurationMs = builder.defaultDurationMs;
+        this.minPartitionDurationMs = Math.max(0L, builder.minPartitionDurationMs);
+        this.maxWavesPerWorker = Math.max(0, builder.maxWavesPerWorker);
         this.leaseTimeoutMs = builder.leaseTimeoutMs;
         this.demoData = builder.demoData;
     }
@@ -110,6 +121,14 @@ public final class DistributionBrokerConfig {
         return defaultDurationMs;
     }
 
+    public long minPartitionDurationMs() {
+        return minPartitionDurationMs;
+    }
+
+    public int maxWavesPerWorker() {
+        return maxWavesPerWorker;
+    }
+
     public long leaseTimeoutMs() {
         return leaseTimeoutMs;
     }
@@ -129,6 +148,8 @@ public final class DistributionBrokerConfig {
         private int defaultMaxPartitionSize = 10;
         private int defaultMaxRetries = 1;
         private long defaultDurationMs = 5_000L;
+        private long minPartitionDurationMs = DistributionSettings.getBrokerMinPartitionDurationMs();
+        private int maxWavesPerWorker = DistributionSettings.getBrokerMaxWavesPerWorker();
         private long leaseTimeoutMs = 60_000L;
         private boolean demoData = Boolean.parseBoolean(
                 System.getProperty("citrus.test.distribution.demo.data",
@@ -181,6 +202,16 @@ public final class DistributionBrokerConfig {
 
         public Builder defaultDurationMs(long defaultDurationMs) {
             this.defaultDurationMs = defaultDurationMs;
+            return this;
+        }
+
+        public Builder minPartitionDurationMs(long minPartitionDurationMs) {
+            this.minPartitionDurationMs = minPartitionDurationMs;
+            return this;
+        }
+
+        public Builder maxWavesPerWorker(int maxWavesPerWorker) {
+            this.maxWavesPerWorker = maxWavesPerWorker;
             return this;
         }
 
