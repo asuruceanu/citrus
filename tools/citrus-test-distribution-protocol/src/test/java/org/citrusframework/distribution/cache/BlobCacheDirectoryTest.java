@@ -134,6 +134,53 @@ class BlobCacheDirectoryTest {
     }
 
     @Test
+    void shouldPruneEmptyBlobShardDirectoryOnDeleteButKeepSharedShards() throws Exception {
+        BlobCacheDirectory cache = new BlobCacheDirectory(tempDir.resolve("cache"));
+        byte[] first = "first".getBytes();
+        byte[] sibling = null;
+        for (int i = 0; sibling == null; i++) {
+            byte[] candidate = ("sibling " + i).getBytes();
+            if (sha(candidate).substring(0, 2).equals(sha(first).substring(0, 2))) {
+                sibling = candidate;
+            }
+        }
+        Path firstBlob = cache.put(sha(first), first);
+        Path siblingBlob = cache.put(sha(sibling), sibling);
+        Path shard = firstBlob.getParent();
+
+        assertThat(cache.delete(sha(first))).isTrue();
+        assertThat(shard).as("shard still holds the sibling").isDirectory();
+        assertThat(siblingBlob).exists();
+
+        assertThat(cache.delete(sha(sibling))).isTrue();
+        assertThat(shard).as("empty shard pruned").doesNotExist();
+        assertThat(cache.getRootDir().resolve("blobs")).isDirectory();
+        assertThat(cache.delete(sha(sibling))).isFalse();
+    }
+
+    @Test
+    void shouldKeepBlobWhenItsNamedJarDirectoryCannotBeDeleted() throws Exception {
+        assumeFalse("root".equals(System.getProperty("user.name")), "root ignores directory permissions");
+        byte[] jar = jarWith("b.txt", "b");
+        String sha = sha(jar);
+        BlobCacheDirectory cache = new BlobCacheDirectory(tempDir.resolve("cache"));
+        Path blob = cache.put(sha, jar);
+        Path named = cache.materializeForClasspath(new ArtifactRef("lib.jar", sha, ArtifactKind.JAR, jar.length),
+                tempDir.resolve("partition"));
+        Path namedDir = named.getParent();
+        assumeTrue(namedDir.toFile().setWritable(false), "file system supports read-only directories");
+        try {
+            assertThatThrownBy(() -> cache.delete(sha)).isInstanceOf(java.io.IOException.class);
+            assertThat(blob).as("blob kept so callers' bookkeeping stays accurate").exists();
+        } finally {
+            namedDir.toFile().setWritable(true);
+        }
+        assertThat(cache.delete(sha)).isTrue();
+        assertThat(blob).doesNotExist();
+        assertThat(namedDir).doesNotExist();
+    }
+
+    @Test
     void shouldDeleteNamedJarDirectoryWithBlobAndSweepOrphanStaging() throws Exception {
         byte[] jar = jarWith("a.txt", "a");
         String sha = sha(jar);

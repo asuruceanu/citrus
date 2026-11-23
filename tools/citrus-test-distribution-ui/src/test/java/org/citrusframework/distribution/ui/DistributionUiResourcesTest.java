@@ -55,6 +55,7 @@ class DistributionUiResourcesTest {
                     .contains("freeSpaceBufferBytes")
                     .contains("evictedBlobsTotal")
                     .contains("LOW_DISK")
+                    .contains("w.state !== 'OFFLINE' && w.cacheStats && w.cacheStats.lowDiskSpace")
                     .contains("worker.offline")
                     .contains("session.aborted")
                     .contains("/abort")

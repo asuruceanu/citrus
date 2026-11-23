@@ -20,9 +20,11 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.file.AtomicMoveNotSupportedException;
+import java.nio.file.DirectoryNotEmptyException;
 import java.nio.file.Files;
 import java.nio.file.InvalidPathException;
 import java.nio.file.LinkOption;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.FileVisitResult;
@@ -259,7 +261,10 @@ public class BlobCacheDirectory {
     }
 
     /**
-     * Deletes the blob for {@code sha256} together with its {@code classpath/<sha256>/} directory of named jars.
+     * Deletes the blob for {@code sha256} together with its {@code classpath/<sha256>/} directory of named jars, and
+     * prunes the {@code blobs/<first two hex chars>/} directory when it is left empty (best effort). The named jars
+     * are deleted first, so when that fails the blob is still present and the exception reports that nothing was
+     * evicted.
      *
      * @return {@code true} if the blob existed
      * @throws IllegalArgumentException on an invalid digest
@@ -270,9 +275,20 @@ public class BlobCacheDirectory {
         if (!classpathDir.startsWith(rootDir)) {
             throw new IllegalArgumentException("Classpath path escapes cache root: " + sha256);
         }
-        boolean existed = Files.deleteIfExists(blob);
         deleteRecursively(classpathDir);
+        boolean existed = Files.deleteIfExists(blob);
+        pruneEmptyDirectory(blob.getParent());
         return existed;
+    }
+
+    private static void pruneEmptyDirectory(Path dir) {
+        try {
+            Files.deleteIfExists(dir);
+        } catch (DirectoryNotEmptyException | NoSuchFileException ignored) {
+            // still shared with other blobs, or already gone
+        } catch (IOException e) {
+            LOG.debug("Could not prune empty cache directory {}: {}", dir, e.toString());
+        }
     }
 
     /**
@@ -621,7 +637,23 @@ public class BlobCacheDirectory {
     }
 
     private static void moveIntoPlace(Path tmp, Path target) throws IOException {
-        Files.createDirectories(target.getParent());
+        // delete(String) prunes empty shard directories, so a concurrent delete may remove the parent between
+        // createDirectories and the move: recreate it and retry a few times.
+        for (int attempt = 1; ; attempt++) {
+            Files.createDirectories(target.getParent());
+            try {
+                moveOnce(tmp, target);
+                return;
+            } catch (NoSuchFileException e) {
+                if (attempt >= 3 || !Files.exists(tmp, LinkOption.NOFOLLOW_LINKS)
+                        || Files.isDirectory(target.getParent(), LinkOption.NOFOLLOW_LINKS)) {
+                    throw e;
+                }
+            }
+        }
+    }
+
+    private static void moveOnce(Path tmp, Path target) throws IOException {
         boolean targetExisted = Files.exists(target, LinkOption.NOFOLLOW_LINKS);
         try {
             Files.move(tmp, target, StandardCopyOption.ATOMIC_MOVE);

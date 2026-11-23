@@ -57,6 +57,7 @@ import org.junit.jupiter.api.io.TempDir;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatNoException;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.junit.jupiter.api.Assumptions.assumeFalse;
 
 class WorkerFileCacheTest {
 
@@ -348,6 +349,7 @@ class WorkerFileCacheTest {
     @Test
     @DisabledOnOs(OS.WINDOWS)
     void shouldContinueEvictionWhenSingleBlobDeleteFailsAndRateLimitTightDiskWarning() throws Exception {
+        assumeFalse("root".equals(System.getProperty("user.name")), "root ignores directory permissions");
         byte[] first = null;
         byte[] second = null;
         for (int i = 0; first == null || second == null; i++) {

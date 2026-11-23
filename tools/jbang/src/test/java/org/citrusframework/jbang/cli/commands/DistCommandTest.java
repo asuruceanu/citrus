@@ -24,9 +24,14 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.util.Arrays;
 import java.util.List;
 import java.util.stream.Stream;
 
+import org.aesh.AeshRuntimeRunner;
+import org.aesh.command.CommandDefinition;
+import org.aesh.command.CommandResult;
+import org.aesh.command.invocation.CommandInvocation;
 import org.citrusframework.distribution.broker.DistributionBrokerConfig;
 import org.citrusframework.distribution.broker.DistributionBrokerServer;
 import org.citrusframework.distribution.config.DistributionJson;
@@ -253,6 +258,46 @@ class DistCommandTest extends CommandTest {
         noCleanup.brokerUrl = "http://localhost:8765";
         noCleanup.noCacheCleanup = true;
         assertThat(noCleanup.buildWorkerConfig().cacheCleanup()).isFalse();
+    }
+
+    static Stream<Arguments> boundCacheCommandLines() {
+        return Stream.of(
+                Arguments.of(List.of("--no-cache-cleanup", "--cache-free-space-buffer-size=64MiB")),
+                Arguments.of(List.of("--cache-cleanup=false", "--cache-free-space-buffer-size", "64MiB")),
+                Arguments.of(List.of("--cache-cleanup", "--no-cache-cleanup", "--cache-free-space-buffer-size=64MiB")));
+    }
+
+    @ParameterizedTest
+    @MethodSource("boundCacheCommandLines")
+    void shouldBindNormalizedCacheOptionsThroughTheCommandParser(List<String> input) {
+        String[] args = Stream.concat(Stream.of("dist", "worker", "start", "--broker-url", "http://localhost:1",
+                "--cache-dir", tempDir.resolve("bound-cache").toString()), input.stream()).toArray(String[]::new);
+        String[] normalized = DistWorkerStart.normalizeWorkerStartArgs(args);
+        CapturingWorkerStart.captured = null;
+
+        CommandResult result = AeshRuntimeRunner.builder()
+                .command(CapturingWorkerStart.class)
+                .args(Arrays.copyOfRange(normalized, 3, normalized.length))
+                .execute();
+
+        assertThat(result).isEqualTo(CommandResult.SUCCESS);
+        DistributionWorkerConfig config = CapturingWorkerStart.captured;
+        assertThat(config).isNotNull();
+        assertThat(config.cacheDir()).isEqualTo(tempDir.resolve("bound-cache"));
+        assertThat(config.cacheCleanup()).isFalse();
+        assertThat(config.cacheFreeSpaceBufferBytes()).isEqualTo(67_108_864L);
+    }
+
+    /** Lets the command parser populate the real worker start options, then captures the built configuration. */
+    @CommandDefinition(name = "start", description = "Captures the worker configuration")
+    public static class CapturingWorkerStart extends DistWorkerStart {
+        static volatile DistributionWorkerConfig captured;
+
+        @Override
+        public CommandResult execute(CommandInvocation invocation) {
+            captured = buildWorkerConfig();
+            return CommandResult.SUCCESS;
+        }
     }
 
     @Test

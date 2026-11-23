@@ -1365,8 +1365,9 @@ function formatBytes(bytes) {
   return unit === 0 ? `${Math.round(value)} B` : `${value.toFixed(1)} ${units[unit]}`;
 }
 
+/** An OFFLINE worker keeps its last reported cache stats, but no longer counts as low on disk. */
 function isLowDisk(w) {
-  return !!(w && w.cacheStats && w.cacheStats.lowDiskSpace);
+  return !!(w && w.state !== 'OFFLINE' && w.cacheStats && w.cacheStats.lowDiskSpace);
 }
 
 /** Usable disk as a percentage of the free-space buffer, clamped to 0-100; an unknown disk or no buffer reads as full. */
