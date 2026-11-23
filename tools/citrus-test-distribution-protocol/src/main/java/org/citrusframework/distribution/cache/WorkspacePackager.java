@@ -33,6 +33,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.TreeMap;
+import java.util.function.Supplier;
 
 import org.citrusframework.distribution.model.ArtifactKind;
 import org.citrusframework.distribution.model.ArtifactRef;
@@ -124,6 +125,16 @@ public final class WorkspacePackager {
     public static Optional<WorkspaceFileSet> packageInputToCache(BlobCacheDirectory cache, Path baseDir,
                                                                  String rawRelativePath, boolean optional,
                                                                  List<String> excludedPaths) throws IOException {
+        return packageInputToCacheLazily(() -> cache, baseDir, rawRelativePath, optional, excludedPaths);
+    }
+
+    /**
+     * Like {@link #packageInputToCache(BlobCacheDirectory, Path, String, boolean, List)}, but obtains the cache
+     * only when an existing input is about to be stored.
+     */
+    public static Optional<WorkspaceFileSet> packageInputToCacheLazily(Supplier<BlobCacheDirectory> cache, Path baseDir,
+                                                                 String rawRelativePath, boolean optional,
+                                                                 List<String> excludedPaths) throws IOException {
         String relative = validateRelativePath(rawRelativePath);
         Path base = baseDir.toAbsolutePath().normalize();
         Path target = resolveWithoutSymlinks(base, relative, "declared input");
@@ -136,13 +147,13 @@ public final class WorkspacePackager {
 
         BasicFileAttributes attrs = Files.readAttributes(target, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
         if (attrs.isRegularFile()) {
-            return Optional.of(packageRegularFile(cache, relative, target));
+            return Optional.of(packageRegularFile(cache.get(), relative, target));
         }
         if (attrs.isDirectory()) {
             List<String> entries = ClasspathPackager.listEntries(target).stream()
                     .filter(entry -> !isExcluded(relative + "/" + stripSlash(entry), excludedPaths))
                     .toList();
-            return Optional.of(packageEntries(cache, relative, target, entries));
+            return Optional.of(packageEntries(cache.get(), relative, target, entries));
         }
         throw new IllegalArgumentException("Declared input path '" + relative + "' is not a regular file or directory");
     }
@@ -233,13 +244,36 @@ public final class WorkspacePackager {
      */
     public static List<MaterializedEntry> materializeIntoDirectory(BlobCacheDirectory cache, WorkspaceFileSet fileSet,
                                                                    Path targetRoot) throws IOException {
+        return materializeIntoDirectory(cache, fileSet, null, targetRoot, true);
+    }
+
+    /**
+     * Places {@code fileSet} under {@code targetRoot} at its relative path from a blob the caller has already verified,
+     * without hashing it again.
+     *
+     * @param verifiedBlob the cache's blob path for the file set's artifact, verified by the caller
+     * @return the regular files written
+     * @throws IllegalArgumentException if the relative path is unsafe, the artifact is not a
+     *                                  {@link ArtifactKind#REGULAR_FILE} or {@link ArtifactKind#DIRECTORY_ZIP}, or
+     *                                  {@code verifiedBlob} is not the cache's blob path for it
+     * @throws IOException              if the blob is missing, a symbolic link lies on the destination path, or the
+     *                                  archive is unsafe or exceeds the ZIP limits
+     */
+    public static List<MaterializedEntry> materializeIntoDirectory(BlobCacheDirectory cache, WorkspaceFileSet fileSet,
+                                                                   Path verifiedBlob, Path targetRoot) throws IOException {
+        return materializeIntoDirectory(cache, fileSet, verifiedBlob, targetRoot, false);
+    }
+
+    private static List<MaterializedEntry> materializeIntoDirectory(BlobCacheDirectory cache, WorkspaceFileSet fileSet,
+                                                                    Path verifiedBlob, Path targetRoot, boolean verify)
+            throws IOException {
         String relative = validateRelativePath(fileSet.relativePath());
         ArtifactRef artifact = fileSet.artifact();
         if (artifact == null || (artifact.kind() != ArtifactKind.REGULAR_FILE && artifact.kind() != ArtifactKind.DIRECTORY_ZIP)) {
             throw new IllegalArgumentException("Workspace path '" + relative + "' must be a REGULAR_FILE or DIRECTORY_ZIP artifact");
         }
-        Path blob = cache.getVerifiedPath(artifact.sha256());
-        if (blob == null) {
+        Path blob = verify ? cache.getVerifiedPath(artifact.sha256()) : cache.requireBlobPath(artifact.sha256(), verifiedBlob);
+        if (blob == null || (!verify && !Files.isRegularFile(blob, LinkOption.NOFOLLOW_LINKS))) {
             throw new IOException("Blob " + artifact.sha256() + " for workspace path '" + relative
                     + "' is missing from or corrupted in the cache");
         }

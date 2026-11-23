@@ -22,6 +22,7 @@ import java.util.concurrent.TimeUnit;
 import org.citrusframework.api.agent.CitrusAgentConfiguration;
 import org.citrusframework.distribution.worker.DistributionWorkerClient;
 import org.citrusframework.distribution.worker.DistributionWorkerConfig;
+import org.citrusframework.util.StringUtils;
 
 /**
  * Lifecycle bridge connecting {@link CitrusAgentServer} worker mode to {@link DistributionWorkerClient}.
@@ -31,14 +32,28 @@ final class DistributionWorkerBridge implements AutoCloseable {
     private final DistributionWorkerClient workerClient;
 
     DistributionWorkerBridge(CitrusAgentConfiguration configuration) {
+        this.workerClient = new DistributionWorkerClient(buildWorkerConfig(configuration));
+    }
+
+    /**
+     * Builds the worker configuration from the agent configuration. Cache settings not explicitly configured on the
+     * agent are left to the worker defaults (system property, environment variable, built-in default).
+     */
+    static DistributionWorkerConfig buildWorkerConfig(CitrusAgentConfiguration configuration) {
         DistributionWorkerConfig.Builder builder = DistributionWorkerConfig.builder()
                 .brokerUrl(configuration.getBrokerUrl())
                 .authToken(configuration.getAuthToken())
                 .addCapabilitiesCsv(configuration.getCapabilities());
-        if (configuration.getCacheDir() != null && !configuration.getCacheDir().isBlank()) {
+        if (StringUtils.hasText(configuration.getCacheDir())) {
             builder.cacheDir(Paths.get(configuration.getCacheDir()));
         }
-        this.workerClient = new DistributionWorkerClient(builder.build());
+        if (configuration.getCacheCleanup() != null) {
+            builder.cacheCleanup(configuration.getCacheCleanup());
+        }
+        if (StringUtils.hasText(configuration.getCacheFreeSpaceBufferSize())) {
+            builder.cacheFreeSpaceBufferSize(configuration.getCacheFreeSpaceBufferSize());
+        }
+        return builder.build();
     }
 
     void start() {

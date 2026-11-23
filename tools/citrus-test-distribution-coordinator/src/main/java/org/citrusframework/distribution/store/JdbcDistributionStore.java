@@ -41,10 +41,12 @@ import org.citrusframework.distribution.model.TestExecutionRecord;
 import org.citrusframework.distribution.model.TestHistorySummary;
 import org.citrusframework.distribution.model.TestOutcomeStatus;
 import org.citrusframework.distribution.model.WorkUnitSpec;
+import org.citrusframework.distribution.model.WorkerCacheStats;
 import org.citrusframework.distribution.model.WorkerRecord;
 import org.citrusframework.distribution.model.WorkerState;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import tools.jackson.core.JacksonException;
 import tools.jackson.core.type.TypeReference;
 
 /**
@@ -130,7 +132,8 @@ public class JdbcDistributionStore implements DistributionStore {
                         "state VARCHAR(32), " +
                         "active_partition_id VARCHAR(64), " +
                         "last_heartbeat_at BIGINT, " +
-                        "registered_at BIGINT)",
+                        "registered_at BIGINT, " +
+                        "cache_stats_json VARCHAR(2048))",
                 "CREATE TABLE IF NOT EXISTS dist_partitions (" +
                         "partition_id VARCHAR(64) NOT NULL, " +
                         "session_id VARCHAR(64), " +
@@ -217,6 +220,7 @@ public class JdbcDistributionStore implements DistributionStore {
         partitionColumns.put("produced_outputs_json", longText);
         partitionColumns.put("error_message", "VARCHAR(4096)");
         additions.put("dist_partitions", partitionColumns);
+        additions.put("dist_workers", Map.of("cache_stats_json", "VARCHAR(2048)"));
         additions.put("dist_sessions", Map.of("failure_reason", "VARCHAR(4096)"));
         additions.put("dist_test_executions", Map.of("unique_id", "VARCHAR(1024)"));
         for (Map.Entry<String, Map<String, String>> table : additions.entrySet()) {
@@ -457,9 +461,10 @@ public class JdbcDistributionStore implements DistributionStore {
     public synchronized void upsertWorker(WorkerRecord w) {
         String capsJson = truncate(DistributionJson.toJson(w.capabilities() != null ? w.capabilities() : Map.of()), 4096);
         String updateSql = "UPDATE dist_workers SET host=?, capabilities_json=?, state=?, active_partition_id=?, " +
-                "last_heartbeat_at=?, registered_at=? WHERE worker_id=?";
+                "last_heartbeat_at=?, registered_at=?, cache_stats_json=? WHERE worker_id=?";
         String insertSql = "INSERT INTO dist_workers (worker_id, host, capabilities_json, state, active_partition_id, " +
-                "last_heartbeat_at, registered_at) VALUES (?, ?, ?, ?, ?, ?, ?)";
+                "last_heartbeat_at, registered_at, cache_stats_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
+        String cacheJson = w.cacheStats() != null ? DistributionJson.toJson(w.cacheStats()) : null;
         try (Connection conn = dataSource.getConnection()) {
             try (PreparedStatement ps = conn.prepareStatement(updateSql)) {
                 ps.setString(1, w.host());
@@ -468,7 +473,8 @@ public class JdbcDistributionStore implements DistributionStore {
                 ps.setString(4, w.activePartitionId());
                 ps.setLong(5, w.lastHeartbeatAt());
                 ps.setLong(6, w.registeredAt());
-                ps.setString(7, w.workerId());
+                ps.setString(7, cacheJson);
+                ps.setString(8, w.workerId());
                 if (ps.executeUpdate() > 0) {
                     return;
                 }
@@ -481,6 +487,7 @@ public class JdbcDistributionStore implements DistributionStore {
                 ps.setString(5, w.activePartitionId());
                 ps.setLong(6, w.lastHeartbeatAt());
                 ps.setLong(7, w.registeredAt());
+                ps.setString(8, cacheJson);
                 ps.executeUpdate();
             }
         } catch (SQLException e) {
@@ -491,30 +498,55 @@ public class JdbcDistributionStore implements DistributionStore {
     @Override
     public List<WorkerRecord> listWorkers() {
         String sql = "SELECT worker_id, host, capabilities_json, state, active_partition_id, " +
-                "last_heartbeat_at, registered_at FROM dist_workers ORDER BY registered_at ASC";
+                "last_heartbeat_at, registered_at, cache_stats_json FROM dist_workers ORDER BY registered_at ASC";
         List<WorkerRecord> workers = new ArrayList<>();
         try (Connection conn = dataSource.getConnection();
              PreparedStatement ps = conn.prepareStatement(sql);
              ResultSet rs = ps.executeQuery()) {
             while (rs.next()) {
-                String capsRaw = rs.getString("capabilities_json");
-                Map<String, String> caps = capsRaw == null || capsRaw.isBlank()
-                        ? Map.of()
-                        : DistributionJson.fromJson(capsRaw, STRING_MAP_TYPE);
+                String workerId = rs.getString("worker_id");
+                Map<String, String> caps = readWorkerCapabilities(rs.getString("capabilities_json"), workerId);
+                WorkerCacheStats cacheStats = readWorkerCacheStats(rs.getString("cache_stats_json"), workerId);
                 workers.add(new WorkerRecord(
-                        rs.getString("worker_id"),
+                        workerId,
                         rs.getString("host"),
                         caps,
                         WorkerState.valueOf(rs.getString("state")),
                         rs.getString("active_partition_id"),
                         rs.getLong("last_heartbeat_at"),
-                        rs.getLong("registered_at")
+                        rs.getLong("registered_at"),
+                        cacheStats
                 ));
             }
             return workers;
         } catch (SQLException e) {
             throw new IllegalStateException("Failed to list workers", e);
         }
+    }
+
+    private static Map<String, String> readWorkerCapabilities(String json, String workerId) {
+        if (json != null && !json.isBlank()) {
+            try {
+                Map<String, String> capabilities = DistributionJson.fromJson(json, STRING_MAP_TYPE);
+                if (capabilities != null) {
+                    return capabilities;
+                }
+            } catch (JacksonException e) {
+                LOG.warn("Ignoring malformed capabilities JSON for worker {}", workerId);
+            }
+        }
+        return Map.of();
+    }
+
+    private static WorkerCacheStats readWorkerCacheStats(String json, String workerId) {
+        if (json != null && !json.isBlank()) {
+            try {
+                return DistributionJson.fromJson(json, WorkerCacheStats.class);
+            } catch (JacksonException e) {
+                LOG.warn("Ignoring malformed cache statistics JSON for worker {}", workerId);
+            }
+        }
+        return null;
     }
 
     @Override

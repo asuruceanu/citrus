@@ -3,7 +3,7 @@
 - **Date:** 2026-11-21
 - **Revision:** 6 (As built — see §0 for amendments made during implementation; Revision 5 approved 2026-11-21)
 - **Status:** Approved
-- **Reference:** [Develocity Test Distribution 3.8 — External Test Resources](https://docs.develocity.ai/test-distribution/3.8/#external-test-resources)
+- **Reference:** External test resource handling as commonly found in distributed test execution setups
 
 ## 0. As-Built Amendments (Revision 6, 2026-11-22)
 
@@ -66,7 +66,7 @@ Across the full 84-POM Citrus repository, modules fall into four external-resour
 3. **Ephemeral CWD / `target/` / `java.io.tmpdir` scratch writes & global logger mutation (11 modules):** Modules such as `core/citrus-api`, `core/citrus-base`, `endpoints/citrus-{ftp,camel,kafka,ssh}`, `connectors/citrus-{playwright,selenium,jbang-connector}`, `tools/schema-generator`, and `tools/jbang` write transient directories/files under relative CWD paths (`target/ftp`, `target/sftp`, `target/data`, `target/schema`, `target/citrus-reports`, `.citrus-jbang`, screenshots/HARs/videos), write fixed filenames in `java.io.tmpdir` (`hostkey.ser`), or mutate process-wide Log4j2 levels (`Configurator.setRootLevel(...)`). Furthermore, Citrus's default `HtmlReporter`, `JUnitReporter`, and `MessageTracingTestListener` write to relative `target/citrus-reports` and `target/citrus-logs/trace/messages` across **all** Citrus modules unless redirected.
 4. **True host-coupled tests (4 modules):** JBang CLI/engine tests (`tools/jbang` and `connectors/citrus-jbang-connector`) that inspect live host JVM processes (`ProcessHandle.allProcesses()`) or invoke non-`--offline` JBang/Maven resolution against `~/.m2/repository` / `~/.jbang`, plus Quarkus bootstrap tests (`citrus-quarkus-deployment`, `citrus-quarkus-it`) whose `io.quarkus.bootstrap` augmentation resolves local SNAPSHOT workspace artifacts out of `~/.m2/repository`.
 
-Following the Develocity Test Distribution 3.8 model for External Test Resources, workers will materialize declared input file-sets into an isolated per-partition working directory, redirect default Citrus report/trace directories per partition, rewrite host workspace paths in propagated system properties, export declared new/modified output files back to the host workspace using all-or-nothing staging with conflict detection, and classify all 84 POMs across the repository.
+Following the external test resources model of other distributed test runners, workers will materialize declared input file-sets into an isolated per-partition working directory, redirect default Citrus report/trace directories per partition, rewrite host workspace paths in propagated system properties, export declared new/modified output files back to the host workspace using all-or-nothing staging with conflict detection, and classify all 84 POMs across the repository.
 
 ## 2. Goals, Non-Goals, and Anti-Goals
 

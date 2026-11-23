@@ -49,6 +49,10 @@ public class CitrusAgentConfiguration extends CitrusAppConfiguration {
 
     private String cacheDir = "";
 
+    private Boolean cacheCleanup;
+
+    private String cacheFreeSpaceBufferSize;
+
     /**
      * Gets the port.
      */
@@ -129,6 +133,30 @@ public class CitrusAgentConfiguration extends CitrusAppConfiguration {
     @SchemaProperty(description = "Local content-addressed blob cache directory in worker mode.")
     public void setCacheDir(String cacheDir) {
         this.cacheDir = cacheDir;
+    }
+
+    /**
+     * Gets the worker cache cleanup flag or {@code null} when not explicitly configured.
+     */
+    public Boolean getCacheCleanup() {
+        return cacheCleanup;
+    }
+
+    @SchemaProperty(description = "Enable or disable cleanup of the worker local file cache (worker mode)")
+    public void setCacheCleanup(Boolean cacheCleanup) {
+        this.cacheCleanup = cacheCleanup;
+    }
+
+    /**
+     * Gets the worker cache free space buffer size expression or {@code null} when not explicitly configured.
+     */
+    public String getCacheFreeSpaceBufferSize() {
+        return cacheFreeSpaceBufferSize;
+    }
+
+    @SchemaProperty(description = "Minimum free space to keep on the worker cache drive, e.g. 2GiB or 512MiB (worker mode)")
+    public void setCacheFreeSpaceBufferSize(String cacheFreeSpaceBufferSize) {
+        this.cacheFreeSpaceBufferSize = cacheFreeSpaceBufferSize;
     }
 
     /**

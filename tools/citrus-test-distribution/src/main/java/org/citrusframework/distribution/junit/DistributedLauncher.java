@@ -47,6 +47,7 @@ import org.citrusframework.distribution.model.SubmitWorkResponse;
 import org.citrusframework.distribution.model.WorkUnitSpec;
 import org.citrusframework.distribution.model.WorkerTestEventPayload;
 import org.citrusframework.distribution.model.WorkspaceFileSet;
+import org.citrusframework.distribution.workspace.WorkspaceLease;
 import org.junit.platform.launcher.Launcher;
 import org.junit.platform.launcher.LauncherDiscoveryListener;
 import org.junit.platform.launcher.LauncherDiscoveryRequest;
@@ -510,7 +511,7 @@ public class DistributedLauncher implements Launcher {
     }
 
     private static boolean isHostOrInternalProperty(String key) {
-        if (HOST_SYSTEM_PROPERTY_KEYS.contains(key)) {
+        if (HOST_SYSTEM_PROPERTY_KEYS.contains(key) || WorkspaceLease.TICKET_PROPERTY.equals(key)) {
             return true;
         }
         for (String prefix : HOST_SYSTEM_PROPERTY_PREFIXES) {
@@ -596,8 +597,10 @@ public class DistributedLauncher implements Launcher {
             List<WorkspaceFileSet> inputs = new ArrayList<>();
             for (DistributionSettings.DeclaredPathSpec input : declaredInputs) {
                 try {
-                    WorkspacePackager.packageInputToCache(cache, hostBaseDir, input.relativePath(), input.optional(), internal)
-                            .ifPresent(inputs::add);
+                    WorkspacePackager.packageInputToCacheLazily(() -> {
+                        markLauncherOwned(cache);
+                        return cache;
+                    }, hostBaseDir, input.relativePath(), input.optional(), internal).ifPresent(inputs::add);
                 } catch (IOException e) {
                     throw new java.io.UncheckedIOException("Failed to package declared input '" + input.relativePath() + "'", e);
                 }
@@ -614,6 +617,9 @@ public class DistributedLauncher implements Launcher {
                             + "' passes through a symbolic link or junction: " + link);
                 }
             }
+            if (!outputs.isEmpty()) {
+                markLauncherOwned(cache);
+            }
             boolean fork = DistributionSettings.parseForkWorkspace(
                     setting(DistributionSettings.FORK_PROPERTY, DistributionSettings.FORK_ENV));
             PartitionPolicy policy = DistributionSettings.parsePartitionPolicy(
@@ -622,6 +628,22 @@ public class DistributedLauncher implements Launcher {
             return new WorkspaceSettings(hostBaseDir, cache, List.copyOf(inputs), outputs,
                     fork || !declaredInputs.isEmpty() || !outputs.isEmpty(), policy,
                     relativeWorkingDirectory(hostBaseDir, Path.of(System.getProperty("user.dir", ""))));
+        }
+
+        /**
+         * Claims the host cache before using it, so it cannot be shared with a worker.
+         */
+        private static void markLauncherOwned(BlobCacheDirectory cache) {
+            try {
+                String owner = BlobCacheDirectory.recordOwnerIfAbsent(cache.getRootDir(), BlobCacheDirectory.OWNER_LAUNCHER);
+                if (!BlobCacheDirectory.OWNER_LAUNCHER.equals(owner) && !BlobCacheDirectory.OWNER_COORDINATOR.equals(owner)) {
+                    throw new IllegalStateException("Host cache directory " + cache.getRootDir()
+                            + " is marked as owned by " + owner + ". Choose a separate launcher cache directory.");
+                }
+            } catch (IOException e) {
+                throw new java.io.UncheckedIOException("Could not mark host cache " + cache.getRootDir()
+                        + " as owned by the launcher", e);
+            }
         }
 
         /**

@@ -21,6 +21,7 @@ const state = {
   mobileMenuOpen: false,
   theme: localStorage.getItem(STORAGE_THEME_KEY) || 'light',
   authToken: localStorage.getItem(STORAGE_TOKEN_KEY) || '',
+  authTokenDraft: '',
   showAuthModal: false,
   authError: '',
   sseConnected: false,
@@ -60,6 +61,8 @@ let lastDetailLoadAt = 0;
 let detailTimer = null;
 // Increases with every session detail request; a response that is no longer the latest is discarded.
 let detailRequestSeq = 0;
+let workerRequestSeq = 0;
+let workerPollInFlight = false;
 let pollTimer = null;
 let suppressHashChange = false;
 
@@ -132,6 +135,32 @@ function setView(view, detailTab = null) {
   }
 }
 
+function openAuthModal() {
+  if (!state.showAuthModal) {
+    state.authTokenDraft = state.authToken;
+    state.showAuthModal = true;
+  }
+  renderApp();
+}
+
+function closeAuthModal() {
+  state.showAuthModal = false;
+  state.authTokenDraft = '';
+}
+
+function commitAuthToken(token) {
+  if (token) {
+    localStorage.setItem(STORAGE_TOKEN_KEY, token);
+  } else {
+    localStorage.removeItem(STORAGE_TOKEN_KEY);
+  }
+  state.authToken = token;
+  state.authError = '';
+  closeAuthModal();
+  connectSse();
+  refreshAll();
+}
+
 function apiHeaders() {
   const headers = { 'Accept': 'application/json' };
   if (state.authToken) {
@@ -140,14 +169,19 @@ function apiHeaders() {
   return headers;
 }
 
-async function apiGet(path) {
-  const res = await fetch(path, { headers: apiHeaders() });
-  if (res.status === 401) {
-    state.showAuthModal = true;
+function requireApiAccess(response, authToken) {
+  if (response.status !== 401) return;
+  if (authToken === state.authToken) {
     state.authError = 'Bearer token required to access broker API.';
-    renderApp();
-    throw new Error('Unauthorized');
+    openAuthModal();
   }
+  throw new Error('Unauthorized');
+}
+
+async function apiGet(path) {
+  const authToken = state.authToken;
+  const res = await fetch(path, { headers: apiHeaders() });
+  requireApiAccess(res, authToken);
   if (!res.ok) {
     throw new Error(`HTTP ${res.status}`);
   }
@@ -155,17 +189,13 @@ async function apiGet(path) {
 }
 
 async function apiPost(path, body = {}) {
+  const authToken = state.authToken;
   const res = await fetch(path, {
     method: 'POST',
     headers: { ...apiHeaders(), 'Content-Type': 'application/json' },
     body: JSON.stringify(body)
   });
-  if (res.status === 401) {
-    state.showAuthModal = true;
-    state.authError = 'Bearer token required to access broker API.';
-    renderApp();
-    throw new Error('Unauthorized');
-  }
+  requireApiAccess(res, authToken);
   if (!res.ok) {
     throw new Error(`HTTP ${res.status}`);
   }
@@ -206,6 +236,31 @@ async function loadHistory(force = false) {
   }
 }
 
+async function loadWorkers() {
+  const requestSeq = ++workerRequestSeq;
+  const workers = await apiGet('/api/v1/workers');
+  // An event can start a full refresh while a worker poll is already in progress.
+  if (requestSeq !== workerRequestSeq) return false;
+  state.workers = Array.isArray(workers) ? workers : [];
+  return true;
+}
+
+async function pollWorkers() {
+  if (refreshInFlight || workerPollInFlight) return;
+  workerPollInFlight = true;
+  try {
+    if (await loadWorkers() && shouldPollWorkers()) {
+      renderApp();
+    }
+  } catch (err) {
+    if (err.message !== 'Unauthorized') {
+      console.warn('Worker refresh error:', err.message);
+    }
+  } finally {
+    workerPollInFlight = false;
+  }
+}
+
 async function refreshAll() {
   // One refresh at a time: events arriving meanwhile coalesce into a single follow-up refresh.
   if (refreshInFlight) {
@@ -214,12 +269,11 @@ async function refreshAll() {
   }
   refreshInFlight = true;
   try {
-    const [sessions, workers] = await Promise.all([
+    const [sessions] = await Promise.all([
       apiGet('/api/v1/sessions?limit=500'),
-      apiGet('/api/v1/workers')
+      loadWorkers()
     ]);
     state.sessions = Array.isArray(sessions) ? sessions : [];
-    state.workers = Array.isArray(workers) ? workers : [];
     loadHistory(); // independent: a slow history query must not hold back sessions and workers
     state.authError = '';
 
@@ -310,10 +364,17 @@ function ensurePollingLoop() {
         connectSse();
       }
       refreshAll();
+    } else if (shouldPollWorkers()) {
+      // Heartbeats update worker telemetry without publishing a lifecycle event.
+      pollWorkers();
     } else if (state.sessions.some(s => s.status === 'RUNNING')) {
       renderApp();
     }
   }, POLL_INTERVAL_MS);
+}
+
+function shouldPollWorkers() {
+  return state.sseConnected && !state.authError && (state.view === 'overview' || state.view === 'workers');
 }
 
 function connectSse() {
@@ -325,6 +386,9 @@ function connectSse() {
   eventSource.onopen = () => {
     state.sseConnected = true;
     renderApp();
+    if (shouldPollWorkers()) {
+      pollWorkers();
+    }
   };
   eventSource.onerror = () => {
     state.sseConnected = false;
@@ -468,7 +532,7 @@ function renderTopbar() {
         </button>
         <button
           class="icon-btn"
-          onClick=${() => { state.showAuthModal = true; renderApp(); }}
+          onClick=${openAuthModal}
           aria-label="Configure Bearer token"
         >
           🔑 ${state.authToken ? 'Auth Set' : 'Auth'}
@@ -618,7 +682,10 @@ function renderOverview() {
                       <div class="mono" style="font-weight:700;font-size:12.5px">${w.workerId}</div>
                       <div style="font-size:11.5px;color:var(--text-muted)">${w.host} · heartbeat ${formatAgo(w.lastHeartbeatAt)}</div>
                     </div>
-                    ${statusBadge(w.state)}
+                    <div class="overview-worker-badges">
+                      ${isLowDisk(w) ? html`<span class="badge badge-failed">LOW DISK</span>` : null}
+                      ${statusBadge(w.state)}
+                    </div>
                   </div>
                 `)}
           </div>
@@ -1350,11 +1417,71 @@ function renderSessionDetail() {
   `;
 }
 
+function formatBytes(bytes) {
+  if (typeof bytes !== 'number' || !Number.isFinite(bytes) || bytes < 0) return 'N/A';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let value = bytes;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit++;
+  }
+  return unit === 0 ? `${Math.round(value)} B` : `${value.toFixed(1)} ${units[unit]}`;
+}
+
+/** An OFFLINE worker keeps its last reported cache stats, but no longer counts as low on disk. */
+function isLowDisk(w) {
+  return !!(w && w.state !== 'OFFLINE' && w.cacheStats && w.cacheStats.lowDiskSpace);
+}
+
+/** Usable disk as a percentage of the buffer, clamped to 0–100. No buffer shows full; unknown usable space shows empty. */
+function cacheDiskPercent(cacheStats) {
+  const buffer = Number(cacheStats.freeSpaceBufferBytes);
+  const usable = Number(cacheStats.usableDiskBytes);
+  if (!Number.isFinite(buffer) || buffer <= 0) return 100;
+  if (!Number.isFinite(usable) || usable < 0) return 0;
+  return Math.max(0, Math.min(100, Math.round((usable / buffer) * 100)));
+}
+
+function renderWorkerCacheTelemetry(w) {
+  const c = w.cacheStats;
+  if (!c) {
+    return html`<div class="worker-cache-panel worker-cache-empty">Local file cache: no telemetry reported</div>`;
+  }
+  const lowDisk = isLowDisk(w);
+  const pct = cacheDiskPercent(c);
+  const usableLabel = Number(c.usableDiskBytes) < 0 || !Number.isFinite(Number(c.usableDiskBytes))
+    ? 'N/A'
+    : formatBytes(Number(c.usableDiskBytes));
+  const bufferLabel = Number(c.freeSpaceBufferBytes) > 0 ? formatBytes(Number(c.freeSpaceBufferBytes)) : 'none';
+  return html`
+    <div class=${`worker-cache-panel ${lowDisk ? 'low-disk' : ''}`}>
+      <div class="worker-cache-head">
+        <span class="worker-cache-title">Local File Cache</span>
+        <span>
+          <span class=${`badge ${c.cleanupEnabled ? 'badge-idle' : 'badge-offline'}`}>${c.cleanupEnabled ? 'AUTO LRU' : 'NO CLEANUP'}</span>
+          ${lowDisk ? html` <span class="badge badge-failed">LOW DISK</span>` : null}
+        </span>
+      </div>
+      <div class="worker-cache-row">
+        <strong>${formatBytes(c.cachedBytes)}</strong> in ${Number(c.blobCount) || 0} blobs
+        · evicted <strong>${Number(c.evictedBlobsTotal) || 0}</strong>
+      </div>
+      <div class="worker-cache-bar" title=${`Usable disk ${usableLabel} vs buffer ${bufferLabel}`}>
+        <div class=${`worker-cache-bar-fill ${lowDisk ? 'low-disk' : ''}`} style=${`width:${pct}%`}></div>
+      </div>
+      <div class="worker-cache-row worker-cache-muted">Usable disk ${usableLabel} · buffer ${bufferLabel}</div>
+    </div>
+  `;
+}
+
 function renderWorkersPool() {
-  const states = ['ALL', 'IDLE', 'BUSY', 'DRAINING', 'OFFLINE'];
+  const states = ['ALL', 'IDLE', 'BUSY', 'DRAINING', 'OFFLINE', 'LOW_DISK'];
   const q = state.workerQuery.trim().toLowerCase();
   const filtered = state.workers.filter(w => {
-    if (state.workerStateFilter !== 'ALL' && w.state !== state.workerStateFilter) return false;
+    if (state.workerStateFilter === 'LOW_DISK') {
+      if (!isLowDisk(w)) return false;
+    } else if (state.workerStateFilter !== 'ALL' && w.state !== state.workerStateFilter) return false;
     if (!q) return true;
     const capStr = Object.entries(w.capabilities || {}).map(([k, v]) => `${k}=${v}`).join(' ').toLowerCase();
     return (w.workerId || '').toLowerCase().includes(q)
@@ -1385,7 +1512,7 @@ function renderWorkersPool() {
             <button
               class=${`filter-pill ${state.workerStateFilter === st ? 'active' : ''}`}
               onClick=${() => { state.workerStateFilter = st; renderApp(); }}
-            >${st}</button>
+            >${st === 'LOW_DISK' ? 'LOW DISK' : st}</button>
           `)}
         </div>
       </div>
@@ -1414,6 +1541,8 @@ function renderWorkersPool() {
                     <span class="tag mono">${k}=${v}</span>
                   `)}
                 </div>
+
+                ${renderWorkerCacheTelemetry(w)}
               </div>
             `)}
           </div>
@@ -1699,11 +1828,11 @@ function renderModals() {
 
   if (state.showAuthModal) {
     return html`
-      <div class="modal-backdrop" onClick=${() => { state.showAuthModal = false; renderApp(); }}>
+      <div class="modal-backdrop" onClick=${() => { closeAuthModal(); renderApp(); }}>
         <div class="modal-panel" style="max-width:440px" onClick=${e => e.stopPropagation()}>
           <div class="modal-header">
             <strong style="font-size:16px">Broker Bearer Authentication</strong>
-            <button class="btn btn-sm" onClick=${() => { state.showAuthModal = false; renderApp(); }}>✕</button>
+            <button class="btn btn-sm" onClick=${() => { closeAuthModal(); renderApp(); }}>✕</button>
           </div>
           <div class="modal-body">
             ${state.authError ? html`<div style="margin-bottom:12px;padding:8px 12px;border-radius:8px;background:var(--rose-bg);color:var(--rose-text);font-weight:600">${state.authError}</div>` : null}
@@ -1715,30 +1844,17 @@ function renderModals() {
               style="width:100%;margin-bottom:16px"
               type="password"
               placeholder="Enter broker --auth-token value…"
-              value=${state.authToken}
-              onInput=${e => { state.authToken = e.target.value; }}
+              value=${state.authTokenDraft}
+              onInput=${e => { state.authTokenDraft = e.target.value; }}
             />
             <div style="display:flex;justify-content:flex-end;gap:8px">
               <button
                 class="btn"
-                onClick=${() => {
-                  state.authToken = '';
-                  localStorage.removeItem(STORAGE_TOKEN_KEY);
-                  state.showAuthModal = false;
-                  connectSse();
-                  refreshAll();
-                }}
+                onClick=${() => commitAuthToken('')}
               >Clear</button>
               <button
                 class="btn btn-primary"
-                onClick=${() => {
-                  localStorage.setItem(STORAGE_TOKEN_KEY, state.authToken.trim());
-                  state.authToken = state.authToken.trim();
-                  state.showAuthModal = false;
-                  state.authError = '';
-                  connectSse();
-                  refreshAll();
-                }}
+                onClick=${() => commitAuthToken(state.authTokenDraft.trim())}
               >Save & Connect</button>
             </div>
           </div>
@@ -1819,7 +1935,7 @@ window.addEventListener('keydown', e => {
   if (e.key === 'Escape' && (state.selectedPartition || state.selectedTestExecution || state.showAuthModal)) {
     state.selectedPartition = null;
     state.selectedTestExecution = null;
-    state.showAuthModal = false;
+    closeAuthModal();
     renderApp();
   }
 });

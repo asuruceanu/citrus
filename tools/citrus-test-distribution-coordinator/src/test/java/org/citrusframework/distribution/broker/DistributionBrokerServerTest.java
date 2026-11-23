@@ -31,6 +31,7 @@ import java.util.concurrent.CompletionStage;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 
+import org.citrusframework.distribution.cache.BlobCacheDirectory;
 import org.citrusframework.distribution.cache.ClasspathPackager;
 import org.citrusframework.distribution.config.DistributionJson;
 import org.citrusframework.distribution.model.ArtifactKind;
@@ -59,6 +60,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class DistributionBrokerServerTest {
 
@@ -105,6 +107,18 @@ class DistributionBrokerServerTest {
                             .GET().build(),
                     HttpResponse.BodyHandlers.ofString());
             assertThat(validAuth.statusCode()).isEqualTo(200);
+        }
+    }
+
+    @Test
+    void shouldRefuseAWorkerOwnedCache() throws Exception {
+        Path cacheDir = tempDir.resolve("worker-owned");
+        BlobCacheDirectory.recordOwnerIfAbsent(cacheDir, BlobCacheDirectory.OWNER_WORKER);
+        DistributionBrokerConfig config = DistributionBrokerConfig.builder().port(0).cacheDir(cacheDir).build();
+        try (DistributionBrokerServer server = new DistributionBrokerServer(config)) {
+            assertThatThrownBy(server::start)
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessageContainingAll(cacheDir.toString(), "owned by worker", "--cache-dir");
         }
     }
 
@@ -506,6 +520,27 @@ class DistributionBrokerServerTest {
         WorkerWsMessage pollMessage(long timeoutMs) throws InterruptedException {
             return messages.poll(timeoutMs, TimeUnit.MILLISECONDS);
         }
+    }
+
+    @Test
+    void shouldMarkItsBlobCacheAsCoordinatorOwnedButKeepAnExistingOwner() throws Exception {
+        Path fresh = tempDir.resolve("owned-cache");
+        Path adopted = tempDir.resolve("adopted-cache");
+        BlobCacheDirectory.recordOwnerIfAbsent(adopted, BlobCacheDirectory.OWNER_LAUNCHER);
+
+        for (Path cacheDir : List.of(fresh, adopted)) {
+            DistributionBrokerConfig config = DistributionBrokerConfig.builder()
+                    .port(0)
+                    .cacheDir(cacheDir)
+                    .jdbcUrl("jdbc:hsqldb:mem:broker_owner_" + System.nanoTime())
+                    .build();
+            try (DistributionBrokerServer server = new DistributionBrokerServer(config)) {
+                server.start();
+            }
+        }
+
+        assertThat(BlobCacheDirectory.readOwner(fresh)).contains(BlobCacheDirectory.OWNER_COORDINATOR);
+        assertThat(BlobCacheDirectory.readOwner(adopted)).contains(BlobCacheDirectory.OWNER_LAUNCHER);
     }
 
     @Test

@@ -16,6 +16,9 @@
 
 package org.citrusframework.distribution.worker;
 
+import java.io.Closeable;
+import java.io.FilePermission;
+import java.io.FilterInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -24,8 +27,12 @@ import java.io.PrintWriter;
 import java.io.Reader;
 import java.io.UncheckedIOException;
 import java.io.Writer;
+import java.net.JarURLConnection;
+import java.net.MalformedURLException;
 import java.net.URL;
 import java.net.URLClassLoader;
+import java.net.URLConnection;
+import java.net.URLStreamHandler;
 import java.nio.charset.Charset;
 import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
@@ -33,10 +40,12 @@ import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.SimpleFileVisitor;
 import java.nio.file.attribute.BasicFileAttributes;
+import java.security.Permission;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Enumeration;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -48,9 +57,10 @@ import java.util.function.BiConsumer;
 import java.util.function.BiFunction;
 import java.util.function.Consumer;
 import java.util.function.Function;
+import java.util.jar.JarEntry;
+import java.util.jar.JarFile;
 import java.util.stream.Stream;
 
-import org.citrusframework.distribution.cache.BlobCacheDirectory;
 import org.citrusframework.distribution.config.DistributionSettings;
 import org.citrusframework.distribution.config.DistributionSettings.WorkerCwdCheckMode;
 import org.citrusframework.distribution.config.PathRewriter;
@@ -58,6 +68,7 @@ import org.citrusframework.distribution.model.ArtifactRef;
 import org.citrusframework.distribution.model.PartitionAssignPayload;
 import org.citrusframework.distribution.model.WorkerTestEventPayload;
 import org.citrusframework.distribution.model.WorkspaceFileSet;
+import org.citrusframework.distribution.workspace.WorkspaceLease;
 import org.junit.platform.engine.CancellationToken;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -76,13 +87,26 @@ public final class IsolatedPartitionRunner implements PartitionRunner {
     static final String MESSAGE_TRACE_DIRECTORY_PROPERTY = "citrus.message.trace.directory";
 
     private final DistributionWorkerConfig config;
-    private final BlobCacheDirectory blobCache;
-    private final BrokerBlobClient blobs;
+    private final WorkerFileCache sharedCache;
+    private final BrokerBlobClient sharedBlobs;
 
-    public IsolatedPartitionRunner(DistributionWorkerConfig config) {
-        this.config = config;
-        this.blobCache = new BlobCacheDirectory(config.cacheDir());
-        this.blobs = new BrokerBlobClient(config, blobCache);
+    /**
+     * Runs partitions against the worker's shared cache and blob client, both owned by the caller.
+     */
+    IsolatedPartitionRunner(DistributionWorkerConfig config, WorkerFileCache cache, BrokerBlobClient blobs) {
+        this.config = Objects.requireNonNull(config, "config");
+        this.sharedCache = Objects.requireNonNull(cache, "cache");
+        this.sharedBlobs = Objects.requireNonNull(blobs, "blobs");
+    }
+
+    /**
+     * Test convenience: every {@link #execute} locks the configured cache directory and creates its own blob client,
+     * releasing both when the partition ends.
+     */
+    IsolatedPartitionRunner(DistributionWorkerConfig config) {
+        this.config = Objects.requireNonNull(config, "config");
+        this.sharedCache = null;
+        this.sharedBlobs = null;
     }
 
     /**
@@ -115,27 +139,60 @@ public final class IsolatedPartitionRunner implements PartitionRunner {
             PartitionAssignPayload assignment,
             CancellationToken cancellationToken,
             Consumer<WorkerTestEventPayload> eventSink) {
-        Path partitionRoot = null;
+        if (sharedCache != null) {
+            return execute(assignment, cancellationToken, eventSink, sharedCache, sharedBlobs);
+        }
+        WorkerFileCache cache;
+        try {
+            cache = WorkerFileCache.open(config.cacheDir(), config.cacheCleanup(), config.cacheFreeSpaceBufferBytes());
+        } catch (RuntimeException e) {
+            LOG.warn("Partition {} failed: cannot open the worker cache", assignment.partitionId(), e);
+            return new PartitionExecutionResult(false, e.getMessage() != null ? e.getMessage() : e.getClass().getName());
+        }
+        try (cache; BrokerBlobClient blobs = new BrokerBlobClient(config, cache)) {
+            return execute(assignment, cancellationToken, eventSink, cache, blobs);
+        }
+    }
+
+    /**
+     * Runs the partition. All classpath digests are pinned before the first download and stay pinned until the
+     * partition class loader is closed.
+     */
+    private PartitionExecutionResult execute(
+            PartitionAssignPayload assignment,
+            CancellationToken cancellationToken,
+            Consumer<WorkerTestEventPayload> eventSink,
+            WorkerFileCache cache,
+            BrokerBlobClient blobs) {
+        WorkerWorkspaceRegistry.Workspace workspace = null;
         ThreadScopedProperties systemProps = null;
         Properties previousScope = null;
         boolean workerScopeEntered = false;
+        WorkerFileCache.PinLease pins = null;
 
         try {
-            partitionRoot = Files.createTempDirectory("cdist-");
+            List<ArtifactRef> classpathArtifacts = assignment.classpathArtifacts() != null
+                    ? assignment.classpathArtifacts() : List.of();
+            pins = cache.pinAll(classpathArtifacts.stream().map(ArtifactRef::sha256).toList());
+
+            workspace = cache.createWorkspace(false, workspaceLeaseRequested(assignment.systemProperties()));
+            Path partitionRoot = workspace.root();
             Path workspaceDir = Files.createDirectories(partitionRoot.resolve("workspace"));
             Files.createDirectories(workspaceDir.resolve("target"));
 
             List<URL> urls = new ArrayList<>();
-            for (ArtifactRef artifact : assignment.classpathArtifacts() != null ? assignment.classpathArtifacts() : List.<ArtifactRef>of()) {
-                blobs.ensureCached(artifact.sha256());
-                urls.add(blobCache.materializeForClasspath(artifact, partitionRoot).toUri().toURL());
+            for (ArtifactRef artifact : classpathArtifacts) {
+                // ensureCached returns a verified blob: materializing it hashes nothing again
+                Path verified = blobs.ensureCached(artifact);
+                urls.add(cache.materializeForClasspath(artifact, verified, partitionRoot).toUri().toURL());
             }
 
             Map<String, String> overrides = partitionOverrides(assignment.systemProperties(), workspaceDir);
+            addWorkspaceLeaseTicket(overrides, workspace);
             WorkingDirectorySnapshot before = null;
             synchronized (WORKER_JVM_LOCK) {
                 if (config.cwdCheckMode() != WorkerCwdCheckMode.OFF) {
-                    before = WorkingDirectorySnapshot.take(workingDirectory(), config.cacheDir());
+                    before = WorkingDirectorySnapshot.take(workingDirectory(), config.cacheDir(), cache.rootDir());
                 }
                 systemProps = installThreadScopedProperties();
                 ACTIVE_WORKER_SCOPES.incrementAndGet();
@@ -160,7 +217,8 @@ public final class IsolatedPartitionRunner implements PartitionRunner {
             if (before != null && before.available()) {
                 List<String> changed;
                 synchronized (WORKER_JVM_LOCK) {
-                    WorkingDirectorySnapshot after = WorkingDirectorySnapshot.take(workingDirectory(), config.cacheDir());
+                    WorkingDirectorySnapshot after = WorkingDirectorySnapshot.take(workingDirectory(), config.cacheDir(),
+                            cache.rootDir());
                     changed = after.available() ? before.changedEntries(after) : List.of();
                 }
                 if (!changed.isEmpty()) {
@@ -180,21 +238,37 @@ public final class IsolatedPartitionRunner implements PartitionRunner {
             }
             return new PartitionExecutionResult(true, null);
         } catch (Throwable t) {
+            if (t instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+            }
             LOG.warn("Partition {} failed during execution", assignment.partitionId(), t);
             return new PartitionExecutionResult(false, t.getMessage() != null ? t.getMessage() : t.getClass().getName());
         } finally {
-            if (systemProps != null) {
-                systemProps.exitScope(previousScope);
-            }
-            if (workerScopeEntered) {
-                synchronized (WORKER_JVM_LOCK) {
-                    if (ACTIVE_WORKER_SCOPES.decrementAndGet() <= 0) {
-                        ACTIVE_WORKER_SCOPES.set(0);
-                        systemProps.base().remove(DistributionSettings.ROLE_PROPERTY);
+            try {
+                if (systemProps != null) {
+                    systemProps.exitScope(previousScope);
+                }
+                if (workerScopeEntered) {
+                    synchronized (WORKER_JVM_LOCK) {
+                        if (ACTIVE_WORKER_SCOPES.decrementAndGet() <= 0) {
+                            ACTIVE_WORKER_SCOPES.set(0);
+                            systemProps.base().remove(DistributionSettings.ROLE_PROPERTY);
+                        }
                     }
                 }
+                if (workspace != null) {
+                    try {
+                        workspace.close();
+                    } catch (IOException e) {
+                        LOG.debug("Could not clean up partition workspace {}", workspace.root(), e);
+                    }
+                }
+            } finally {
+                if (pins != null) {
+                    // The partition class loader is closed by now: its named jars may be evicted again.
+                    pins.close();
+                }
             }
-            deleteRecursivelyQuietly(partitionRoot);
         }
     }
 
@@ -223,6 +297,19 @@ public final class IsolatedPartitionRunner implements PartitionRunner {
                 assigned != null ? assigned : Map.of(), workspaceDir);
         overrides.put("basedir", workspaceDir.toAbsolutePath().normalize().toString());
         return overrides;
+    }
+
+    static boolean workspaceLeaseRequested(Map<String, String> assigned) {
+        return assigned != null && Boolean.parseBoolean(assigned.get(WorkspaceLease.ENABLED_PROPERTY));
+    }
+
+    static void addWorkspaceLeaseTicket(Map<String, String> properties, WorkerWorkspaceRegistry.Workspace workspace) {
+        Path ticket = workspace.leaseTicket();
+        if (ticket == null) {
+            properties.remove(WorkspaceLease.TICKET_PROPERTY);
+        } else {
+            properties.put(WorkspaceLease.TICKET_PROPERTY, ticket.toString());
+        }
     }
 
     /**
@@ -258,11 +345,13 @@ public final class IsolatedPartitionRunner implements PartitionRunner {
 
         /**
          * Takes a snapshot; when the directory itself cannot be listed the snapshot is marked unavailable and no
-         * comparison is made. Unreadable sub-directories are skipped.
+         * comparison is made. Unreadable sub-directories are skipped. Entries at or below any of {@code excluded}
+         * (the worker cache, as configured and canonical) are left out, also when an excluded directory is reached
+         * through a link or {@code root} itself is a link.
          */
-        static WorkingDirectorySnapshot take(Path root, Path excluded) {
+        static WorkingDirectorySnapshot take(Path root, Path... excluded) {
             Map<String, String> entries = new TreeMap<>();
-            Path excludedDir = excluded != null ? excluded.toAbsolutePath().normalize() : null;
+            List<Path> excludedDir = excludedDirectories(root, excluded);
             List<Path> topLevel;
             try (Stream<Path> top = Files.list(root)) {
                 topLevel = top.toList();
@@ -303,9 +392,46 @@ public final class IsolatedPartitionRunner implements PartitionRunner {
             return new WorkingDirectorySnapshot(entries, true);
         }
 
-        private static void record(Path root, Path entry, Map<String, String> entries, Path excludedDir) {
-            if (excludedDir != null && entry.toAbsolutePath().normalize().startsWith(excludedDir)) {
-                return;
+        /**
+         * The excluded directories as absolute paths in the namespace of {@code root}: each as given, and, when its
+         * real location lies inside the real location of {@code root}, also as the corresponding path below
+         * {@code root}.
+         */
+        static List<Path> excludedDirectories(Path root, Path... excluded) {
+            List<Path> result = new ArrayList<>();
+            if (excluded == null) {
+                return result;
+            }
+            Path absoluteRoot = root.toAbsolutePath().normalize();
+            Path realRoot = realPathOrNull(absoluteRoot);
+            for (Path path : excluded) {
+                if (path == null) {
+                    continue;
+                }
+                Path absolute = path.toAbsolutePath().normalize();
+                result.add(absolute);
+                Path real = realPathOrNull(absolute);
+                if (realRoot != null && real != null && real.startsWith(realRoot)) {
+                    result.add(absoluteRoot.resolve(realRoot.relativize(real)).normalize());
+                }
+            }
+            return result;
+        }
+
+        private static Path realPathOrNull(Path path) {
+            try {
+                return path.toRealPath();
+            } catch (IOException e) {
+                return null;
+            }
+        }
+
+        private static void record(Path root, Path entry, Map<String, String> entries, List<Path> excludedDirs) {
+            Path absolute = entry.toAbsolutePath().normalize();
+            for (Path excludedDir : excludedDirs) {
+                if (absolute.startsWith(excludedDir)) {
+                    return;
+                }
             }
             try {
                 BasicFileAttributes attrs = Files.readAttributes(entry, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
@@ -381,6 +507,7 @@ public final class IsolatedPartitionRunner implements PartitionRunner {
                 }
             }
             snapshot.putAll(base);
+            snapshot.remove(WorkspaceLease.TICKET_PROPERTY);
             if (partitionOverrides != null) {
                 for (Map.Entry<String, String> entry : partitionOverrides.entrySet()) {
                     String key = entry.getKey();
@@ -647,18 +774,276 @@ public final class IsolatedPartitionRunner implements PartitionRunner {
         }
     }
 
-    private static void deleteRecursivelyQuietly(Path dir) {
-        if (dir == null || !Files.exists(dir)) {
-            return;
+    /**
+     * Uses the JDK's {@code jar:} URL parsing and comparison and owns the uncached JarFiles opened by its connections.
+     * Closing an entry stream closes its JarFile promptly. Closing the handler releases the remaining JarFiles,
+     * including those opened just for metadata.
+     */
+    static final class UncachedJarHandler extends URLStreamHandler implements Closeable {
+
+        private final Set<JarFile> openJars = new HashSet<>();
+        private boolean closed;
+
+        @Override
+        protected URLConnection openConnection(URL url) throws IOException {
+            checkOpen();
+            return new OwnedJarConnection(url, (JarURLConnection) jdkUrl(url).openConnection());
         }
-        try (Stream<Path> walk = Files.walk(dir)) {
-            walk.sorted((a, b) -> b.compareTo(a)).forEach(p -> {
-                try {
-                    Files.deleteIfExists(p);
-                } catch (IOException ignored) {
+
+        private synchronized void checkOpen() throws IOException {
+            if (closed) {
+                throw new IOException("Partition JAR handler is closed");
+            }
+        }
+
+        private synchronized JarFile openLocalJar(JarURLConnection connection) throws IOException {
+            checkOpen();
+            return retain(connection.getJarFile());
+        }
+
+        private synchronized JarFile retain(JarFile jar) throws IOException {
+            if (closed) {
+                // A connection can finish opening while the partition is closing.
+                try (jar) {
+                    checkOpen();
                 }
-            });
-        } catch (IOException ignored) {
+            }
+            openJars.add(jar);
+            return jar;
+        }
+
+        private synchronized void release(JarFile jar) {
+            openJars.remove(jar);
+        }
+
+        @Override
+        public synchronized void close() throws IOException {
+            closed = true;
+            IOException failure = null;
+            for (JarFile jar : openJars) {
+                try {
+                    jar.close();
+                } catch (IOException e) {
+                    if (failure == null) {
+                        failure = e;
+                    } else {
+                        failure.addSuppressed(e);
+                    }
+                }
+            }
+            openJars.clear();
+            if (failure != null) {
+                throw failure;
+            }
+        }
+
+        private final class OwnedJarConnection extends JarURLConnection {
+
+            private final JarURLConnection delegate;
+            private JarFile jar;
+
+            private OwnedJarConnection(URL url, JarURLConnection delegate) throws MalformedURLException {
+                super(url);
+                this.delegate = delegate;
+                delegate.setUseCaches(false);
+                useCaches = false;
+            }
+
+            @Override
+            public synchronized void connect() throws IOException {
+                if (!connected) {
+                    checkOpen();
+                    // Wait for local file opens during shutdown. Remote downloads can finish independently.
+                    jar = isLocalFile() ? openLocalJar(delegate) : retain(delegate.getJarFile());
+                    connected = true;
+                }
+            }
+
+            @Override
+            public void setUseCaches(boolean useCaches) {
+                super.setUseCaches(false);
+            }
+
+            @Override
+            public JarFile getJarFile() throws IOException {
+                connect();
+                return jar;
+            }
+
+            @Override
+            public JarEntry getJarEntry() throws IOException {
+                connect();
+                return delegate.getJarEntry();
+            }
+
+            @Override
+            public InputStream getInputStream() throws IOException {
+                connect();
+                return new FilterInputStream(delegate.getInputStream()) {
+                    @Override
+                    public void close() throws IOException {
+                        super.close();
+                        release(jar);
+                    }
+                };
+            }
+
+            @Override
+            public Object getContent() throws IOException {
+                return getEntryName() == null ? getJarFile() : super.getContent();
+            }
+
+            @Override
+            public int getContentLength() {
+                long length = getContentLengthLong();
+                return length > Integer.MAX_VALUE ? -1 : (int) length;
+            }
+
+            @Override
+            public long getContentLengthLong() {
+                try {
+                    connect();
+                    if (getEntryName() == null && isLocalFile()) {
+                        return getHeaderFieldLong("content-length", -1);
+                    }
+                    return delegate.getContentLengthLong();
+                } catch (IOException e) {
+                    return -1;
+                }
+            }
+
+            @Override
+            public String getContentType() {
+                try {
+                    if (getEntryName() != null) {
+                        connect();
+                    }
+                    return delegate.getContentType();
+                } catch (IOException e) {
+                    return Objects.requireNonNullElse(guessContentTypeFromName(getEntryName()), "content/unknown");
+                }
+            }
+
+            @Override
+            public String getHeaderField(String name) {
+                try {
+                    checkOpen();
+                    if (!isLocalFile()) {
+                        return delegate.getHeaderField(name);
+                    }
+                    synchronized (UncachedJarHandler.this) {
+                        checkOpen();
+                        // The JDK opens a file stream when reading headers. Scope that stream to this call.
+                        URLConnection file = getJarFileURL().openConnection();
+                        try (InputStream stream = file.getInputStream()) {
+                            return file.getHeaderField(name);
+                        }
+                    }
+                } catch (IOException e) {
+                    return null;
+                }
+            }
+
+            private boolean isLocalFile() throws IOException {
+                return "file".equals(getJarFileURL().getProtocol()) && getPermission() instanceof FilePermission;
+            }
+
+            @Override
+            public Permission getPermission() throws IOException {
+                return delegate.getPermission();
+            }
+
+            @Override
+            public void setAllowUserInteraction(boolean allowUserInteraction) {
+                delegate.setAllowUserInteraction(allowUserInteraction);
+            }
+
+            @Override
+            public boolean getAllowUserInteraction() {
+                return delegate.getAllowUserInteraction();
+            }
+
+            @Override
+            public void setIfModifiedSince(long ifModifiedSince) {
+                delegate.setIfModifiedSince(ifModifiedSince);
+            }
+
+            @Override
+            public void setRequestProperty(String key, String value) {
+                delegate.setRequestProperty(key, value);
+            }
+
+            @Override
+            public void addRequestProperty(String key, String value) {
+                delegate.addRequestProperty(key, value);
+            }
+
+            @Override
+            public String getRequestProperty(String key) {
+                return delegate.getRequestProperty(key);
+            }
+
+            @Override
+            public Map<String, List<String>> getRequestProperties() {
+                return delegate.getRequestProperties();
+            }
+        }
+
+        /**
+         * The JDK's jar handler does not implement this variant (it throws {@link UnsupportedOperationException}); a
+         * {@code jar:} URL opens its inner URL itself, so the proxy is not applicable and the plain connection is used.
+         */
+        @Override
+        protected URLConnection openConnection(URL url, java.net.Proxy proxy) throws IOException {
+            return openConnection(url);
+        }
+
+        /** Parses {@code spec} like the JDK's jar handler, relative to {@code url}'s current (context) fields. */
+        @Override
+        @SuppressWarnings("deprecation") // URL(URL, String): resolves through the JDK's jar handler, accepts spaces
+        protected void parseURL(URL url, String spec, int start, int limit) {
+            try {
+                URL context = url.getFile() == null || url.getFile().isEmpty() ? null : jdkUrl(url);
+                URL resolved = new URL(context, spec);
+                setURL(url, resolved.getProtocol(), resolved.getHost(), resolved.getPort(), resolved.getAuthority(),
+                        resolved.getUserInfo(), resolved.getPath(), resolved.getQuery(), resolved.getRef());
+            } catch (MalformedURLException e) {
+                // URL's constructor reports this as a MalformedURLException.
+                throw new IllegalArgumentException(e.getMessage(), e);
+            }
+        }
+
+        @Override
+        protected boolean equals(URL first, URL second) {
+            URL jdkFirst = jdkUrlOrNull(first);
+            return jdkFirst != null && jdkFirst.equals(jdkUrlOrNull(second));
+        }
+
+        @Override
+        protected int hashCode(URL url) {
+            URL jdk = jdkUrlOrNull(url);
+            return jdk != null ? jdk.hashCode() : url.toExternalForm().hashCode();
+        }
+
+        @Override
+        protected boolean sameFile(URL first, URL second) {
+            URL jdkFirst = jdkUrlOrNull(first);
+            URL jdkSecond = jdkUrlOrNull(second);
+            return jdkFirst != null && jdkSecond != null && jdkFirst.sameFile(jdkSecond);
+        }
+
+        /** The same URL with the JDK's default handler for its protocol (no URI round trip, so spaces are fine). */
+        @SuppressWarnings("deprecation")
+        static URL jdkUrl(URL url) throws MalformedURLException {
+            return new URL(url.toExternalForm());
+        }
+
+        private static URL jdkUrlOrNull(URL url) {
+            try {
+                return url != null ? jdkUrl(url) : null;
+            } catch (MalformedURLException e) {
+                return null;
+            }
         }
     }
 
@@ -670,6 +1055,11 @@ public final class IsolatedPartitionRunner implements PartitionRunner {
      * else is loaded from the partition, falling back only to the JVM's own platform and bootstrap loaders: a class or
      * resource the partition does not ship must not leak in from the worker's application classpath (for example the
      * worker's own Citrus jars), or it would link against a second copy of the same classes.
+     * <p>
+     * {@code jar:} URLs of partition resources open their connections without the JDK's JarFile cache: a cached
+     * JarFile stays open until the worker JVM exits, which would keep the disk space of an evicted named jar in use
+     * (and prevent deleting it on Windows). The loader's own jar handles are released when it is closed after the
+     * partition.
      */
     static final class PartitionClassLoader extends URLClassLoader {
 
@@ -703,6 +1093,7 @@ public final class IsolatedPartitionRunner implements PartitionRunner {
         private static final List<Path> WORKER_JAVA_AGENTS = javaAgentPaths(
                 java.lang.management.ManagementFactory.getRuntimeMXBean().getInputArguments());
 
+        private final UncachedJarHandler jarHandler = new UncachedJarHandler();
         private final ClassLoader jdkLoader;
         private final ClassLoader agentHost;
         private final List<Path> agentLocations;
@@ -830,6 +1221,41 @@ public final class IsolatedPartitionRunner implements PartitionRunner {
                     resolveClass(loaded);
                 }
                 return loaded;
+            }
+        }
+
+        @Override
+        public URL findResource(String name) {
+            return uncached(super.findResource(name));
+        }
+
+        @Override
+        public Enumeration<URL> findResources(String name) throws IOException {
+            List<URL> urls = new ArrayList<>();
+            for (URL url : Collections.list(super.findResources(name))) {
+                urls.add(uncached(url));
+            }
+            return Collections.enumeration(urls);
+        }
+
+        /** Attaches the partition's handler to its {@code jar:} URLs. */
+        @SuppressWarnings("deprecation") // URL(URL, String, URLStreamHandler): the only way to attach a handler without a URI
+        private URL uncached(URL url) {
+            if (url == null || !"jar".equals(url.getProtocol())) {
+                return url;
+            }
+            try {
+                return new URL(null, url.toExternalForm(), jarHandler);
+            } catch (MalformedURLException e) {
+                // keep the JDK's own (caching) handler rather than losing the resource
+                return url;
+            }
+        }
+
+        @Override
+        public void close() throws IOException {
+            try (jarHandler) {
+                super.close();
             }
         }
 

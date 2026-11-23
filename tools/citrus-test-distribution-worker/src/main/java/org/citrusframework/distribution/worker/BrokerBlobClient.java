@@ -17,63 +17,121 @@
 package org.citrusframework.distribution.worker;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Objects;
+import java.util.OptionalLong;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 
 import org.citrusframework.distribution.cache.BlobCacheDirectory;
 import org.citrusframework.distribution.cache.ClasspathPackager;
 import org.citrusframework.distribution.config.DistributionJson;
+import org.citrusframework.distribution.model.ArtifactRef;
 import org.citrusframework.distribution.model.MissingDigestsRequest;
 import org.citrusframework.distribution.model.MissingDigestsResponse;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * Moves content-addressed blobs between the worker's {@link BlobCacheDirectory} and the coordinator's blob store.
+ * Moves content-addressed blobs between the worker's {@link WorkerFileCache} and the coordinator's blob store.
+ * <p>
+ * Downloads stream in {@value #CHUNK_BYTES}-byte chunks into a temporary file under the cache's {@code tmp/}, never
+ * exceed {@link ClasspathPackager#MAX_BLOB_BYTES}, make room on the cache volume first (from the declared artifact
+ * size, and again from a larger {@code Content-Length}), and are verified while promoted into the blob store. A
+ * download that fails verification is retried once. Reads time out after a period without data, and temporary files
+ * are removed on every outcome.
  */
-final class BrokerBlobClient {
+final class BrokerBlobClient implements AutoCloseable {
 
     private static final Logger LOG = LoggerFactory.getLogger(BrokerBlobClient.class);
 
-    private final DistributionWorkerConfig config;
-    private final BlobCacheDirectory blobCache;
-    private final HttpClient httpClient;
-    private final Set<String> verifiedBlobs = ConcurrentHashMap.newKeySet();
+    static final int CHUNK_BYTES = 64 * 1024;
 
-    BrokerBlobClient(DistributionWorkerConfig config, BlobCacheDirectory blobCache) {
+    private final DistributionWorkerConfig config;
+    private final WorkerFileCache cache;
+    private final HttpClient httpClient;
+    private final long maxBlobBytes;
+    private final ScheduledThreadPoolExecutor readWatchdog;
+    private final Set<InputStream> openBodies = ConcurrentHashMap.newKeySet();
+    private final AtomicBoolean closed = new AtomicBoolean();
+    private final AtomicLong downloadRequests = new AtomicLong();
+    private volatile WorkerFileCache.DownloadFileOpener tempFileOpener = Files::newOutputStream;
+
+    BrokerBlobClient(DistributionWorkerConfig config, WorkerFileCache cache) {
+        this(config, cache, ClasspathPackager.MAX_BLOB_BYTES);
+    }
+
+    BrokerBlobClient(DistributionWorkerConfig config, WorkerFileCache cache, long maxBlobBytes) {
         this.config = config;
-        this.blobCache = blobCache;
+        this.maxBlobBytes = maxBlobBytes;
+        this.cache = Objects.requireNonNull(cache, "cache");
         this.httpClient = HttpClient.newBuilder()
                 .connectTimeout(Duration.ofSeconds(10))
                 .build();
+        readWatchdog = new ScheduledThreadPoolExecutor(1, task -> {
+            Thread thread = new Thread(task, "citrus-dist-blob-watchdog-" + config.workerId());
+            thread.setDaemon(true);
+            return thread;
+        });
+        readWatchdog.setRemoveOnCancelPolicy(true);
     }
 
     /**
-     * Makes sure {@code sha256} is in the local cache with verified content, downloading it from the coordinator if
-     * absent or corrupted (once more if the download fails verification). Digests verified in this JVM are not hashed
-     * again.
+     * Makes sure the blob of {@code artifact} is in the local cache with verified content and returns its path.
+     *
+     * @throws IOException if the declared size exceeds {@link ClasspathPackager#MAX_BLOB_BYTES}, or the blob cannot be
+     *                     downloaded, stored or verified
      */
-    void ensureCached(String sha256) throws IOException, InterruptedException {
-        if (verifiedBlobs.contains(sha256) && blobCache.contains(sha256)) {
-            return;
+    Path ensureCached(ArtifactRef artifact) throws IOException, InterruptedException {
+        return ensureCached(artifact.sha256(), artifact.sizeBytes());
+    }
+
+    /**
+     * Makes sure {@code sha256} is in the local cache with verified content and returns its path. The size is taken
+     * from the response.
+     */
+    Path ensureCached(String sha256) throws IOException, InterruptedException {
+        return ensureCached(sha256, 0L);
+    }
+
+    private Path ensureCached(String sha256, long sizeBytes) throws IOException, InterruptedException {
+        BlobCacheDirectory.validateDigest(sha256);
+        if (sizeBytes > maxBlobBytes) {
+            throw new IOException("Blob " + sha256 + " declares " + sizeBytes + " bytes, more than the maximum of "
+                    + maxBlobBytes);
         }
-        if (blobCache.getVerifiedPath(sha256) == null) {
-            byte[] content = download(sha256);
-            if (!sha256.equals(ClasspathPackager.sha256Hex(content))) {
-                LOG.warn("Blob {} failed verification after download, retrying once", sha256);
-                content = download(sha256);
+        Path cached = cache.verifyOrInvalidate(sha256);
+        if (cached != null) {
+            return cached;
+        }
+        long expectedBytes = Math.clamp(sizeBytes, 0L, maxBlobBytes);
+        cache.ensureFreeSpaceForDownload(expectedBytes);
+        try {
+            return download(sha256, expectedBytes);
+        } catch (DigestMismatchException first) {
+            LOG.warn("Blob {} failed verification after download, retrying once", sha256);
+            try {
+                return download(sha256, expectedBytes);
+            } catch (DigestMismatchException second) {
+                second.addSuppressed(first);
+                throw new IOException("Blob " + sha256 + " failed verification twice after download", second);
             }
-            blobCache.put(sha256, content);
         }
-        verifiedBlobs.add(sha256);
     }
 
     /**
@@ -94,7 +152,7 @@ final class BrokerBlobClient {
         }
         MissingDigestsResponse missing = DistributionJson.fromJson(missingResponse.body(), MissingDigestsResponse.class);
         for (String sha256 : missing.missing() != null ? missing.missing() : List.<String>of()) {
-            Path blob = blobCache.getVerifiedPath(sha256);
+            Path blob = cache.verifyOrInvalidate(sha256);
             if (blob == null) {
                 throw new IOException("Output blob " + sha256 + " is missing from the worker cache");
             }
@@ -109,16 +167,107 @@ final class BrokerBlobClient {
         }
     }
 
-    private byte[] download(String sha256) throws IOException, InterruptedException {
-        HttpResponse<byte[]> response = httpClient.send(request("/api/v1/cache/blobs/" + sha256)
+    /**
+     * Streams the blob into a temporary file and promotes it into the cache.
+     *
+     * @throws DigestMismatchException if the downloaded content does not match {@code sha256}
+     */
+    private Path download(String sha256, long expectedBytes) throws IOException, InterruptedException {
+        downloadRequests.incrementAndGet();
+        HttpResponse<InputStream> response = httpClient.send(request("/api/v1/cache/blobs/" + sha256)
                         .timeout(Duration.ofSeconds(60))
                         .GET()
                         .build(),
-                HttpResponse.BodyHandlers.ofByteArray());
+                HttpResponse.BodyHandlers.ofInputStream());
+        try (InputStream body = response.body()) {
+            openBodies.add(body);
+            try {
+                if (closed.get()) {
+                    throw new IOException("Blob client closed during download of " + sha256);
+                }
+                return storeResponse(response, body, sha256, expectedBytes);
+            } finally {
+                openBodies.remove(body);
+            }
+        }
+    }
+
+    private Path storeResponse(HttpResponse<InputStream> response, InputStream body, String sha256, long expectedBytes)
+            throws IOException {
         if (response.statusCode() != 200) {
             throw new IOException("Failed to download blob " + sha256 + " from broker: HTTP " + response.statusCode());
         }
-        return response.body();
+        OptionalLong contentLength = response.headers().firstValueAsLong("Content-Length");
+        if (contentLength.isPresent()) {
+            long declared = contentLength.getAsLong();
+            if (declared > maxBlobBytes) {
+                throw new IOException("Blob " + sha256 + " has a Content-Length of " + declared
+                        + " bytes, more than the maximum of " + maxBlobBytes);
+            }
+            if (declared > expectedBytes) {
+                cache.ensureFreeSpaceForDownload(declared);
+            }
+        }
+
+        try (WorkerFileCache.DownloadStaging staging = cache.openDownloadStaging(tempFileOpener)) {
+            long total = 0;
+            byte[] buffer = new byte[CHUNK_BYTES];
+            int read;
+            while ((read = readWithIdleTimeout(body, buffer, sha256)) != -1) {
+                total += read;
+                if (total > maxBlobBytes) {
+                    throw new IOException("Blob " + sha256 + " exceeds the maximum of " + maxBlobBytes + " bytes");
+                }
+                staging.write(buffer, read);
+            }
+            try {
+                return staging.promote(sha256);
+            } catch (IllegalArgumentException e) {
+                throw new DigestMismatchException(e);
+            }
+        }
+    }
+
+    private int readWithIdleTimeout(InputStream body, byte[] buffer, String sha256) throws IOException {
+        AtomicBoolean reading = new AtomicBoolean(true);
+        ScheduledFuture<?> timeout;
+        try {
+            timeout = readWatchdog.schedule(() -> {
+                if (reading.getAndSet(false)) {
+                    closeBody(body);
+                }
+            }, config.blobReadIdleTimeout().toNanos(), TimeUnit.NANOSECONDS);
+        } catch (RejectedExecutionException e) {
+            throw new IOException("Blob client closed during download of " + sha256, e);
+        }
+
+        try {
+            int count = body.read(buffer);
+            if (reading.getAndSet(false)) {
+                return count;
+            }
+        } catch (IOException e) {
+            if (reading.getAndSet(false)) {
+                throw e;
+            }
+            throw stalledDownload(sha256, e);
+        } finally {
+            timeout.cancel(false);
+        }
+        throw stalledDownload(sha256, null);
+    }
+
+    private IOException stalledDownload(String sha256, IOException cause) {
+        return new IOException("Blob download stalled for " + config.blobReadIdleTimeout() + " while reading " + sha256,
+                cause);
+    }
+
+    private static void closeBody(InputStream body) {
+        try {
+            body.close();
+        } catch (IOException e) {
+            LOG.debug("Could not close blob response body", e);
+        }
     }
 
     private HttpRequest.Builder request(String path) {
@@ -127,5 +276,31 @@ final class BrokerBlobClient {
             builder.header("Authorization", "Bearer " + config.authToken());
         }
         return builder;
+    }
+
+    /** Blob download requests sent to the coordinator by this client. */
+    long downloadRequests() {
+        return downloadRequests.get();
+    }
+
+    void tempFileOpener(WorkerFileCache.DownloadFileOpener opener) {
+        this.tempFileOpener = Objects.requireNonNull(opener);
+    }
+
+    /** Aborts outstanding exchanges and releases the HTTP client. Idempotent. */
+    @Override
+    public void close() {
+        if (closed.compareAndSet(false, true)) {
+            openBodies.forEach(BrokerBlobClient::closeBody);
+            httpClient.shutdownNow();
+            readWatchdog.shutdownNow();
+        }
+    }
+
+    /** A downloaded blob whose content does not match its digest. */
+    private static final class DigestMismatchException extends IOException {
+        DigestMismatchException(IllegalArgumentException cause) {
+            super(cause.getMessage(), cause);
+        }
     }
 }

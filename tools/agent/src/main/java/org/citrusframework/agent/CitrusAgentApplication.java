@@ -20,7 +20,7 @@ import io.netty.handler.codec.http.HttpResponseStatus;
 import io.vertx.core.AbstractVerticle;
 import io.vertx.core.Future;
 import io.vertx.core.Handler;
-import io.vertx.core.Vertx;
+import io.vertx.core.Promise;
 import io.vertx.core.http.HttpHeaders;
 import io.vertx.core.http.HttpMethod;
 import io.vertx.core.http.HttpServerResponse;
@@ -67,6 +67,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 import java.util.stream.Stream;
 
@@ -89,6 +90,7 @@ public class CitrusAgentApplication extends AbstractVerticle implements CitrusIn
      * Router customizations
      */
     private final List<Consumer<Router>> routerCustomizations;
+    private final BooleanSupplier startupCancelled;
 
     private final ExecutorService executorService = Executors.newCachedThreadPool();
 
@@ -104,15 +106,19 @@ public class CitrusAgentApplication extends AbstractVerticle implements CitrusIn
      * Constructor with given application configuration and route customizations.
      */
     public CitrusAgentApplication(CitrusAgentConfiguration configuration, List<Consumer<Router>> routerCustomizations) {
+        this(configuration, routerCustomizations, () -> false);
+    }
+
+    CitrusAgentApplication(CitrusAgentConfiguration configuration, List<Consumer<Router>> routerCustomizations,
+                           BooleanSupplier startupCancelled) {
         this.configuration = configuration;
+        this.startupCancelled = startupCancelled;
         this.routerCustomizations = Optional.ofNullable(routerCustomizations)
                 .orElse(Collections.emptyList());
     }
 
     @Override
-    public void start() {
-        CitrusInstanceManager.addInstanceProcessor(this);
-
+    public void start(Promise<Void> startPromise) {
         Router router = Router.router(getVertx());
         router.route().handler(CorsHandler.create()
                 .addOriginWithRegex(CitrusAgentSettings.getCorsAllowedOrigin())
@@ -138,16 +144,31 @@ public class CitrusAgentApplication extends AbstractVerticle implements CitrusIn
                 .handler(wrapThrowingHandler(ctx -> ctx.response().end(agentTestListener.getLogs())));
 
         routerCustomizations.forEach(customization -> customization.accept(router));
+        if (startupCancelled.getAsBoolean()) {
+            startPromise.tryFail("Citrus agent HTTP startup cancelled");
+            return;
+        }
 
         templateEngine = ThymeleafTemplateEngine.create(getVertx());
 
         getVertx().createHttpServer()
                 .requestHandler(router)
                 .listen(configuration.getPort())
-                .onFailure(handler ->
-                        logger.info("Failed to start server on port {} - error message is {}", configuration.getPort(), handler.getMessage()))
-                .onSuccess(unused ->
-                        logger.info("Server started, listening on port {}", configuration.getPort()));
+                .onSuccess(server -> {
+                    if (startupCancelled.getAsBoolean() || startPromise.future().isComplete()) {
+                        server.close();
+                        startPromise.tryFail("Citrus agent HTTP startup cancelled");
+                        return;
+                    }
+                    CitrusInstanceManager.addInstanceProcessor(this);
+                    if (startPromise.tryComplete()) {
+                        logger.info("Server started, listening on port {}", server.actualPort());
+                    } else {
+                        CitrusInstanceManager.removeInstanceProcessor(this);
+                        server.close();
+                    }
+                })
+                .onFailure(startPromise::tryFail);
     }
 
     @Override
@@ -422,13 +443,11 @@ public class CitrusAgentApplication extends AbstractVerticle implements CitrusIn
 
     @Override
     public void stop() {
+        CitrusInstanceManager.removeInstanceProcessor(this);
         CitrusInstanceManager.get().ifPresent(citrus -> {
             logger.info("Closing Citrus and its application context");
             citrus.close();
         });
-
-        Optional.ofNullable(getVertx())
-                .ifPresent(Vertx::close);
     }
 
     private static String createReport(TestResults results) {

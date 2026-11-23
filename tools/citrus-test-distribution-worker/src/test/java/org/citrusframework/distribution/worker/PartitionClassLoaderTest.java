@@ -16,12 +16,19 @@
 
 package org.citrusframework.distribution.worker;
 
+import java.io.IOException;
 import java.io.InputStream;
+import java.net.JarURLConnection;
 import java.net.URL;
+import java.net.URLConnection;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Collections;
 import java.util.List;
+import java.util.jar.JarEntry;
+import java.util.jar.JarFile;
+import java.util.jar.JarOutputStream;
 
 import org.citrusframework.distribution.model.TestOutcomeStatus;
 import org.citrusframework.distribution.model.WorkerTestEventPayload;
@@ -174,6 +181,142 @@ class PartitionClassLoaderTest {
 
         try (IsolatedPartitionRunner.PartitionClassLoader loader = loaderOver(partition)) {
             assertThat(loader.loadClass(filter).getClassLoader()).isSameAs(loader);
+        }
+    }
+
+    @Test
+    @SuppressWarnings("deprecation")
+    void shouldOpenPartitionJarResourcesWithoutTheJdkJarFileCache() throws Exception {
+        // The JDK caches the JarFile of a jar: URL connection until the JVM exits, which would keep an evicted named
+        // jar's disk space in use (and block deleting it on Windows).
+        Path jar = tempDir.resolve("resources.jar");
+        try (JarOutputStream out = new JarOutputStream(Files.newOutputStream(jar))) {
+            for (String name : List.of("probe/data.txt", "probe/other.txt")) {
+                out.putNextEntry(new JarEntry(name));
+                out.write(name.getBytes(StandardCharsets.UTF_8));
+                out.closeEntry();
+            }
+        }
+
+        try (IsolatedPartitionRunner.PartitionClassLoader loader = new IsolatedPartitionRunner.PartitionClassLoader(
+                new URL[] {jar.toUri().toURL()}, WORKER)) {
+            URL resource = loader.getResource("probe/data.txt");
+            assertThat(resource.getProtocol()).isEqualTo("jar");
+            try (java.net.URLClassLoader plain = new java.net.URLClassLoader(new URL[] {jar.toUri().toURL()}, null)) {
+                assertThat(resource.toExternalForm()).as("the URL itself is unchanged")
+                        .isEqualTo(plain.getResource("probe/data.txt").toExternalForm());
+            }
+
+            URLConnection first = resource.openConnection();
+            URLConnection second = resource.openConnection();
+            assertThat(first).isInstanceOf(JarURLConnection.class);
+            first.setUseCaches(true);
+            assertThat(first.getUseCaches()).isFalse();
+            try (JarFile a = ((JarURLConnection) first).getJarFile(); JarFile b = ((JarURLConnection) second).getJarFile()) {
+                assertThat(a).as("no shared, cached JarFile").isNotSameAs(b);
+            }
+            JarURLConnection streaming = (JarURLConnection) resource.openConnection();
+            try (JarFile streamedJar = streaming.getJarFile()) {
+                try (InputStream in = streaming.getInputStream()) {
+                    assertThat(new String(in.readAllBytes(), StandardCharsets.UTF_8)).isEqualTo("probe/data.txt");
+                }
+                assertThatThrownBy(() -> streamedJar.getJarEntry("probe/data.txt"))
+                        .isInstanceOf(IllegalStateException.class);
+            }
+            URL sibling = new URL(resource, "other.txt");
+            assertThat(sibling.openConnection().getUseCaches()).isFalse();
+            try (InputStream in = sibling.openStream()) {
+                assertThat(new String(in.readAllBytes(), StandardCharsets.UTF_8)).isEqualTo("probe/other.txt");
+            }
+            assertThat(Collections.list(loader.getResources("probe/data.txt")))
+                    .singleElement().satisfies(url -> assertThat(url.openConnection().getUseCaches()).isFalse());
+            try (InputStream in = loader.getResourceAsStream("probe/other.txt")) {
+                assertThat(in).isNotNull();
+            }
+        }
+
+        Files.delete(jar);
+        assertThat(jar).doesNotExist();
+    }
+
+    @Test
+    @SuppressWarnings("deprecation")
+    void shouldCloseJarOpenedForMetadataWhenThePartitionCloses() throws Exception {
+        Path jar = tempDir.resolve("metadata.jar");
+        try (JarOutputStream out = new JarOutputStream(Files.newOutputStream(jar))) {
+            out.putNextEntry(new JarEntry("probe/metadata.txt"));
+            out.write(new byte[] {1, 2, 3});
+            out.closeEntry();
+        }
+
+        try (IsolatedPartitionRunner.PartitionClassLoader loader = loaderOver(jar)) {
+            URL resource = loader.getResource("probe/metadata.txt");
+            JarURLConnection connection = (JarURLConnection) resource.openConnection();
+            JarURLConnection unused = (JarURLConnection) resource.openConnection();
+            JarURLConnection archive = (JarURLConnection) new URL(resource, "/").openConnection();
+            assertThat(connection.getContentLengthLong()).isEqualTo(3);
+            assertThat(archive.getContentLengthLong()).isEqualTo(Files.size(jar));
+            try (JarFile openedJar = connection.getJarFile(); JarFile openedArchive = (JarFile) archive.getContent()) {
+                assertThat(connection.getJarEntry().getName()).isEqualTo("probe/metadata.txt");
+                assertThat(openedJar.getJarEntry("probe/metadata.txt")).isNotNull();
+
+                loader.close();
+
+                assertThatThrownBy(() -> openedJar.getJarEntry(connection.getEntryName()))
+                        .isInstanceOf(IllegalStateException.class);
+                assertThatThrownBy(openedArchive::size).isInstanceOf(IllegalStateException.class);
+                assertThatThrownBy(unused::getJarFile).isInstanceOf(IOException.class);
+            }
+        }
+    }
+
+    @Test
+    @SuppressWarnings("deprecation")
+    void shouldResolvePartitionJarUrlsLikeJdkJarUrls() throws Exception {
+        Path jar = tempDir.resolve("resolve.jar");
+        try (JarOutputStream out = new JarOutputStream(Files.newOutputStream(jar))) {
+            for (String name : List.of("abs.txt", "probe/data.txt", "probe/sub/nested.txt", "probe/with space.txt")) {
+                out.putNextEntry(new JarEntry(name));
+                out.write(name.getBytes(StandardCharsets.UTF_8));
+                out.closeEntry();
+            }
+        }
+
+        try (IsolatedPartitionRunner.PartitionClassLoader loader = new IsolatedPartitionRunner.PartitionClassLoader(
+                new URL[] {jar.toUri().toURL()}, WORKER);
+             java.net.URLClassLoader plain = new java.net.URLClassLoader(new URL[] {jar.toUri().toURL()}, null)) {
+            URL nested = loader.getResource("probe/sub/nested.txt");
+            URL jdkNested = plain.getResource("probe/sub/nested.txt");
+
+            for (String spec : List.of("/abs.txt", "../data.txt", "./nested.txt", "../with space.txt",
+                    "../with%20space.txt", "#fragment", jdkNested.toExternalForm())) {
+                URL resolved = new URL(nested, spec);
+                URL jdkResolved = new URL(jdkNested, spec);
+                assertThat(resolved.toExternalForm()).as(spec).isEqualTo(jdkResolved.toExternalForm());
+                assertThat(resolved.openConnection().getUseCaches()).as(spec).isFalse();
+                URLConnection jdkConnection = jdkResolved.openConnection();
+                jdkConnection.setUseCaches(false);
+                try (InputStream in = resolved.openStream(); InputStream jdkIn = jdkConnection.getInputStream()) {
+                    assertThat(in.readAllBytes()).as(spec).isEqualTo(jdkIn.readAllBytes());
+                }
+            }
+
+            URL spaced = loader.getResource("probe/with space.txt");
+            assertThat(spaced).isNotNull();
+            try (InputStream in = spaced.openStream()) {
+                assertThat(new String(in.readAllBytes(), StandardCharsets.UTF_8)).isEqualTo("probe/with space.txt");
+            }
+
+            URL jdkData = plain.getResource("probe/data.txt");
+            URL data = loader.getResource("probe/data.txt");
+            assertThat(data).isEqualTo(jdkData);
+            assertThat(jdkData).isEqualTo(data);
+            assertThat(data.hashCode()).isEqualTo(jdkData.hashCode());
+            assertThat(data.sameFile(jdkData)).isTrue();
+            assertThat(new java.util.HashSet<>(List.of(data, jdkData, loader.getResource("probe/data.txt")))).hasSize(1);
+            assertThat(data).isNotEqualTo(loader.getResource("abs.txt"));
+
+            assertThat(data.openConnection(java.net.Proxy.NO_PROXY).getUseCaches()).isFalse();
         }
     }
 

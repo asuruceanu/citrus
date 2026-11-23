@@ -16,25 +16,46 @@
 
 package org.citrusframework.distribution.junit;
 
+import java.io.File;
+import java.io.IOException;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Predicate;
 import java.util.stream.Stream;
 
 import org.citrusframework.distribution.annotations.LocalOnly;
 import org.citrusframework.distribution.annotations.RemoteOnly;
 import org.citrusframework.distribution.broker.DistributionBrokerConfig;
 import org.citrusframework.distribution.broker.DistributionBrokerServer;
+import org.citrusframework.distribution.cache.BlobCacheDirectory;
+import org.citrusframework.distribution.cache.ClasspathPackager;
+import org.citrusframework.distribution.config.DistributionJson;
 import org.citrusframework.distribution.config.DistributionSettings;
+import org.citrusframework.distribution.workspace.WorkspaceLease;
+import org.citrusframework.distribution.model.ArtifactRef;
 import org.citrusframework.distribution.model.CreateSessionRequest;
 import org.citrusframework.distribution.model.PartitionPolicy;
 import org.citrusframework.distribution.model.SubmitWorkRequest;
+import org.citrusframework.distribution.model.TestOutcomeStatus;
 import org.citrusframework.distribution.model.WorkUnitSpec;
+import org.citrusframework.distribution.model.WorkerCacheStats;
+import org.citrusframework.distribution.model.WorkerRecord;
+import org.citrusframework.distribution.model.WorkerTestEventPayload;
 import org.citrusframework.distribution.worker.DistributionWorkerClient;
 import org.citrusframework.distribution.worker.DistributionWorkerConfig;
 import org.junit.jupiter.api.AfterEach;
@@ -176,7 +197,7 @@ class DistributedLauncherTest {
             System.setProperty(DistributionSettings.ENABLED_PROPERTY, "true");
             System.setProperty(DistributionSettings.BROKER_URL_PROPERTY, cluster.broker.baseUrl());
 
-            List<String> finished = new java.util.concurrent.CopyOnWriteArrayList<>();
+            List<String> finished = new CopyOnWriteArrayList<>();
             DistributedLauncher launcher = new DistributedLauncher(LauncherFactory.create());
             launcher.registerTestExecutionListeners(new TestExecutionListener() {
                 @Override
@@ -227,7 +248,7 @@ class DistributedLauncherTest {
     }
 
     private static String planMethodId(TestPlan plan, Class<?> type, String method) {
-        java.util.List<TestIdentifier> found = new java.util.ArrayList<>();
+        java.util.List<TestIdentifier> found = new ArrayList<>();
         java.util.ArrayDeque<TestIdentifier> queue = new java.util.ArrayDeque<>(plan.getRoots());
         while (!queue.isEmpty()) {
             TestIdentifier id = queue.poll();
@@ -244,11 +265,11 @@ class DistributedLauncherTest {
     /** Mirrors what Surefire's RunListenerAdapter needs: tests from the plan, nested in a started class container. */
     private static final class SurefireLikeListener implements TestExecutionListener {
         private TestPlan plan;
-        private final Set<String> startedContainers = new java.util.HashSet<>();
+        private final Set<String> startedContainers = new HashSet<>();
         private final Map<String, Integer> classStarts = new java.util.concurrent.ConcurrentHashMap<>();
         private final Map<String, TestExecutionResult.Status> finishedTests = new java.util.concurrent.ConcurrentHashMap<>();
         private final Set<String> finishedContainers = java.util.concurrent.ConcurrentHashMap.newKeySet();
-        private final List<String> problems = new java.util.concurrent.CopyOnWriteArrayList<>();
+        private final List<String> problems = new CopyOnWriteArrayList<>();
 
         @Override
         public void testPlanExecutionStarted(TestPlan testPlan) {
@@ -329,8 +350,8 @@ class DistributedLauncherTest {
 
             assertThatThrownBy(() -> run(RemoteWorkspaceFixture.class))
                     .hasMessageContaining("src/test/resources");
-            HttpResponse<String> sessions = java.net.http.HttpClient.newHttpClient().send(
-                    java.net.http.HttpRequest.newBuilder(java.net.URI.create(cluster.broker.baseUrl() + "/api/v1/sessions")).GET().build(),
+            HttpResponse<String> sessions = HttpClient.newHttpClient().send(
+                    HttpRequest.newBuilder(URI.create(cluster.broker.baseUrl() + "/api/v1/sessions")).GET().build(),
                     HttpResponse.BodyHandlers.ofString());
             assertThat(sessions.body()).as("nothing reached the coordinator").isEqualTo("[]");
         }
@@ -370,12 +391,27 @@ class DistributedLauncherTest {
     }
 
     @Test
+    void shouldMarkTheHostCacheAsLauncherOwnedWhenItIsUsed() throws Exception {
+        Path module = tempDir.resolve("module-owner");
+        Files.createDirectories(module.resolve("src/test/resources"));
+        Files.writeString(module.resolve("src/test/resources/data.txt"), "data");
+        System.setProperty(DistributionSettings.BASEDIR_PROPERTY, module.toString());
+        System.setProperty(DistributionSettings.INPUTS_PROPERTY, "src/test/resources");
+
+        DistributedLauncher.WorkspaceSettings settings = DistributedLauncher.WorkspaceSettings.resolve();
+
+        assertThat(BlobCacheDirectory.readOwner(settings.cache().getRootDir()))
+                .contains(BlobCacheDirectory.OWNER_LAUNCHER);
+    }
+
+    @Test
     void shouldForkWhenOnlyMissingOptionalInputsAreDeclared() {
         Path module = tempDir.resolve("module-optional");
         System.setProperty(DistributionSettings.BASEDIR_PROPERTY, module.toString());
         System.setProperty(DistributionSettings.INPUTS_PROPERTY, "?not/there");
         DistributedLauncher.WorkspaceSettings settings = DistributedLauncher.WorkspaceSettings.resolve();
         assertThat(settings.inputArtifacts()).isEmpty();
+        assertThat(settings.cache().getRootDir()).doesNotExist();
         assertThat(settings.forkWorkspace()).as("declaring inputs implies a forked JVM").isTrue();
     }
 
@@ -415,7 +451,7 @@ class DistributedLauncherTest {
                     .jdbcUrl("jdbc:hsqldb:mem:launcher_ws_" + System.nanoTime())
                     .build());
             broker.start();
-            List<DistributionWorkerClient> workers = new java.util.ArrayList<>();
+            List<DistributionWorkerClient> workers = new ArrayList<>();
             for (int i = 0; i < 2; i++) {
                 DistributionWorkerClient worker = new DistributionWorkerClient(DistributionWorkerConfig.builder()
                         .workerId("ws-worker-" + i)
@@ -424,7 +460,7 @@ class DistributedLauncherTest {
                         .forkJvmArgs(List.of("-Xmx384m"))
                         .build());
                 worker.start();
-                assertThat(worker.awaitRegistration(5, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+                assertThat(worker.awaitRegistration(5, TimeUnit.SECONDS)).isTrue();
                 workers.add(worker);
             }
             return new Cluster(broker, workers, new BrokerHttpClient(broker.baseUrl(), "", 3_000L));
@@ -434,14 +470,14 @@ class DistributedLauncherTest {
          * A sibling submission running {@code fixture} in a forked JVM from this test JVM's classpath, uploaded first.
          */
         SubmitWorkRequest siblingWithOutputs(String sessionId, Class<?> fixture) throws Exception {
-            List<org.citrusframework.distribution.model.ArtifactRef> classpath = new java.util.ArrayList<>();
-            for (String entry : System.getProperty("java.class.path").split(java.io.File.pathSeparator)) {
+            List<ArtifactRef> classpath = new ArrayList<>();
+            for (String entry : System.getProperty("java.class.path").split(File.pathSeparator)) {
                 Path path = Path.of(entry);
                 if (!Files.exists(path)) {
                     continue;
                 }
-                org.citrusframework.distribution.cache.ClasspathPackager.PackagedArtifact packaged =
-                        org.citrusframework.distribution.cache.ClasspathPackager.packagePath(path);
+                ClasspathPackager.PackagedArtifact packaged =
+                        ClasspathPackager.packagePath(path);
                 client.uploadArtifact(packaged);
                 classpath.add(packaged.ref());
             }
@@ -621,6 +657,8 @@ class DistributedLauncherTest {
         source.setProperty("surefire.real.class.path", "/host/target/surefirebooter.jar");
         source.setProperty("maven.multiModuleProjectDirectory", "/host/workspace");
         source.setProperty("basedir", "/host/workspace/module");
+        source.setProperty(WorkspaceLease.ENABLED_PROPERTY, "true");
+        source.setProperty(WorkspaceLease.TICKET_PROPERTY, "/host/local-ticket");
         source.setProperty("localRepository", "/host/.m2/repository");
 
         java.util.Map<String, String> forwarded = DistributedLauncher.collectPropagatedProperties(source);
@@ -629,7 +667,9 @@ class DistributedLauncherTest {
                 .containsEntry("citrus.default.timeout", "15000")
                 .containsEntry("spring.profiles.active", "integration")
                 .containsEntry("custom.service.port", "19090")
+                .containsEntry(WorkspaceLease.ENABLED_PROPERTY, "true")
                 .doesNotContainKeys(
+                        WorkspaceLease.TICKET_PROPERTY,
                         "citrus.test.distribution.broker.url",
                         "junit.platform.launcher.interceptors.enabled",
                         "java.home",
@@ -639,6 +679,234 @@ class DistributedLauncherTest {
                         "maven.multiModuleProjectDirectory",
                         "basedir",
                         "localRepository");
+    }
+
+    @Test
+    void shouldReuseWorkerLocalFileCacheAcrossSessionsAndPersistAfterWorkerRestart() throws Exception {
+        Path brokerCacheDir = tempDir.resolve("broker-cache");
+        Path workerCacheDir = tempDir.resolve("worker-file-cache");
+        Path module = Files.createDirectories(tempDir.resolve("module-warm"));
+        Files.createDirectories(module.resolve("src/test/resources"));
+        Files.writeString(module.resolve("src/test/resources/data.txt"), WarmCacheFixture.EXPECTED_DATA);
+
+        DistributionBrokerServer broker = new DistributionBrokerServer(DistributionBrokerConfig.builder()
+                .port(0)
+                .cacheDir(brokerCacheDir)
+                .jdbcUrl("jdbc:hsqldb:mem:launcher_warm_" + System.nanoTime())
+                .build());
+        broker.start();
+        try {
+            BrokerHttpClient client = new BrokerHttpClient(broker.baseUrl(), "", 3_000L);
+            System.setProperty(DistributionSettings.ENABLED_PROPERTY, "true");
+            System.setProperty(DistributionSettings.BROKER_URL_PROPERTY, broker.baseUrl());
+            System.setProperty(DistributionSettings.BASEDIR_PROPERTY, module.toString());
+            System.setProperty(DistributionSettings.INPUTS_PROPERTY, "src/test/resources");
+
+            // Session 1: a cold worker cache, filled from the broker.
+            try (DistributionWorkerClient worker = startCachingWorker(broker, "warm-worker-1", workerCacheDir)) {
+                Outcome outcome = run(WarmCacheFixture.class);
+                assertThat(outcome.failed()).isZero();
+                assertThat(outcome.passed()).isEqualTo(1);
+
+                assertThat(workerCacheDir.resolve("blobs")).isDirectory();
+                assertThat(workerCacheDir.resolve(".lock")).isRegularFile();
+                assertThat(filesUnder(workerCacheDir.resolve("tmp"))).as("no download leftovers").isEmpty();
+
+                WorkerCacheStats stats = awaitCacheStats(broker.baseUrl(), "warm-worker-1", s -> s.blobCount() > 0);
+                assertThat(stats.cleanupEnabled()).isTrue();
+                assertThat(stats.freeSpaceBufferBytes()).isZero();
+                assertThat(stats.blobCount()).isPositive();
+                assertThat(stats.cachedBytes()).isPositive();
+                assertThat(stats.usableDiskBytes()).isPositive();
+                assertThat(stats.lowDiskSpace()).isFalse();
+            }
+
+            // The broker loses every blob: session 2 can only run from the worker's local file cache.
+            DistributedLauncher.WorkspaceSettings workspace = DistributedLauncher.WorkspaceSettings.resolve();
+            assertThat(workspace.inputArtifacts()).hasSize(1);
+            Path brokerInputBlob = new BlobCacheDirectory(brokerCacheDir)
+                    .resolveBlobPath(workspace.inputArtifacts().get(0).artifact().sha256());
+            assertThat(brokerInputBlob).isRegularFile();
+            deleteRecursively(brokerCacheDir.resolve("blobs"));
+            assertThat(brokerInputBlob).doesNotExist();
+
+            // Session 2: a restarted worker on the same cache directory. Submitted directly, without the launcher's
+            // upload step, so nothing repopulates the broker's blob cache.
+            try (DistributionWorkerClient worker = startCachingWorker(broker, "warm-worker-2", workerCacheDir)) {
+                WorkerCacheStats restarted = awaitCacheStats(broker.baseUrl(), "warm-worker-2", s -> s.blobCount() > 0);
+                assertThat(restarted.cachedBytes()).as("cache survives the worker restart").isPositive();
+
+                List<ArtifactRef> classpath = new ArrayList<>();
+                for (String entry : System.getProperty("java.class.path").split(File.pathSeparator)) {
+                    Path path = Path.of(entry);
+                    if (!entry.isBlank() && Files.exists(path)) {
+                        classpath.add(ClasspathPackager.packagePath(path).ref());
+                    }
+                }
+                String sessionId = client.createSession(
+                        new CreateSessionRequest("citrus", "main", "abc", List.of(), 5, 0)).sessionId();
+                Set<String> partitions = Set.copyOf(client.submitWork(sessionId, new SubmitWorkRequest(
+                        "warm-2", "default", classpath, Map.of(), List.of(unit(WarmCacheFixture.class)),
+                        classpath.size() + 1, 0, workspace.inputArtifacts(), List.of(), true, PartitionPolicy.LPT,
+                        workspace.workingDirectory())).partitionIds());
+
+                List<String> testStatuses = new CopyOnWriteArrayList<>();
+                List<String> partitionStates = new CopyOnWriteArrayList<>();
+                Set<String> pending = new HashSet<>(partitions);
+                client.streamSessionEvents(sessionId, 0L, 60_000L, event -> {
+                    if (event.partitionId() == null || !partitions.contains(event.partitionId())) {
+                        return false;
+                    }
+                    switch (event.type()) {
+                        case "test.event" -> {
+                            WorkerTestEventPayload payload = DistributionJson.convert(event.data(),
+                                    WorkerTestEventPayload.class);
+                            if (payload.status() != TestOutcomeStatus.STARTED) {
+                                testStatuses.add(payload.testName() + ":" + payload.status()
+                                        + (payload.errorMessage() != null ? " " + payload.errorMessage() : ""));
+                            }
+                        }
+                        case "partition.completed", "partition.lost" -> {
+                            partitionStates.add(event.type() + ":" + event.data().get("state")
+                                    + (event.data().get("errorMessage") != null
+                                    ? " " + event.data().get("errorMessage") : ""));
+                            pending.remove(event.partitionId());
+                        }
+                        default -> {
+                            // other events are irrelevant here
+                        }
+                    }
+                    return pending.isEmpty();
+                });
+
+                assertThat(partitionStates).containsExactly("partition.completed:COMPLETED");
+                assertThat(testStatuses).containsExactly("readInputFromWarmCache():PASSED");
+                assertThat(brokerInputBlob).as("nothing re-uploaded the input to the broker").doesNotExist();
+            }
+        } finally {
+            broker.close();
+        }
+    }
+
+    @Test
+    void shouldNotCreateDefaultWorkerCacheWhenDistributionDisabled() throws Exception {
+        Path isolatedUserHome = Files.createDirectories(tempDir.resolve("isolated-user-home"));
+        String originalUserHome = System.getProperty("user.home");
+        LocalDisabledFixture.EXECUTED.set(false);
+        try {
+            System.setProperty("user.home", isolatedUserHome.toString());
+            System.setProperty(DistributionSettings.ENABLED_PROPERTY, "false");
+            System.setProperty("junit.platform.launcher.interceptors.enabled", "true");
+
+            Launcher launcher = LauncherFactory.create();
+            launcher.execute(LauncherDiscoveryRequestBuilder.request()
+                    .selectors(DiscoverySelectors.selectClass(LocalDisabledFixture.class))
+                    .build());
+
+            assertThat(LocalDisabledFixture.EXECUTED.get()).isTrue();
+            assertThat(isolatedUserHome.resolve(".citrus-test-distribution-agent")).doesNotExist();
+        } finally {
+            System.clearProperty("junit.platform.launcher.interceptors.enabled");
+            System.setProperty("user.home", originalUserHome);
+        }
+    }
+
+    private static DistributionWorkerClient startCachingWorker(DistributionBrokerServer broker, String workerId,
+                                                               Path cacheDir) throws Exception {
+        DistributionWorkerClient worker = new DistributionWorkerClient(DistributionWorkerConfig.builder()
+                .workerId(workerId)
+                .brokerUrl(broker.baseUrl())
+                .cacheDir(cacheDir)
+                .cacheCleanup(true)
+                .cacheFreeSpaceBufferBytes(0L)
+                .forkJvmArgs(List.of("-Xmx384m"))
+                .build());
+        try {
+            worker.start();
+            assertThat(worker.awaitRegistration(5, TimeUnit.SECONDS)).isTrue();
+            return worker;
+        } catch (Exception | Error failure) {
+            try {
+                worker.close();
+            } catch (RuntimeException closeFailure) {
+                failure.addSuppressed(closeFailure);
+            }
+            throw failure;
+        }
+    }
+
+    /** Polls {@code GET /api/v1/workers} until the worker reports cache statistics matching {@code condition}. */
+    private static WorkerCacheStats awaitCacheStats(String brokerUrl, String workerId,
+                                                    Predicate<WorkerCacheStats> condition)
+            throws Exception {
+        HttpRequest request = HttpRequest.newBuilder(URI.create(brokerUrl + "/api/v1/workers")).GET().build();
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        WorkerCacheStats last = null;
+        try (HttpClient http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build()) {
+            for (long remaining = deadline - System.nanoTime(); remaining > 0; remaining = deadline - System.nanoTime()) {
+                var requestResult = http.sendAsync(request, HttpResponse.BodyHandlers.ofString());
+                HttpResponse<String> response;
+                try {
+                    response = requestResult.get(remaining, TimeUnit.NANOSECONDS);
+                } finally {
+                    requestResult.cancel(true);
+                }
+                assertThat(response.statusCode()).isEqualTo(200);
+                for (WorkerRecord worker : DistributionJson.fromJson(response.body(), WorkerRecord[].class)) {
+                    if (workerId.equals(worker.workerId())) {
+                        last = worker.cacheStats();
+                    }
+                }
+                if (last != null && condition.test(last)) {
+                    return last;
+                }
+                TimeUnit.NANOSECONDS.sleep(Math.min(TimeUnit.MILLISECONDS.toNanos(100),
+                        Math.max(0, deadline - System.nanoTime())));
+            }
+        }
+        throw new AssertionError("Worker " + workerId + " did not report matching cache statistics; last: " + last);
+    }
+
+    private static List<Path> filesUnder(Path dir) throws IOException {
+        if (!Files.exists(dir)) {
+            return List.of();
+        }
+        try (Stream<Path> files = Files.walk(dir)) {
+            return files.filter(Files::isRegularFile).toList();
+        }
+    }
+
+    private static void deleteRecursively(Path dir) throws IOException {
+        try (Stream<Path> paths = Files.walk(dir)) {
+            for (Path path : paths.sorted(Comparator.reverseOrder()).toList()) {
+                Files.delete(path);
+            }
+        }
+    }
+
+    /** Runs in a forked worker JVM; its only input comes from the declared {@code src/test/resources}. */
+    public static class WarmCacheFixture {
+        static final String EXPECTED_DATA = "warm-cache-data";
+
+        @Test
+        void readInputFromWarmCache() throws Exception {
+            if (!DistributionSettings.isWorkerRole()) {
+                throw new AssertionError("must run on a worker");
+            }
+            String data = Files.readString(Path.of("src/test/resources/data.txt"));
+            if (!EXPECTED_DATA.equals(data)) {
+                throw new AssertionError("unexpected input content: " + data);
+            }
+        }
+    }
+
+    public static class LocalDisabledFixture {
+        static final AtomicBoolean EXECUTED = new AtomicBoolean(false);
+
+        @Test
+        void runsLocally() {
+            EXECUTED.set(true);
+        }
     }
 
     /** Runs in a forked worker JVM with the module workspace as working directory. */

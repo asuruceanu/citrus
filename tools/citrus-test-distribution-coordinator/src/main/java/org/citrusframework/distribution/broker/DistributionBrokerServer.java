@@ -16,6 +16,7 @@
 
 package org.citrusframework.distribution.broker;
 
+import java.io.IOException;
 import java.util.concurrent.TimeUnit;
 
 import io.vertx.core.Vertx;
@@ -41,13 +42,22 @@ public final class DistributionBrokerServer implements AutoCloseable {
         if (vertx != null) {
             return;
         }
+        BlobCacheDirectory blobCache = new BlobCacheDirectory(config.cacheDir());
+        try {
+            String owner = BlobCacheDirectory.recordOwnerIfAbsent(blobCache.getRootDir(), BlobCacheDirectory.OWNER_COORDINATOR);
+            if (!BlobCacheDirectory.OWNER_COORDINATOR.equals(owner) && !BlobCacheDirectory.OWNER_LAUNCHER.equals(owner)) {
+                throw new IllegalStateException("Coordinator cache directory " + blobCache.getRootDir()
+                        + " is marked as owned by " + owner + ". Choose a separate --cache-dir.");
+            }
+        } catch (IOException e) {
+            throw new IllegalStateException("Could not mark blob cache " + blobCache.getRootDir() + " as owned by the coordinator", e);
+        }
+
         store = new JdbcDistributionStore(config.jdbcUrl(), config.jdbcUsername(), config.jdbcPassword());
         store.initialize();
         if (config.demoData()) {
             DemoDataSeeder.seed(store);
         }
-
-        BlobCacheDirectory blobCache = new BlobCacheDirectory(config.cacheDir());
         BrokerEventStreamHub eventHub = new BrokerEventStreamHub();
         BrokerSessionCoordinator coordinator = new BrokerSessionCoordinator(config, store, eventHub);
 

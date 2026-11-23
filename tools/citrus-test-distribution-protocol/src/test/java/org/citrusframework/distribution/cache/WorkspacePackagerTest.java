@@ -404,7 +404,7 @@ class WorkspacePackagerTest {
         String sha = ClasspathPackager.sha256Hex(payload);
         Path stored = cache.put(sha, payload);
 
-        Path tmp = Files.write(cache.newTempFile("dup-"), payload);
+        Path tmp = Files.write(cache.newTempFile("ws-"), payload);
         assertThat(cache.putFromFile(sha, tmp)).isEqualTo(stored);
         assertThat(tmp).doesNotExist();
         assertThat(tmpFiles(cache)).isEmpty();
@@ -514,6 +514,54 @@ class WorkspacePackagerTest {
         assertThatThrownBy(() -> cache.putFromFile("0".repeat(64), sparse))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining(String.valueOf(ClasspathPackager.MAX_BLOB_BYTES));
+    }
+
+    @Test
+    void shouldMaterializeFromAnAlreadyVerifiedBlobWithoutRehashingIt(@TempDir Path tempDir) throws Exception {
+        HashCountingCache cache = new HashCountingCache(tempDir.resolve("cache"));
+        Path baseDir = Files.createDirectories(tempDir.resolve("module/src/test/resources")).getParent().getParent().getParent();
+        Files.writeString(baseDir.resolve("src/test/resources/greeting.txt"), "hello");
+        WorkspaceFileSet input = WorkspacePackager.packageInputToCache(cache, baseDir, "src/test/resources", false).orElseThrow();
+        Path inputBlob = cache.resolveBlobPath(input.artifact().sha256());
+        Path classes = Files.createDirectories(tempDir.resolve("classes"));
+        Files.writeString(classes.resolve("A.class"), "a");
+        ClasspathPackager.PackagedArtifact packaged = ClasspathPackager.packagePath(classes);
+        Path classesBlob = cache.put(packaged.ref().sha256(), packaged.bytes());
+        cache.hashes.set(0);
+
+        Path workspace = Files.createDirectories(tempDir.resolve("ws"));
+        WorkspacePackager.materializeIntoDirectory(cache, input, inputBlob, workspace);
+        Path extracted = cache.materializeForClasspath(packaged.ref(), classesBlob, tempDir.resolve("partition"));
+
+        assertThat(workspace.resolve("src/test/resources/greeting.txt")).hasContent("hello");
+        assertThat(extracted.resolve("A.class")).hasContent("a");
+        assertThat(cache.hashes).as("a verified blob is not hashed again").hasValue(0);
+
+        WorkspacePackager.materializeIntoDirectory(cache, input, Files.createDirectories(tempDir.resolve("ws-2")));
+        cache.materializeForClasspath(packaged.ref(), tempDir.resolve("partition-2"));
+        assertThat(cache.hashes).as("the overloads without a verified blob still verify").hasValue(2);
+
+        assertThatThrownBy(() -> WorkspacePackager.materializeIntoDirectory(cache, input, classesBlob,
+                Files.createDirectories(tempDir.resolve("ws-3"))))
+                .as("the verified blob must be the cache's blob of the artifact")
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> cache.materializeForClasspath(packaged.ref(), inputBlob, tempDir.resolve("partition-3")))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    /** Counts full content verifications. */
+    static final class HashCountingCache extends BlobCacheDirectory {
+        final java.util.concurrent.atomic.AtomicInteger hashes = new java.util.concurrent.atomic.AtomicInteger();
+
+        HashCountingCache(Path rootDir) {
+            super(rootDir);
+        }
+
+        @Override
+        public boolean isIntact(String sha256) throws IOException {
+            hashes.incrementAndGet();
+            return super.isIntact(sha256);
+        }
     }
 
     private static Path writeZip(Path zip, Map<String, String> entries) throws IOException {

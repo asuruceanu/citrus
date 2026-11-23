@@ -25,6 +25,12 @@ public record WorkerRecord(
         WorkerState state,
         String activePartitionId,
         long lastHeartbeatAt,
-        long registeredAt
+        long registeredAt,
+        WorkerCacheStats cacheStats
 ) {
+
+    public WorkerRecord(String workerId, String host, Map<String, String> capabilities, WorkerState state,
+                        String activePartitionId, long lastHeartbeatAt, long registeredAt) {
+        this(workerId, host, capabilities, state, activePartitionId, lastHeartbeatAt, registeredAt, null);
+    }
 }

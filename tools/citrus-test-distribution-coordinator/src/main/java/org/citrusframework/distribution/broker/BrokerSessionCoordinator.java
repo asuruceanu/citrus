@@ -49,6 +49,7 @@ import org.citrusframework.distribution.model.TestHistorySummary;
 import org.citrusframework.distribution.model.TestOutcomeStatus;
 import org.citrusframework.distribution.model.WorkUnitSpec;
 import org.citrusframework.distribution.model.WorkerHeartbeatPayload;
+import org.citrusframework.distribution.model.WorkerCacheStats;
 import org.citrusframework.distribution.model.WorkerRecord;
 import org.citrusframework.distribution.model.WorkerRegisterPayload;
 import org.citrusframework.distribution.model.WorkerState;
@@ -371,7 +372,8 @@ public final class BrokerSessionCoordinator {
                             WorkerState.IDLE,
                             null,
                             wr.lastHeartbeatAt(),
-                            wr.registeredAt()
+                            wr.registeredAt(),
+                            wr.cacheStats()
                     ));
                 }
             }
@@ -509,6 +511,7 @@ public final class BrokerSessionCoordinator {
                 caps,
                 sender
         );
+        conn.cacheStats = payload.cacheStats();
         workers.put(connectionId, conn);
         persistWorker(conn);
 
@@ -543,6 +546,9 @@ public final class BrokerSessionCoordinator {
         switch (message.type()) {
             case WorkerWsMessage.WORKER_HEARTBEAT -> {
                 WorkerHeartbeatPayload hb = DistributionJson.convert(message.payload(), WorkerHeartbeatPayload.class);
+                if (hb != null && hb.cacheStats() != null) {
+                    conn.cacheStats = hb.cacheStats();
+                }
                 if (hb != null && conn.cancelledPartitionId != null
                         && !conn.cancelledPartitionId.equals(hb.activePartitionId())) {
                     confirmCancellation(conn);
@@ -971,7 +977,8 @@ public final class BrokerSessionCoordinator {
                 conn.state,
                 conn.activePartitionId,
                 conn.lastHeartbeatAt,
-                conn.connectedAt
+                conn.connectedAt,
+                conn.cacheStats
         ));
     }
 
@@ -1292,6 +1299,8 @@ public final class BrokerSessionCoordinator {
         /** Sequence number of this worker's latest assignment (0 = never), for least-recently-used dispatch. */
         private long lastAssignedAt;
         private String activePartitionId;
+        /** Latest local file cache telemetry reported by the worker; null for workers that report none. */
+        private volatile WorkerCacheStats cacheStats;
         /** Partition whose expired attempt this worker was told to cancel and has not yet confirmed ending. */
         private String cancelledPartitionId;
 

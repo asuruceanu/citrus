@@ -17,10 +17,12 @@
 package org.citrusframework.distribution.worker;
 
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.UUID;
 
 import org.citrusframework.distribution.config.DistributionSettings;
@@ -37,9 +39,12 @@ public final class DistributionWorkerConfig {
     private final String brokerUrl;
     private final String authToken;
     private final Path cacheDir;
+    private final boolean cacheCleanup;
+    private final long cacheFreeSpaceBufferBytes;
     private final Map<String, String> capabilities;
     private final long heartbeatIntervalMs;
     private final long reconnectDelayMs;
+    private final Duration blobReadIdleTimeout;
     private final WorkerForkMode forkMode;
     private final List<String> forkJvmArgs;
     private final WorkerCwdCheckMode cwdCheckMode;
@@ -49,12 +54,19 @@ public final class DistributionWorkerConfig {
         this.hostName = builder.hostName;
         this.brokerUrl = builder.brokerUrl;
         this.authToken = builder.authToken;
-        this.cacheDir = builder.cacheDir;
+        // Cache settings fall back to system property / environment / default only when not set explicitly, so an
+        // invalid lower-tier value cannot break a configuration whose explicit option overrides it.
+        this.cacheDir = builder.cacheDir != null ? builder.cacheDir : DistributionSettings.getWorkerCacheDir();
+        this.cacheCleanup = builder.cacheCleanup != null ? builder.cacheCleanup
+                : DistributionSettings.isWorkerCacheCleanupEnabled();
+        this.cacheFreeSpaceBufferBytes = builder.cacheFreeSpaceBufferBytes != null
+                ? builder.cacheFreeSpaceBufferBytes : DistributionSettings.getWorkerCacheFreeSpaceBufferBytes();
         Map<String, String> caps = new LinkedHashMap<>(builder.capabilities);
         caps.putIfAbsent(DistributionSettings.WORKSPACE_CAPABILITY_KEY, "true");
         this.capabilities = Collections.unmodifiableMap(caps);
         this.heartbeatIntervalMs = builder.heartbeatIntervalMs;
         this.reconnectDelayMs = builder.reconnectDelayMs;
+        this.blobReadIdleTimeout = builder.blobReadIdleTimeout;
         this.forkMode = builder.forkMode;
         this.forkJvmArgs = List.copyOf(builder.forkJvmArgs);
         this.cwdCheckMode = builder.cwdCheckMode;
@@ -88,12 +100,30 @@ public final class DistributionWorkerConfig {
         return cacheDir;
     }
 
+    /**
+     * Whether the worker evicts least recently used blobs to keep the free space buffer on the cache volume.
+     */
+    public boolean cacheCleanup() {
+        return cacheCleanup;
+    }
+
+    /**
+     * Free disk space, in bytes, the worker tries to keep on the cache volume when cache cleanup is enabled.
+     */
+    public long cacheFreeSpaceBufferBytes() {
+        return cacheFreeSpaceBufferBytes;
+    }
+
     public Map<String, String> capabilities() {
         return capabilities;
     }
 
     public long heartbeatIntervalMs() {
         return heartbeatIntervalMs;
+    }
+
+    Duration blobReadIdleTimeout() {
+        return blobReadIdleTimeout;
     }
 
     public long reconnectDelayMs() {
@@ -127,10 +157,14 @@ public final class DistributionWorkerConfig {
         private String hostName = resolveHostName();
         private String brokerUrl = normalizeBrokerBaseUrl(DistributionSettings.getBrokerUrl());
         private String authToken = DistributionSettings.getAuthToken();
-        private Path cacheDir = java.nio.file.Paths.get(DistributionSettings.getCacheDir()).resolve("worker");
+        /** Explicit cache settings; {@code null} means "resolve from settings in {@link #build()}". */
+        private Path cacheDir;
+        private Boolean cacheCleanup;
+        private Long cacheFreeSpaceBufferBytes;
         private Map<String, String> capabilities = new LinkedHashMap<>(DistributionSettings.detectHostCapabilities(null));
         private long heartbeatIntervalMs = 5_000L;
         private long reconnectDelayMs = 1_000L;
+        private Duration blobReadIdleTimeout = Duration.ofSeconds(60);
         private WorkerForkMode forkMode = DistributionSettings.parseWorkerForkMode(DistributionSettings.getString(
                 DistributionSettings.WORKER_FORK_MODE_PROPERTY, DistributionSettings.WORKER_FORK_MODE_ENV, null));
         private List<String> forkJvmArgs = DistributionSettings.parseForkJvmArgs(DistributionSettings.getString(
@@ -183,11 +217,39 @@ public final class DistributionWorkerConfig {
             return this;
         }
 
+        /**
+         * @throws NullPointerException if {@code cacheDir} is {@code null}
+         */
         public Builder cacheDir(Path cacheDir) {
-            if (cacheDir != null) {
-                this.cacheDir = cacheDir;
-            }
+            this.cacheDir = Objects.requireNonNull(cacheDir, "cacheDir must not be null");
             return this;
+        }
+
+        public Builder cacheCleanup(boolean cacheCleanup) {
+            this.cacheCleanup = cacheCleanup;
+            return this;
+        }
+
+        /**
+         * @throws IllegalArgumentException if {@code cacheFreeSpaceBufferBytes} is negative
+         */
+        public Builder cacheFreeSpaceBufferBytes(long cacheFreeSpaceBufferBytes) {
+            if (cacheFreeSpaceBufferBytes < 0) {
+                throw new IllegalArgumentException("Worker cache free space buffer must not be negative: "
+                        + cacheFreeSpaceBufferBytes);
+            }
+            this.cacheFreeSpaceBufferBytes = cacheFreeSpaceBufferBytes;
+            return this;
+        }
+
+        /**
+         * Sets the free space buffer from a byte size expression such as {@code 2GiB}, {@code 512MiB} or a plain
+         * number of bytes, parsed with {@link DistributionSettings#parseByteSize(String, String)}.
+         *
+         * @throws IllegalArgumentException if {@code size} is {@code null}, blank or not a valid byte size
+         */
+        public Builder cacheFreeSpaceBufferSize(String size) {
+            return cacheFreeSpaceBufferBytes(DistributionSettings.parseByteSize(size, "cacheFreeSpaceBufferSize"));
         }
 
         public Builder capabilities(Map<String, String> capabilities) {
@@ -204,6 +266,15 @@ public final class DistributionWorkerConfig {
 
         public Builder heartbeatIntervalMs(long heartbeatIntervalMs) {
             this.heartbeatIntervalMs = heartbeatIntervalMs;
+            return this;
+        }
+
+        Builder blobReadIdleTimeout(Duration timeout) {
+            Objects.requireNonNull(timeout, "blobReadIdleTimeout");
+            if (timeout.isZero() || timeout.isNegative()) {
+                throw new IllegalArgumentException("Blob read idle timeout must be positive");
+            }
+            this.blobReadIdleTimeout = timeout;
             return this;
         }
 
@@ -234,7 +305,9 @@ public final class DistributionWorkerConfig {
         }
 
         /**
-         * Builds the configuration. Workers advertise {@code citrus.workspace.v1=true} unless the capabilities
+         * Builds the configuration. Cache settings not set on this builder are resolved now from system properties,
+         * environment variables and defaults; an invalid value in the tier that is used throws
+         * {@link IllegalArgumentException}. Workers advertise {@code citrus.workspace.v1=true} unless the capabilities
          * explicitly set it (for example to {@code false}).
          */
         public DistributionWorkerConfig build() {

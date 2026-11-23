@@ -92,6 +92,18 @@ class DistributionBrokerUiTest {
             assertThat(seedResp.statusCode()).isEqualTo(200);
             assertThat(seedResp.body()).contains("\"seededSessions\":6");
 
+            HttpResponse<String> workersResp = client.send(
+                    HttpRequest.newBuilder(URI.create(server.baseUrl() + "/api/v1/workers"))
+                            .header("Authorization", "Bearer ui-token")
+                            .GET()
+                            .build(),
+                    HttpResponse.BodyHandlers.ofString());
+            assertThat(workersResp.statusCode()).isEqualTo(200);
+            assertThat(workersResp.body())
+                    .contains("\"cacheStats\":{")
+                    .contains("\"lowDiskSpace\":true")
+                    .contains("\"cleanupEnabled\":false");
+
             HttpResponse<String> detailResp = client.send(
                     HttpRequest.newBuilder(URI.create(server.baseUrl() + "/api/v1/sessions/sess-citrus-main-942"))
                             .header("Authorization", "Bearer ui-token")

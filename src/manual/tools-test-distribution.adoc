@@ -300,6 +300,7 @@ Long lists (build sessions, partitions, test executions and test history) are pa
 ==== Workers Pool (`#workers`)
 
 Displays cards for every worker in the cluster, filterable by state (`ALL`, `IDLE`, `BUSY`, `DRAINING`, `OFFLINE`) and searchable by worker ID, host name, or capability key/value (such as `docker=true`, `os=linux`, `citrus.workspace.v1=true`), along with last heartbeat age and active partition ID.
+Workers that report local file cache statistics show a `Local File Cache` section with the cleanup policy (`AUTO LRU` or `NO CLEANUP`), the number and size of cached blobs, usable disk space against the configured free space buffer, and the number of evicted blobs. A `LOW DISK` badge, and the `LOW_DISK` filter, mark workers whose usable disk space is below their buffer.
 
 ==== Test History and Flakiness (`#history`)
 
@@ -317,15 +318,50 @@ citrus dist worker start \
   --broker-url=http://127.0.0.1:8765 \
   --worker-id=worker-k8s-01 \
   --auth-token=secret-ci-token \
-  --capabilities=docker=true,kafka=true
+  --capabilities=docker=true,kafka=true \
+  --cache-dir=/var/lib/citrus/worker-cache \
+  --cache-free-space-buffer-size=4GiB
 
 # Citrus Agent container / JAR in worker mode
 java -jar citrus-agent.jar \
   --mode worker \
   --broker-url http://coordinator.internal:8765 \
   --auth-token secret-ci-token \
-  --capabilities docker=true,zone=eu-central-1
+  --capabilities docker=true,zone=eu-central-1 \
+  --cache-dir /var/lib/citrus/worker-cache \
+  --no-cache-cleanup
 ----
+
+Both commands accept the same local file cache options:
+
+* `--cache-dir DIR` — Directory of the worker's local file cache (default `${user.home}/.citrus-test-distribution-agent/file-cache`).
+* `--[no-]cache-cleanup[=true|false]` — Enables (default) or disables automatic eviction of cached files. Both commands also accept a space-separated Boolean, such as `--cache-cleanup false`. Without a value, `--no-cache-cleanup` disables cleanup. When the flag is given several times, the last one wins.
+* `--cache-free-space-buffer-size SIZE` — Free disk space the worker keeps available on the cache drive when cleanup is enabled (default `2GiB`; `KiB`, `MiB` and `GiB` suffixes in any letter case, or plain bytes).
+
+Both commands validate the cache flags when invoked with `--help` or `-h`.
+
+The worker keeps every classpath jar and declared input it downloads from the coordinator in this cache and reuses it
+across partitions, sessions and worker restarts, so a warm worker only downloads what changed. Cached files are
+verified before reuse, and a corrupted file is removed and downloaded again. The worker fails the partition if a blob
+download goes 60 seconds without receiving data and removes the partial download. With cleanup enabled, the worker evicts the
+least recently used files when the usable space on the cache drive falls below the buffer: when it starts, before each
+download and after each partition. Files used by the running partition are never evicted. If evicting everything else
+still does not free enough space, the worker logs a warning and continues; the partition fails only when the disk
+actually runs full. With cleanup disabled, the cache grows without limit. If the usable space on the cache drive is
+already below `--cache-free-space-buffer-size`, the worker evicts every cached file not in use each time it starts and
+after each partition, so the cache effectively runs cold; on small disks, lower the buffer.
+
+IMPORTANT: Sharing a local file cache directory between several workers is not supported. A worker locks its cache
+directory exclusively (lock file `<cacheDir>/.lock`) and refuses to start when another worker holds that lock. When running
+more than one worker on the same host, give each worker its own `--cache-dir`, or run each worker in its own container.
+The cache directory must be on a local filesystem that supports file locks. A worker also refuses a cache directory
+marked as belonging to the coordinator or host launcher.
+
+NOTE: Upgrading from an earlier version: the default worker cache directory moved from `.citrus-dist/cache/worker`
+below the worker's working directory to `${user.home}/.citrus-test-distribution-agent/file-cache`, which is shared by
+every worker of the same user account and locked by the first one. Old `.citrus-dist/cache/worker` directories are no
+longer used and can be deleted safely. Hosts that run several worker daemons under the same account must now give each
+daemon its own `--cache-dir`; otherwise every daemon after the first fails to start on the cache lock.
 
 Every worker automatically advertises host capabilities (`os`, `arch`, `jdk`, `cpuCores`, `memoryMb`, and `citrus.workspace.v1=true`) merged with any custom `--capabilities` `key=value` pairs. On `SIGTERM` or shutdown, the worker sends `worker.draining` so the coordinator stops assigning new partitions while allowing any in-flight partition to finish within its drain timeout before closing the WebSocket.
 
@@ -475,8 +511,9 @@ serialized within the JVM and across JVMs (lock file `target/.citrus-dist-output
 
 Staging happens in `target/.citrus-dist-outputs/tx-*` and is removed afterwards; downloaded blobs are kept in
 `target/.citrus-dist/cache` (configurable with `citrus.test.distribution.cacheDir`; a relative value is resolved below
-the module's `target/`) and are not evicted automatically. Workers keep their own cache in `<cacheDir>/worker`, relative to the worker's working directory
-(default `.citrus-dist/cache/worker`).
+the module's `target/`) and are not evicted automatically. `citrus.test.distribution.cacheDir` only applies to the
+caches of the build host and the coordinator. Workers keep their own local file cache, by default in
+`${user.home}/.citrus-test-distribution-agent/file-cache` (see `citrus.test.distribution.worker.cacheDir` below).
 
 [[tools-test-distribution-external-resources-worker]]
 === Worker settings
@@ -502,13 +539,81 @@ daemons share a directory.
 |`citrus.test.distribution.worker.handshakeTimeoutMs`
 |How long a forked JVM may take to connect back to its worker.
 |`15000`
+|`citrus.test.distribution.worker.cacheDir` / `CITRUS_DIST_WORKER_CACHE_DIR` (alias `TEST_DISTRIBUTION_AGENT_CACHE_DIR`)
+|Directory of the worker's local file cache. Each worker needs its own directory (see
+<<tools-test-distribution-workers>>).
+|`${user.home}/.citrus-test-distribution-agent/file-cache`
+|`citrus.test.distribution.worker.cacheCleanup` / `CITRUS_DIST_WORKER_CACHE_CLEANUP` (alias `TEST_DISTRIBUTION_AGENT_CACHE_CLEANUP`)
+|`true` evicts the least recently used cached files to keep the free space buffer available; `false` never evicts.
+|`true`
+|`citrus.test.distribution.worker.cacheFreeSpaceBufferSize` / `CITRUS_DIST_WORKER_CACHE_FREE_SPACE_BUFFER_SIZE` (alias `TEST_DISTRIBUTION_AGENT_CACHE_FREE_SPACE_BUFFER_SIZE`)
+|Free disk space to keep available on the cache drive when cleanup is enabled: a number of bytes, or a whole number
+with a `KiB`, `MiB` or `GiB` suffix (any letter case). Every worker checks the free space of its drive on its own, so
+when several workers share a drive, size the buffer to also absorb the downloads and workspaces of the other workers
+running at the same time.
+|`2GiB`
 |===
 
+The worker cache settings are also available as command line options (see <<tools-test-distribution-workers>>).
+Command line options take precedence over system properties, which take precedence over the `CITRUS_DIST_WORKER_*`
+environment variables and then their `TEST_DISTRIBUTION_AGENT_*` aliases. Blank values count as unset; invalid values
+stop the worker with an error.
+
 A worker runs one partition at a time; run several worker daemons per machine for more parallelism (tests that bind
-fixed ports can then still collide across daemons on the same machine; use capabilities or separate hosts for them). Cancelling a
+fixed ports can then still collide across daemons on the same machine; use capabilities or separate hosts for them).
+Each daemon needs its own `--cache-dir`: a worker locks its local file cache directory, so a second daemon using the same
+(default) directory refuses to start (see <<tools-test-distribution-workers>>). Cancelling a
 partition (lease expiry, lost connection, worker shutdown) kills the forked JVM and every process it started; nothing is
 uploaded from a cancelled or crashed run. The forked JVM's `java.io.tmpdir` is a short `/tmp/cdtmp-*` directory on POSIX
 systems so Unix domain socket paths stay within platform limits.
+When a worker starts with the same cache directory and temporary directory settings, it also tries to remove the
+private partition workspaces left by a worker JVM that was forcibly killed or called `Runtime.halt()`.
+Recovery checks a matching ownership record and the identities of the worker and partition JVMs on the same host.
+Workspaces are left in place if either JVM is still alive, a fork launch could not be confirmed, or ownership cannot be
+verified. On Linux, recovery also requires the same boot and process namespace.
+
+On Linux and macOS, the worker checks both directories for current filesystem references before removing a partition
+workspace. An open file or working directory can keep both directories in place even after the worker and partition JVMs
+exit. Linux uses `/proc` to check visible processes running under the worker's user identity and macOS uses the
+system `lsof` command. Cleanup is deferred if the check cannot complete. On Linux, a process that denies inspection
+defers cleanup unless comparable kernel start times show that it predates the worker that created the workspace.
+Such older processes are outside the check when they deny inspection. Unix socket paths are retained when the worker
+cannot establish whether a listener still owns them.
+On other platforms, the worker defers startup recovery and uses the platform's filesystem behavior during normal cleanup.
+A process that only retains a path for future use has no current filesystem reference for the worker to check.
+
+[[tools-test-distribution-workspace-lease]]
+=== Workspace leases for background helpers
+
+Set the test JVM system property `citrus.dist.workspace.lease.enabled=true` to let same-host Java helpers hold a
+partition workspace after the partition ends. The enabled worker publishes an opaque local ticket as
+`citrus.dist.workspace.lease.ticket` in the forked or isolated partition. Send the helper only this ticket, and wait for
+it to acknowledge acquisition before allowing the partition to finish or forwarding any workspace path. A helper that
+receives the ticket after cleanup starts may fail to acquire it and should stop the operation.
+
+Use `org.citrusframework:citrus-test-distribution-protocol` on the helper's classpath. With the ticket as its first
+argument, the helper can acquire the lease and get the workspace path as follows.
+
+[source,java]
+----
+import java.nio.file.Path;
+import org.citrusframework.distribution.workspace.WorkspaceLease;
+
+try (WorkspaceLease lease = WorkspaceLease.acquire(Path.of(args[0]))) {
+    Path workspace = lease.workspace();
+    // Keep the lease open through every idle period and every use of the path.
+}
+----
+
+Each helper acquires its own lease. The ticket and lease are local to the worker host and must be used by cooperating
+processes under the worker's account on a filesystem with atomic file moves and cross-process file locking. Keep the
+ticket private and close the lease when finished. The lease extends the lifetime of the workspace and its fork temp
+directory. A helper that needs to survive a forked partition must run independently of its process tree. The worker
+can terminate fork descendants on successful completion or cancellation.
+
+If a helper exits abruptly, the operating system releases its lock. Cleanup closes admission to new leases. On Linux
+and macOS, a later worker startup can reclaim deferred workspaces once the leases and filesystem references have
+cleared. Startup recovery on other platforms retains orphaned workspaces.
 
 [[tools-test-distribution-external-resources-compat]]
 === Requirements and caveats
@@ -528,7 +633,9 @@ version.
 the partition's other tests have run.
 * In the shared worker JVM (`forkMode=AUTO`) the JUnit Platform, SLF4J and the Log4j API come from the worker; the tests
 see no other worker classes except those of the worker's own `-javaagent` jars (for example a JaCoCo runtime).
-* Worker caches are not evicted automatically.
+* Worker cache eviction is exact least-recently-used ordering while a worker runs. After a restart, files last used
+within the same file system timestamp interval are evicted in a fixed (deterministic) order, so the order across
+restarts is only approximately least recently used.
 
 [[tools-test-distribution-external-resources-limits]]
 === Limits
