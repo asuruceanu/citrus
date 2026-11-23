@@ -92,6 +92,22 @@ class WorkspaceReferencesTest {
     }
 
     @Test
+    @EnabledOnOs(OS.MAC)
+    void shouldUseFullScanWhenNativeProcessInventoryFails() throws IOException {
+        List<List<String>> commands = new ArrayList<>();
+
+        boolean inUse = WorkspaceReferences.inUse(List.of(tempDir), false, null, Map.of(), () -> {
+            throw new RuntimeException("Native process inventory failed");
+        }, command -> {
+            commands.add(command);
+            return new WorkspaceReferences.LsofResult("123\n", 0);
+        });
+
+        assertThat(inUse).isTrue();
+        assertThat(commands).singleElement().satisfies(command -> assertThat(command).contains("+D", tempDir.toString()));
+    }
+
+    @Test
     void shouldFallbackConservativelyWhenSurvivorBatchExceedsMaxPids() throws IOException {
         List<Long> survivors = LongStream.rangeClosed(1, 257).boxed().toList();
         List<List<String>> commands = new ArrayList<>();
@@ -203,32 +219,31 @@ class WorkspaceReferencesTest {
 
     @Test
     @EnabledOnOs(OS.MAC)
-    void shouldFallbackWhenAnotherSurvivorAppearsAfterTheTargetedScan() throws Exception {
+    void shouldFallbackWhenASurvivorDisappearsBeforeInspectionAndAnotherAppears() throws Exception {
         Process first = new ProcessBuilder("/bin/cat").start();
+        ProcessHandle exited = first.toHandle();
+        assertThat(first.destroyForcibly().waitFor(10, TimeUnit.SECONDS)).isTrue();
+        assertThat(exited.info().startInstant()).isEmpty();
+        Process later = new ProcessBuilder("/bin/cat").start();
         try {
-            Process later = new ProcessBuilder("/bin/cat").start();
-            try {
-                AtomicInteger snapshots = new AtomicInteger();
-                List<List<String>> commands = new ArrayList<>();
+            AtomicInteger snapshots = new AtomicInteger();
+            List<List<String>> commands = new ArrayList<>();
 
-                boolean inUse = WorkspaceReferences.inUse(List.of(tempDir), false, null, Map.of(),
-                        () -> snapshots.getAndIncrement() == 0 ? Stream.of(first.toHandle()) : Stream.of(later.toHandle()),
-                        command -> {
-                            commands.add(command);
-                            return command.contains("-p") ? new WorkspaceReferences.LsofResult("", 1)
-                                    : new WorkspaceReferences.LsofResult(later.pid() + "\n", 0);
-                        });
+            boolean inUse = WorkspaceReferences.inUse(List.of(tempDir), false, null, Map.of(),
+                    () -> snapshots.getAndIncrement() == 0 ? Stream.of(exited) : Stream.of(later.toHandle()),
+                    command -> {
+                        commands.add(command);
+                        return command.contains("-p") ? new WorkspaceReferences.LsofResult("", 1)
+                                : new WorkspaceReferences.LsofResult(later.pid() + "\n", 0);
+                    });
 
-                assertThat(inUse).isTrue();
-                assertThat(snapshots).hasValue(2);
-                assertThat(commands).hasSize(2);
-                assertThat(commands.getFirst()).contains("-p", Long.toString(first.pid()));
-                assertThat(commands.getLast()).contains("+D", tempDir.toString());
-            } finally {
-                assertThat(later.destroyForcibly().waitFor(10, TimeUnit.SECONDS)).isTrue();
-            }
+            assertThat(inUse).isTrue();
+            assertThat(snapshots).hasValue(2);
+            assertThat(commands).hasSize(2);
+            assertThat(commands.getFirst()).contains("-p", Long.toString(exited.pid()));
+            assertThat(commands.getLast()).contains("+D", tempDir.toString());
         } finally {
-            assertThat(first.destroyForcibly().waitFor(10, TimeUnit.SECONDS)).isTrue();
+            assertThat(later.destroyForcibly().waitFor(10, TimeUnit.SECONDS)).isTrue();
         }
     }
 

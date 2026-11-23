@@ -122,7 +122,7 @@ final class WorkerWorkspaceRegistry {
         if (forked && !leased) {
             try {
                 baselineProcesses = WorkspaceReferences.captureMacOsBaselineProcesses();
-            } catch (SecurityException | UnsupportedOperationException e) {
+            } catch (RuntimeException e) {
                 LOG.debug("Could not capture baseline processes for a forked partition workspace", e);
             }
         }

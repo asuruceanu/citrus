@@ -89,26 +89,27 @@ final class WorkspaceReferences {
             if (containsUnixSocket(roots)) {
                 return true;
             }
-            List<SurvivorProcess> survivors;
-            try {
-                survivors = postLaunchProcesses(macOsBaselineProcesses, allProcesses);
-            } catch (SecurityException | UnsupportedOperationException e) {
+            Optional<List<SurvivorProcess>> snapshot = postLaunchProcesses(macOsBaselineProcesses, allProcesses);
+            if (snapshot.isEmpty()) {
+                checkInterrupted();
                 return macOsReferences(roots, commandRunner);
             }
+            List<SurvivorProcess> survivors = snapshot.get();
             return macOsProcessReferences(roots, survivors.stream().map(SurvivorProcess::pid).toList(), commandRunner,
-                    output -> hasUnverifiedSurvivors(survivors, postLaunchProcesses(macOsBaselineProcesses, allProcesses),
-                            output));
+                    output -> postLaunchProcesses(macOsBaselineProcesses, allProcesses)
+                            .map(rechecked -> hasUnverifiedSurvivors(survivors, rechecked, output)).orElse(true));
         }
         // An orphan on a platform without an inspection backend has no owner left to vouch for it.
         return recovering;
     }
 
-    private static List<SurvivorProcess> postLaunchProcesses(Map<Long, Instant> baseline,
-                                                            Supplier<Stream<ProcessHandle>> allProcesses) {
-        ProcessHandle current = ProcessHandle.current();
-        String currentUser = current.info().user().orElse(null);
+    private static Optional<List<SurvivorProcess>> postLaunchProcesses(Map<Long, Instant> baseline,
+                                                                       Supplier<Stream<ProcessHandle>> allProcesses) {
         try (var processes = allProcesses.get()) {
-            return processes.filter(process -> process.pid() != current.pid() && process.isAlive())
+            ProcessHandle current = ProcessHandle.current();
+            String currentUser = current.info().user().orElse(null);
+            // A process that exits after enumeration may already have handed its references to a new child.
+            return Optional.of(processes.filter(process -> process.pid() != current.pid())
                     .map(process -> {
                         ProcessHandle.Info info = process.info();
                         Instant startedAt = info.startInstant().orElse(null);
@@ -120,7 +121,10 @@ final class WorkspaceReferences {
                     })
                     .filter(Objects::nonNull)
                     .limit(MAX_TARGETED_PIDS + 1L)
-                    .toList();
+                    .toList());
+        } catch (RuntimeException e) {
+            // A failed native inventory or metadata lookup cannot establish which processes survived.
+            return Optional.empty();
         }
     }
 
