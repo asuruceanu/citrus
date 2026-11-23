@@ -23,6 +23,7 @@ import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.nio.file.attribute.FileTime;
 import java.security.MessageDigest;
 import java.util.HexFormat;
 import java.util.List;
@@ -33,6 +34,7 @@ import java.util.zip.ZipOutputStream;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import org.citrusframework.distribution.config.DistributionJson;
 import org.citrusframework.distribution.model.ArtifactKind;
@@ -70,6 +72,84 @@ class BlobCacheDirectoryTest {
         assertThat(onClasspath).hasBinaryContent(jar);
         assertThat(cache.materializeForClasspath(ref, tempDir.resolve("other-partition")))
                 .as("shared by every partition of the worker").isEqualTo(onClasspath);
+    }
+
+    @Test
+    void shouldRepairAnIndependentlyReplacedNamedJarThroughEitherMaterializationMethod() throws Exception {
+        byte[] jar = jarWith("a.txt", "a");
+        String sha = sha(jar);
+        BlobCacheDirectory cache = new BlobCacheDirectory(tempDir.resolve("cache"));
+        Path blob = cache.put(sha, jar);
+        ArtifactRef ref = new ArtifactRef("library.jar", sha, ArtifactKind.JAR, jar.length);
+        Path named = cache.materializeForClasspath(ref, blob, tempDir);
+        FileTime originalTime = Files.getLastModifiedTime(named);
+
+        Files.move(named, tempDir.resolve("original-name.jar"));
+        Files.write(named, new byte[jar.length]);
+        Files.setLastModifiedTime(named, originalTime);
+
+        assertThat(cache.materializeForClasspath(ref, blob, tempDir)).hasBinaryContent(jar);
+        assertThat(blob).hasBinaryContent(jar);
+
+        Files.move(named, tempDir.resolve("repaired-name.jar"));
+        Files.write(named, new byte[jar.length]);
+        Files.setLastModifiedTime(named, originalTime);
+
+        assertThat(cache.materializeForClasspath(ref, tempDir)).hasBinaryContent(jar);
+        assertThat(blob).hasBinaryContent(jar);
+    }
+
+    @Test
+    void shouldReplaceANamedJarSymlinkEvenWhenItTargetsTheCanonicalBlob() throws Exception {
+        byte[] jar = jarWith("a.txt", "a");
+        String sha = sha(jar);
+        BlobCacheDirectory cache = new BlobCacheDirectory(tempDir.resolve("cache"));
+        Path blob = cache.put(sha, jar);
+        ArtifactRef ref = new ArtifactRef("library.jar", sha, ArtifactKind.JAR, jar.length);
+        Path named = cache.materializeForClasspath(ref, blob, tempDir);
+        Files.delete(named);
+        assumeTrue(createSymlink(named, blob), "file system supports symbolic links");
+
+        assertThat(cache.materializeForClasspath(ref, blob, tempDir)).hasBinaryContent(jar);
+        assertThat(Files.isSymbolicLink(named)).isFalse();
+        assertThat(blob).hasBinaryContent(jar);
+    }
+
+    @Test
+    void shouldReuseUnchangedNamedJarCopiesAndRefreshChangedCopiesWhenLinksAreUnsupported() throws Exception {
+        byte[] jar = jarWith("a.txt", "a");
+        String sha = sha(jar);
+        AtomicInteger linkAttempts = new AtomicInteger();
+        BlobCacheDirectory cache = new BlobCacheDirectory(tempDir.resolve("cache"), (link, target) -> {
+            linkAttempts.incrementAndGet();
+            throw new UnsupportedOperationException("simulated");
+        });
+        Path blob = cache.put(sha, jar);
+        ArtifactRef ref = new ArtifactRef("library.jar", sha, ArtifactKind.JAR, jar.length);
+
+        Path named = cache.materializeForClasspath(ref, blob, tempDir);
+        assertThat(named).hasBinaryContent(jar);
+        assertThat(Files.isSameFile(named, blob)).isFalse();
+        FileTime blobTime = Files.getLastModifiedTime(blob);
+        Files.setLastModifiedTime(blob, FileTime.fromMillis(blobTime.toMillis() + 60_000));
+        assertThat(cache.materializeForClasspath(ref, tempDir)).isEqualTo(named);
+        assertThat(linkAttempts).hasValue(1);
+
+        FileTime originalTime = Files.getLastModifiedTime(named);
+        Files.write(named, new byte[jar.length]);
+        Files.setLastModifiedTime(named, FileTime.fromMillis(originalTime.toMillis() + 60_000));
+
+        assertThat(cache.materializeForClasspath(ref, blob, tempDir)).hasBinaryContent(jar);
+        assertThat(cache.materializeForClasspath(ref, tempDir)).isEqualTo(named);
+        assertThat(linkAttempts).hasValue(2);
+
+        Path savedCopy = Files.move(named, tempDir.resolve("saved-copy.jar"));
+        cache.deleteNamedJars(sha);
+        Files.createDirectories(named.getParent());
+        Files.move(savedCopy, named);
+
+        assertThat(cache.materializeForClasspath(ref, tempDir)).hasBinaryContent(jar);
+        assertThat(linkAttempts).hasValue(3);
     }
 
     @Test

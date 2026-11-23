@@ -36,13 +36,16 @@ import java.nio.file.SimpleFileVisitor;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.BasicFileAttributes;
+import java.nio.file.attribute.FileTime;
 import java.security.DigestInputStream;
 import java.security.MessageDigest;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
@@ -123,11 +126,31 @@ public class BlobCacheDirectory {
         void move(Path source, Path target, CopyOption... options) throws IOException;
     }
 
+    /** Links a named jar; a test seam for file systems without hard links. */
+    @FunctionalInterface
+    interface FileLinker {
+        void link(Path link, Path target) throws IOException;
+    }
+
+    private record JarFileStamp(Object fileKey, long size, FileTime modified, FileTime created) {
+        static JarFileStamp of(BasicFileAttributes attrs) {
+            return new JarFileStamp(attrs.fileKey(), attrs.size(), attrs.lastModifiedTime(), attrs.creationTime());
+        }
+    }
+
     private final Path rootDir;
+    private final FileLinker fileLinker;
+    private final Object namedJarLock = new Object();
+    private final Map<String, Map<Path, JarFileStamp>> namedJarCopies = new HashMap<>();
     private volatile FileMover fileMover = Files::move;
 
     public BlobCacheDirectory(Path rootDir) {
+        this(rootDir, Files::createLink);
+    }
+
+    BlobCacheDirectory(Path rootDir, FileLinker fileLinker) {
         this.rootDir = rootDir.toAbsolutePath().normalize();
+        this.fileLinker = Objects.requireNonNull(fileLinker);
     }
 
     void fileMover(FileMover fileMover) {
@@ -440,21 +463,26 @@ public class BlobCacheDirectory {
      */
     public boolean delete(String sha256) throws IOException {
         Path blob = resolveBlobPathForAccess(sha256);
-        deleteNamedJars(sha256);
-        boolean existed = Files.deleteIfExists(blob);
-        pruneEmptyDirectory(blob.getParent());
-        return existed;
+        synchronized (namedJarLock) {
+            deleteNamedJars(sha256);
+            boolean existed = Files.deleteIfExists(blob);
+            pruneEmptyDirectory(blob.getParent());
+            return existed;
+        }
     }
 
     /** Removes the cached classpath names for a digest without touching the canonical blob. */
     public void deleteNamedJars(String sha256) throws IOException {
         validateDigest(sha256);
         Path classpathDir = rootDir.resolve("classpath").resolve(sha256);
-        requireCacheDirectories(classpathDir.getParent());
-        if (isLinkLike(classpathDir)) {
-            Files.deleteIfExists(classpathDir);
-        } else {
-            deleteRecursively(classpathDir);
+        synchronized (namedJarLock) {
+            requireCacheDirectories(classpathDir.getParent());
+            if (isLinkLike(classpathDir)) {
+                Files.deleteIfExists(classpathDir);
+            } else {
+                deleteRecursively(classpathDir);
+            }
+            namedJarCopies.remove(sha256);
         }
     }
 
@@ -615,11 +643,11 @@ public class BlobCacheDirectory {
             throw new IllegalArgumentException("REGULAR_FILE artifact " + ref.name() + " cannot be placed on the classpath");
         }
         Path blobPath = verifiedBlob != null ? verifiedBlob : resolveBlobPathForAccess(ref.sha256());
-        if (!Files.isRegularFile(blobPath, LinkOption.NOFOLLOW_LINKS)) {
-            throw new IOException("Cached blob does not exist: " + ref.sha256());
-        }
         if (ref.kind() == ArtifactKind.JAR) {
             return namedJar(ref, blobPath);
+        }
+        if (!Files.isRegularFile(blobPath, LinkOption.NOFOLLOW_LINKS)) {
+            throw new IOException("Cached blob does not exist: " + ref.sha256());
         }
 
         Path extractDir = workspaceDir.toAbsolutePath().normalize().resolve("extracted").resolve(ref.sha256());
@@ -658,41 +686,88 @@ public class BlobCacheDirectory {
             name = name + ".jar";
         }
         Path dir = rootDir.resolve("classpath").resolve(ref.sha256()).normalize();
-        requireCacheDirectories(dir);
         Path named = dir.resolve(name).normalize();
         if (!named.startsWith(rootDir)) {
             throw new IOException("Classpath entry escapes cache root: " + ref.name());
         }
-        if (Files.isRegularFile(named, LinkOption.NOFOLLOW_LINKS)) {
-            return named;
-        }
-        synchronized (this) {
-            if (Files.isRegularFile(named, LinkOption.NOFOLLOW_LINKS)) {
+        synchronized (namedJarLock) {
+            requireCacheDirectories(dir);
+            BasicFileAttributes blobAttrs = regularFileAttributes(blobPath);
+            if (blobAttrs == null) {
+                throw new IOException("Cached blob does not exist: " + ref.sha256());
+            }
+            BasicFileAttributes namedAttrs = regularFileAttributes(named);
+            if (namedAttrs != null && sameFile(blobPath, blobAttrs, named, namedAttrs)) {
                 return named;
             }
-            Files.createDirectories(dir);
-            // Stage under a unique name, and treat any failure to publish as fine once a concurrent caller
-            // has published the same digest.
-            Path staging = Files.createTempFile(dir, ".staging-", ".jar");
-            try {
-                Files.delete(staging);
-                try {
-                    Files.createLink(staging, blobPath);
-                } catch (UnsupportedOperationException | IOException linkFailed) {
-                    Files.copy(blobPath, staging, StandardCopyOption.REPLACE_EXISTING, LinkOption.NOFOLLOW_LINKS);
-                }
-                if (!Files.isRegularFile(staging, LinkOption.NOFOLLOW_LINKS)) {
-                    throw new IOException("Cached blob is not a regular file: " + ref.sha256());
-                }
-                Files.move(staging, named, StandardCopyOption.ATOMIC_MOVE);
-            } catch (IOException publishFailed) {
-                if (!Files.isRegularFile(named, LinkOption.NOFOLLOW_LINKS)) {
-                    throw publishFailed;
-                }
-            } finally {
-                Files.deleteIfExists(staging);
+            Map<Path, JarFileStamp> copies = namedJarCopies.get(ref.sha256());
+            JarFileStamp copy = copies == null ? null : copies.get(named);
+            // Copies are stamped for the digest. Access-time bookkeeping may touch the canonical blob.
+            if (copy != null && namedAttrs != null && copy.equals(JarFileStamp.of(namedAttrs))) {
+                return named;
+            }
+            if (copy != null) {
+                copies.remove(named);
+            }
+
+            JarFileStamp publishedCopy = publishNamedJar(blobPath, named);
+            if (publishedCopy != null) {
+                namedJarCopies.computeIfAbsent(ref.sha256(), ignored -> new HashMap<>())
+                        .put(named, publishedCopy);
             }
             return named;
+        }
+    }
+
+    private static BasicFileAttributes regularFileAttributes(Path file) throws IOException {
+        try {
+            BasicFileAttributes attrs = Files.readAttributes(file, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+            return attrs.isRegularFile() && !attrs.isOther() ? attrs : null;
+        } catch (NoSuchFileException absent) {
+            return null;
+        }
+    }
+
+    private static boolean sameFile(Path blob, BasicFileAttributes blobAttrs, Path named, BasicFileAttributes namedAttrs)
+            throws IOException {
+        Object blobKey = blobAttrs.fileKey();
+        Object namedKey = namedAttrs.fileKey();
+        if (blobKey != null && namedKey != null) {
+            return blobKey.equals(namedKey);
+        }
+        // Some providers only expose file identity through isSameFile. Both entries were checked without following links.
+        try {
+            return Files.isSameFile(blob, named);
+        } catch (NoSuchFileException vanished) {
+            return false;
+        }
+    }
+
+    private JarFileStamp publishNamedJar(Path blob, Path named) throws IOException {
+        Path dir = Files.createDirectories(named.getParent());
+        Path staging = Files.createTempFile(dir, ".staging-", ".jar");
+        try {
+            Files.delete(staging);
+            boolean copied = false;
+            try {
+                fileLinker.link(staging, blob);
+            } catch (UnsupportedOperationException | IOException linkFailed) {
+                Files.copy(blob, staging, StandardCopyOption.REPLACE_EXISTING, LinkOption.NOFOLLOW_LINKS);
+                copied = true;
+            }
+            BasicFileAttributes stagedAttrs = regularFileAttributes(staging);
+            if (stagedAttrs == null) {
+                throw new IOException("Cached blob is not a regular file: " + blob);
+            }
+            try {
+                Files.move(staging, named, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+            } catch (AtomicMoveNotSupportedException | FileAlreadyExistsException unavailable) {
+                Files.move(staging, named, StandardCopyOption.REPLACE_EXISTING);
+            }
+            // Stamp the staged copy so a replacement of the published path cannot become trusted.
+            return copied ? JarFileStamp.of(stagedAttrs) : null;
+        } finally {
+            Files.deleteIfExists(staging);
         }
     }
 
