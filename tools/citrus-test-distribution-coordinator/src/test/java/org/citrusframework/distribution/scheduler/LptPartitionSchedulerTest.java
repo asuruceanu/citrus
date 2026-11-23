@@ -164,6 +164,49 @@ class LptPartitionSchedulerTest {
                 .allSatisfy(partition -> assertThat(partition.workUnits()).isNotEmpty());
     }
 
+    @Test
+    void shouldSizeAdaptivePartitionsWhenGroupDurationExceedsLongRange() {
+        List<WorkUnitSpec> units = units("Slow", 2, Map.of(), Long.MAX_VALUE);
+        LptPartitionScheduler scheduler = new LptPartitionScheduler();
+
+        for (long minPartitionDurationMs : List.of(5_000L, Long.MAX_VALUE)) {
+            List<PartitionRecord> partitions = scheduler.schedule("s1", units, Map.of(), 1_000L, 1, PartitionPolicy.LPT,
+                    minPartitionDurationMs, 0, null);
+
+            assertThat(partitions).extracting(PartitionRecord::estimatedDurationMs)
+                    .containsExactly(Long.MAX_VALUE, Long.MAX_VALUE);
+        }
+    }
+
+    @Test
+    void shouldSaturatePartitionDurationWhenItsUnitsExceedLongRange() {
+        List<WorkUnitSpec> units = units("Slow", 2, Map.of(), Long.MAX_VALUE);
+        LptPartitionScheduler scheduler = new LptPartitionScheduler();
+
+        for (PartitionPolicy policy : List.of(PartitionPolicy.LPT, PartitionPolicy.SINGLE)) {
+            assertThat(scheduler.schedule("s1", units, Map.of(), 1_000L, 2, policy))
+                    .extracting(PartitionRecord::estimatedDurationMs).containsExactly(Long.MAX_VALUE);
+        }
+    }
+
+    @Test
+    void shouldFallBackForNegativeHistoryAndKeepZeroDurationHistory() {
+        List<WorkUnitSpec> units = new ArrayList<>(units("Test", 25, Map.of(), 0L));
+        units.set(1, new WorkUnitSpec("Test1", "pkg.Test1", null, null, Map.of(), 275L));
+        Map<String, Long> history = new HashMap<>();
+        units.forEach(unit -> history.put(unit.key(), -1L));
+        history.put("Test0", 0L);
+
+        List<PartitionRecord> partitions = new LptPartitionScheduler()
+                .schedule("s1", units, history, 1_000L, 1, PartitionPolicy.LPT, 0L, 12, caps -> 1);
+
+        assertThat(partitions).hasSize(12).allSatisfy(partition -> assertThat(partition.workUnits()).isNotEmpty());
+        assertThat(partitions.stream().flatMap(partition -> partition.workUnits().stream()))
+                .extracting(WorkUnitSpec::estimatedDurationMs)
+                .containsExactlyInAnyOrderElementsOf(
+                        IntStream.range(0, 25).mapToObj(i -> i == 0 ? 0L : i == 1 ? 275L : 1_000L).toList());
+    }
+
     private static List<WorkUnitSpec> units(String prefix, int count, Map<String, String> capabilities, long durationMs) {
         return IntStream.range(0, count)
                 .mapToObj(i -> new WorkUnitSpec(prefix + i, "pkg." + prefix + i, null, null, capabilities, durationMs))

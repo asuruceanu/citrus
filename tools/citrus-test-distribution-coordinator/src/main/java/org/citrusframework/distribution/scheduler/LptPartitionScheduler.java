@@ -16,6 +16,7 @@
 
 package org.citrusframework.distribution.scheduler;
 
+import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
@@ -103,10 +104,10 @@ public class LptPartitionScheduler {
     }
 
     private static WorkUnitSpec withResolvedDuration(WorkUnitSpec raw, Map<String, Long> history, long fallbackDuration) {
-        long resolvedDuration = history.getOrDefault(
-                raw.key(),
-                raw.estimatedDurationMs() > 0 ? raw.estimatedDurationMs() : fallbackDuration
-        );
+        long defaultDuration = raw.estimatedDurationMs() > 0 ? raw.estimatedDurationMs() : fallbackDuration;
+        Long historicalDuration = history.get(raw.key());
+        long resolvedDuration = historicalDuration != null && historicalDuration >= 0
+                ? historicalDuration : defaultDuration;
         Map<String, String> normalizedCaps = raw.requiredCapabilities() == null || raw.requiredCapabilities().isEmpty()
                 ? Map.of()
                 : new TreeMap<>(raw.requiredCapabilities());
@@ -133,7 +134,8 @@ public class LptPartitionScheduler {
                 }
             }
         }
-        long sumDuration = units.stream().mapToLong(WorkUnitSpec::estimatedDurationMs).sum();
+        long sumDuration = units.stream().mapToLong(WorkUnitSpec::estimatedDurationMs)
+                .reduce(0L, LptPartitionScheduler::addDurations);
         return newPartition(sessionId, capabilities, List.copyOf(units), sumDuration);
     }
 
@@ -154,9 +156,7 @@ public class LptPartitionScheduler {
             int maxBinsFromSize = Math.ceilDiv(groupUnits.size(), capSize);
             int binCount = maxBinsFromSize;
             if (minPartitionDurationMs > 0) {
-                long totalEstimatedMs = groupUnits.stream().mapToLong(WorkUnitSpec::estimatedDurationMs).sum();
-                long durationBins = Math.ceilDiv(Math.max(1L, totalEstimatedMs), minPartitionDurationMs);
-                binCount = (int) Math.min(binCount, durationBins);
+                binCount = limitBinsByDuration(groupUnits, binCount, minPartitionDurationMs);
             }
             if (maxWavesPerWorker > 0 && eligibleWorkerCounter != null) {
                 int eligibleWorkers = eligibleWorkerCounter.applyAsInt(group.getKey());
@@ -184,7 +184,7 @@ public class LptPartitionScheduler {
                     }
                 }
                 bins.get(target).add(unit);
-                binDurations[target] += unit.estimatedDurationMs();
+                binDurations[target] = addDurations(binDurations[target], unit.estimatedDurationMs());
             }
             for (int i = 0; i < binCount; i++) {
                 partitions.add(newPartition(sessionId, group.getKey(), List.copyOf(bins.get(i)), binDurations[i]));
@@ -194,6 +194,27 @@ public class LptPartitionScheduler {
         partitions.sort(Comparator.comparingLong(PartitionRecord::estimatedDurationMs).reversed()
                 .thenComparing(p -> p.workUnits().get(0).key()));
         return partitions;
+    }
+
+    private static int limitBinsByDuration(List<WorkUnitSpec> units, int binCount, long minPartitionDurationMs) {
+        try {
+            long total = units.stream().mapToLong(WorkUnitSpec::estimatedDurationMs).reduce(0L, Math::addExact);
+            return (int) Math.min(binCount, Math.ceilDiv(Math.max(1L, total), minPartitionDurationMs));
+        } catch (ArithmeticException overflow) {
+            // A saturated total can underestimate the bin count when the minimum duration is also large.
+            BigInteger total = units.stream()
+                    .map(unit -> BigInteger.valueOf(unit.estimatedDurationMs()))
+                    .reduce(BigInteger.ZERO, BigInteger::add);
+            BigInteger durationBins = total.subtract(BigInteger.ONE)
+                    .divide(BigInteger.valueOf(minPartitionDurationMs))
+                    .add(BigInteger.ONE);
+            return durationBins.min(BigInteger.valueOf(binCount)).intValueExact();
+        }
+    }
+
+    /** Adds two non-negative durations while keeping the projected partition duration representable. */
+    private static long addDurations(long left, long right) {
+        return left > Long.MAX_VALUE - right ? Long.MAX_VALUE : left + right;
     }
 
     private static PartitionRecord newPartition(String sessionId, Map<String, String> capabilities,
