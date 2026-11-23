@@ -207,8 +207,37 @@ public class BlobCacheDirectory {
         return resolved;
     }
 
+    /**
+     * Resolves a blob path for file operations, rejecting redirected parent directories. The caller decides how
+     * to handle the blob entry itself, which may be a symbolic link that needs to be removed.
+     */
+    public Path resolveBlobPathForAccess(String sha256) throws IOException {
+        Path path = resolveBlobPath(sha256);
+        requireCacheDirectories(path.getParent());
+        return path;
+    }
+
+    private void requireCacheDirectories(Path directory) throws IOException {
+        Path current = rootDir;
+        for (Path name : rootDir.relativize(directory)) {
+            current = current.resolve(name);
+            try {
+                BasicFileAttributes attrs = Files.readAttributes(current, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+                if (!attrs.isDirectory() || attrs.isOther()) {
+                    throw new IOException("Cache path is not a real directory: " + current);
+                }
+            } catch (NoSuchFileException absent) {
+                return;
+            }
+        }
+    }
+
     public boolean contains(String sha256) {
-        return Files.isRegularFile(resolveBlobPath(sha256));
+        try {
+            return Files.isRegularFile(resolveBlobPathForAccess(sha256), LinkOption.NOFOLLOW_LINKS);
+        } catch (IOException e) {
+            return false;
+        }
     }
 
     /**
@@ -224,7 +253,9 @@ public class BlobCacheDirectory {
             throw new IllegalArgumentException("Unsupported cache temporary file prefix '" + prefix
                     + "': it must be one sweepTempFiles() removes");
         }
-        Path tmpDir = Files.createDirectories(rootDir.resolve("tmp"));
+        Path tmpDir = rootDir.resolve("tmp");
+        requireCacheDirectories(tmpDir);
+        Files.createDirectories(tmpDir);
         return Files.createTempFile(tmpDir, prefix, ".tmp");
     }
 
@@ -241,8 +272,8 @@ public class BlobCacheDirectory {
         if (!sha256.equals(actual)) {
             throw new IllegalArgumentException("SHA-256 mismatch: expected " + sha256 + " but got " + actual);
         }
-        Path target = resolveBlobPath(sha256);
-        if (Files.isRegularFile(target)) {
+        Path target = resolveBlobPathForAccess(sha256);
+        if (Files.isRegularFile(target, LinkOption.NOFOLLOW_LINKS)) {
             return target;
         }
         Path tmp = newTempFile(sha256.substring(0, 8) + "-");
@@ -269,16 +300,17 @@ public class BlobCacheDirectory {
             throw new IllegalArgumentException("Blob source is not a regular file: " + sourceFile);
         }
         checkBlobSize(Files.size(sourceFile), expectedSha256);
-        Path target = resolveBlobPath(expectedSha256);
+        Path target = resolveBlobPathForAccess(expectedSha256);
 
         Path source = sourceFile.toAbsolutePath().normalize();
         if (rootDir.resolve("tmp").equals(source.getParent())) {
+            requireCacheDirectories(source.getParent());
             if (!storeTempBlob(expectedSha256, source, target)) {
                 Files.deleteIfExists(source);
             }
             return target;
         }
-        if (Files.isRegularFile(target)) {
+        if (Files.isRegularFile(target, LinkOption.NOFOLLOW_LINKS)) {
             verifyDigest(expectedSha256, ClasspathPackager.sha256Hex(source));
             return target;
         }
@@ -314,14 +346,15 @@ public class BlobCacheDirectory {
         if (!rootDir.resolve("tmp").equals(source.getParent()) || !Files.isRegularFile(source, LinkOption.NOFOLLOW_LINKS)) {
             throw new IllegalArgumentException("Blob source is not a regular file in the cache temporary directory: " + source);
         }
-        Path target = resolveBlobPath(expectedSha256);
+        requireCacheDirectories(source.getParent());
+        Path target = resolveBlobPathForAccess(expectedSha256);
         checkBlobSize(Files.size(source), expectedSha256);
         return storeTempBlob(expectedSha256, source, target);
     }
 
     private boolean storeTempBlob(String expectedSha256, Path source, Path target) throws IOException {
         verifyDigest(expectedSha256, ClasspathPackager.sha256Hex(source));
-        if (Files.isRegularFile(target)) {
+        if (Files.isRegularFile(target, LinkOption.NOFOLLOW_LINKS)) {
             return false;
         }
         moveIntoPlace(source, target);
@@ -333,7 +366,7 @@ public class BlobCacheDirectory {
      * absent or corrupted. A corrupted blob is deleted so the caller can fetch or package it again.
      */
     public Path getVerifiedPath(String sha256) throws IOException {
-        Path blob = resolveBlobPath(sha256);
+        Path blob = resolveBlobPathForAccess(sha256);
         if (!Files.isRegularFile(blob, LinkOption.NOFOLLOW_LINKS)) {
             return null;
         }
@@ -344,7 +377,7 @@ public class BlobCacheDirectory {
         } catch (NoSuchFileException vanished) {
             return null;
         }
-        Files.deleteIfExists(blob);
+        delete(sha256);
         return null;
     }
 
@@ -355,7 +388,12 @@ public class BlobCacheDirectory {
      * @throws NoSuchFileException if the blob does not exist
      */
     public boolean isIntact(String sha256) throws IOException {
-        return sha256.equals(ClasspathPackager.sha256Hex(resolveBlobPath(sha256)));
+        Path blob = resolveBlobPathForAccess(sha256);
+        MessageDigest digest = ClasspathPackager.newSha256();
+        try (InputStream in = new DigestInputStream(Files.newInputStream(blob, LinkOption.NOFOLLOW_LINKS), digest)) {
+            in.transferTo(OutputStream.nullOutputStream());
+        }
+        return sha256.equals(HexFormat.of().formatHex(digest.digest()));
     }
 
     /**
@@ -401,13 +439,23 @@ public class BlobCacheDirectory {
      * @throws IllegalArgumentException on an invalid digest
      */
     public boolean delete(String sha256) throws IOException {
-        Path blob = resolveBlobPath(sha256);
-        // resolveBlobPath validated the digest, so this stays under the root
-        Path classpathDir = rootDir.resolve("classpath").resolve(sha256);
-        deleteRecursively(classpathDir);
+        Path blob = resolveBlobPathForAccess(sha256);
+        deleteNamedJars(sha256);
         boolean existed = Files.deleteIfExists(blob);
         pruneEmptyDirectory(blob.getParent());
         return existed;
+    }
+
+    /** Removes the cached classpath names for a digest without touching the canonical blob. */
+    public void deleteNamedJars(String sha256) throws IOException {
+        validateDigest(sha256);
+        Path classpathDir = rootDir.resolve("classpath").resolve(sha256);
+        requireCacheDirectories(classpathDir.getParent());
+        if (isLinkLike(classpathDir)) {
+            Files.deleteIfExists(classpathDir);
+        } else {
+            deleteRecursively(classpathDir);
+        }
     }
 
     private static void pruneEmptyDirectory(Path dir) {
@@ -493,6 +541,15 @@ public class BlobCacheDirectory {
         }
         Files.walkFileTree(path, new SimpleFileVisitor<>() {
             @Override
+            public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs) throws IOException {
+                if (attrs.isOther()) {
+                    Files.deleteIfExists(dir);
+                    return FileVisitResult.SKIP_SUBTREE;
+                }
+                return FileVisitResult.CONTINUE;
+            }
+
+            @Override
             public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
                 Files.deleteIfExists(file);
                 return FileVisitResult.CONTINUE;
@@ -510,7 +567,11 @@ public class BlobCacheDirectory {
     }
 
     public byte[] readBytes(String sha256) throws IOException {
-        return Files.readAllBytes(resolveBlobPath(sha256));
+        Path blob = resolveBlobPathForAccess(sha256);
+        if (!Files.isRegularFile(blob, LinkOption.NOFOLLOW_LINKS)) {
+            throw new NoSuchFileException(blob.toString());
+        }
+        return Files.readAllBytes(blob);
     }
 
     /**
@@ -540,8 +601,8 @@ public class BlobCacheDirectory {
      *
      * @throws IllegalArgumentException otherwise
      */
-    Path requireBlobPath(String sha256, Path verifiedBlob) {
-        Path expected = resolveBlobPath(sha256);
+    Path requireBlobPath(String sha256, Path verifiedBlob) throws IOException {
+        Path expected = resolveBlobPathForAccess(sha256);
         if (verifiedBlob == null || !expected.equals(verifiedBlob.toAbsolutePath().normalize())) {
             throw new IllegalArgumentException("Verified blob " + verifiedBlob + " is not the cached blob " + expected);
         }
@@ -553,8 +614,8 @@ public class BlobCacheDirectory {
         if (ref.kind() == ArtifactKind.REGULAR_FILE) {
             throw new IllegalArgumentException("REGULAR_FILE artifact " + ref.name() + " cannot be placed on the classpath");
         }
-        Path blobPath = verifiedBlob != null ? verifiedBlob : resolveBlobPath(ref.sha256());
-        if (!Files.isRegularFile(blobPath)) {
+        Path blobPath = verifiedBlob != null ? verifiedBlob : resolveBlobPathForAccess(ref.sha256());
+        if (!Files.isRegularFile(blobPath, LinkOption.NOFOLLOW_LINKS)) {
             throw new IOException("Cached blob does not exist: " + ref.sha256());
         }
         if (ref.kind() == ArtifactKind.JAR) {
@@ -597,15 +658,16 @@ public class BlobCacheDirectory {
             name = name + ".jar";
         }
         Path dir = rootDir.resolve("classpath").resolve(ref.sha256()).normalize();
+        requireCacheDirectories(dir);
         Path named = dir.resolve(name).normalize();
         if (!named.startsWith(rootDir)) {
             throw new IOException("Classpath entry escapes cache root: " + ref.name());
         }
-        if (Files.isRegularFile(named)) {
+        if (Files.isRegularFile(named, LinkOption.NOFOLLOW_LINKS)) {
             return named;
         }
         synchronized (this) {
-            if (Files.isRegularFile(named)) {
+            if (Files.isRegularFile(named, LinkOption.NOFOLLOW_LINKS)) {
                 return named;
             }
             Files.createDirectories(dir);
@@ -617,11 +679,14 @@ public class BlobCacheDirectory {
                 try {
                     Files.createLink(staging, blobPath);
                 } catch (UnsupportedOperationException | IOException linkFailed) {
-                    Files.copy(blobPath, staging, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                    Files.copy(blobPath, staging, StandardCopyOption.REPLACE_EXISTING, LinkOption.NOFOLLOW_LINKS);
                 }
-                Files.move(staging, named, java.nio.file.StandardCopyOption.ATOMIC_MOVE);
+                if (!Files.isRegularFile(staging, LinkOption.NOFOLLOW_LINKS)) {
+                    throw new IOException("Cached blob is not a regular file: " + ref.sha256());
+                }
+                Files.move(staging, named, StandardCopyOption.ATOMIC_MOVE);
             } catch (IOException publishFailed) {
-                if (!Files.isRegularFile(named)) {
+                if (!Files.isRegularFile(named, LinkOption.NOFOLLOW_LINKS)) {
                     throw publishFailed;
                 }
             } finally {
@@ -810,6 +875,7 @@ public class BlobCacheDirectory {
         // delete(String) prunes empty shard directories, so a concurrent delete may remove the parent between
         // createDirectories and the move: recreate it and retry a few times.
         for (int attempt = 1; ; attempt++) {
+            requireCacheDirectories(target.getParent());
             Files.createDirectories(target.getParent());
             try {
                 moveOnce(tmp, target);

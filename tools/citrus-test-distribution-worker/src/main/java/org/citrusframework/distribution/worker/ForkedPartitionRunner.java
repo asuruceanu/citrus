@@ -113,6 +113,8 @@ final class ForkedPartitionRunner implements PartitionRunner {
     private final DistributionWorkerConfig config;
     /** Forks of this runner; {@code ACTIVE_FORKS} holds those of every runner for the shutdown hook. */
     private final Set<ActiveFork> forks = ConcurrentHashMap.newKeySet();
+    private final Object forkStartMonitor = new Object();
+    private volatile boolean stopping;
     private final WorkerFileCache sharedCache;
     private final BrokerBlobClient sharedBlobs;
     private final long handshakeTimeoutMs;
@@ -146,6 +148,9 @@ final class ForkedPartitionRunner implements PartitionRunner {
     public IsolatedPartitionRunner.PartitionExecutionResult execute(PartitionAssignPayload assignment,
                                                                     CancellationToken cancellationToken,
                                                                     Consumer<WorkerTestEventPayload> eventSink) {
+        if (stopping || cancelled(cancellationToken)) {
+            return cancelledResult();
+        }
         if (sharedCache != null) {
             return execute(assignment, cancellationToken, eventSink, sharedCache, sharedBlobs);
         }
@@ -220,7 +225,14 @@ final class ForkedPartitionRunner implements PartitionRunner {
 
             ForkedPartitionMain.ForkedExecutionSummary summary;
             try (ServerSocket server = new ServerSocket(0, 50, InetAddress.getLoopbackAddress())) {
-                fork.process = launch(argfile, request, server.getLocalPort(), workspace, workingDirectory, fork.tmpDir);
+                // Publish the child before shutdown can snapshot the active forks. Classpath preparation remains
+                // outside the monitor so shutdown can prevent a delayed preparation from launching at all.
+                synchronized (forkStartMonitor) {
+                    if (stopping || cancelled(cancellationToken)) {
+                        return cancelledResult();
+                    }
+                    fork.process = launch(argfile, request, server.getLocalPort(), workspace, workingDirectory, fork.tmpDir);
+                }
                 fork.watcher = processWatcher(fork, cancellationToken);
                 summary = runProtocol(server, fork, token, cancellationToken, eventSink);
             }
@@ -272,10 +284,13 @@ final class ForkedPartitionRunner implements PartitionRunner {
     }
 
     /**
-     * Kills the process trees of this runner's running forks, for example when the worker closes while a partition
-     * thread does not stop in time. The partitions then fail and clean up as after a crash.
+     * Prevents new launches and kills the process trees of this runner's running forks. Partitions then fail and
+     * clean up as after a crash.
      */
     void killActiveForks() {
+        synchronized (forkStartMonitor) {
+            stopping = true;
+        }
         for (ActiveFork fork : forks) {
             fork.killAll();
         }

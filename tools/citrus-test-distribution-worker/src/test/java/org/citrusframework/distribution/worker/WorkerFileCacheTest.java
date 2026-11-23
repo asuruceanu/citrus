@@ -19,6 +19,7 @@ package org.citrusframework.distribution.worker;
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
+import java.io.UncheckedIOException;
 import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -265,6 +266,83 @@ class WorkerFileCacheTest {
             assertThat(blob).doesNotExist();
 
             assertThat(cache.verifyOrInvalidate(sha)).as("absent blob").isNull();
+        }
+    }
+
+    @Test
+    void shouldReverifyAFileReplacedWhileTouchingAWarmBlob() throws Exception {
+        byte[] content = "verified blob".getBytes(StandardCharsets.UTF_8);
+        String sha = ClasspathPackager.sha256Hex(content);
+        AtomicReference<Runnable> onTouch = new AtomicReference<>();
+        try (WorkerFileCache cache = WorkerFileCache.open(tempDir, false, 0L, PLENTY, clockWithTouchHook(onTouch))) {
+            Path blob = promote(cache, content);
+            Path replacement = Files.write(blob.resolveSibling("replacement"), corrupt(content));
+            Files.setLastModifiedTime(replacement, Files.getLastModifiedTime(blob));
+            onTouch.set(() -> {
+                try {
+                    Files.move(replacement, blob, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+                } catch (IOException e) {
+                    throw new UncheckedIOException(e);
+                }
+            });
+
+            assertThat(cache.verifyOrInvalidate(sha)).isNull();
+            assertThat(blob).doesNotExist();
+            assertThat(promote(cache, content)).hasBinaryContent(content);
+            assertThat(cache.verifyOrInvalidate(sha)).isEqualTo(blob);
+        }
+    }
+
+    @Test
+    void shouldRestoreABlobReplacedWithASymbolicLinkWithoutTouchingItsTarget() throws Exception {
+        byte[] content = "verified blob".getBytes(StandardCharsets.UTF_8);
+        String sha = ClasspathPackager.sha256Hex(content);
+        Path external = Files.writeString(tempDir.resolve("outside"), "keep me");
+        FileTime externalTime = Files.getLastModifiedTime(external);
+        try (WorkerFileCache cache = WorkerFileCache.open(tempDir.resolve("cache"), false, 0L, PLENTY, FIXED_CLOCK,
+                FileChannel::tryLock, root -> new BlobCacheDirectory(root) {
+                    @Override
+                    public boolean isIntact(String sha256) throws IOException {
+                        assertThat(Files.isSymbolicLink(resolveBlobPath(sha256))).isFalse();
+                        return super.isIntact(sha256);
+                    }
+                })) {
+            Path blob = promote(cache, content);
+            Files.delete(blob);
+            try {
+                Files.createSymbolicLink(blob, external);
+            } catch (IOException | UnsupportedOperationException e) {
+                assumeTrue(false, "file system supports symbolic links");
+            }
+
+            assertThat(cache.verifyOrInvalidate(sha)).isNull();
+            assertThat(Files.isSymbolicLink(blob)).isFalse();
+            assertThat(promote(cache, content)).hasBinaryContent(content);
+            assertThat(external).hasContent("keep me");
+            assertThat(Files.getLastModifiedTime(external)).isEqualTo(externalTime);
+        }
+    }
+
+    @Test
+    void shouldRebuildTheNamedJarWhenRedownloadingAMissingCanonicalBlob() throws Exception {
+        byte[] content = "classpath jar contents".getBytes(StandardCharsets.UTF_8);
+        String sha = ClasspathPackager.sha256Hex(content);
+        ArtifactRef artifact = new ArtifactRef("library.jar", sha, ArtifactKind.JAR, content.length);
+        Path dir = tempDir.resolve("cache");
+        Path workspace = tempDir.resolve("workspace");
+        try (WorkerFileCache cache = WorkerFileCache.open(dir, false, 0L, PLENTY, FIXED_CLOCK);
+             WorkerFileCache.PinLease lease = cache.pinAll(List.of(sha))) {
+            Path blob = promote(cache, content);
+            Path named = cache.materializeForClasspath(artifact, blob, workspace);
+            Files.write(named, corrupt(content));
+            Files.delete(blob);
+        }
+
+        try (WorkerFileCache cache = WorkerFileCache.open(dir, false, 0L, PLENTY, FIXED_CLOCK);
+             WorkerFileCache.PinLease lease = cache.pinAll(List.of(sha))) {
+            assertThat(cache.verifyOrInvalidate(sha)).isNull();
+            Path blob = promote(cache, content);
+            assertThat(cache.materializeForClasspath(artifact, blob, workspace)).hasBinaryContent(content);
         }
     }
 
@@ -775,25 +853,8 @@ class WorkerFileCacheTest {
     void shouldNotTouchAWarmBlobAfterCloseCompleted() throws Exception {
         byte[] content = "warm blob touched on lookup".getBytes(StandardCharsets.UTF_8);
         String sha = ClasspathPackager.sha256Hex(content);
-        AtomicReference<Runnable> onTouch = new AtomicReference<>(() -> { });
-        Clock clock = new Clock() {
-            @Override
-            public ZoneOffset getZone() {
-                return ZoneOffset.UTC;
-            }
-
-            @Override
-            public Clock withZone(java.time.ZoneId zone) {
-                return this;
-            }
-
-            @Override
-            public Instant instant() {
-                onTouch.getAndSet(() -> { }).run();
-                return FIXED_CLOCK.instant();
-            }
-        };
-        WorkerFileCache cache = WorkerFileCache.open(tempDir, false, 0L, PLENTY, clock);
+        AtomicReference<Runnable> onTouch = new AtomicReference<>();
+        WorkerFileCache cache = WorkerFileCache.open(tempDir, false, 0L, PLENTY, clockWithTouchHook(onTouch));
         AtomicReference<CompletableFuture<Void>> closing = new AtomicReference<>();
         AtomicBoolean closedBeforeTouch = new AtomicBoolean();
         try {
@@ -817,6 +878,76 @@ class WorkerFileCacheTest {
             assertThatThrownBy(() -> cache.verifyOrInvalidate(sha)).isInstanceOf(IllegalStateException.class);
         } finally {
             cache.close();
+        }
+    }
+
+    private static Clock clockWithTouchHook(AtomicReference<Runnable> onTouch) {
+        return new Clock() {
+            @Override
+            public ZoneOffset getZone() {
+                return ZoneOffset.UTC;
+            }
+
+            @Override
+            public Clock withZone(java.time.ZoneId zone) {
+                return this;
+            }
+
+            @Override
+            public Instant instant() {
+                Runnable hook = onTouch.getAndSet(null);
+                if (hook != null) {
+                    hook.run();
+                }
+                return FIXED_CLOCK.instant();
+            }
+        };
+    }
+
+    @Test
+    void shouldRetainCacheOwnershipWhilePublishingANamedJar() throws Exception {
+        byte[] content = "classpath jar contents".getBytes(StandardCharsets.UTF_8);
+        String sha = ClasspathPackager.sha256Hex(content);
+        ArtifactRef artifact = new ArtifactRef("library.jar", sha, ArtifactKind.JAR, content.length);
+        CountDownLatch publishing = new CountDownLatch(1);
+        CountDownLatch finishPublishing = new CountDownLatch(1);
+        try (WorkerFileCache cache = WorkerFileCache.open(tempDir, false, 0L, PLENTY, FIXED_CLOCK, FileChannel::tryLock,
+                root -> new BlobCacheDirectory(root) {
+                    @Override
+                    public Path materializeForClasspath(ArtifactRef ref, Path verifiedBlob, Path workspaceDir)
+                            throws IOException {
+                        publishing.countDown();
+                        awaitQuietly(finishPublishing);
+                        return super.materializeForClasspath(ref, verifiedBlob, workspaceDir);
+                    }
+                })) {
+            Path blob = promote(cache, content);
+            CompletableFuture<Path> result = new CompletableFuture<>();
+            CompletableFuture.runAsync(() -> {
+                try {
+                    result.complete(cache.materializeForClasspath(artifact, blob, tempDir));
+                } catch (IOException | RuntimeException e) {
+                    result.completeExceptionally(e);
+                }
+            });
+            try {
+                assertThat(publishing.await(10, TimeUnit.SECONDS)).isTrue();
+                CountDownLatch closeStarted = new CountDownLatch(1);
+                CompletableFuture<Void> closing = CompletableFuture.runAsync(() -> {
+                    closeStarted.countDown();
+                    cache.close();
+                });
+                assertThat(closeStarted.await(10, TimeUnit.SECONDS)).isTrue();
+                assertThatThrownBy(() -> closing.get(300, TimeUnit.MILLISECONDS)).isInstanceOf(TimeoutException.class);
+                assertThatThrownBy(() -> WorkerFileCache.open(tempDir, false, 0L, PLENTY, FIXED_CLOCK))
+                        .isInstanceOf(IllegalStateException.class)
+                        .hasMessageContaining("--cache-dir");
+                finishPublishing.countDown();
+                assertThat(result.get(10, TimeUnit.SECONDS)).hasBinaryContent(content);
+                closing.get(10, TimeUnit.SECONDS);
+            } finally {
+                finishPublishing.countDown();
+            }
         }
     }
 

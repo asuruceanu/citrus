@@ -140,6 +140,31 @@ class BlobCacheDirectoryTest {
     }
 
     @Test
+    void shouldRefuseToDeleteThroughRedirectedCacheDirectories() throws Exception {
+        BlobCacheDirectory cache = new BlobCacheDirectory(tempDir.resolve("cache"));
+        byte[] content = "cached blob".getBytes();
+        String sha = sha(content);
+        Path blob = cache.put(sha, content);
+        Path outside = Files.createDirectory(tempDir.resolve("outside"));
+        Path outsideJar = Files.writeString(Files.createDirectory(outside.resolve(sha)).resolve("library.jar"), "keep");
+        Path classpath = cache.getRootDir().resolve("classpath");
+        assumeTrue(createSymlink(classpath, outside), "file system supports symbolic links");
+
+        assertThatThrownBy(() -> cache.delete(sha))
+                .isInstanceOf(IOException.class).hasMessageContaining(classpath.toString());
+        assertThat(outsideJar).hasContent("keep");
+        assertThat(blob).hasBinaryContent(content);
+
+        Files.delete(classpath);
+        Path shard = blob.getParent();
+        Path outsideShard = Files.move(shard, outside.resolve("shard"));
+        assumeTrue(createSymlink(shard, outsideShard), "file system supports symbolic links");
+        assertThatThrownBy(() -> cache.delete(sha))
+                .isInstanceOf(IOException.class).hasMessageContaining(shard.toString());
+        assertThat(outsideShard.resolve(sha)).hasBinaryContent(content);
+    }
+
+    @Test
     void shouldPruneEmptyBlobShardDirectoryOnDeleteButKeepSharedShards() throws Exception {
         BlobCacheDirectory cache = new BlobCacheDirectory(tempDir.resolve("cache"));
         byte[] first = "first".getBytes();

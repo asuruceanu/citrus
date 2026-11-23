@@ -27,6 +27,7 @@ import java.nio.file.LinkOption;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.nio.file.attribute.BasicFileAttributeView;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.nio.file.attribute.FileTime;
 import java.time.Clock;
@@ -50,6 +51,7 @@ import org.citrusframework.distribution.cache.BlobCacheDirectory;
 import org.citrusframework.distribution.cache.BlobCacheDirectory.BlobEntry;
 import org.citrusframework.distribution.cache.WorkspacePackager;
 import org.citrusframework.distribution.cache.WorkspacePackager.MaterializedEntry;
+import org.citrusframework.distribution.model.ArtifactKind;
 import org.citrusframework.distribution.model.ArtifactRef;
 import org.citrusframework.distribution.model.WorkerCacheStats;
 import org.citrusframework.distribution.model.WorkspaceFileSet;
@@ -69,9 +71,9 @@ import org.slf4j.LoggerFactory;
  *     <li>Blobs verified once are stamped with their size, modification time and file key, so later lookups re-hash
  *     only when the file changed on disk. Callers materialize the path {@link #verifyOrInvalidate} returned without
  *     hashing it again.</li>
- *     <li>Promotion of downloads, staging of forked partition outputs, pinning, touching blobs on lookup, deleting
- *     corrupted blobs and eviction run under one lock, so a newly stored blob is stamped and pinned before eviction can
- *     see it, and no blob is pinned while an eviction is deciding what to delete.</li>
+ *     <li>Promotion of downloads, publication of named JARs, staging of forked partition outputs, pinning, touching
+ *     blobs on lookup, deleting corrupted blobs and eviction run under one lock, so a newly stored blob is stamped
+ *     and pinned before eviction can see it, and no blob is pinned while an eviction is deciding what to delete.</li>
  *     <li>Removing a digest always removes its named jar directory as well, since a hard-linked named jar keeps the
  *     blob's disk space in use.</li>
  *     <li>Once closed, the cache never mutates its directory again (another worker may own it by then): eviction
@@ -126,15 +128,23 @@ final class WorkerFileCache implements AutoCloseable {
         boolean delete(String sha256) throws IOException;
     }
 
-    private record VerifiedBlobStamp(long sizeBytes, FileTime lastModifiedTime, Object fileKey) {
+    private record VerifiedBlobStamp(long sizeBytes, FileTime lastModifiedTime, Object fileKey, FileTime creationTime) {
 
         static VerifiedBlobStamp of(BasicFileAttributes attrs) {
-            return new VerifiedBlobStamp(attrs.size(), attrs.lastModifiedTime(), attrs.fileKey());
+            return new VerifiedBlobStamp(attrs.size(), attrs.lastModifiedTime(), attrs.fileKey(), attrs.creationTime());
         }
 
         boolean matches(BasicFileAttributes attrs) {
-            return attrs.isRegularFile() && sizeBytes == attrs.size()
-                    && lastModifiedTime.equals(attrs.lastModifiedTime()) && Objects.equals(fileKey, attrs.fileKey());
+            return attrs.isRegularFile() && sameSnapshot(attrs);
+        }
+
+        boolean sameSnapshot(BasicFileAttributes attrs) {
+            return sameFile(attrs) && lastModifiedTime.equals(attrs.lastModifiedTime());
+        }
+
+        boolean sameFile(BasicFileAttributes attrs) {
+            return sizeBytes == attrs.size() && Objects.equals(fileKey, attrs.fileKey())
+                    && (fileKey != null || creationTime.equals(attrs.creationTime()));
         }
     }
 
@@ -383,8 +393,17 @@ final class WorkerFileCache implements AutoCloseable {
      * @throws IllegalStateException if the cache is closed
      */
     Path materializeForClasspath(ArtifactRef artifact, Path verifiedBlob, Path workspaceDir) throws IOException {
-        ensureOpen();
-        return blobCache.materializeForClasspath(artifact, verifiedBlob, workspaceDir);
+        if (artifact.kind() != ArtifactKind.JAR) {
+            ensureOpen();
+            return blobCache.materializeForClasspath(artifact, verifiedBlob, workspaceDir);
+        }
+        evictionLock.lock();
+        try {
+            ensureOpen();
+            return blobCache.materializeForClasspath(artifact, verifiedBlob, workspaceDir);
+        } finally {
+            evictionLock.unlock();
+        }
     }
 
     /**
@@ -415,7 +434,7 @@ final class WorkerFileCache implements AutoCloseable {
 
     private Path verifyOrInvalidate(String sha256, boolean retryWhenChanged) throws IOException {
         ensureOpen();
-        Path blob = blobCache.resolveBlobPath(sha256);
+        Path blob = blobCache.resolveBlobPathForAccess(sha256);
         BasicFileAttributes attrs = readAttributes(blob);
         if (attrs == null) {
             forgetMissing(sha256);
@@ -426,25 +445,28 @@ final class WorkerFileCache implements AutoCloseable {
             evictionLock.lock();
             try {
                 ensureOpen();
-                BasicFileAttributes current = readAttributes(blob);
-                if (current != null && stamp.matches(current)) {
-                    recordAccess(sha256, blob);
+                VerifiedBlobStamp currentStamp = verifiedStamps.get(sha256);
+                if (currentStamp != null && recordAccess(sha256, blob, currentStamp, true)) {
                     return blob;
                 }
-                verifiedStamps.remove(sha256, stamp);
             } finally {
                 evictionLock.unlock();
             }
-            // evicted or changed since the first look: verify from scratch
-            return verifyOrInvalidate(sha256, retryWhenChanged);
+            return retryWhenChanged ? verifyOrInvalidate(sha256, false) : null;
         }
 
-        verifiedStamps.remove(sha256);
-        boolean intact;
+        boolean intact = false;
         try {
-            intact = blobCache.isIntact(sha256);
+            if (attrs.isRegularFile()) {
+                intact = blobCache.isIntact(sha256);
+            }
         } catch (NoSuchFileException e) {
-            intact = false;
+            // Check below whether it vanished or was replaced.
+        } catch (IOException e) {
+            BasicFileAttributes current = readAttributes(blob);
+            if (current != null && VerifiedBlobStamp.of(attrs).matches(current)) {
+                throw e;
+            }
         }
         evictionLock.lock();
         try {
@@ -455,7 +477,7 @@ final class WorkerFileCache implements AutoCloseable {
                 forgetBlob(sha256);
                 return null;
             }
-            if (VerifiedBlobStamp.of(attrs).matches(current)) {
+            if (attrs.isRegularFile() == current.isRegularFile() && VerifiedBlobStamp.of(attrs).sameSnapshot(current)) {
                 if (!intact) {
                     corruptedBlobRemovals++;
                     LOG.warn("Removing corrupted blob {} from worker cache {}", sha256, canonicalDir);
@@ -463,9 +485,13 @@ final class WorkerFileCache implements AutoCloseable {
                     forgetBlob(sha256);
                     return null;
                 }
-                registerBlob(sha256, current.size());
-                recordAccess(sha256, blob);
-                return blob;
+                if (stamp != null && !stamp.sameFile(current)) {
+                    blobCache.deleteNamedJars(sha256);
+                }
+                if (recordAccess(sha256, blob, VerifiedBlobStamp.of(current), true)) {
+                    registerBlob(sha256, current.size());
+                    return blob;
+                }
             }
             if (!retryWhenChanged) {
                 LOG.debug("Blob {} in worker cache {} keeps changing while it is verified", sha256, canonicalDir);
@@ -499,7 +525,12 @@ final class WorkerFileCache implements AutoCloseable {
         evictionLock.lock();
         try {
             ensureOpen();
-            Path target = blobCache.resolveBlobPath(expectedSha256);
+            Path target = blobCache.resolveBlobPathForAccess(expectedSha256);
+            BasicFileAttributes staged = readAttributes(tempFile);
+            BasicFileAttributes previous = readAttributes(target);
+            if (previous == null || !previous.isRegularFile()) {
+                blobCache.deleteNamedJars(expectedSha256);
+            }
             if (!blobCache.storeTempBlob(expectedSha256, tempFile)) {
                 // A file that appeared during the download is independent of the bytes we just verified.
                 Path existing = verifyOrInvalidate(expectedSha256);
@@ -511,8 +542,16 @@ final class WorkerFileCache implements AutoCloseable {
                             + " changed during download and could not be verified");
                 }
             }
-            registerStored(expectedSha256, target, true);
-            return target;
+            VerifiedBlobStamp downloaded = staged != null ? VerifiedBlobStamp.of(staged) : null;
+            if (registerStored(expectedSha256, target, downloaded)) {
+                return target;
+            }
+            Path verified = verifyOrInvalidate(expectedSha256);
+            if (verified == null) {
+                throw new IOException("Blob " + expectedSha256 + " in worker cache " + canonicalDir
+                        + " changed during promotion and could not be verified");
+            }
+            return verified;
         } finally {
             evictionLock.unlock();
         }
@@ -537,7 +576,7 @@ final class WorkerFileCache implements AutoCloseable {
                 pinRegistrar.accept(sha256);
                 // The packager cannot tell whether it stored the blob or found it already present, so an existing
                 // blob is never trusted here without a matching stamp.
-                registerStored(sha256, blobCache.resolveBlobPath(sha256), false);
+                registerStored(sha256, blobCache.resolveBlobPathForAccess(sha256), verifiedStamps.get(sha256));
             }
             return output;
         } finally {
@@ -801,19 +840,17 @@ final class WorkerFileCache implements AutoCloseable {
     }
 
     /**
-     * Accounts for and touches a blob after a store operation. Its content is trusted only when {@code freshlyStored}
-     * (verified while moved into place) or when its existing stamp still matches; the store operations return an
-     * existing target without re-hashing it, so any other blob loses its stamp and is re-hashed on next lookup.
+     * Accounts for and touches a stored blob. Returns whether it still matches a verified snapshot of the moved
+     * download or an existing blob. An unstamped blob is hashed the next time it is needed.
      */
-    private void registerStored(String sha256, Path stored, boolean freshlyStored) throws IOException {
+    private boolean registerStored(String sha256, Path stored, VerifiedBlobStamp verified) throws IOException {
         BasicFileAttributes attrs = readAttributes(stored);
         if (attrs == null) {
             throw new NoSuchFileException(stored.toString(), null, "blob vanished right after it was stored");
         }
         registerBlob(sha256, attrs.size());
-        VerifiedBlobStamp stamp = verifiedStamps.get(sha256);
-        boolean trusted = freshlyStored || (stamp != null && stamp.matches(attrs));
-        recordAccess(sha256, stored, trusted);
+        boolean trusted = verified != null && verified.matches(attrs);
+        return recordAccess(sha256, stored, VerifiedBlobStamp.of(attrs), trusted);
     }
 
     private void registerBlob(String sha256, long sizeBytes) {
@@ -833,13 +870,13 @@ final class WorkerFileCache implements AutoCloseable {
         }
     }
 
-    private void forgetMissing(String sha256) {
+    private void forgetMissing(String sha256) throws IOException {
         if (!knownBlobSizes.containsKey(sha256) && !verifiedStamps.containsKey(sha256)) {
             return;
         }
         evictionLock.lock();
         try {
-            if (readAttributes(blobCache.resolveBlobPath(sha256)) == null) {
+            if (!closed.get() && readAttributes(blobCache.resolveBlobPathForAccess(sha256)) == null) {
                 forgetBlob(sha256);
             }
         } finally {
@@ -847,36 +884,37 @@ final class WorkerFileCache implements AutoCloseable {
         }
     }
 
-    /** Records an access: session order, modification time (best effort) and a fresh verification stamp. */
-    private void recordAccess(String sha256, Path blob) {
-        recordAccess(sha256, blob, true);
-    }
-
     /**
-     * Records an access; refreshes the verification stamp only for {@code verified} content and drops it otherwise.
+     * Records an access without treating a replacement file as verified. Checks the snapshot immediately before
+     * touching the blob and confirms the touched file's identity before recording the updated timestamp.
      */
-    private void recordAccess(String sha256, Path blob, boolean verified) {
-        if (!verified) {
-            verifiedStamps.remove(sha256);
+    private boolean recordAccess(String sha256, Path blob, VerifiedBlobStamp before, boolean verified) throws IOException {
+        FileTime accessed = FileTime.from(clock.instant());
+        blobCache.resolveBlobPathForAccess(sha256);
+        BasicFileAttributes current = readAttributes(blob);
+        if (current == null || !before.matches(current)) {
+            return false;
         }
         accessSequence.put(sha256, sequenceGenerator.incrementAndGet());
         try {
-            Files.setLastModifiedTime(blob, FileTime.from(clock.instant()));
+            Files.getFileAttributeView(blob, BasicFileAttributeView.class, LinkOption.NOFOLLOW_LINKS)
+                    .setTimes(accessed, null, null);
         } catch (IOException e) {
             LOG.debug("Could not touch cached blob {}: {}", blob, e.toString());
         }
         BasicFileAttributes attrs = verified ? readAttributes(blob) : null;
-        if (attrs != null && attrs.isRegularFile()) {
+        if (attrs != null && attrs.isRegularFile() && before.sameFile(attrs)) {
             verifiedStamps.put(sha256, VerifiedBlobStamp.of(attrs));
-        } else {
-            verifiedStamps.remove(sha256);
+            return true;
         }
+        verifiedStamps.remove(sha256);
+        return false;
     }
 
-    private static BasicFileAttributes readAttributes(Path path) {
+    private static BasicFileAttributes readAttributes(Path path) throws IOException {
         try {
             return Files.readAttributes(path, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
-        } catch (IOException e) {
+        } catch (NoSuchFileException e) {
             return null;
         }
     }

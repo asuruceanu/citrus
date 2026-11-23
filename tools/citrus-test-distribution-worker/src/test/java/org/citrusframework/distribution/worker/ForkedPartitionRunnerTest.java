@@ -33,6 +33,7 @@ import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -342,6 +343,48 @@ class ForkedPartitionRunnerTest {
             assertThat(second.success()).as(second.errorMessage()).isTrue();
             assertThat(hashes).as("a warm partition re-hashes nothing")
                     .hasValue(cold.classpathArtifacts().size() + inputs.size());
+        }
+    }
+
+    @Test
+    void shouldPreventAForkStillPreparingItsClasspathFromLaunchingAfterShutdown() throws Exception {
+        DistributionWorkerConfig config = workerConfig(tempDir.resolve("worker-cache"), "http://127.0.0.1:9");
+        BlobCacheDirectory seeding = new BlobCacheDirectory(config.cacheDir());
+        PartitionAssignPayload pending = assignment(seeding, Map.of(), List.of(), List.of(),
+                unit(PlainFixture.class, "passes"));
+        CountDownLatch verifying = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        try (WorkerFileCache cache = WorkerFileCache.open(config.cacheDir(), false, 0L, null, Clock.systemUTC(),
+                FileChannel::tryLock, root -> new BlobCacheDirectory(root) {
+                    @Override
+                    public boolean isIntact(String sha256) throws IOException {
+                        verifying.countDown();
+                        try {
+                            if (!release.await(10, TimeUnit.SECONDS)) {
+                                throw new IOException("Timed out waiting to continue classpath verification");
+                            }
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            throw new IOException(e);
+                        }
+                        return super.isIntact(sha256);
+                    }
+                });
+             BrokerBlobClient blobs = new BrokerBlobClient(config, cache)) {
+            ForkedPartitionRunner runner = new ForkedPartitionRunner(config, cache, blobs);
+            List<WorkerTestEventPayload> events = new CopyOnWriteArrayList<>();
+            CompletableFuture<IsolatedPartitionRunner.PartitionExecutionResult> execution =
+                    CompletableFuture.supplyAsync(() -> runner.execute(pending, CancellationToken.create(), events::add));
+            try {
+                assertThat(verifying.await(5, TimeUnit.SECONDS)).isTrue();
+                runner.killActiveForks();
+            } finally {
+                release.countDown();
+            }
+            IsolatedPartitionRunner.PartitionExecutionResult result = execution.get(20, TimeUnit.SECONDS);
+            assertThat(result.success()).isFalse();
+            assertThat(result.errorMessage()).containsIgnoringCase("cancelled");
+            assertThat(events).isEmpty();
         }
     }
 

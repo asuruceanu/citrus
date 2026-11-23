@@ -24,6 +24,7 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashSet;
@@ -815,32 +816,48 @@ class DistributedLauncherTest {
                 .cacheFreeSpaceBufferBytes(0L)
                 .forkJvmArgs(List.of("-Xmx384m"))
                 .build());
-        worker.start();
-        assertThat(worker.awaitRegistration(5, TimeUnit.SECONDS)).isTrue();
-        return worker;
+        try {
+            worker.start();
+            assertThat(worker.awaitRegistration(5, TimeUnit.SECONDS)).isTrue();
+            return worker;
+        } catch (Exception | Error failure) {
+            try {
+                worker.close();
+            } catch (RuntimeException closeFailure) {
+                failure.addSuppressed(closeFailure);
+            }
+            throw failure;
+        }
     }
 
     /** Polls {@code GET /api/v1/workers} until the worker reports cache statistics matching {@code condition}. */
     private static WorkerCacheStats awaitCacheStats(String brokerUrl, String workerId,
                                                     Predicate<WorkerCacheStats> condition)
             throws Exception {
-        HttpClient http = HttpClient.newHttpClient();
-        long deadline = System.currentTimeMillis() + 10_000L;
+        HttpRequest request = HttpRequest.newBuilder(URI.create(brokerUrl + "/api/v1/workers")).GET().build();
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
         WorkerCacheStats last = null;
-        while (System.currentTimeMillis() < deadline) {
-            HttpResponse<String> resp = http.send(HttpRequest.newBuilder(
-                            URI.create(brokerUrl + "/api/v1/workers")).GET().build(),
-                    HttpResponse.BodyHandlers.ofString());
-            assertThat(resp.statusCode()).isEqualTo(200);
-            for (WorkerRecord worker : DistributionJson.fromJson(resp.body(), WorkerRecord[].class)) {
-                if (workerId.equals(worker.workerId())) {
-                    last = worker.cacheStats();
+        try (HttpClient http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build()) {
+            for (long remaining = deadline - System.nanoTime(); remaining > 0; remaining = deadline - System.nanoTime()) {
+                var requestResult = http.sendAsync(request, HttpResponse.BodyHandlers.ofString());
+                HttpResponse<String> response;
+                try {
+                    response = requestResult.get(remaining, TimeUnit.NANOSECONDS);
+                } finally {
+                    requestResult.cancel(true);
                 }
+                assertThat(response.statusCode()).isEqualTo(200);
+                for (WorkerRecord worker : DistributionJson.fromJson(response.body(), WorkerRecord[].class)) {
+                    if (workerId.equals(worker.workerId())) {
+                        last = worker.cacheStats();
+                    }
+                }
+                if (last != null && condition.test(last)) {
+                    return last;
+                }
+                TimeUnit.NANOSECONDS.sleep(Math.min(TimeUnit.MILLISECONDS.toNanos(100),
+                        Math.max(0, deadline - System.nanoTime())));
             }
-            if (last != null && condition.test(last)) {
-                return last;
-            }
-            Thread.sleep(100L);
         }
         throw new AssertionError("Worker " + workerId + " did not report matching cache statistics; last: " + last);
     }
