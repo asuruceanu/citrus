@@ -328,7 +328,7 @@ class JdbcDistributionStoreTest {
     }
 
     @Test
-    void shouldAddFailureReasonColumnToLegacySessionTable() throws Exception {
+    void shouldAddMissingColumnsToLegacySessionTable() throws Exception {
         String jdbcUrl = "jdbc:hsqldb:file:" + tempDir.resolve("db/legacy-sessions").toAbsolutePath() + ";shutdown=true";
         try (java.sql.Connection conn = java.sql.DriverManager.getConnection(jdbcUrl, "SA", "");
              java.sql.Statement stmt = conn.createStatement()) {
@@ -342,6 +342,7 @@ class JdbcDistributionStoreTest {
         try (JdbcDistributionStore store = new JdbcDistributionStore(jdbcUrl, "SA", "")) {
             store.initialize();
             assertThat(store.findSession("sess-old").orElseThrow().failureReason()).isNull();
+            assertThat(store.findRequestedMaxPartitionSize("sess-old")).isEmpty();
         }
     }
 

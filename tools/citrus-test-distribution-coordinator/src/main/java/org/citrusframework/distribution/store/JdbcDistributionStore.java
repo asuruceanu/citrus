@@ -23,6 +23,7 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.sql.Types;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Comparator;
@@ -31,6 +32,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
+import java.util.OptionalInt;
 import java.util.PriorityQueue;
 
 import org.apache.commons.dbcp2.BasicDataSource;
@@ -133,7 +135,8 @@ public class JdbcDistributionStore implements DistributionStore {
                         "cached_blobs INT, " +
                         "serial_duration_ms BIGINT, " +
                         "wall_duration_ms BIGINT, " +
-                        "failure_reason VARCHAR(4096))",
+                        "failure_reason VARCHAR(4096), " +
+                        "requested_max_partition_size INT)",
                 "CREATE TABLE IF NOT EXISTS dist_session_changes (" +
                         "session_id VARCHAR(64), " +
                         "file_path VARCHAR(1024), " +
@@ -234,7 +237,8 @@ public class JdbcDistributionStore implements DistributionStore {
         partitionColumns.put("error_message", "VARCHAR(4096)");
         additions.put("dist_partitions", partitionColumns);
         additions.put("dist_workers", Map.of("cache_stats_json", "VARCHAR(2048)"));
-        additions.put("dist_sessions", Map.of("failure_reason", "VARCHAR(4096)"));
+        additions.put("dist_sessions", Map.of("failure_reason", "VARCHAR(4096)",
+                "requested_max_partition_size", "INT"));
         additions.put("dist_test_executions", Map.of("unique_id", "VARCHAR(1024)"));
         for (Map.Entry<String, Map<String, String>> table : additions.entrySet()) {
             java.util.Set<String> columns = existing.getOrDefault(table.getKey(), java.util.Set.of());
@@ -301,14 +305,24 @@ public class JdbcDistributionStore implements DistributionStore {
     }
 
     @Override
-    public synchronized void saveSession(BuildSessionRecord s) {
+    public void saveSession(BuildSessionRecord s) {
+        saveSession(s, null);
+    }
+
+    @Override
+    public void saveSession(BuildSessionRecord s, int requestedMaxPartitionSize) {
+        saveSession(s, Integer.valueOf(requestedMaxPartitionSize));
+    }
+
+    private synchronized void saveSession(BuildSessionRecord s, Integer requestedMaxPartitionSize) {
         String updateSql = "UPDATE dist_sessions SET project_name=?, git_branch=?, git_commit=?, status=?, " +
                 "started_at=?, finished_at=?, total_tests=?, passed_tests=?, failed_tests=?, skipped_tests=?, " +
-                "total_blobs=?, cached_blobs=?, serial_duration_ms=?, wall_duration_ms=?, failure_reason=? WHERE session_id=?";
+                "total_blobs=?, cached_blobs=?, serial_duration_ms=?, wall_duration_ms=?, failure_reason=?, " +
+                "requested_max_partition_size=COALESCE(?, requested_max_partition_size) WHERE session_id=?";
         String insertSql = "INSERT INTO dist_sessions (session_id, project_name, git_branch, git_commit, status, " +
                 "started_at, finished_at, total_tests, passed_tests, failed_tests, skipped_tests, " +
-                "total_blobs, cached_blobs, serial_duration_ms, wall_duration_ms, failure_reason) " +
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+                "total_blobs, cached_blobs, serial_duration_ms, wall_duration_ms, failure_reason, requested_max_partition_size) " +
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
         try (Connection conn = dataSource.getConnection()) {
             try (PreparedStatement ps = conn.prepareStatement(updateSql)) {
                 ps.setString(1, s.projectName());
@@ -326,7 +340,8 @@ public class JdbcDistributionStore implements DistributionStore {
                 ps.setLong(13, s.serialDurationMs());
                 ps.setLong(14, s.wallDurationMs());
                 ps.setString(15, truncate(s.failureReason(), 4096));
-                ps.setString(16, s.sessionId());
+                ps.setObject(16, requestedMaxPartitionSize, Types.INTEGER);
+                ps.setString(17, s.sessionId());
                 if (ps.executeUpdate() > 0) {
                     return;
                 }
@@ -348,10 +363,31 @@ public class JdbcDistributionStore implements DistributionStore {
                 ps.setLong(14, s.serialDurationMs());
                 ps.setLong(15, s.wallDurationMs());
                 ps.setString(16, truncate(s.failureReason(), 4096));
+                ps.setObject(17, requestedMaxPartitionSize, Types.INTEGER);
                 ps.executeUpdate();
             }
         } catch (SQLException e) {
             throw new IllegalStateException("Failed to save build session " + s.sessionId(), e);
+        }
+    }
+
+    @Override
+    public OptionalInt findRequestedMaxPartitionSize(String sessionId) {
+        String sql = "SELECT requested_max_partition_size FROM dist_sessions WHERE session_id=?";
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, sessionId);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) {
+                    int requestedSize = rs.getInt(1);
+                    if (!rs.wasNull()) {
+                        return OptionalInt.of(requestedSize);
+                    }
+                }
+                return OptionalInt.empty();
+            }
+        } catch (SQLException e) {
+            throw new IllegalStateException("Failed to find requested partition size for session " + sessionId, e);
         }
     }
 

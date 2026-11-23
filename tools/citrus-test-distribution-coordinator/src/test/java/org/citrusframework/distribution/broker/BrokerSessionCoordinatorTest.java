@@ -93,6 +93,42 @@ class BrokerSessionCoordinatorTest {
     }
 
     @Test
+    void shouldHonorExplicitPartitionCapAfterRestart() {
+        assertPartitionSizingAfterRestart(2, 3, 2);
+    }
+
+    @Test
+    void shouldRetainAdaptivePartitionSizingAfterRestart() {
+        assertPartitionSizingAfterRestart(0, 1, 6);
+    }
+
+    private void assertPartitionSizingAfterRestart(int requestedSize, int partitionCount, int largestPartition) {
+        String jdbcUrl = "jdbc:hsqldb:file:" + tempDir.resolve("restart/session-store") + ";shutdown=true";
+        String sessionId;
+        try (JdbcDistributionStore before = new JdbcDistributionStore(jdbcUrl, "SA", "")) {
+            before.initialize();
+            BrokerSessionCoordinator running = new BrokerSessionCoordinator(
+                    DistributionBrokerConfig.builder().defaultMaxPartitionSize(10).build(),
+                    before, new BrokerEventStreamHub());
+            sessionId = running.createSession(
+                    new CreateSessionRequest("citrus", "main", "abc", List.of(), requestedSize, 1)).sessionId();
+        }
+
+        try (JdbcDistributionStore after = new JdbcDistributionStore(jdbcUrl, "SA", "")) {
+            after.initialize();
+            BrokerSessionCoordinator restarted = new BrokerSessionCoordinator(
+                    DistributionBrokerConfig.builder().defaultMaxPartitionSize(4).minPartitionDurationMs(5_000L).build(),
+                    after, new BrokerEventStreamHub());
+            List<WorkUnitSpec> units = IntStream.range(0, 6).mapToObj(i -> unit("pkg.RestartTest" + i)).toList();
+            restarted.submitWork(sessionId, new SubmitWorkRequest("sub-after-restart", "module", List.of(), Map.of(),
+                    units, 0, 0));
+
+            assertThat(after.listPartitions(sessionId)).hasSize(partitionCount)
+                    .allSatisfy(partition -> assertThat(partition.workUnits()).hasSize(largestPartition));
+        }
+    }
+
+    @Test
     void shouldPreservePartitionSizeCapForDeclaredOutputs() {
         assertFastUnitsScheduled(0, List.of("target/docs"), 12, 2);
     }

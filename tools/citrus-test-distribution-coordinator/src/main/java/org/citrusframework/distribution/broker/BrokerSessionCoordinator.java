@@ -104,7 +104,7 @@ public final class BrokerSessionCoordinator {
                 0L,
                 0, 0, 0, 0, 0, 0, 0L, 0L
         );
-        store.saveSession(record);
+        store.saveSession(record, request.maxPartitionSize());
         if (request.changedFiles() != null && !request.changedFiles().isEmpty()) {
             store.saveChangedFiles(sessionId, request.changedFiles());
         }
@@ -1116,10 +1116,13 @@ public final class BrokerSessionCoordinator {
             return null;
         }
         BuildSessionRecord record = stored.get();
-        // The original requested size is unavailable after restart. Retain the previous fixed-size default.
         int defaultPartitionSize = config.defaultMaxPartitionSize();
+        // Sessions created before the requested size was stored keep the fixed broker default.
+        int requestedMaxPartitionSize = store.findRequestedMaxPartitionSize(sessionId)
+                .orElse(Math.max(1, defaultPartitionSize));
+        int maxPartitionSize = requestedMaxPartitionSize > 0 ? requestedMaxPartitionSize : defaultPartitionSize;
         SessionRuntime rehydrated = new SessionRuntime(
-                record, defaultPartitionSize, config.defaultMaxRetries(), Math.max(1, defaultPartitionSize));
+                record, maxPartitionSize, config.defaultMaxRetries(), requestedMaxPartitionSize);
         rehydrated.cachedBlobs = Math.max(0, record.cachedBlobs());
         rehydrated.uploadedBlobs = Math.max(0, record.totalBlobs() - record.cachedBlobs());
         Set<String> seenPartitionIds = new HashSet<>();
