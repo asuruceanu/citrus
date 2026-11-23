@@ -374,8 +374,9 @@ final class WorkerFileCache implements AutoCloseable {
     Path promoteDownload(String expectedSha256, Path tempFile) throws IOException {
         evictionLock.lock();
         try {
+            boolean existed = Files.exists(blobCache.resolveBlobPath(expectedSha256), LinkOption.NOFOLLOW_LINKS);
             Path stored = blobCache.putFromFile(expectedSha256, tempFile);
-            registerStored(expectedSha256, stored);
+            registerStored(expectedSha256, stored, !existed);
             return stored;
         } finally {
             evictionLock.unlock();
@@ -398,7 +399,9 @@ final class WorkerFileCache implements AutoCloseable {
             if (output.isPresent()) {
                 String sha256 = output.get().artifact().sha256();
                 pinRegistrar.accept(sha256);
-                registerStored(sha256, blobCache.resolveBlobPath(sha256));
+                // The packager cannot tell whether it stored the blob or found it already present, so an existing
+                // blob is never trusted here without a matching stamp.
+                registerStored(sha256, blobCache.resolveBlobPath(sha256), false);
             }
             return output;
         } finally {
@@ -596,13 +599,20 @@ final class WorkerFileCache implements AutoCloseable {
         }
     }
 
-    private void registerStored(String sha256, Path stored) throws IOException {
+    /**
+     * Accounts for and touches a blob after a store operation. Its content is trusted only when {@code freshlyStored}
+     * (verified while moved into place) or when its existing stamp still matches; the store operations return an
+     * existing target without re-hashing it, so any other blob loses its stamp and is re-hashed on next lookup.
+     */
+    private void registerStored(String sha256, Path stored, boolean freshlyStored) throws IOException {
         BasicFileAttributes attrs = readAttributes(stored);
         if (attrs == null) {
             throw new NoSuchFileException(stored.toString(), null, "blob vanished right after it was stored");
         }
         registerBlob(sha256, attrs.size());
-        recordAccess(sha256, stored);
+        VerifiedBlobStamp stamp = verifiedStamps.get(sha256);
+        boolean trusted = freshlyStored || (stamp != null && stamp.matches(attrs));
+        recordAccess(sha256, stored, trusted);
     }
 
     private void registerBlob(String sha256, long sizeBytes) {
@@ -638,13 +648,23 @@ final class WorkerFileCache implements AutoCloseable {
 
     /** Records an access: session order, modification time (best effort) and a fresh verification stamp. */
     private void recordAccess(String sha256, Path blob) {
+        recordAccess(sha256, blob, true);
+    }
+
+    /**
+     * Records an access; refreshes the verification stamp only for {@code verified} content and drops it otherwise.
+     */
+    private void recordAccess(String sha256, Path blob, boolean verified) {
+        if (!verified) {
+            verifiedStamps.remove(sha256);
+        }
         accessSequence.put(sha256, sequenceGenerator.incrementAndGet());
         try {
             Files.setLastModifiedTime(blob, FileTime.from(clock.instant()));
         } catch (IOException e) {
             LOG.debug("Could not touch cached blob {}: {}", blob, e.toString());
         }
-        BasicFileAttributes attrs = readAttributes(blob);
+        BasicFileAttributes attrs = verified ? readAttributes(blob) : null;
         if (attrs != null && attrs.isRegularFile()) {
             verifiedStamps.put(sha256, VerifiedBlobStamp.of(attrs));
         } else {

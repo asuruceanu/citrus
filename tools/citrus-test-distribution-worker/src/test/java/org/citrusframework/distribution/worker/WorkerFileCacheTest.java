@@ -535,6 +535,61 @@ class WorkerFileCacheTest {
         }
     }
 
+    @Test
+    void shouldNotTrustCorruptExistingBlobWhenPromotingOrStagingTheSameDigest() throws Exception {
+        byte[] seededContent = "seeded content".getBytes(StandardCharsets.UTF_8);
+        String seededSha = ClasspathPackager.sha256Hex(seededContent);
+        byte[] stampedContent = "stamped content".getBytes(StandardCharsets.UTF_8);
+        String stampedSha = ClasspathPackager.sha256Hex(stampedContent);
+        byte[] outputContent = "forked output".getBytes(StandardCharsets.UTF_8);
+        String outputSha = ClasspathPackager.sha256Hex(outputContent);
+
+        // Blobs present before open have no stamp; corrupt them in place keeping size and mtime.
+        Path cacheDir = Files.createDirectories(tempDir.resolve("cache")).toRealPath();
+        BlobCacheDirectory seeding = new BlobCacheDirectory(cacheDir);
+        Path seededBlob = corruptInPlace(seeding.put(seededSha, seededContent));
+        Path outputBlob = corruptInPlace(seeding.put(outputSha, outputContent));
+
+        Path workspace = Files.createDirectories(tempDir.resolve("workspace"));
+        Files.createDirectories(workspace.resolve("target"));
+        Map<String, String> baseline = Map.of();
+        Files.write(workspace.resolve("target/report.txt"), outputContent);
+
+        try (WorkerFileCache cache = WorkerFileCache.open(cacheDir, true, 0L, PLENTY, FIXED_CLOCK);
+             WorkerFileCache.PinLease lease = cache.pinAll(List.of())) {
+            assertThat(promote(cache, seededContent)).isEqualTo(seededBlob);
+            assertThat(cache.verifyOrInvalidate(seededSha)).as("promote must not stamp a corrupt existing blob").isNull();
+            assertThat(seededBlob).doesNotExist();
+
+            Optional<WorkspaceFileSet> staged = cache.stageAndPinOutput(workspace, "target/report.txt", baseline, lease::pin);
+            assertThat(staged).isPresent();
+            assertThat(staged.get().artifact().sha256()).isEqualTo(outputSha);
+            assertThat(cache.verifyOrInvalidate(outputSha)).as("staging must not stamp a corrupt existing blob").isNull();
+            assertThat(outputBlob).doesNotExist();
+
+            // A stamped blob changed on disk (mismatching stamp) is not re-stamped by a repeated promote.
+            Path stampedBlob = promote(cache, stampedContent);
+            Files.write(stampedBlob, corrupt(stampedContent));
+            Files.setLastModifiedTime(stampedBlob, FileTime.from(FIXED_CLOCK.instant().plusSeconds(5)));
+            assertThat(promote(cache, stampedContent)).isEqualTo(stampedBlob);
+            assertThat(cache.verifyOrInvalidate(stampedSha)).isNull();
+            assertThat(stampedBlob).doesNotExist();
+
+            // Freshly stored and still-matching blobs stay valid.
+            assertThat(promote(cache, stampedContent)).exists();
+            assertThat(promote(cache, stampedContent)).exists();
+            assertThat(cache.verifyOrInvalidate(stampedSha)).isEqualTo(stampedBlob);
+            assertThat(cache.statsSnapshot().blobCount()).isEqualTo(1);
+        }
+    }
+
+    private static Path corruptInPlace(Path blob) throws IOException {
+        FileTime mtime = Files.getLastModifiedTime(blob);
+        Files.write(blob, corrupt(Files.readAllBytes(blob)));
+        Files.setLastModifiedTime(blob, mtime);
+        return blob;
+    }
+
     private static Path promote(WorkerFileCache cache, byte[] bytes) throws IOException {
         Path tmp = cache.newDownloadTempFile();
         try {
