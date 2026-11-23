@@ -23,7 +23,9 @@ import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.nio.file.attribute.FileTime;
+import java.nio.file.attribute.PosixFilePermissions;
 import java.security.MessageDigest;
 import java.util.HexFormat;
 import java.util.List;
@@ -149,7 +151,50 @@ class BlobCacheDirectoryTest {
         Files.move(savedCopy, named);
 
         assertThat(cache.materializeForClasspath(ref, tempDir)).hasBinaryContent(jar);
-        assertThat(linkAttempts).hasValue(3);
+        assertThat(linkAttempts).as("a byte-identical copy can be reused after restoring it").hasValue(2);
+    }
+
+    @Test
+    void shouldRepairANamedJarCopyWhenItsBytesChangeWithoutChangingItsAttributes() throws Exception {
+        byte[] jar = jarWith("a.txt", "a");
+        String sha = sha(jar);
+        BlobCacheDirectory cache = new BlobCacheDirectory(tempDir.resolve("cache"), (link, target) -> {
+            throw new UnsupportedOperationException("simulated");
+        });
+        Path blob = cache.put(sha, jar);
+        ArtifactRef ref = new ArtifactRef("library.jar", sha, ArtifactKind.JAR, jar.length);
+        Path named = cache.materializeForClasspath(ref, blob, tempDir);
+        BasicFileAttributes original = Files.readAttributes(named, BasicFileAttributes.class);
+
+        Files.write(named, new byte[jar.length]);
+        Files.setLastModifiedTime(named, original.lastModifiedTime());
+
+        BasicFileAttributes changed = Files.readAttributes(named, BasicFileAttributes.class);
+        assertThat(changed.fileKey()).isEqualTo(original.fileKey());
+        assertThat(changed.size()).isEqualTo(original.size());
+        assertThat(changed.creationTime()).isEqualTo(original.creationTime());
+        assertThat(changed.lastModifiedTime()).isEqualTo(original.lastModifiedTime());
+        assertThat(cache.materializeForClasspath(ref, blob, tempDir)).hasBinaryContent(jar);
+        assertThat(blob).hasBinaryContent(jar);
+    }
+
+    @Test
+    void shouldReplaceAnUnreadableNamedJarWhenTheCanonicalBlobIsReadable() throws Exception {
+        assumeTrue(tempDir.getFileSystem().supportedFileAttributeViews().contains("posix"),
+                "file system supports POSIX permissions");
+        byte[] jar = jarWith("a.txt", "a");
+        String sha = sha(jar);
+        BlobCacheDirectory cache = new BlobCacheDirectory(tempDir.resolve("cache"));
+        Path blob = cache.put(sha, jar);
+        ArtifactRef ref = new ArtifactRef("library.jar", sha, ArtifactKind.JAR, jar.length);
+        Path named = cache.materializeForClasspath(ref, blob, tempDir);
+        Files.delete(named);
+        Files.write(named, new byte[jar.length]);
+        Files.setPosixFilePermissions(named, PosixFilePermissions.fromString("---------"));
+        assumeTrue(!Files.isReadable(named), "file system enforces read permissions for this user");
+
+        assertThat(cache.materializeForClasspath(ref, blob, tempDir)).hasBinaryContent(jar);
+        assertThat(blob).hasBinaryContent(jar);
     }
 
     @Test

@@ -20,6 +20,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.AccessDeniedException;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.CopyOption;
 import java.nio.file.DirectoryIteratorException;
@@ -36,16 +37,14 @@ import java.nio.file.SimpleFileVisitor;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.BasicFileAttributes;
-import java.nio.file.attribute.FileTime;
 import java.security.DigestInputStream;
 import java.security.MessageDigest;
 import java.util.ArrayList;
-import java.util.HashMap;
+import java.util.Arrays;
 import java.util.HashSet;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Locale;
-import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
@@ -132,16 +131,9 @@ public class BlobCacheDirectory {
         void link(Path link, Path target) throws IOException;
     }
 
-    private record JarFileStamp(Object fileKey, long size, FileTime modified, FileTime created) {
-        static JarFileStamp of(BasicFileAttributes attrs) {
-            return new JarFileStamp(attrs.fileKey(), attrs.size(), attrs.lastModifiedTime(), attrs.creationTime());
-        }
-    }
-
     private final Path rootDir;
     private final FileLinker fileLinker;
     private final Object namedJarLock = new Object();
-    private final Map<String, Map<Path, JarFileStamp>> namedJarCopies = new HashMap<>();
     private volatile FileMover fileMover = Files::move;
 
     public BlobCacheDirectory(Path rootDir) {
@@ -482,7 +474,6 @@ public class BlobCacheDirectory {
             } else {
                 deleteRecursively(classpathDir);
             }
-            namedJarCopies.remove(sha256);
         }
     }
 
@@ -700,21 +691,11 @@ public class BlobCacheDirectory {
             if (namedAttrs != null && sameFile(blobPath, blobAttrs, named, namedAttrs)) {
                 return named;
             }
-            Map<Path, JarFileStamp> copies = namedJarCopies.get(ref.sha256());
-            JarFileStamp copy = copies == null ? null : copies.get(named);
-            // Copies are stamped for the digest. Access-time bookkeeping may touch the canonical blob.
-            if (copy != null && namedAttrs != null && copy.equals(JarFileStamp.of(namedAttrs))) {
+            // A separately stored copy can change without changing its file attributes.
+            if (namedAttrs != null && namedAttrs.size() == blobAttrs.size() && sameContents(blobPath, named)) {
                 return named;
             }
-            if (copy != null) {
-                copies.remove(named);
-            }
-
-            JarFileStamp publishedCopy = publishNamedJar(blobPath, named);
-            if (publishedCopy != null) {
-                namedJarCopies.computeIfAbsent(ref.sha256(), ignored -> new HashMap<>())
-                        .put(named, publishedCopy);
-            }
+            publishNamedJar(blobPath, named);
             return named;
         }
     }
@@ -743,20 +724,42 @@ public class BlobCacheDirectory {
         }
     }
 
-    private JarFileStamp publishNamedJar(Path blob, Path named) throws IOException {
+    private static boolean sameContents(Path blob, Path named) throws IOException {
+        try (InputStream expected = Files.newInputStream(blob, LinkOption.NOFOLLOW_LINKS)) {
+            InputStream actual;
+            try {
+                actual = Files.newInputStream(named, LinkOption.NOFOLLOW_LINKS);
+            } catch (AccessDeniedException | NoSuchFileException unavailable) {
+                return false;
+            }
+            try (actual) {
+                byte[] expectedBytes = new byte[16 * 1024];
+                byte[] actualBytes = new byte[expectedBytes.length];
+                while (true) {
+                    int expectedRead = expected.readNBytes(expectedBytes, 0, expectedBytes.length);
+                    int actualRead = actual.readNBytes(actualBytes, 0, actualBytes.length);
+                    if (!Arrays.equals(expectedBytes, 0, expectedRead, actualBytes, 0, actualRead)) {
+                        return false;
+                    }
+                    if (expectedRead < expectedBytes.length) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+
+    private void publishNamedJar(Path blob, Path named) throws IOException {
         Path dir = Files.createDirectories(named.getParent());
         Path staging = Files.createTempFile(dir, ".staging-", ".jar");
         try {
             Files.delete(staging);
-            boolean copied = false;
             try {
                 fileLinker.link(staging, blob);
             } catch (UnsupportedOperationException | IOException linkFailed) {
                 Files.copy(blob, staging, StandardCopyOption.REPLACE_EXISTING, LinkOption.NOFOLLOW_LINKS);
-                copied = true;
             }
-            BasicFileAttributes stagedAttrs = regularFileAttributes(staging);
-            if (stagedAttrs == null) {
+            if (regularFileAttributes(staging) == null) {
                 throw new IOException("Cached blob is not a regular file: " + blob);
             }
             try {
@@ -764,8 +767,6 @@ public class BlobCacheDirectory {
             } catch (AtomicMoveNotSupportedException | FileAlreadyExistsException unavailable) {
                 Files.move(staging, named, StandardCopyOption.REPLACE_EXISTING);
             }
-            // Stamp the staged copy so a replacement of the published path cannot become trusted.
-            return copied ? JarFileStamp.of(stagedAttrs) : null;
         } finally {
             Files.deleteIfExists(staging);
         }
