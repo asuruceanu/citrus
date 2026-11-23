@@ -38,8 +38,17 @@ final class LinuxWorkspaceReferences {
     private LinuxWorkspaceReferences() {
     }
 
-    static boolean inUse(List<Path> roots) throws IOException {
+    static StartTicks currentStart() {
+        try {
+            return new StartTicks(timeNamespace(), processStartTicks(PROC.resolve("self")));
+        } catch (IOException | SecurityException e) {
+            return null;
+        }
+    }
+
+    static boolean inUse(List<Path> roots, StartTicks workerStart) throws IOException {
         Path self = PROC.resolve("self").toRealPath();
+        long workerTicks = comparableStartTicks(workerStart);
         String[] ownUserIds = processStatus(self).userIds();
         if (ownUserIds.length != 4) {
             throw new IOException("Cannot determine the worker's Linux user IDs");
@@ -47,15 +56,88 @@ final class LinuxWorkspaceReferences {
         String workerUid = ownUserIds[3]; // The filesystem UID governs access to the private workspace.
         try (var processes = Files.newDirectoryStream(PROC, path -> PID.matcher(path.getFileName().toString()).matches())) {
             for (Path process : processes) {
-                ProcessStatus status = userProcessStatus(process, self, workerUid);
-                if (status != null && processUsesWorkspace(process, status, roots)) {
-                    return true;
+                try {
+                    ProcessStatus status = userProcessStatus(process, self, workerUid);
+                    if (status != null && processUsesWorkspace(process, status, roots)) {
+                        return true;
+                    }
+                } catch (AccessDeniedException e) {
+                    // Existing host services may deny inspection. An older process cannot be a child of this
+                    // worker. Readable processes were checked above regardless of when they started.
+                    if (!startedBeforeWorker(process, workerTicks)) {
+                        throw e;
+                    }
                 }
             }
         } catch (DirectoryIteratorException e) {
             throw e.getCause();
         }
         return unixSocketInWorkspace(roots);
+    }
+
+    private static long comparableStartTicks(StartTicks workerStart) {
+        try {
+            return workerStart != null && workerStart.timeNamespace().equals(timeNamespace()) ? workerStart.ticks() : -1;
+        } catch (IOException | SecurityException e) {
+            return -1;
+        }
+    }
+
+    private static boolean startedBeforeWorker(Path process, long workerTicks) {
+        if (workerTicks < 0) {
+            return false;
+        }
+        try {
+            return processStartTicks(process) < workerTicks;
+        } catch (NoSuchFileException e) {
+            return Files.notExists(process);
+        } catch (IOException | SecurityException e) {
+            return false;
+        }
+    }
+
+    private static String timeNamespace() throws IOException {
+        return Files.readSymbolicLink(PROC.resolve("self/ns/time")).toString();
+    }
+
+    private static long processStartTicks(Path process) throws IOException {
+        String stat = Files.readString(process.resolve("stat"));
+        int commandEnd = stat.lastIndexOf(')');
+        if (commandEnd >= 0 && commandEnd + 2 < stat.length()) {
+            // After the parenthesized command (field 2), field 22 is the time since boot in kernel clock ticks.
+            String[] fields = WHITESPACE.split(stat.substring(commandEnd + 2), 21);
+            if (fields.length > 19) {
+                try {
+                    long ticks = Long.parseLong(fields[19]);
+                    if (ticks >= 0) {
+                        return ticks;
+                    }
+                } catch (NumberFormatException ignored) {
+                    // An unreadable start time cannot establish that this process is unrelated.
+                }
+            }
+        }
+        throw new IOException("Cannot determine the Linux process start ticks");
+    }
+
+    record StartTicks(String timeNamespace, long ticks) {
+        String encode() {
+            return timeNamespace + "/" + ticks;
+        }
+
+        static StartTicks parse(String value) {
+            if (value == null) {
+                return null;
+            }
+            int slash = value.lastIndexOf('/');
+            if (slash > 0) {
+                long ticks = Long.parseLong(value.substring(slash + 1));
+                if (ticks >= 0) {
+                    return new StartTicks(value.substring(0, slash), ticks);
+                }
+            }
+            throw new IllegalArgumentException("Invalid Linux worker start ticks");
+        }
     }
 
     private static ProcessStatus userProcessStatus(Path process, Path self, String workerUid) throws IOException {

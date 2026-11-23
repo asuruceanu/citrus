@@ -575,8 +575,10 @@ verified. On Linux, recovery also requires the same boot and process namespace.
 On Linux and macOS, the worker checks both directories for current filesystem references before removing a partition
 workspace. An open file or working directory can keep both directories in place even after the worker and partition JVMs
 exit. Linux uses `/proc` to check visible processes running under the worker's user identity and macOS uses the
-system `lsof` command. Cleanup is deferred if the check cannot complete, for example when a same-user process restricts
-inspection. Unix socket paths are retained when the worker cannot establish whether a listener still owns them.
+system `lsof` command. Cleanup is deferred if the check cannot complete. On Linux, a process that denies inspection
+defers cleanup unless comparable kernel start times show that it predates the worker that created the workspace.
+Such older processes are outside the check when they deny inspection. Unix socket paths are retained when the worker
+cannot establish whether a listener still owns them.
 On other platforms, the worker defers startup recovery and uses the platform's filesystem behavior during normal cleanup.
 A process that only retains a path for future use has no current filesystem reference for the worker to check.
 

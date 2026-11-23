@@ -19,6 +19,7 @@ import java.io.IOException;
 import java.net.StandardProtocolFamily;
 import java.net.UnixDomainSocketAddress;
 import java.nio.channels.ServerSocketChannel;
+import java.nio.file.AccessDeniedException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -184,6 +185,36 @@ class WorkerWorkspaceRecoveryTest {
     }
 
     @Test
+    @EnabledOnOs(OS.LINUX)
+    void shouldDeferCleanupForAnOpaqueProcessStartedAfterTheWorker() throws Exception {
+        Path python = Path.of("/usr/bin/python3");
+        assumeTrue(Files.isExecutable(python), "Python 3 is required to set Linux PR_SET_DUMPABLE");
+        assumeTrue(WorkspaceReferences.linuxWorkerStart() != null, "Linux process start ticks must be comparable");
+        Path cacheDir = tempDir.resolve("worker");
+        Path ready = tempDir.resolve("worker.ready");
+        try (WorkerProcess older = startOpaqueProcess(python, "older", tempDir)) {
+            assumeProcessCwdIsOpaque(older.process());
+            try (WorkerProcess worker = startWorker("waitForKill", cacheDir, ready.toString())) {
+                worker.awaitReady(ready);
+                try (WorkspacePaths paths = WorkspacePaths.read(ready);
+                     WorkerProcess newer = startOpaqueProcess(python, "newer", paths.inProcessRoot())) {
+                    assumeProcessCwdIsOpaque(newer.process());
+                    stop(worker.process());
+                    openCache(cacheDir);
+
+                    assertPresent(paths.inProcessRoot());
+
+                    stop(newer.process());
+                    openCache(cacheDir);
+
+                    assertThat(older.process().isAlive()).isTrue();
+                    assertThat(paths.inProcessRoot()).doesNotExist();
+                }
+            }
+        }
+    }
+
+    @Test
     @EnabledOnOs({OS.LINUX, OS.MAC})
     void shouldPreserveBothForkedDirectoriesWhenABackgroundProcessStillUsesOne() throws Exception {
         try (WorkerFileCache cache = WorkerFileCache.open(tempDir.resolve("worker"), false, 0L);
@@ -303,10 +334,40 @@ class WorkerWorkspaceRecoveryTest {
 
     private WorkerProcess startBackgroundUser(String id, Path workingDirectory, Path heldFile) throws Exception {
         Path ready = tempDir.resolve(id + ".ready");
-        Path log = tempDir.resolve(id + ".log");
         String[] args = heldFile == null ? new String[] { ready.toString() }
                 : new String[] { ready.toString(), heldFile.toString() };
-        Process process = javaProcess(ForkedChildMain.class, args)
+        return startReadyProcess(javaProcess(ForkedChildMain.class, args), ready, workingDirectory);
+    }
+
+    private WorkerProcess startOpaqueProcess(Path python, String id, Path workingDirectory) throws Exception {
+        Path ready = tempDir.resolve(id + ".ready");
+        String script = """
+                import ctypes
+                import pathlib
+                import sys
+
+                PR_SET_DUMPABLE = 4
+                if ctypes.CDLL(None, use_errno=True).prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) != 0:
+                    raise OSError(ctypes.get_errno(), 'prctl(PR_SET_DUMPABLE)')
+                pathlib.Path(sys.argv[1]).touch()
+                sys.stdin.buffer.read()
+                """;
+        return startReadyProcess(new ProcessBuilder(python.toString(), "-I", "-c", script, ready.toString()), ready,
+                workingDirectory);
+    }
+
+    private static void assumeProcessCwdIsOpaque(Process process) throws IOException {
+        try {
+            Files.readSymbolicLink(Path.of("/proc", Long.toString(process.pid()), "cwd"));
+            assumeTrue(false, "The test must run without permission to inspect nondumpable processes");
+        } catch (AccessDeniedException expected) {
+            // The process is opaque to the same user running the worker.
+        }
+    }
+
+    private WorkerProcess startReadyProcess(ProcessBuilder builder, Path ready, Path workingDirectory) throws Exception {
+        Path log = Files.createTempFile(tempDir, "background-", ".log");
+        Process process = builder
                 .directory(workingDirectory.toFile())
                 .redirectErrorStream(true)
                 .redirectOutput(log.toFile()).start();

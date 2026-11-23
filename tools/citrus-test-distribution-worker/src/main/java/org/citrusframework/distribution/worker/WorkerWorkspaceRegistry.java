@@ -71,6 +71,7 @@ final class WorkerWorkspaceRegistry {
     private final String shortTempKey;
     private final String processScope;
     private final ProcessIdentity worker;
+    private final LinuxWorkspaceReferences.StartTicks linuxWorkerStart;
 
     WorkerWorkspaceRegistry(Path cacheRoot) throws IOException {
         journal = cacheRoot.toRealPath().resolve(".workspaces");
@@ -89,6 +90,7 @@ final class WorkerWorkspaceRegistry {
         shortTempKey = shortTempBase == null ? "" : digest(shortTempBase.toString());
         processScope = processScope();
         worker = ProcessIdentity.of(ProcessHandle.current());
+        linuxWorkerStart = WorkspaceReferences.linuxWorkerStart();
     }
 
     void recover() throws IOException {
@@ -157,7 +159,7 @@ final class WorkerWorkspaceRegistry {
                 continue;
             }
             Record record = new Record(randomHex(16), tempKey, forked ? shortTempKey : "", processScope,
-                    worker, LaunchState.PREPARING, null);
+                    worker, linuxWorkerStart, LaunchState.PREPARING, null);
             try {
                 writeRecord(entry, record);
             } catch (IOException | RuntimeException e) {
@@ -192,7 +194,7 @@ final class WorkerWorkspaceRegistry {
         }
         // A process using either directory may also need the other. Check both before removing anything.
         try {
-            if (!ownedRoots.isEmpty() && WorkspaceReferences.inUse(ownedRoots, recovering)) {
+            if (!ownedRoots.isEmpty() && WorkspaceReferences.inUse(ownedRoots, recovering, record.linuxWorkerStart())) {
                 LOG.debug("Deferring cleanup of referenced partition workspace {}", id);
                 return;
             }
@@ -339,6 +341,9 @@ final class WorkerWorkspaceRegistry {
             properties.setProperty("scope", record.processScope());
             properties.setProperty("state", record.state().name());
             record.worker().write(properties, "worker");
+            if (record.linuxWorkerStart() != null) {
+                properties.setProperty("workerLinuxStart", record.linuxWorkerStart().encode());
+            }
             if (record.child() != null) {
                 record.child().write(properties, "child");
             }
@@ -364,11 +369,13 @@ final class WorkerWorkspaceRegistry {
         }
         LaunchState state = LaunchState.valueOf(properties.getProperty("state", ""));
         String scope = properties.getProperty("scope");
-        if (scope == null || properties.size() != (state == LaunchState.LAUNCHED ? 10 : 8)) {
+        String workerStart = properties.getProperty("workerLinuxStart");
+        int requiredProperties = state == LaunchState.LAUNCHED ? 10 : 8;
+        if (scope == null || properties.size() != requiredProperties + (workerStart == null ? 0 : 1)) {
             return null;
         }
         return new Record(token, temp, shortTemp, scope,
-                ProcessIdentity.read(properties, "worker"), state,
+                ProcessIdentity.read(properties, "worker"), LinuxWorkspaceReferences.StartTicks.parse(workerStart), state,
                 state == LaunchState.LAUNCHED ? ProcessIdentity.read(properties, "child") : null);
     }
 
@@ -499,14 +506,15 @@ final class WorkerWorkspaceRegistry {
     }
 
     private record Record(String token, String tempKey, String shortTempKey, String processScope,
-                          ProcessIdentity worker, LaunchState state, ProcessIdentity child) {
+                          ProcessIdentity worker, LinuxWorkspaceReferences.StartTicks linuxWorkerStart,
+                          LaunchState state, ProcessIdentity child) {
 
         Record withLaunch(LaunchState updatedState, ProcessIdentity updatedChild) {
-            return new Record(token, tempKey, shortTempKey, processScope, worker, updatedState, updatedChild);
+            return new Record(token, tempKey, shortTempKey, processScope, worker, linuxWorkerStart, updatedState, updatedChild);
         }
 
         Record withoutShortTemp() {
-            return new Record(token, tempKey, "", processScope, worker, state, child);
+            return new Record(token, tempKey, "", processScope, worker, linuxWorkerStart, state, child);
         }
 
         boolean canRecover() {

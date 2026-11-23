@@ -34,16 +34,25 @@ final class WorkspaceReferences {
     private WorkspaceReferences() {
     }
 
-    static boolean inUse(List<Path> roots, boolean recovering) throws IOException {
-        String os = System.getProperty("os.name", "").toLowerCase(Locale.ROOT);
+    static LinuxWorkspaceReferences.StartTicks linuxWorkerStart() {
+        return osName().contains("linux") ? LinuxWorkspaceReferences.currentStart() : null;
+    }
+
+    static boolean inUse(List<Path> roots, boolean recovering, LinuxWorkspaceReferences.StartTicks linuxWorkerStart)
+            throws IOException {
+        String os = osName();
         if (os.contains("linux")) {
-            return LinuxWorkspaceReferences.inUse(roots) || containsUnixSocket(roots);
+            return LinuxWorkspaceReferences.inUse(roots, linuxWorkerStart) || containsUnixSocket(roots);
         }
         if (os.startsWith("mac")) {
             return macOsReferences(roots) || containsUnixSocket(roots);
         }
         // An orphan on a platform without an inspection backend has no owner left to vouch for it.
         return recovering;
+    }
+
+    private static String osName() {
+        return System.getProperty("os.name", "").toLowerCase(Locale.ROOT);
     }
 
     private static boolean containsUnixSocket(List<Path> roots) throws IOException {
