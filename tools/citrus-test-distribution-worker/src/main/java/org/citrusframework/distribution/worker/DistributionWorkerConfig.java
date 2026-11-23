@@ -37,6 +37,8 @@ public final class DistributionWorkerConfig {
     private final String brokerUrl;
     private final String authToken;
     private final Path cacheDir;
+    private final boolean cacheCleanup;
+    private final long cacheFreeSpaceBufferBytes;
     private final Map<String, String> capabilities;
     private final long heartbeatIntervalMs;
     private final long reconnectDelayMs;
@@ -50,6 +52,8 @@ public final class DistributionWorkerConfig {
         this.brokerUrl = builder.brokerUrl;
         this.authToken = builder.authToken;
         this.cacheDir = builder.cacheDir;
+        this.cacheCleanup = builder.cacheCleanup;
+        this.cacheFreeSpaceBufferBytes = builder.cacheFreeSpaceBufferBytes;
         Map<String, String> caps = new LinkedHashMap<>(builder.capabilities);
         caps.putIfAbsent(DistributionSettings.WORKSPACE_CAPABILITY_KEY, "true");
         this.capabilities = Collections.unmodifiableMap(caps);
@@ -86,6 +90,20 @@ public final class DistributionWorkerConfig {
 
     public Path cacheDir() {
         return cacheDir;
+    }
+
+    /**
+     * Whether the worker evicts least recently used blobs to keep the free space buffer on the cache volume.
+     */
+    public boolean cacheCleanup() {
+        return cacheCleanup;
+    }
+
+    /**
+     * Free disk space, in bytes, the worker tries to keep on the cache volume when cache cleanup is enabled.
+     */
+    public long cacheFreeSpaceBufferBytes() {
+        return cacheFreeSpaceBufferBytes;
     }
 
     public Map<String, String> capabilities() {
@@ -127,7 +145,9 @@ public final class DistributionWorkerConfig {
         private String hostName = resolveHostName();
         private String brokerUrl = normalizeBrokerBaseUrl(DistributionSettings.getBrokerUrl());
         private String authToken = DistributionSettings.getAuthToken();
-        private Path cacheDir = java.nio.file.Paths.get(DistributionSettings.getCacheDir()).resolve("worker");
+        private Path cacheDir = DistributionSettings.getWorkerCacheDir();
+        private boolean cacheCleanup = DistributionSettings.isWorkerCacheCleanupEnabled();
+        private long cacheFreeSpaceBufferBytes = DistributionSettings.getWorkerCacheFreeSpaceBufferBytes();
         private Map<String, String> capabilities = new LinkedHashMap<>(DistributionSettings.detectHostCapabilities(null));
         private long heartbeatIntervalMs = 5_000L;
         private long reconnectDelayMs = 1_000L;
@@ -187,6 +207,23 @@ public final class DistributionWorkerConfig {
             if (cacheDir != null) {
                 this.cacheDir = cacheDir;
             }
+            return this;
+        }
+
+        public Builder cacheCleanup(boolean cacheCleanup) {
+            this.cacheCleanup = cacheCleanup;
+            return this;
+        }
+
+        /**
+         * @throws IllegalArgumentException if {@code cacheFreeSpaceBufferBytes} is negative
+         */
+        public Builder cacheFreeSpaceBufferBytes(long cacheFreeSpaceBufferBytes) {
+            if (cacheFreeSpaceBufferBytes < 0) {
+                throw new IllegalArgumentException("Worker cache free space buffer must not be negative: "
+                        + cacheFreeSpaceBufferBytes);
+            }
+            this.cacheFreeSpaceBufferBytes = cacheFreeSpaceBufferBytes;
             return this;
         }
 
