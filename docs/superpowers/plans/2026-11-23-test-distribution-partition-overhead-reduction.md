@@ -54,29 +54,29 @@
     - `public static long getMinRemoteDurationMs()` and `static long getMinRemoteDurationMs(UnaryOperator<String> prop, UnaryOperator<String> env)` (returns `Math.max(0L, ...)` defaulting to `2_000L`)
     - `public static int getMinRemoteColdUnits()` and `static int getMinRemoteColdUnits(UnaryOperator<String> prop, UnaryOperator<String> env)` (returns `Math.max(0, ...)` defaulting to `0`)
 
-- [ ] **Step 1: Write failing tests for DTO JSON round-trip and new `DistributionSettings` lookups**
+- [x] **Step 1: Write failing tests for DTO JSON round-trip and new `DistributionSettings` lookups**
 
 Add tests in `DistributionSettingsTest.java`:
 - `shouldReturnEmptyConfiguredMaxPartitionSizeWhenUnsetAndPositiveValueWhenConfigured`: verifies `findConfiguredMaxPartitionSize` returns `OptionalInt.empty()` when unset/invalid/`<=0` and `OptionalInt.of(12)` when property or env is `"12"`, while `getMaxPartitionSize()` still returns `5`.
 - `shouldReadMinRemoteDurationMsAndColdUnitsWithClampedNonNegativeValues`: verifies defaults (`2_000L`, `0`), property/env overrides, and negative strings clamping to `0`.
 - `shouldRoundTripHistoricalDurationsDtos`: serializes/deserializes `HistoricalDurationsRequest(List.of("pkg.A"), 10)` and `HistoricalDurationsResponse(Map.of("pkg.A", 450L))` via `DistributionJson`, plus null normalization to empty collections.
 
-- [ ] **Step 2: Run protocol tests to verify RED**
+- [x] **Step 2: Run protocol tests to verify RED**
 
 Run: `./mvnw test -pl tools/citrus-test-distribution-protocol -Dtest=DistributionSettingsTest -Dcitrus.test.distribution.enabled=false`
 Expected: FAIL to compile (`HistoricalDurationsRequest` and `findConfiguredMaxPartitionSize` not defined).
 
-- [ ] **Step 3: Implement DTOs and `DistributionSettings` methods**
+- [x] **Step 3: Implement DTOs and `DistributionSettings` methods**
 
 1. Create `HistoricalDurationsRequest` and `HistoricalDurationsResponse` in `org.citrusframework.distribution.model` with `@JsonCreator`/`@JsonProperty` or canonical record annotations matching `MissingDigestsRequest`/`MissingDigestsResponse`.
 2. Add the new constants and methods to `DistributionSettings` (note: guard `aliasEnvKey != null` in `resolveFirstNonBlank` if passing `null` when no secondary alias env exists).
 
-- [ ] **Step 4: Run all protocol tests and install reactor artifact**
+- [x] **Step 4: Run all protocol tests and install reactor artifact**
 
 Run: `./mvnw test-compile test -pl tools/citrus-test-distribution-protocol -Dcitrus.test.distribution.enabled=false && ./mvnw install -DskipTests -pl tools/citrus-test-distribution-protocol`
 Expected: PASS (all protocol tests green; `citrus-test-distribution-protocol` installed to local Maven repo).
 
-- [ ] **Step 5: Commit Task 1**
+- [x] **Step 5: Commit Task 1**
 
 ```bash
 git add tools/citrus-test-distribution-protocol
@@ -96,7 +96,7 @@ git commit -m "feat(distribution): add history duration DTOs and client bypass s
 - Produces:
   - Bounded `jarResourceCache` (`MAX_JAR_RESOURCE_CACHE_ENTRIES = 4_096`) and `codeSourceCache` on `ForkedPartitionRunner`, plus package-private `int jarOpenCountForTesting()` (or `LongAdder` counter incremented inside `scanJarWatchedResources` right before `new JarFile(...)`) so unit tests deterministically assert exact `JarFile` open counts without filesystem brittle hacks.
 
-- [ ] **Step 1: Write failing tests in `ForkedPartitionRunnerClasspathCacheTest`**
+- [x] **Step 1: Write failing tests in `ForkedPartitionRunnerClasspathCacheTest`**
 
 Create `ForkedPartitionRunnerClasspathCacheTest.java` testing real temporary JAR files:
 - `shouldOpenContentAddressedCachedJarOnlyOnceAcrossPartitionsEvenWhenMtimeChanges`: creates `<tmp>/classpath/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef/sample.jar` (without Jackson 3 `tools/jackson/...` resources) + JUnit JARs, runs `verifyJUnitPlatform` + `childClasspath` twice while mutating `Files.setLastModifiedTime` between runs (simulating `WorkerFileCache.recordAccess`), and asserts `runner.jarOpenCountForTesting()` increments on pass 1 and increments by `0` on pass 2.
@@ -104,12 +104,12 @@ Create `ForkedPartitionRunnerClasspathCacheTest.java` testing real temporary JAR
 - `shouldNotCacheCorruptJarFailureAndRecoverWhenReplaced`: writes corrupt non-ZIP bytes to `<tmp>/external/broken.jar`, asserts `verifyJUnitPlatform` throws `UncheckedIOException`, replaces `broken.jar` with a valid JAR, and asserts the next call succeeds.
 - `shouldBoundJarResourceCacheAtMaxEntries`: populates `> 4_096` tiny distinct JAR entries (or exercises package-private cache capacity helper) and asserts cache size never exceeds `4_096` without throwing.
 
-- [ ] **Step 2: Run `ForkedPartitionRunnerClasspathCacheTest` to verify RED**
+- [x] **Step 2: Run `ForkedPartitionRunnerClasspathCacheTest` to verify RED**
 
 Run: `./mvnw test -pl tools/citrus-test-distribution-worker -Dtest=ForkedPartitionRunnerClasspathCacheTest -Dcitrus.test.distribution.enabled=false`
 Expected: FAIL (`jarOpenCountForTesting` missing / JAR re-opened on every call).
 
-- [ ] **Step 3: Implement bounded JAR resource cache and `codeSource` cache in `ForkedPartitionRunner`**
+- [x] **Step 3: Implement bounded JAR resource cache and `codeSource` cache in `ForkedPartitionRunner`**
 
 In `ForkedPartitionRunner.java`:
 - Define `CANCELLATION_TOKEN_RESOURCE = "org/junit/platform/engine/CancellationToken.class"` and `WATCHED_RESOURCES` (`Set<String>` containing the 8 `RUNTIME_ANCHORS` class resource paths plus `CANCELLATION_TOKEN_RESOURCE`).
@@ -118,12 +118,12 @@ In `ForkedPartitionRunner.java`:
 - Cache `Set<String>` of present `WATCHED_RESOURCES` in a `ConcurrentHashMap<JarResourceCacheKey, Set<String>>` bounded at `4_096` entries (evicting via iterator when inserting at capacity) and increment `jarOpenCount` inside `scanJarWatchedResources` when opening `new JarFile(entry.toFile())`. Do not cache if `JarFile` throws `IOException` (rethrow `UncheckedIOException` as today).
 - Cache `codeSource(String className)` in `ConcurrentHashMap<String, Optional<Path>>`.
 
-- [ ] **Step 4: Run worker tests to verify GREEN**
+- [x] **Step 4: Run worker tests to verify GREEN**
 
 Run: `./mvnw test -pl tools/citrus-test-distribution-worker -Dcitrus.test.distribution.enabled=false`
 Expected: PASS (all existing worker tests + 4 new cache tests pass).
 
-- [ ] **Step 5: Commit Task 2**
+- [x] **Step 5: Commit Task 2**
 
 ```bash
 git add tools/citrus-test-distribution-worker/src/main/java/org/citrusframework/distribution/worker/ForkedPartitionRunner.java \
@@ -149,7 +149,7 @@ git commit -m "perf(distribution): cache classpath JAR anchor lookups and worker
     - `static boolean matchesAnyRoot(String lsofNameField, List<Path> normalizedRoots)`
     - `static Optional<Boolean> parseMacOsProcessLsofOutput(String stdout, int exitCode, List<Path> normalizedRoots)` (`Optional.of(true)` if any `'n'` line matches `roots`, `Optional.of(false)` if exit code `0` or `1` and all non-empty lines start with `'p'`/`'f'`/`'n'` with no match, `Optional.empty()` on unexpected exit code or warning/unrecognized lines to trigger fallback).
 
-- [ ] **Step 1: Write failing tests in `WorkspaceReferencesTest`**
+- [x] **Step 1: Write failing tests in `WorkspaceReferencesTest`**
 
 Create `WorkspaceReferencesTest.java` covering:
 - `shouldAvoidSiblingPrefixFalsePositiveWhenMatchingLsofPaths`: `/private/tmp/cdtmp-10/open.txt` and `/private/tmp/cdtmp-10` do **not** match root `/private/tmp/cdtmp-1`, whereas `/private/tmp/cdtmp-1` and `/private/tmp/cdtmp-1/sub/file.txt` **do** match.
@@ -158,12 +158,12 @@ Create `WorkspaceReferencesTest.java` covering:
 - `shouldSkipFullLsofOnMacOsWhenNoPostLaunchProcessesSurvived` (`@EnabledOnOs(OS.MAC)`): captures `baseline = WorkspaceReferences.captureMacOsBaselineProcesses()`, creates two empty temp dirs, calls 4-arg `WorkspaceReferences.inUse(roots, false, null, baseline)` using a package-private `CommandRunner` seam (or counter on `lsof` invocations), and asserts **zero** `/usr/sbin/lsof` processes are spawned!
 - `shouldFallbackConservativelyWhenSurvivorBatchExceedsMaxPids`: passes a synthetic survivor PID list of `257` PIDs into package-private helper and verifies it delegates to the fallback path rather than truncating PIDs.
 
-- [ ] **Step 2: Run `WorkspaceReferencesTest` to verify RED**
+- [x] **Step 2: Run `WorkspaceReferencesTest` to verify RED**
 
 Run: `./mvnw test -pl tools/citrus-test-distribution-worker -Dtest=WorkspaceReferencesTest -Dcitrus.test.distribution.enabled=false`
 Expected: FAIL to compile (`captureMacOsBaselineProcesses`, 4-arg `inUse`, and parser helpers not defined).
 
-- [ ] **Step 3: Implement macOS post-launch survivor diff and targeted `lsof -Fn -p` in `WorkspaceReferences` & `WorkerWorkspaceRegistry`**
+- [x] **Step 3: Implement macOS post-launch survivor diff and targeted `lsof -Fn -p` in `WorkspaceReferences` & `WorkerWorkspaceRegistry`**
 
 1. In `WorkspaceReferences.java`:
    - Keep 3-arg `inUse(roots, recovering, linuxWorkerStart)` delegating to 4-arg `inUse(roots, recovering, linuxWorkerStart, null)`.
@@ -176,12 +176,12 @@ Expected: FAIL to compile (`captureMacOsBaselineProcesses`, 4-arg `inUse`, and p
 2. In `WorkerWorkspaceRegistry.java`:
    - In `create(boolean forked, boolean leased)`, capture `Map<Long, Instant> baselineProcesses = forked ? WorkspaceReferences.captureMacOsBaselineProcesses() : null` **before** returning the `Workspace`, store it on `Workspace`, and pass `(!recovering && forked && !current.leased()) ? baselineProcesses : null` into `removeOwnedDirectories` -> `WorkspaceReferences.inUse(...)`.
 
-- [ ] **Step 4: Run full worker test suite including `WorkerWorkspaceRecoveryTest` to verify GREEN**
+- [x] **Step 4: Run full worker test suite including `WorkerWorkspaceRecoveryTest` to verify GREEN**
 
 Run: `./mvnw test -pl tools/citrus-test-distribution-worker -Dcitrus.test.distribution.enabled=false`
 Expected: PASS (all `WorkerWorkspaceRecoveryTest` background-process & Unix-socket tests and `WorkspaceReferencesTest` pass).
 
-- [ ] **Step 5: Commit Task 3**
+- [x] **Step 5: Commit Task 3**
 
 ```bash
 git add tools/citrus-test-distribution-worker/src/main/java/org/citrusframework/distribution/worker/WorkspaceReferences.java \
@@ -217,7 +217,7 @@ git commit -m "perf(distribution): skip full-host macOS lsof when no post-launch
   - HTTP endpoint `POST /api/v1/history/durations` on `DistributionBrokerVerticle`:
     - Accepts `HistoricalDurationsRequest`, rejects `testKeys.size() > 10_000` or malformed JSON with `400`, returns `200` `HistoricalDurationsResponse` (`{"durationsMs":{}}` when `testKeys` is empty).
 
-- [ ] **Step 1: Write failing tests in `LptPartitionSchedulerTest`, `JdbcDistributionStoreTest`, `BrokerSessionCoordinatorTest`, and `DistributionBrokerServerTest`**
+- [x] **Step 1: Write failing tests in `LptPartitionSchedulerTest`, `JdbcDistributionStoreTest`, `BrokerSessionCoordinatorTest`, and `DistributionBrokerServerTest`**
 
 Add to `LptPartitionSchedulerTest.java`:
 - `shouldPackFastModuleIntoFewerPartitionsWhenMinPartitionDurationFloorApplies`: 19 units of `150ms` each (`2_850ms` total), `maxPartitionSize = 5`, `minPartitionDurationMs = 5_000L`, `maxWavesPerWorker = 2`, `eligibleWorkers = 6` -> produces `1` partition containing all 19 units.
@@ -235,12 +235,12 @@ Add to `BrokerSessionCoordinatorTest.java`:
 Add to `DistributionBrokerServerTest.java`:
 - `shouldServeHistoricalDurationsEndpointAndValidateBounds`: records test executions, posts `HistoricalDurationsRequest(List.of("pkg.SampleTest", "pkg.Unknown"), 10)` to `/api/v1/history/durations` -> asserts `200` with `durationsMs` containing `"pkg.SampleTest"` only; posts empty `testKeys` -> `200` empty map; posts `10_001` keys -> `400`.
 
-- [ ] **Step 2: Run coordinator tests to verify RED**
+- [x] **Step 2: Run coordinator tests to verify RED**
 
 Run: `./mvnw test -pl tools/citrus-test-distribution-coordinator -Dtest=LptPartitionSchedulerTest,JdbcDistributionStoreTest,BrokerSessionCoordinatorTest,DistributionBrokerServerTest -Dcitrus.test.distribution.enabled=false`
 Expected: FAIL (9-arg `schedule`, `minPartitionDurationMs` / `/api/v1/history/durations` missing; `JdbcDistributionStoreTest` multi-method assertion fails).
 
-- [ ] **Step 3: Implement adaptive `LptPartitionScheduler`, `JdbcDistributionStore` session-sum query, `DistributionBrokerConfig`, adaptive `BrokerSessionCoordinator`, and HTTP route**
+- [x] **Step 3: Implement adaptive `LptPartitionScheduler`, `JdbcDistributionStore` session-sum query, `DistributionBrokerConfig`, adaptive `BrokerSessionCoordinator`, and HTTP route**
 
 1. In `LptPartitionScheduler`: keep existing 5-arg and 6-arg `schedule` methods delegating to the 9-arg `schedule(..., 0L, 0, caps -> 0)`. In `lptPartitions`:
    - `int maxBinsFromSize = Math.ceilDiv(n, capSize);`
@@ -272,12 +272,12 @@ Expected: FAIL (9-arg `schedule`, `minPartitionDurationMs` / `/api/v1/history/du
    - Add `public Map<String, Long> findHistoricalDurations(List<String> testKeys, int limit)` returning `Map.of()` when `testKeys == null || testKeys.isEmpty()`, otherwise delegating to `store.findHistoricalDurationsMs(dedupedNonBlankKeys, limit <= 0 ? 10 : Math.min(limit, 100))`.
 5. In `DistributionBrokerVerticle`: mount `router.post("/api/v1/history/durations").handler(this::handleHistoricalDurations)` validating body & `testKeys.size() <= 10_000` (`400` on violation) and returning `200` JSON `HistoricalDurationsResponse`.
 
-- [ ] **Step 4: Run all coordinator tests and install reactor artifact**
+- [x] **Step 4: Run all coordinator tests and install reactor artifact**
 
 Run: `./mvnw test -pl tools/citrus-test-distribution-coordinator -Dcitrus.test.distribution.enabled=false && ./mvnw install -DskipTests -pl tools/citrus-test-distribution-coordinator`
 Expected: PASS (all coordinator unit and server tests green; `citrus-test-distribution-coordinator` installed to local Maven repo).
 
-- [ ] **Step 5: Commit Task 4**
+- [x] **Step 5: Commit Task 4**
 
 ```bash
 git add tools/citrus-test-distribution-coordinator
@@ -303,7 +303,7 @@ git commit -m "feat(distribution): add session-summed history durations and adap
   - `BrokerHttpClient.findHistoricalDurations(List<String> workUnitKeys, int recentLimit)` returning `Optional<Map<String, Long>>` (`Optional.of(Map.of())` when `workUnitKeys.isEmpty()`, `Optional.of(response.durationsMs())` on HTTP `200`, `Optional.empty()` at `LOG.debug` on non-`200` or `IOException`; restores interrupt flag and returns `Optional.empty()` on `InterruptedException`).
   - `LocalFallbackExecutor.executeTestPlanLocally(Launcher delegate, TestPlan testPlan, List<WorkUnitSpec> units, TestExecutionListener[] additionalListeners)` executing `delegate.execute(testPlan, merged)` once, capturing `WorkerTestEventPayload` executions mapped to each `WorkUnitSpec.key()`, and writing `SurefireReportWriter` XML when `citrus.test.distribution.reportDir` is set.
 
-- [ ] **Step 1: Write failing tests in `DistributedLauncherTest` and `TestDistributionMavenExtensionTest`**
+- [x] **Step 1: Write failing tests in `DistributedLauncherTest` and `TestDistributionMavenExtensionTest`**
 
 Add to `DistributedLauncherTest.java`:
 - `shouldRunSmallModuleLocallyOnWarmHistorySkipRemoteDispatchAndReportLocalTests`:
@@ -317,12 +317,12 @@ Add to `DistributedLauncherTest.java`:
 Add to `TestDistributionMavenExtensionTest.java`:
 - `shouldOmitMaxPartitionSizeWhenUnsetAndPropagateMinRemoteThresholds`: verifies that when `maxPartitionSize` is not configured, `CreateSessionRequest.maxPartitionSize()` sent by the extension is `0` and `MAX_PARTITION_SIZE_PROPERTY` is not injected into plugin system properties, whereas configured `minRemoteDurationMs` and `minRemoteColdUnits` are propagated into Surefire/Failsafe properties.
 
-- [ ] **Step 2: Run launcher and Maven extension tests to verify RED**
+- [x] **Step 2: Run launcher and Maven extension tests to verify RED**
 
 Run: `./mvnw test -pl tools/citrus-test-distribution,tools/maven/citrus-test-distribution-maven-extension -Dtest=DistributedLauncherTest,TestDistributionMavenExtensionTest -Dcitrus.test.distribution.enabled=false`
 Expected: FAIL (`findHistoricalDurations` / warm local bypass / `maxPartitionSize == 0` not implemented).
 
-- [ ] **Step 3: Implement `BrokerHttpClient`, `LocalFallbackExecutor.executeTestPlanLocally`, `DistributedLauncher` bypass, `TestDistributionLifecycleParticipant`, and manual docs**
+- [x] **Step 3: Implement `BrokerHttpClient`, `LocalFallbackExecutor.executeTestPlanLocally`, `DistributedLauncher` bypass, `TestDistributionLifecycleParticipant`, and manual docs**
 
 1. In `BrokerHttpClient.java`: implement `findHistoricalDurations(List<String> workUnitKeys, int recentLimit)` posting `HistoricalDurationsRequest` to `/api/v1/history/durations` via `sendJsonPost`, returning `Optional.of(resp.durationsMs())` on `200` and `Optional.empty()` (logging at `DEBUG`) on non-`200` or `IOException`/`InterruptedException`.
 2. In `LocalFallbackExecutor.java`: extract shared listener/collector logic from `executeLocally` and add `executeTestPlanLocally(Launcher delegate, TestPlan testPlan, List<WorkUnitSpec> units, TestExecutionListener[] additionalListeners)`:
@@ -345,12 +345,12 @@ Expected: FAIL (`findHistoricalDurations` / warm local bypass / `maxPartitionSiz
    - Update the macOS workspace reference paragraph (~line 579) to note that clean forked workspace closes skip full-host `lsof +D` when no post-launch processes survive (using targeted `lsof -p` on surviving post-launch PIDs), while startup recovery, leased workspaces, and in-process runs retain full `lsof +D`.
    - Document `citrus.test.distribution.minRemoteDurationMs`, `citrus.test.distribution.minRemoteColdUnits`, `citrus.test.distribution.broker.minPartitionDurationMs`, and `citrus.test.distribution.broker.maxWavesPerWorker` in the configuration reference section.
 
-- [ ] **Step 4: Run full 5-module test suite to verify GREEN**
+- [x] **Step 4: Run full 5-module test suite to verify GREEN**
 
 Run: `./mvnw test -pl tools/citrus-test-distribution-protocol,tools/citrus-test-distribution-coordinator,tools/citrus-test-distribution-worker,tools/citrus-test-distribution,tools/maven/citrus-test-distribution-maven-extension -Dcitrus.test.distribution.enabled=false`
 Expected: PASS (0 failures, 0 errors across all 5 modules).
 
-- [ ] **Step 5: Commit Task 5**
+- [x] **Step 5: Commit Task 5**
 
 ```bash
 git add tools/citrus-test-distribution \
