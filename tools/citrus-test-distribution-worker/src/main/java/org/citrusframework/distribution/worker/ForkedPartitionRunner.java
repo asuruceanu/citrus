@@ -182,8 +182,17 @@ final class ForkedPartitionRunner implements PartitionRunner {
                                                                      WorkerFileCache cache,
                                                                      BrokerBlobClient blobs) {
         ActiveFork fork = new ActiveFork();
-        ACTIVE_FORKS.add(fork);
-        forks.add(fork);
+        Lock startLock = JVM_FORK_START_FENCE.readLock();
+        startLock.lock();
+        try {
+            if (jvmStopping) {
+                return cancelledResult();
+            }
+            ACTIVE_FORKS.add(fork);
+            forks.add(fork);
+        } finally {
+            startLock.unlock();
+        }
         WorkerFileCache.PinLease pins = null;
         try {
             List<ArtifactRef> classpathArtifacts = assignment.classpathArtifacts() != null
@@ -193,29 +202,42 @@ final class ForkedPartitionRunner implements PartitionRunner {
             assignment.inputArtifacts().forEach(input -> pinned.add(input.artifact().sha256()));
             pins = cache.pinAll(pinned);
 
-            fork.partitionRoot = Files.createTempDirectory("cdist-");
-            Path workspace = Files.createDirectories(fork.partitionRoot.resolve("workspace"));
-            Files.createDirectories(workspace.resolve("target"));
-            Path ipc = createOwnerOnlyDirectory(fork.partitionRoot.resolve("ipc"));
-            fork.tmpDir = createChildTmpDir(fork.partitionRoot);
+            Path workspace;
+            Path ipc;
+            synchronized (fork.cleanupMonitor) {
+                if (jvmStopping) {
+                    return cancelledResult();
+                }
+                fork.partitionRoot = Files.createTempDirectory("cdist-");
+                workspace = Files.createDirectories(fork.partitionRoot.resolve("workspace"));
+                Files.createDirectories(workspace.resolve("target"));
+                ipc = createOwnerOnlyDirectory(fork.partitionRoot.resolve("ipc"));
+                fork.tmpDir = createChildTmpDir(fork.partitionRoot);
+            }
 
-            // ensureCached returns verified blobs: materializing them hashes nothing again
+            // Verification and downloads may block. Only materialization can recreate paths removed by cleanup.
             List<Path> classpath = new ArrayList<>();
             for (ArtifactRef artifact : classpathArtifacts) {
                 Path verified = blobs.ensureCached(artifact);
-                classpath.add(cache.materializeForClasspath(artifact, verified, fork.partitionRoot));
+                synchronized (fork.cleanupMonitor) {
+                    if (jvmStopping) {
+                        return cancelledResult();
+                    }
+                    classpath.add(cache.materializeForClasspath(artifact, verified, fork.partitionRoot));
+                }
             }
             for (WorkspaceFileSet input : assignment.inputArtifacts()) {
                 Path verified = blobs.ensureCached(input.artifact());
-                cache.materializeIntoDirectory(input, verified, workspace);
+                synchronized (fork.cleanupMonitor) {
+                    if (jvmStopping) {
+                        return cancelledResult();
+                    }
+                    cache.materializeIntoDirectory(input, verified, workspace);
+                }
             }
             Map<String, String> baseline = WorkspacePackager.snapshotBaselineHashes(workspace, assignment.outputPaths());
-            Path workingDirectory = childWorkingDirectory(workspace, assignment.workingDirectory());
-
             verifyJUnitPlatform(classpath);
-            Path argfile = ipc.resolve("classpath.argfile");
-            writeOwnerOnly(argfile, argfileClasspathLine(childClasspath(classpath)) + System.lineSeparator(),
-                    argfileCharset());
+            String classpathLine = argfileClasspathLine(childClasspath(classpath)) + System.lineSeparator();
 
             byte[] secret = new byte[32];
             new SecureRandom().nextBytes(secret);
@@ -223,18 +245,25 @@ final class ForkedPartitionRunner implements PartitionRunner {
             Map<String, String> properties = new LinkedHashMap<>(
                     IsolatedPartitionRunner.workspaceOverrides(assignment.systemProperties(), workspace));
             properties.put(DistributionSettings.ROLE_PROPERTY, DistributionSettings.ROLE_WORKER);
+            String requestJson = DistributionJson.toJson(new ForkedPartitionMain.ForkRequest(assignment.partitionId(),
+                    assignment.sessionId(), assignment.attempt(), token, properties, assignment.workUnits()));
+            Path argfile = ipc.resolve("classpath.argfile");
             Path request = ipc.resolve("request.json");
-            writeOwnerOnly(request, DistributionJson.toJson(new ForkedPartitionMain.ForkRequest(assignment.partitionId(),
-                    assignment.sessionId(), assignment.attempt(), token, properties, assignment.workUnits())),
-                    StandardCharsets.UTF_8);
+            Path workingDirectory;
+            synchronized (fork.cleanupMonitor) {
+                if (jvmStopping) {
+                    return cancelledResult();
+                }
+                workingDirectory = childWorkingDirectory(workspace, assignment.workingDirectory());
+                writeOwnerOnly(argfile, classpathLine, argfileCharset());
+                writeOwnerOnly(request, requestJson, StandardCharsets.UTF_8);
+            }
 
             ForkedPartitionMain.ForkedExecutionSummary summary;
             try (ServerSocket server = new ServerSocket(0, 50, InetAddress.getLoopbackAddress())) {
                 // Publish the child before either worker close or JVM shutdown can collect it for cleanup.
-                // Keep classpath preparation outside both launch guards so shutdown can fence delayed forks.
                 synchronized (forkStartMonitor) {
-                    Lock launchLock = JVM_FORK_START_FENCE.readLock();
-                    launchLock.lock();
+                    startLock.lock();
                     try {
                         if (jvmStopping || stopping || cancelled(cancellationToken)) {
                             return cancelledResult();
@@ -242,7 +271,7 @@ final class ForkedPartitionRunner implements PartitionRunner {
                         fork.process = launch(argfile, request, server.getLocalPort(), workspace, workingDirectory, fork.tmpDir);
                         fork.watcher = processWatcher(fork, cancellationToken);
                     } finally {
-                        launchLock.unlock();
+                        startLock.unlock();
                     }
                 }
                 summary = runProtocol(server, fork, token, cancellationToken, eventSink);
@@ -313,12 +342,13 @@ final class ForkedPartitionRunner implements PartitionRunner {
         Lock shutdownLock = JVM_FORK_START_FENCE.writeLock();
         shutdownLock.lock();
         try {
-            // Every launch that passed the shutdown check has now published its process.
+            // Every registration and launch that passed the shutdown check has now published its resources.
             active = List.copyOf(ACTIVE_FORKS);
         } finally {
             shutdownLock.unlock();
         }
-        active.forEach(ActiveFork::cleanUp);
+        // Reap launched children before waiting for any in-flight workspace materialization.
+        active.stream().sorted(Comparator.comparing(fork -> fork.process == null)).forEach(ActiveFork::cleanUp);
     }
 
     private static boolean cancelled(CancellationToken cancellationToken) {
@@ -714,6 +744,7 @@ final class ForkedPartitionRunner implements PartitionRunner {
         private final Set<ProcessHandle> seen = ConcurrentHashMap.newKeySet();
         private final List<Thread> drains = new CopyOnWriteArrayList<>();
         private final Deque<String> tail = new ArrayDeque<>();
+        /** Serializes private path creation and writes with cleanup. */
         private final Object cleanupMonitor = new Object();
 
         synchronized void remember(String line) {
@@ -755,7 +786,6 @@ final class ForkedPartitionRunner implements PartitionRunner {
                     watching.interrupt();
                 }
                 killAll();
-                // A preparation that was still in flight during shutdown may have created these paths since.
                 deleteRecursively(tmpDir);
                 deleteRecursively(partitionRoot);
             }

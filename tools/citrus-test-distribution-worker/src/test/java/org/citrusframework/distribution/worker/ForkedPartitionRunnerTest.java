@@ -223,6 +223,93 @@ class ForkedPartitionRunnerTest {
         }
     }
 
+    /** Pauses preparation across the real JVM shutdown hook and leaves the JVM to halt it. */
+    public static class PreparingWorkerShutdownProbe {
+        public static void main(String[] args) throws Exception {
+            Path root = Path.of(args[0]);
+            DistributionWorkerConfig config = workerConfig(root.resolve("preparing-cache"), "http://127.0.0.1:9");
+            PartitionAssignPayload pending = assignment(new BlobCacheDirectory(config.cacheDir()),
+                    Map.of(), List.of(), List.of(), unit(PlainFixture.class, "passes"));
+            CountDownLatch verifying = new CountDownLatch(1);
+            CountDownLatch resume = new CountDownLatch(1);
+            CountDownLatch materializedOrFinished = new CountDownLatch(1);
+            WorkerFileCache cache = WorkerFileCache.open(config.cacheDir(), false, 0L, null, Clock.systemUTC(),
+                    FileChannel::tryLock, path -> new BlobCacheDirectory(path) {
+                        @Override
+                        public boolean isIntact(String sha256) throws IOException {
+                            verifying.countDown();
+                            await(resume);
+                            return super.isIntact(sha256);
+                        }
+
+                        @Override
+                        public Path materializeForClasspath(ArtifactRef ref, Path verifiedBlob, Path workspaceDir)
+                                throws IOException {
+                            Path materialized = super.materializeForClasspath(ref, verifiedBlob, workspaceDir);
+                            materializedOrFinished.countDown();
+                            // Keep any recreated paths on disk until the JVM has exited.
+                            await(new CountDownLatch(1));
+                            return materialized;
+                        }
+                    });
+            BrokerBlobClient blobs = new BrokerBlobClient(config, cache);
+            ForkedPartitionRunner runner = new ForkedPartitionRunner(config, cache, blobs);
+            CompletableFuture<IsolatedPartitionRunner.PartitionExecutionResult> execution =
+                    CompletableFuture.supplyAsync(() -> runner.execute(pending, CancellationToken.create(), e -> { }));
+            execution.whenComplete((result, error) -> materializedOrFinished.countDown());
+            assertThat(verifying.await(10, TimeUnit.SECONDS)).isTrue();
+
+            Object fork = ((java.util.Set<?>) readField(ForkedPartitionRunner.class, runner, "forks"))
+                    .iterator().next();
+            Path partitionRoot = (Path) readField(fork.getClass(), fork, "partitionRoot");
+            Path tmpDir = (Path) readField(fork.getClass(), fork, "tmpDir");
+            assertThat(partitionRoot).exists();
+            assertThat(tmpDir).exists();
+            Files.write(root.resolve("preparing-paths.txt"), List.of(partitionRoot.toString(), tmpDir.toString()));
+
+            Thread workerHook = (Thread) readField(ForkedPartitionRunner.class, null, "SHUTDOWN_HOOK");
+            Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+                try {
+                    long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+                    while (workerHook.getState() == Thread.State.NEW && System.nanoTime() < deadline) {
+                        Thread.sleep(10);
+                    }
+                    workerHook.join(10_000);
+                    assertThat(workerHook.getState()).isEqualTo(Thread.State.TERMINATED);
+                    assertThat(partitionRoot).doesNotExist();
+                    assertThat(tmpDir).doesNotExist();
+                    resume.countDown();
+                    assertThat(materializedOrFinished.await(10, TimeUnit.SECONDS)).isTrue();
+                    assertThat(execution).isDone();
+                    IsolatedPartitionRunner.PartitionExecutionResult result = execution.get();
+                    assertThat(result.success()).isFalse();
+                    assertThat(result.errorMessage()).isEqualTo("Partition cancelled");
+                    Files.createFile(root.resolve("preparing-shutdown-complete"));
+                } catch (Exception e) {
+                    throw new IllegalStateException(e);
+                }
+            }));
+            System.exit(0);
+        }
+
+        private static Object readField(Class<?> type, Object instance, String name) throws ReflectiveOperationException {
+            Field field = type.getDeclaredField(name);
+            field.setAccessible(true);
+            return field.get(instance);
+        }
+
+        private static void await(CountDownLatch latch) throws IOException {
+            try {
+                if (!latch.await(45, TimeUnit.SECONDS)) {
+                    throw new IOException("Timed out waiting during workspace preparation");
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IOException(e);
+            }
+        }
+    }
+
     public static class CrashingFixture {
         @Test
         void exitAbruptly() {
@@ -519,6 +606,31 @@ class ForkedPartitionRunnerTest {
                 List<ProcessHandle> handles = new ArrayList<>(probe.descendants().toList());
                 handles.add(probe.toHandle());
                 ForkedPartitionRunner.destroyAll(handles);
+            }
+        }
+    }
+
+    @Test
+    void shouldLeaveNoPrivateWorkspaceAfterJvmExitDuringPreparation() throws Exception {
+        Path java = Path.of(System.getProperty("java.home"), "bin",
+                File.separatorChar == '\\' ? "java.exe" : "java");
+        Path log = tempDir.resolve("preparing-shutdown-probe.log");
+        Process probe = new ProcessBuilder(java.toString(), "-Djava.io.tmpdir=" + tempDir,
+                "-cp", System.getProperty("java.class.path"),
+                PreparingWorkerShutdownProbe.class.getName(), tempDir.toString())
+                .redirectErrorStream(true)
+                .redirectOutput(log.toFile())
+                .start();
+        try {
+            assertThat(probe.waitFor(60, TimeUnit.SECONDS)).as("worker shutdown probe finished").isTrue();
+            assertThat(probe.exitValue()).as(Files.readString(log)).isZero();
+            for (String path : Files.readAllLines(tempDir.resolve("preparing-paths.txt"))) {
+                assertThat(Path.of(path)).as("private path after worker exit").doesNotExist();
+            }
+            assertThat(tempDir.resolve("preparing-shutdown-complete")).as(Files.readString(log)).exists();
+        } finally {
+            if (probe.isAlive()) {
+                ForkedPartitionRunner.destroyAll(List.of(probe.toHandle()));
             }
         }
     }
