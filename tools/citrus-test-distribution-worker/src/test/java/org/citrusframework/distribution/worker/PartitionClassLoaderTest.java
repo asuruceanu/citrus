@@ -233,6 +233,53 @@ class PartitionClassLoaderTest {
     }
 
     @Test
+    @SuppressWarnings("deprecation")
+    void shouldResolvePartitionJarUrlsLikeJdkJarUrls() throws Exception {
+        Path jar = tempDir.resolve("resolve.jar");
+        try (JarOutputStream out = new JarOutputStream(Files.newOutputStream(jar))) {
+            for (String name : List.of("abs.txt", "probe/data.txt", "probe/sub/nested.txt", "probe/with space.txt")) {
+                out.putNextEntry(new JarEntry(name));
+                out.write(name.getBytes(StandardCharsets.UTF_8));
+                out.closeEntry();
+            }
+        }
+
+        try (IsolatedPartitionRunner.PartitionClassLoader loader = new IsolatedPartitionRunner.PartitionClassLoader(
+                new URL[] {jar.toUri().toURL()}, WORKER);
+             java.net.URLClassLoader plain = new java.net.URLClassLoader(new URL[] {jar.toUri().toURL()}, null)) {
+            URL nested = loader.getResource("probe/sub/nested.txt");
+            URL jdkNested = plain.getResource("probe/sub/nested.txt");
+
+            for (String spec : List.of("/abs.txt", "../data.txt", "./nested.txt", "../with space.txt", "../with%20space.txt")) {
+                URL resolved = new URL(nested, spec);
+                URL jdkResolved = new URL(jdkNested, spec);
+                assertThat(resolved.toExternalForm()).as(spec).isEqualTo(jdkResolved.toExternalForm());
+                assertThat(resolved.openConnection().getUseCaches()).as(spec).isFalse();
+                try (InputStream in = resolved.openStream(); InputStream jdkIn = jdkResolved.openStream()) {
+                    assertThat(in.readAllBytes()).as(spec).isEqualTo(jdkIn.readAllBytes());
+                }
+            }
+
+            URL spaced = loader.getResource("probe/with space.txt");
+            assertThat(spaced).isNotNull();
+            try (InputStream in = spaced.openStream()) {
+                assertThat(new String(in.readAllBytes(), StandardCharsets.UTF_8)).isEqualTo("probe/with space.txt");
+            }
+
+            URL jdkData = plain.getResource("probe/data.txt");
+            URL data = loader.getResource("probe/data.txt");
+            assertThat(data).isEqualTo(jdkData);
+            assertThat(jdkData).isEqualTo(data);
+            assertThat(data.hashCode()).isEqualTo(jdkData.hashCode());
+            assertThat(data.sameFile(jdkData)).isTrue();
+            assertThat(new java.util.HashSet<>(List.of(data, jdkData, loader.getResource("probe/data.txt")))).hasSize(1);
+            assertThat(data).isNotEqualTo(loader.getResource("abs.txt"));
+
+            assertThat(data.openConnection(java.net.Proxy.NO_PROXY).getUseCaches()).isFalse();
+        }
+    }
+
+    @Test
     void shouldHaveANameLikeTheClassLoadersFrameworksExpect() throws Exception {
         // Quarkus' test extension calls getName() on the test class's loader; Surefire's is the JDK "app" loader.
         try (IsolatedPartitionRunner.PartitionClassLoader loader = loaderOver(Files.createDirectories(tempDir.resolve("named")))) {

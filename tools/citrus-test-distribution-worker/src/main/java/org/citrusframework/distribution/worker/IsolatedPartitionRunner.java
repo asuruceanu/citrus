@@ -25,7 +25,6 @@ import java.io.Reader;
 import java.io.UncheckedIOException;
 import java.io.Writer;
 import java.net.MalformedURLException;
-import java.net.URI;
 import java.net.URL;
 import java.net.URLClassLoader;
 import java.net.URLConnection;
@@ -760,6 +759,91 @@ public final class IsolatedPartitionRunner implements PartitionRunner {
     }
 
     /**
+     * The JDK's {@code jar:} URL handling with {@code useCaches=false}: every operation is delegated to an equivalent
+     * URL of the JDK's own jar handler, so parsing (including {@code /absolute} and {@code ../} specs relative to a
+     * jar entry), {@code equals}, {@code hashCode} and {@code sameFile} behave exactly as for JDK jar URLs. Only
+     * connections differ: their JarFile belongs to the connection and is closed with its input stream instead of being
+     * cached until the JVM exits.
+     * <p>
+     * Cost: every connection opens (and closes) the jar file again instead of reusing a cached one; for signed jars
+     * this includes verifying the signature again on each open.
+     */
+    static final class UncachedJarHandler extends URLStreamHandler {
+
+        @Override
+        protected URLConnection openConnection(URL url) throws IOException {
+            return uncachedConnection(jdkUrl(url).openConnection());
+        }
+
+        /**
+         * The JDK's jar handler does not implement this variant (it throws {@link UnsupportedOperationException}); a
+         * {@code jar:} URL opens its inner URL itself, so the proxy is not applicable and the plain connection is used.
+         */
+        @Override
+        protected URLConnection openConnection(URL url, java.net.Proxy proxy) throws IOException {
+            return openConnection(url);
+        }
+
+        private static URLConnection uncachedConnection(URLConnection connection) {
+            connection.setUseCaches(false);
+            return connection;
+        }
+
+        /** Parses {@code spec} like the JDK's jar handler, relative to {@code url}'s current (context) fields. */
+        @Override
+        @SuppressWarnings("deprecation") // URL(URL, String): resolves through the JDK's jar handler, accepts spaces
+        protected void parseURL(URL url, String spec, int start, int limit) {
+            boolean absolute = spec.regionMatches(true, 0, "jar:", 0, 4);
+            URL resolved;
+            try {
+                if (absolute) {
+                    resolved = new URL(spec.substring(0, limit));
+                } else {
+                    resolved = new URL(jdkUrl(url), spec.substring(start, limit));
+                }
+            } catch (MalformedURLException e) {
+                // URL's constructor reports this as a MalformedURLException
+                throw new IllegalArgumentException(e.getMessage(), e);
+            }
+            setURL(url, resolved.getProtocol(), resolved.getHost(), resolved.getPort(), resolved.getAuthority(),
+                    resolved.getUserInfo(), resolved.getPath(), resolved.getQuery(), url.getRef());
+        }
+
+        @Override
+        protected boolean equals(URL first, URL second) {
+            URL jdkFirst = jdkUrlOrNull(first);
+            return jdkFirst != null && jdkFirst.equals(jdkUrlOrNull(second));
+        }
+
+        @Override
+        protected int hashCode(URL url) {
+            URL jdk = jdkUrlOrNull(url);
+            return jdk != null ? jdk.hashCode() : url.toExternalForm().hashCode();
+        }
+
+        @Override
+        protected boolean sameFile(URL first, URL second) {
+            URL jdkFirst = jdkUrlOrNull(first);
+            URL jdkSecond = jdkUrlOrNull(second);
+            return jdkFirst != null && jdkSecond != null && jdkFirst.sameFile(jdkSecond);
+        }
+
+        /** The same URL with the JDK's default handler for its protocol (no URI round trip, so spaces are fine). */
+        @SuppressWarnings("deprecation")
+        static URL jdkUrl(URL url) throws MalformedURLException {
+            return new URL(url.toExternalForm());
+        }
+
+        private static URL jdkUrlOrNull(URL url) {
+            try {
+                return url != null ? jdkUrl(url) : null;
+            } catch (MalformedURLException e) {
+                return null;
+            }
+        }
+    }
+
+    /**
      * Child-first classloader that isolates a partition from the worker's own classpath.
      * <p>
      * JDK classes (every package of a boot-layer module, including {@code org.w3c.dom} and {@code org.xml.sax}) and the
@@ -805,27 +889,8 @@ public final class IsolatedPartitionRunner implements PartitionRunner {
         private static final List<Path> WORKER_JAVA_AGENTS = javaAgentPaths(
                 java.lang.management.ManagementFactory.getRuntimeMXBean().getInputArguments());
 
-        /**
-         * Opens {@code jar:} URLs like the JDK does, but with {@code useCaches=false}: the JarFile then belongs to the
-         * connection and is closed with its input stream instead of being cached for the JVM's lifetime. URLs derived
-         * from a partition resource URL ({@code new URL(resource, "sibling")}) keep this handler.
-         */
-        private static final URLStreamHandler UNCACHED_JAR_HANDLER = new URLStreamHandler() {
-            @Override
-            protected URLConnection openConnection(URL url) throws IOException {
-                URLConnection connection = toJdkJarUrl(url).openConnection();
-                connection.setUseCaches(false);
-                return connection;
-            }
-
-            private URL toJdkJarUrl(URL url) throws MalformedURLException {
-                try {
-                    return URI.create(url.toExternalForm()).toURL();
-                } catch (IllegalArgumentException e) {
-                    throw new MalformedURLException("Invalid jar URL " + url + ": " + e.getMessage());
-                }
-            }
-        };
+        /** Opens partition {@code jar:} URLs without the JDK's JarFile cache, see {@link UncachedJarHandler}. */
+        private static final URLStreamHandler UNCACHED_JAR_HANDLER = new UncachedJarHandler();
 
         private final ClassLoader jdkLoader;
         private final ClassLoader agentHost;
@@ -972,14 +1037,15 @@ public final class IsolatedPartitionRunner implements PartitionRunner {
         }
 
         /** {@code url} with {@link #UNCACHED_JAR_HANDLER} if it is a {@code jar:} URL, else unchanged. */
+        @SuppressWarnings("deprecation") // URL(URL, String, URLStreamHandler): the only way to attach a handler without a URI
         private static URL uncached(URL url) {
             if (url == null || !"jar".equals(url.getProtocol())) {
                 return url;
             }
             try {
-                return URL.of(URI.create(url.toExternalForm()), UNCACHED_JAR_HANDLER);
-            } catch (IllegalArgumentException | MalformedURLException e) {
-                // not expressible as a URI: keep the JDK's own (caching) handler rather than losing the resource
+                return new URL(null, url.toExternalForm(), UNCACHED_JAR_HANDLER);
+            } catch (MalformedURLException e) {
+                // keep the JDK's own (caching) handler rather than losing the resource
                 return url;
             }
         }
