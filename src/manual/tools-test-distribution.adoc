@@ -300,6 +300,7 @@ Long lists (build sessions, partitions, test executions and test history) are pa
 ==== Workers Pool (`#workers`)
 
 Displays cards for every worker in the cluster, filterable by state (`ALL`, `IDLE`, `BUSY`, `DRAINING`, `OFFLINE`) and searchable by worker ID, host name, or capability key/value (such as `docker=true`, `os=linux`, `citrus.workspace.v1=true`), along with last heartbeat age and active partition ID.
+Workers that report local file cache statistics show a `Local File Cache` section with the cleanup policy (`AUTO LRU` or `NO CLEANUP`), the number and size of cached blobs, usable disk space against the configured free space buffer, and the number of evicted blobs. A `LOW DISK` badge, and the `LOW_DISK` filter, mark workers whose usable disk space is below their buffer.
 
 ==== Test History and Flakiness (`#history`)
 
@@ -317,15 +318,38 @@ citrus dist worker start \
   --broker-url=http://127.0.0.1:8765 \
   --worker-id=worker-k8s-01 \
   --auth-token=secret-ci-token \
-  --capabilities=docker=true,kafka=true
+  --capabilities=docker=true,kafka=true \
+  --cache-dir=/var/lib/citrus/worker-cache \
+  --cache-free-space-buffer-size=4GiB
 
 # Citrus Agent container / JAR in worker mode
 java -jar citrus-agent.jar \
   --mode worker \
   --broker-url http://coordinator.internal:8765 \
   --auth-token secret-ci-token \
-  --capabilities docker=true,zone=eu-central-1
+  --capabilities docker=true,zone=eu-central-1 \
+  --cache-dir /var/lib/citrus/worker-cache \
+  --no-cache-cleanup
 ----
+
+Both commands accept the same local file cache options:
+
+* `--cache-dir DIR` — Directory of the worker's local file cache (default `${user.home}/.citrus-test-distribution-agent/file-cache`).
+* `--[no-]cache-cleanup[=true|false]` — Enables (default) or disables automatic eviction of cached files. `--no-cache-cleanup` is the same as `--cache-cleanup=false`; when the flag is given several times, the last one wins.
+* `--cache-free-space-buffer-size SIZE` — Free disk space the worker keeps available on the cache drive when cleanup is enabled (default `2GiB`; `KiB`, `MiB` and `GiB` suffixes in any letter case, or plain bytes).
+
+The worker keeps every classpath jar and declared input it downloads from the coordinator in this cache and reuses it
+across partitions, sessions and worker restarts, so a warm worker only downloads what changed. Cached files are
+verified before reuse; a corrupted file is removed and downloaded again. With cleanup enabled, the worker evicts the
+least recently used files when the usable space on the cache drive falls below the buffer: when it starts, before each
+download and after each partition. Files used by the running partition are never evicted. If evicting everything else
+still does not free enough space, the worker logs a warning and continues; the partition fails only when the disk
+actually runs full. With cleanup disabled, the cache grows without limit.
+
+IMPORTANT: Sharing a local file cache directory between several workers is not supported. A worker locks its cache
+directory exclusively (lock file `<cacheDir>/.lock`) and refuses to start when another worker holds that lock. When running
+more than one worker on the same host, give each worker its own `--cache-dir`, or run each worker in its own container.
+The cache directory must be on a local filesystem that supports file locks.
 
 Every worker automatically advertises host capabilities (`os`, `arch`, `jdk`, `cpuCores`, `memoryMb`, and `citrus.workspace.v1=true`) merged with any custom `--capabilities` `key=value` pairs. On `SIGTERM` or shutdown, the worker sends `worker.draining` so the coordinator stops assigning new partitions while allowing any in-flight partition to finish within its drain timeout before closing the WebSocket.
 
@@ -475,8 +499,9 @@ serialized within the JVM and across JVMs (lock file `target/.citrus-dist-output
 
 Staging happens in `target/.citrus-dist-outputs/tx-*` and is removed afterwards; downloaded blobs are kept in
 `target/.citrus-dist/cache` (configurable with `citrus.test.distribution.cacheDir`; a relative value is resolved below
-the module's `target/`) and are not evicted automatically. Workers keep their own cache in `<cacheDir>/worker`, relative to the worker's working directory
-(default `.citrus-dist/cache/worker`).
+the module's `target/`) and are not evicted automatically. `citrus.test.distribution.cacheDir` only applies to the
+caches of the build host and the coordinator. Workers keep their own local file cache, by default in
+`${user.home}/.citrus-test-distribution-agent/file-cache` (see `citrus.test.distribution.worker.cacheDir` below).
 
 [[tools-test-distribution-external-resources-worker]]
 === Worker settings
@@ -502,7 +527,25 @@ daemons share a directory.
 |`citrus.test.distribution.worker.handshakeTimeoutMs`
 |How long a forked JVM may take to connect back to its worker.
 |`15000`
+|`citrus.test.distribution.worker.cacheDir` / `CITRUS_DIST_WORKER_CACHE_DIR` (alias `TEST_DISTRIBUTION_AGENT_CACHE_DIR`)
+|Directory of the worker's local file cache. Each worker needs its own directory (see
+<<tools-test-distribution-workers>>).
+|`${user.home}/.citrus-test-distribution-agent/file-cache`
+|`citrus.test.distribution.worker.cacheCleanup` / `CITRUS_DIST_WORKER_CACHE_CLEANUP` (alias `TEST_DISTRIBUTION_AGENT_CACHE_CLEANUP`)
+|`true` evicts the least recently used cached files to keep the free space buffer available; `false` never evicts.
+|`true`
+|`citrus.test.distribution.worker.cacheFreeSpaceBufferSize` / `CITRUS_DIST_WORKER_CACHE_FREE_SPACE_BUFFER_SIZE` (alias `TEST_DISTRIBUTION_AGENT_CACHE_FREE_SPACE_BUFFER_SIZE`)
+|Free disk space to keep available on the cache drive when cleanup is enabled: a number of bytes, or a whole number
+with a `KiB`, `MiB` or `GiB` suffix (any letter case). Every worker checks the free space of its drive on its own, so
+when several workers share a drive, size the buffer to also absorb the downloads and workspaces of the other workers
+running at the same time.
+|`2GiB`
 |===
+
+The worker cache settings are also available as command line options (see <<tools-test-distribution-workers>>).
+Command line options take precedence over system properties, which take precedence over the `CITRUS_DIST_WORKER_*`
+environment variables and then their `TEST_DISTRIBUTION_AGENT_*` aliases. Blank values count as unset; invalid values
+stop the worker with an error.
 
 A worker runs one partition at a time; run several worker daemons per machine for more parallelism (tests that bind
 fixed ports can then still collide across daemons on the same machine; use capabilities or separate hosts for them). Cancelling a
@@ -528,7 +571,9 @@ version.
 the partition's other tests have run.
 * In the shared worker JVM (`forkMode=AUTO`) the JUnit Platform, SLF4J and the Log4j API come from the worker; the tests
 see no other worker classes except those of the worker's own `-javaagent` jars (for example a JaCoCo runtime).
-* Worker caches are not evicted automatically.
+* Worker cache eviction is exact least-recently-used ordering while a worker runs. After a restart, files last used
+within the same file system timestamp interval are evicted in a fixed (deterministic) order, so the order across
+restarts is only approximately least recently used.
 
 [[tools-test-distribution-external-resources-limits]]
 === Limits
