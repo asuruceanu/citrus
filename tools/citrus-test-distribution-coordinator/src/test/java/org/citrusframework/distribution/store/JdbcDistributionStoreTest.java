@@ -82,6 +82,25 @@ class JdbcDistributionStoreTest {
     }
 
     @Test
+    void shouldFindRecentTimedSessionsBeyondTheFirstCandidatePageIncludingTies() {
+        String key = "pkg.PagedHistoryTest";
+        try (JdbcDistributionStore store = new JdbcDistributionStore("jdbc:hsqldb:mem:paged_history", "SA", "")) {
+            store.initialize();
+            // The stale attempts fill two pages with the same raw timestamp, but never enter the average.
+            for (int i = 0; i < 64; i++) {
+                String session = "sess-stale-" + i;
+                saveDuration(store, key, session, 2, TestOutcomeStatus.PASSED, 600L, 50L);
+                saveDuration(store, key, session, 1, TestOutcomeStatus.FAILED, 10L, 100L);
+            }
+            // This session's selected run ties on timestamp and wins on session ID.
+            saveDuration(store, key, "sess-first", 1, TestOutcomeStatus.PASSED, 800L, 50L);
+            saveDuration(store, key, null, 1, TestOutcomeStatus.PASSED, 80L, 49L);
+            assertThat(store.findHistoricalDurationsMs(List.of(key), 1)).containsEntry(key, 800L);
+            assertThat(store.findHistoricalDurationsMs(List.of(key), 2)).containsEntry(key, 700L);
+        }
+    }
+
+    @Test
     void shouldOnlySumLatestLocalResultsForDistinctTestIdentities() {
         String key = "pkg.LocalHistoryTest";
         try (JdbcDistributionStore store = new JdbcDistributionStore("jdbc:hsqldb:mem:local_history", "SA", "")) {

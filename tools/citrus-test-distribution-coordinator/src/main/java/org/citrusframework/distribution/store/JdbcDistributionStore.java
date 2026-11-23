@@ -31,6 +31,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
+import java.util.PriorityQueue;
 
 import org.apache.commons.dbcp2.BasicDataSource;
 import org.citrusframework.distribution.TestExecutionIdentity;
@@ -64,6 +65,14 @@ public class JdbcDistributionStore implements DistributionStore {
     private static final TypeReference<Map<String, String>> STRING_MAP_TYPE = new TypeReference<>() {};
     private static final TypeReference<List<WorkUnitSpec>> WORK_UNITS_TYPE = new TypeReference<>() {};
     private static final TypeReference<List<String>> STRING_LIST_TYPE = new TypeReference<>() {};
+
+    private static final int HISTORY_PAGE_SIZE = 32;
+    private static final int LEGACY_HISTORY_ROW = 0;
+    private static final int SESSION_HISTORY = 1;
+    private static final Comparator<DurationObservation> HISTORY_ORDER =
+            Comparator.comparingLong(DurationObservation::recordedAt).reversed()
+                    .thenComparing(DurationObservation::id)
+                    .thenComparingInt(DurationObservation::candidateKind);
 
     private final String jdbcUrl;
     private final BasicDataSource dataSource;
@@ -822,64 +831,61 @@ public class JdbcDistributionStore implements DistributionStore {
         }
         int runLimit = Math.max(1, recentLimit);
         Map<String, Long> durations = new LinkedHashMap<>();
-        // Group worker results by partition attempt. Local attempts are per test, so keep local rows separate
-        // for identity matching. Legacy rows without a session also represent separate runs.
+        // Page by the last recorded row's timestamp, an upper bound on the selected observation's timestamp.
+        // Group remote rows by attempt and keep local and sessionless rows separate.
         String sql = """
-                SELECT session_id, COALESCE(attempt, 1) AS run_attempt,
-                       CASE WHEN partition_id = 'local' OR TRIM(COALESCE(session_id, '')) = '' THEN id END AS row_id,
-                       MAX(CASE WHEN TRIM(COALESCE(session_id, '')) = '' THEN 1 ELSE 0 END) AS legacy_run,
-                       MAX(CASE WHEN partition_id = 'local' THEN 1 ELSE 0 END) AS local_run,
-                       MAX(CASE WHEN partition_id = 'local' THEN unique_id END) AS unique_id,
-                       MAX(CASE WHEN partition_id = 'local' THEN class_name END) AS class_name,
-                       MAX(CASE WHEN partition_id = 'local' THEN test_name END) AS test_name,
-                       MAX(CASE WHEN status IN ('PASSED', 'FAILED') THEN 1 ELSE 0 END) AS timed_result,
-                       SUM(CASE WHEN duration_ms > 0 THEN CAST(duration_ms AS DECIMAL(38, 0)) ELSE 0 END) AS total_ms,
-                       MAX(recorded_at) AS last_recorded_at
-                FROM dist_test_executions
-                WHERE work_unit_key = ?
-                  AND (status IN ('PASSED', 'FAILED') OR (partition_id = 'local' AND status = 'SKIPPED'))
-                GROUP BY session_id, COALESCE(attempt, 1),
-                         CASE WHEN partition_id = 'local' OR TRIM(COALESCE(session_id, '')) = '' THEN id END
-                ORDER BY last_recorded_at ASC NULLS FIRST, run_attempt, row_id
+                WITH candidates AS (
+                    SELECT candidate_kind, candidate_id, upper_at
+                    FROM (
+                        SELECT CASE WHEN TRIM(COALESCE(session_id, '')) = '' THEN 0 ELSE 1 END AS candidate_kind,
+                               CASE WHEN TRIM(COALESCE(session_id, '')) = '' THEN id ELSE session_id END AS candidate_id,
+                               MAX(COALESCE(recorded_at, 0)) AS upper_at
+                        FROM dist_test_executions
+                        WHERE work_unit_key = ?
+                          AND (status IN ('PASSED', 'FAILED') OR (partition_id = 'local' AND status = 'SKIPPED'))
+                        GROUP BY CASE WHEN TRIM(COALESCE(session_id, '')) = '' THEN 0 ELSE 1 END,
+                                 CASE WHEN TRIM(COALESCE(session_id, '')) = '' THEN id ELSE session_id END
+                    ) AS runs
+                    WHERE ? = 0 OR upper_at < ?
+                       OR (upper_at = ? AND (candidate_kind > ? OR (candidate_kind = ? AND candidate_id > ?)))
+                    ORDER BY upper_at DESC, candidate_kind, candidate_id
+                    FETCH FIRST ? ROWS ONLY
+                )
+                SELECT c.candidate_id, c.candidate_kind, c.upper_at, COALESCE(e.attempt, 1) AS run_attempt,
+                       CASE WHEN e.partition_id = 'local' OR c.candidate_kind = 0 THEN e.id END AS row_id,
+                       MAX(CASE WHEN e.partition_id = 'local' THEN 1 ELSE 0 END) AS local_run,
+                       MAX(CASE WHEN e.partition_id = 'local' THEN e.unique_id END) AS unique_id,
+                       MAX(CASE WHEN e.partition_id = 'local' THEN e.class_name END) AS class_name,
+                       MAX(CASE WHEN e.partition_id = 'local' THEN e.test_name END) AS test_name,
+                       MAX(CASE WHEN e.status IN ('PASSED', 'FAILED') THEN 1 ELSE 0 END) AS timed_result,
+                       SUM(CASE WHEN e.duration_ms > 0 THEN CAST(e.duration_ms AS DECIMAL(38, 0)) ELSE 0 END) AS total_ms,
+                       MAX(e.recorded_at) AS last_recorded_at
+                FROM candidates c
+                JOIN dist_test_executions e ON (c.candidate_kind = 0 AND c.candidate_id = e.id)
+                                            OR (c.candidate_kind = 1 AND c.candidate_id = e.session_id)
+                WHERE e.work_unit_key = ?
+                  AND (e.status IN ('PASSED', 'FAILED') OR (e.partition_id = 'local' AND e.status = 'SKIPPED'))
+                GROUP BY c.candidate_id, c.candidate_kind, c.upper_at, COALESCE(e.attempt, 1),
+                         CASE WHEN e.partition_id = 'local' OR c.candidate_kind = 0 THEN e.id END
+                ORDER BY c.upper_at DESC, c.candidate_kind, c.candidate_id,
+                         last_recorded_at ASC NULLS FIRST, run_attempt, row_id
                 """;
         try (Connection conn = dataSource.getConnection();
              PreparedStatement ps = conn.prepareStatement(sql)) {
             for (String key : workUnitKeys) {
-                ps.setString(1, key);
-                List<DurationObservation> overallHistory = new ArrayList<>();
-                Map<String, SessionDurationHistory> sessions = new LinkedHashMap<>();
-                try (ResultSet rs = ps.executeQuery()) {
-                    while (rs.next()) {
-                        String sessionId = rs.getString("session_id");
-                        long recordedAt = rs.getLong("last_recorded_at");
-                        BigDecimal duration = rs.getBigDecimal("total_ms");
-                        boolean timed = rs.getInt("timed_result") == 1;
-                        if (rs.getInt("legacy_run") == 1) {
-                            if (timed) {
-                                overallHistory.add(new DurationObservation(rs.getString("row_id"), duration, recordedAt));
-                            }
-                            continue;
-                        }
-                        SessionDurationHistory session = sessions.computeIfAbsent(sessionId, SessionDurationHistory::new);
-                        int attempt = rs.getInt("run_attempt");
-                        if (rs.getInt("local_run") == 1) {
-                            session.addLocal(key, rs.getString("class_name"), rs.getString("test_name"),
-                                    rs.getString("unique_id"), new LocalTestDuration(attempt, timed, duration, recordedAt));
-                        } else {
-                            session.addRemote(attempt, duration, recordedAt);
-                        }
-                    }
-                }
-                sessions.values().forEach(session -> session.latest().ifPresent(overallHistory::add));
-                if (!overallHistory.isEmpty()) {
-                    overallHistory.sort(Comparator.comparingLong(DurationObservation::recordedAt).reversed()
-                            .thenComparing(DurationObservation::id));
-                    int count = Math.min(runLimit, overallHistory.size());
+                PriorityQueue<DurationObservation> recent = new PriorityQueue<>(HISTORY_ORDER.reversed());
+                HistoryPage page = new HistoryPage(null, 0);
+                // On equal timestamps, an unread candidate could still win the session ID tie-break.
+                do {
+                    page = collectHistoryPage(ps, key, page.lastCandidate(), recent, runLimit);
+                } while (page.candidateCount() == HISTORY_PAGE_SIZE
+                        && (recent.size() < runLimit || page.lastCandidate().upperAt() >= recent.element().recordedAt()));
+                if (!recent.isEmpty()) {
                     BigDecimal sum = BigDecimal.ZERO;
-                    for (DurationObservation observation : overallHistory.subList(0, count)) {
+                    for (DurationObservation observation : recent) {
                         sum = sum.add(observation.duration().max(BigDecimal.ONE));
                     }
-                    BigDecimal average = sum.divide(BigDecimal.valueOf(count), 0, RoundingMode.HALF_UP);
+                    BigDecimal average = sum.divide(BigDecimal.valueOf(recent.size()), 0, RoundingMode.HALF_UP);
                     durations.put(key, average.min(BigDecimal.valueOf(Long.MAX_VALUE)).longValueExact());
                 }
             }
@@ -889,7 +895,79 @@ public class JdbcDistributionStore implements DistributionStore {
         }
     }
 
-    private record DurationObservation(String id, BigDecimal duration, long recordedAt) {
+    private static HistoryPage collectHistoryPage(PreparedStatement ps, String key, HistoryCursor after,
+                                                  PriorityQueue<DurationObservation> recent, int runLimit) throws SQLException {
+        long upperAt = after == null ? 0 : after.upperAt();
+        int candidateKind = after == null ? LEGACY_HISTORY_ROW : after.kind();
+        ps.setString(1, key);
+        ps.setInt(2, after == null ? 0 : 1);
+        ps.setLong(3, upperAt);
+        ps.setLong(4, upperAt);
+        ps.setInt(5, candidateKind);
+        ps.setInt(6, candidateKind);
+        ps.setString(7, after == null ? "" : after.id());
+        ps.setInt(8, HISTORY_PAGE_SIZE);
+        ps.setString(9, key);
+
+        int count = 0;
+        HistoryCursor cursor = null;
+        SessionDurationHistory session = null;
+        try (ResultSet rs = ps.executeQuery()) {
+            while (rs.next()) {
+                String id = rs.getString("candidate_id");
+                int kind = rs.getInt("candidate_kind");
+                if (cursor == null || kind != cursor.kind() || !id.equals(cursor.id())) {
+                    retainSessionObservation(recent, runLimit, session);
+                    cursor = new HistoryCursor(id, kind, rs.getLong("upper_at"));
+                    count++;
+                    session = kind == LEGACY_HISTORY_ROW ? null : new SessionDurationHistory(id);
+                }
+                long recordedAt = rs.getLong("last_recorded_at");
+                BigDecimal duration = rs.getBigDecimal("total_ms");
+                boolean timed = rs.getInt("timed_result") == 1;
+                if (session == null) {
+                    if (timed) {
+                        retainObservation(recent, runLimit, new DurationObservation(id, duration, recordedAt, kind));
+                    }
+                } else {
+                    int attempt = rs.getInt("run_attempt");
+                    if (rs.getInt("local_run") == 1) {
+                        session.addLocal(key, rs.getString("class_name"), rs.getString("test_name"),
+                                rs.getString("unique_id"), new LocalTestDuration(attempt, timed, duration, recordedAt));
+                    } else {
+                        session.addRemote(attempt, duration, recordedAt);
+                    }
+                }
+            }
+        }
+        retainSessionObservation(recent, runLimit, session);
+        return new HistoryPage(cursor, count);
+    }
+
+    private static void retainSessionObservation(PriorityQueue<DurationObservation> recent, int runLimit,
+                                                  SessionDurationHistory session) {
+        if (session != null) {
+            session.latest().ifPresent(observation -> retainObservation(recent, runLimit, observation));
+        }
+    }
+
+    private static void retainObservation(PriorityQueue<DurationObservation> recent, int runLimit,
+                                          DurationObservation observation) {
+        if (recent.size() < runLimit) {
+            recent.add(observation);
+        } else if (HISTORY_ORDER.compare(observation, recent.element()) < 0) {
+            recent.remove();
+            recent.add(observation);
+        }
+    }
+
+    private record HistoryCursor(String id, int kind, long upperAt) {
+    }
+
+    private record HistoryPage(HistoryCursor lastCandidate, int candidateCount) {
+    }
+
+    private record DurationObservation(String id, BigDecimal duration, long recordedAt, int candidateKind) {
     }
 
     private record LocalTestDuration(int attempt, boolean timed, BigDecimal duration, long recordedAt) {
@@ -909,7 +987,7 @@ public class JdbcDistributionStore implements DistributionStore {
 
         private void addRemote(int attempt, BigDecimal duration, long recordedAt) {
             if (remote == null || attempt > remoteAttempt) {
-                remote = new DurationObservation(sessionId, duration, recordedAt);
+                remote = new DurationObservation(sessionId, duration, recordedAt, SESSION_HISTORY);
                 remoteAttempt = attempt;
             }
         }
@@ -935,7 +1013,7 @@ public class JdbcDistributionStore implements DistributionStore {
             }
             // The local fallback can start in the same millisecond as the last remote observation.
             if (localDuration != null && (remote == null || lastLocalResult >= remote.recordedAt())) {
-                return Optional.of(new DurationObservation(sessionId, localDuration, lastLocalResult));
+                return Optional.of(new DurationObservation(sessionId, localDuration, lastLocalResult, SESSION_HISTORY));
             }
             return Optional.ofNullable(remote);
         }
