@@ -100,7 +100,7 @@ TIP: Projects that do not use the Maven extension can add `org.citrusframework:c
 |`1000`
 
 |`citrus.test.distribution.connectTimeoutMs` / `CITRUS_DIST_CONNECT_TIMEOUT_MS`
-|HTTP connect timeout (ms) when contacting the coordinator.
+|HTTP connect timeout in milliseconds. History lookups and local bypass reports also use this value, with a 500 ms minimum, as a deadline for the complete response.
 |`3000`
 
 |`citrus.test.distribution.sessionTimeoutMs` / `CITRUS_DIST_SESSION_TIMEOUT_MS`

@@ -24,6 +24,7 @@ import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.net.http.HttpTimeoutException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -63,14 +64,14 @@ public class BrokerHttpClient {
     private final String baseUrl;
     private final String authToken;
     private final HttpClient httpClient;
-    private final Duration historyTimeout;
+    private final Duration optionalRequestTimeout;
 
     public BrokerHttpClient(String baseUrl, String authToken, long connectTimeoutMs) {
         this.baseUrl = baseUrl.endsWith("/") ? baseUrl.substring(0, baseUrl.length() - 1) : baseUrl;
         this.authToken = authToken;
-        this.historyTimeout = Duration.ofMillis(Math.max(500L, connectTimeoutMs));
+        this.optionalRequestTimeout = Duration.ofMillis(Math.max(500L, connectTimeoutMs));
         this.httpClient = HttpClient.newBuilder()
-                .connectTimeout(historyTimeout)
+                .connectTimeout(optionalRequestTimeout)
                 .build();
     }
 
@@ -85,7 +86,8 @@ public class BrokerHttpClient {
             return Optional.of(Map.of());
         }
         try {
-            var response = sendHistoryRequest(new HistoricalDurationsRequest(workUnitKeys, recentLimit));
+            var response = sendJsonPostWithDeadline("/api/v1/history/durations",
+                    new HistoricalDurationsRequest(workUnitKeys, recentLimit));
             if (response.statusCode() == 200) {
                 var history = DistributionJson.fromJson(response.body(), HistoricalDurationsResponse.class);
                 if (history != null) {
@@ -98,9 +100,7 @@ public class BrokerHttpClient {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             LOG.debug("Historical test duration lookup interrupted", e);
-        } catch (TimeoutException e) {
-            LOG.debug("Historical test duration lookup timed out", e);
-        } catch (ExecutionException | JacksonException | IllegalArgumentException e) {
+        } catch (IOException | JacksonException | IllegalArgumentException e) {
             LOG.debug("Historical test durations unavailable", e);
         }
         return Optional.empty();
@@ -176,10 +176,21 @@ public class BrokerHttpClient {
 
     public void reportLocalTests(String sessionId, ReportLocalTestsRequest request)
             throws IOException, InterruptedException {
+        reportLocalTests(sessionId, request, false);
+    }
+
+    void reportLocalTestsWithDeadline(String sessionId, ReportLocalTestsRequest request)
+            throws IOException, InterruptedException {
+        reportLocalTests(sessionId, request, true);
+    }
+
+    private void reportLocalTests(String sessionId, ReportLocalTestsRequest request, boolean useDeadline)
+            throws IOException, InterruptedException {
         if (request == null || request.executions() == null || request.executions().isEmpty()) {
             return;
         }
-        HttpResponse<String> resp = sendJsonPost("/api/v1/sessions/" + sessionId + "/local-tests", request);
+        String path = "/api/v1/sessions/" + sessionId + "/local-tests";
+        HttpResponse<String> resp = useDeadline ? sendJsonPostWithDeadline(path, request) : sendJsonPost(path, request);
         ensureSuccess(resp, "reportLocalTests");
     }
 
@@ -249,12 +260,16 @@ public class BrokerHttpClient {
         throw new IOException("Timed out waiting for distributed partitions in session " + sessionId);
     }
 
-    private HttpResponse<String> sendHistoryRequest(HistoricalDurationsRequest body)
-            throws InterruptedException, ExecutionException, TimeoutException {
-        var pending = httpClient.sendAsync(jsonPost("/api/v1/history/durations", body), HttpResponse.BodyHandlers.ofString());
+    private HttpResponse<String> sendJsonPostWithDeadline(String path, Object body)
+            throws IOException, InterruptedException {
+        var pending = httpClient.sendAsync(jsonPost(path, body), HttpResponse.BodyHandlers.ofString());
         try {
             // An HTTP request timeout alone does not bound the time spent reading the response body.
-            return pending.get(historyTimeout.toMillis(), TimeUnit.MILLISECONDS);
+            return pending.get(optionalRequestTimeout.toMillis(), TimeUnit.MILLISECONDS);
+        } catch (ExecutionException e) {
+            throw new IOException(e.getCause());
+        } catch (TimeoutException e) {
+            throw new HttpTimeoutException("Timed out waiting for broker response to " + path);
         } finally {
             if (!pending.isDone()) {
                 pending.cancel(true);

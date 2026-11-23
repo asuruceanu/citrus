@@ -159,14 +159,19 @@ public class DistributedLauncher implements Launcher {
         BrokerHttpClient client = new BrokerHttpClient(
                 brokerUrl, authToken, DistributionSettings.getConnectTimeoutMs());
 
-        if (shouldBypassRemoteDistribution(extracted, workspace, client)) {
+        boolean bypassRemote = shouldBypassRemoteDistribution(extracted, workspace, client);
+        if (Thread.currentThread().isInterrupted()) {
+            throw new IllegalStateException("Citrus Test Distribution interrupted before test execution");
+        }
+        if (bypassRemote) {
             List<WorkUnitSpec> units = new ArrayList<>(extracted.localUnits());
             units.addAll(extracted.remoteUnits());
             var stats = LocalFallbackExecutor.executeTestPlanLocally(delegate, testPlan, units,
                     combineListeners(callListeners).toArray(TestExecutionListener[]::new));
             if (!ownsSession && !stats.executions().isEmpty()) {
                 try {
-                    client.reportLocalTests(externalSessionId, new ReportLocalTestsRequest("local-host", stats.executions()));
+                    client.reportLocalTestsWithDeadline(
+                            externalSessionId, new ReportLocalTestsRequest("local-host", stats.executions()));
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                     LOG.warn("Interrupted while reporting local test executions to session {}", externalSessionId);

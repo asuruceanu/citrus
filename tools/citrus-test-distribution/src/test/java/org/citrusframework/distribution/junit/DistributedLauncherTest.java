@@ -35,6 +35,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -67,8 +68,8 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DynamicContainer;
 import org.junit.jupiter.api.DynamicTest;
 import org.junit.jupiter.api.Nested;
-import org.junit.jupiter.api.TestFactory;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.TestFactory;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.platform.engine.TestExecutionResult;
 import org.junit.platform.engine.discovery.DiscoverySelectors;
@@ -714,6 +715,114 @@ class DistributedLauncherTest {
         } finally {
             releaseBody.countDown();
             broker.stop(0);
+        }
+    }
+
+    @Test
+    void shouldFinishWarmLocalRunWhenSharedReportResponseBodyStalls() throws Exception {
+        String key = RemoteSampleFixture.class.getName();
+        CountDownLatch reportStarted = new CountDownLatch(1);
+        CountDownLatch releaseBody = new CountDownLatch(1);
+        HttpServer broker = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        broker.createContext("/api/v1/history/durations", exchange -> {
+            try (exchange) {
+                byte[] body = DistributionJson.toJson(Map.of("durationsMs", Map.of(key, 1L)))
+                        .getBytes(StandardCharsets.UTF_8);
+                exchange.sendResponseHeaders(200, body.length);
+                exchange.getResponseBody().write(body);
+            }
+        });
+        broker.createContext("/api/v1/sessions/reactor/local-tests", exchange -> {
+            try (exchange) {
+                exchange.sendResponseHeaders(200, 0);
+                exchange.getResponseBody().write('{');
+                exchange.getResponseBody().flush();
+                reportStarted.countDown();
+                releaseBody.await(10, TimeUnit.SECONDS);
+                exchange.getResponseBody().write('}');
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        });
+        broker.start();
+        System.setProperty(DistributionSettings.BROKER_URL_PROPERTY, "http://127.0.0.1:" + broker.getAddress().getPort());
+        System.setProperty(DistributionSettings.CONNECT_TIMEOUT_MS_PROPERTY, "500");
+        System.setProperty(DistributionSettings.SESSION_ID_PROPERTY, "reactor");
+        System.setProperty(DistributionSettings.BASEDIR_PROPERTY, tempDir.toString());
+        RemoteSampleFixture.EXECUTED_IN_COORDINATOR.set(false);
+        var execution = new FutureTask<>(() -> run(RemoteSampleFixture.class));
+        Thread launch = Thread.ofVirtual().start(execution);
+        try {
+            assertThat(reportStarted.await(5, TimeUnit.SECONDS)).isTrue();
+            assertThat(execution.get(4, TimeUnit.SECONDS)).isEqualTo(new Outcome(1, 0));
+            assertThat(RemoteSampleFixture.EXECUTED_IN_COORDINATOR.get()).isTrue();
+        } finally {
+            releaseBody.countDown();
+            broker.stop(0);
+            launch.join(Duration.ofSeconds(5));
+        }
+    }
+
+    @Test
+    void shouldAbortBeforeDispatchWhenHistoryLookupIsInterrupted() throws Exception {
+        assertAbortsWhenHistoryLookupIsInterrupted(0);
+    }
+
+    @Test
+    void shouldAbortBeforeColdBypassWhenHistoryLookupIsInterrupted() throws Exception {
+        assertAbortsWhenHistoryLookupIsInterrupted(1);
+    }
+
+    private void assertAbortsWhenHistoryLookupIsInterrupted(int coldThreshold) throws Exception {
+        CountDownLatch historyStarted = new CountDownLatch(1);
+        CountDownLatch releaseHistory = new CountDownLatch(1);
+        AtomicInteger sessionRequests = new AtomicInteger();
+        HttpServer broker = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        broker.createContext("/api/v1/history/durations", exchange -> {
+            try (exchange) {
+                historyStarted.countDown();
+                releaseHistory.await(10, TimeUnit.SECONDS);
+                exchange.sendResponseHeaders(503, -1);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        });
+        broker.createContext("/api/v1/sessions", exchange -> {
+            try (exchange) {
+                sessionRequests.incrementAndGet();
+                exchange.sendResponseHeaders(503, -1);
+            }
+        });
+        broker.start();
+        System.setProperty(DistributionSettings.BROKER_URL_PROPERTY, "http://127.0.0.1:" + broker.getAddress().getPort());
+        System.setProperty(DistributionSettings.CONNECT_TIMEOUT_MS_PROPERTY, "10000");
+        System.setProperty(DistributionSettings.MIN_REMOTE_COLD_UNITS_PROPERTY, Integer.toString(coldThreshold));
+        System.setProperty(DistributionSettings.BASEDIR_PROPERTY, tempDir.toString());
+        RemoteSampleFixture.EXECUTED_IN_COORDINATOR.set(false);
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+        AtomicBoolean interruptPreserved = new AtomicBoolean();
+        Thread launch = Thread.ofVirtual().start(() -> {
+            try {
+                run(RemoteSampleFixture.class);
+            } catch (Throwable e) {
+                failure.set(e);
+            } finally {
+                interruptPreserved.set(Thread.currentThread().isInterrupted());
+            }
+        });
+        try {
+            assertThat(historyStarted.await(5, TimeUnit.SECONDS)).isTrue();
+            launch.interrupt();
+            assertThat(launch.join(Duration.ofSeconds(4))).isTrue();
+            assertThat(failure.get()).isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining("interrupted before test execution");
+            assertThat(interruptPreserved.get()).isTrue();
+            assertThat(RemoteSampleFixture.EXECUTED_IN_COORDINATOR.get()).isFalse();
+            assertThat(sessionRequests.get()).isZero();
+        } finally {
+            releaseHistory.countDown();
+            broker.stop(0);
+            launch.join(Duration.ofSeconds(5));
         }
     }
 
