@@ -76,6 +76,8 @@ class DistributionUiResourcesTest {
                     .contains("EventSource.CLOSED")
                     .contains("state.authTokenDraft = state.authToken;", "value=${state.authTokenDraft}")
                     .contains("onInput=${e => { state.authTokenDraft = e.target.value; }}")
+                    .contains("function requireApiAccess(response, authToken)", "if (authToken === state.authToken)")
+                    .containsPattern("(?s)function apiPost[^}]+.*?requireApiAccess\\(res, authToken\\);")
                     .contains("onClick=${() => commitAuthToken('')}",
                             "onClick=${() => commitAuthToken(state.authTokenDraft.trim())}")
                     .contains("forkWorkspace")

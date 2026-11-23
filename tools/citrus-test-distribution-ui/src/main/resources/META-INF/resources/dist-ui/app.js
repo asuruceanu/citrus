@@ -169,16 +169,19 @@ function apiHeaders() {
   return headers;
 }
 
+function requireApiAccess(response, authToken) {
+  if (response.status !== 401) return;
+  if (authToken === state.authToken) {
+    state.authError = 'Bearer token required to access broker API.';
+    openAuthModal();
+  }
+  throw new Error('Unauthorized');
+}
+
 async function apiGet(path) {
   const authToken = state.authToken;
   const res = await fetch(path, { headers: apiHeaders() });
-  if (res.status === 401) {
-    if (authToken === state.authToken) {
-      state.authError = 'Bearer token required to access broker API.';
-      openAuthModal();
-    }
-    throw new Error('Unauthorized');
-  }
+  requireApiAccess(res, authToken);
   if (!res.ok) {
     throw new Error(`HTTP ${res.status}`);
   }
@@ -186,16 +189,13 @@ async function apiGet(path) {
 }
 
 async function apiPost(path, body = {}) {
+  const authToken = state.authToken;
   const res = await fetch(path, {
     method: 'POST',
     headers: { ...apiHeaders(), 'Content-Type': 'application/json' },
     body: JSON.stringify(body)
   });
-  if (res.status === 401) {
-    state.authError = 'Bearer token required to access broker API.';
-    openAuthModal();
-    throw new Error('Unauthorized');
-  }
+  requireApiAccess(res, authToken);
   if (!res.ok) {
     throw new Error(`HTTP ${res.status}`);
   }
