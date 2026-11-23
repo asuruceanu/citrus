@@ -159,6 +159,7 @@ final class WorkerFileCache implements AutoCloseable {
     private final FileChannel lockChannel;
     private final FileLock fileLock;
     private final AtomicBoolean closed = new AtomicBoolean();
+    private WorkerWorkspaceRegistry workspaceRegistry;
 
     private final ReentrantLock evictionLock = new ReentrantLock();
     private final Set<DownloadStaging> activeDownloads = new HashSet<>(); // guarded by evictionLock
@@ -342,6 +343,8 @@ final class WorkerFileCache implements AutoCloseable {
                 Optional.of(BlobCacheDirectory.recordOwnerIfAbsent(canonicalDir, BlobCacheDirectory.OWNER_WORKER)));
         Files.createDirectories(canonicalDir.resolve("blobs"));
         Files.createDirectories(canonicalDir.resolve("tmp"));
+        workspaceRegistry = new WorkerWorkspaceRegistry(canonicalDir);
+        workspaceRegistry.recover();
         int sweptTemp = blobCache.sweepTempFiles();
         int sweptStaging = blobCache.sweepClasspathStaging();
         if (sweptTemp > 0 || sweptStaging > 0) {
@@ -356,6 +359,16 @@ final class WorkerFileCache implements AutoCloseable {
             if (cacheCleanup) {
                 evictUnderLock(0L);
             }
+        } finally {
+            evictionLock.unlock();
+        }
+    }
+
+    WorkerWorkspaceRegistry.Workspace createWorkspace(boolean forked) throws IOException {
+        evictionLock.lock();
+        try {
+            ensureOpen();
+            return workspaceRegistry.create(forked);
         } finally {
             evictionLock.unlock();
         }

@@ -566,6 +566,12 @@ Each daemon needs its own `--cache-dir`: a worker locks its local file cache dir
 partition (lease expiry, lost connection, worker shutdown) kills the forked JVM and every process it started; nothing is
 uploaded from a cancelled or crashed run. The forked JVM's `java.io.tmpdir` is a short `/tmp/cdtmp-*` directory on POSIX
 systems so Unix domain socket paths stay within platform limits.
+When a worker starts with the same cache directory and temporary directory settings, it also tries to remove the
+private partition workspaces left by a worker JVM that was forcibly killed or called `Runtime.halt()`.
+Recovery checks a matching ownership record and the identities of the worker and partition JVMs on the same host.
+Workspaces are left in place if either JVM is still alive, a fork launch could not be confirmed, or ownership cannot be
+verified. On Linux, recovery also requires the same boot and process namespace. Background processes that outlive the
+recorded JVMs are outside the liveness check.
 
 [[tools-test-distribution-external-resources-compat]]
 === Requirements and caveats

@@ -21,7 +21,6 @@ import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
-import java.io.UncheckedIOException;
 import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
@@ -31,7 +30,6 @@ import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.FileSystems;
 import java.nio.file.Files;
-import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.attribute.PosixFilePermissions;
 import java.security.SecureRandom;
@@ -54,7 +52,6 @@ import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.Consumer;
 import java.util.jar.JarFile;
-import java.util.stream.Stream;
 
 import org.citrusframework.distribution.cache.BlobCacheDirectory;
 import org.citrusframework.distribution.cache.WorkspacePackager;
@@ -208,11 +205,12 @@ final class ForkedPartitionRunner implements PartitionRunner {
                 if (jvmStopping) {
                     return cancelledResult();
                 }
-                fork.partitionRoot = Files.createTempDirectory("cdist-");
+                fork.workspace = cache.createWorkspace(true);
+                fork.partitionRoot = fork.workspace.root();
+                fork.tmpDir = fork.workspace.childTmpDir();
                 workspace = Files.createDirectories(fork.partitionRoot.resolve("workspace"));
                 Files.createDirectories(workspace.resolve("target"));
                 ipc = createOwnerOnlyDirectory(fork.partitionRoot.resolve("ipc"));
-                fork.tmpDir = createChildTmpDir(fork.partitionRoot);
             }
 
             // Verification and downloads may block. Only materialization can recreate paths removed by cleanup.
@@ -268,7 +266,19 @@ final class ForkedPartitionRunner implements PartitionRunner {
                         if (jvmStopping || stopping || cancelled(cancellationToken)) {
                             return cancelledResult();
                         }
-                        fork.process = launch(argfile, request, server.getLocalPort(), workspace, workingDirectory, fork.tmpDir);
+                        fork.workspace.markLaunching();
+                        try {
+                            fork.process = launch(argfile, request, server.getLocalPort(), workspace, workingDirectory,
+                                    fork.tmpDir);
+                        } catch (IOException e) {
+                            try {
+                                fork.workspace.markLaunchFailed();
+                            } catch (IOException recordFailure) {
+                                e.addSuppressed(recordFailure);
+                            }
+                            throw e;
+                        }
+                        fork.workspace.markLaunched(fork.process.toHandle());
                         fork.watcher = processWatcher(fork, cancellationToken);
                     } finally {
                         startLock.unlock();
@@ -692,23 +702,6 @@ final class ForkedPartitionRunner implements PartitionRunner {
         }
     }
 
-    /**
-     * A short temp directory for the child: {@code /tmp/cdtmp-*} on POSIX when {@code /tmp} (or, as on macOS, its
-     * symlink target) is a writable directory — the new directory is owner-only with a random name — otherwise
-     * {@code <partitionRoot>/t}.
-     */
-    private static Path createChildTmpDir(Path partitionRoot) throws IOException {
-        Path tmp = Path.of("/tmp");
-        if (File.separatorChar == '/' && Files.isDirectory(tmp) && Files.isWritable(tmp)) {
-            try {
-                return Files.createTempDirectory(tmp, "cdtmp-");
-            } catch (IOException e) {
-                LOG.debug("Cannot use /tmp for the forked partition temp directory", e);
-            }
-        }
-        return Files.createDirectories(partitionRoot.resolve("t"));
-    }
-
     private static Path createOwnerOnlyDirectory(Path dir) throws IOException {
         Files.createDirectories(dir);
         if (FileSystems.getDefault().supportedFileAttributeViews().contains("posix")) {
@@ -735,6 +728,7 @@ final class ForkedPartitionRunner implements PartitionRunner {
      * Resources of one running fork, cleaned up when the partition ends or the worker JVM shuts down.
      */
     private static final class ActiveFork {
+        private WorkerWorkspaceRegistry.Workspace workspace;
         private volatile Path partitionRoot;
         private volatile Path tmpDir;
         private volatile Process process;
@@ -786,40 +780,13 @@ final class ForkedPartitionRunner implements PartitionRunner {
                     watching.interrupt();
                 }
                 killAll();
-                deleteRecursively(tmpDir);
-                deleteRecursively(partitionRoot);
-            }
-        }
-
-        /**
-         * Deletes {@code root}, retrying briefly because file handles of just-killed processes (notably on Windows)
-         * can take a moment to be released.
-         */
-        private static void deleteRecursively(Path root) {
-            for (int attempt = 0; attempt < 5 && root != null && Files.exists(root, LinkOption.NOFOLLOW_LINKS); attempt++) {
-                if (attempt > 0) {
+                if (workspace != null) {
                     try {
-                        Thread.sleep(200L);
-                    } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
-                        return;
+                        workspace.close();
+                    } catch (IOException e) {
+                        LOG.debug("Could not clean up partition workspace {}", partitionRoot, e);
                     }
                 }
-                deleteOnce(root);
-            }
-        }
-
-        private static void deleteOnce(Path root) {
-            try (Stream<Path> walk = Files.walk(root)) {
-                walk.sorted(Comparator.reverseOrder()).forEach(path -> {
-                    try {
-                        Files.deleteIfExists(path);
-                    } catch (IOException e) {
-                        LOG.debug("Could not delete {}", path, e);
-                    }
-                });
-            } catch (IOException | UncheckedIOException e) {
-                LOG.debug("Could not delete {}", root, e);
             }
         }
     }

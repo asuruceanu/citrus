@@ -163,7 +163,7 @@ public final class IsolatedPartitionRunner implements PartitionRunner {
             Consumer<WorkerTestEventPayload> eventSink,
             WorkerFileCache cache,
             BrokerBlobClient blobs) {
-        Path partitionRoot = null;
+        WorkerWorkspaceRegistry.Workspace workspace = null;
         ThreadScopedProperties systemProps = null;
         Properties previousScope = null;
         boolean workerScopeEntered = false;
@@ -174,7 +174,8 @@ public final class IsolatedPartitionRunner implements PartitionRunner {
                     ? assignment.classpathArtifacts() : List.of();
             pins = cache.pinAll(classpathArtifacts.stream().map(ArtifactRef::sha256).toList());
 
-            partitionRoot = Files.createTempDirectory("cdist-");
+            workspace = cache.createWorkspace(false);
+            Path partitionRoot = workspace.root();
             Path workspaceDir = Files.createDirectories(partitionRoot.resolve("workspace"));
             Files.createDirectories(workspaceDir.resolve("target"));
 
@@ -253,7 +254,13 @@ public final class IsolatedPartitionRunner implements PartitionRunner {
                         }
                     }
                 }
-                deleteRecursivelyQuietly(partitionRoot);
+                if (workspace != null) {
+                    try {
+                        workspace.close();
+                    } catch (IOException e) {
+                        LOG.debug("Could not clean up partition workspace {}", workspace.root(), e);
+                    }
+                }
             } finally {
                 if (pins != null) {
                     // The partition class loader is closed by now: its named jars may be evicted again.
@@ -748,21 +755,6 @@ public final class IsolatedPartitionRunner implements PartitionRunner {
         @Override
         public Object clone() {
             return current().clone();
-        }
-    }
-
-    private static void deleteRecursivelyQuietly(Path dir) {
-        if (dir == null || !Files.exists(dir)) {
-            return;
-        }
-        try (Stream<Path> walk = Files.walk(dir)) {
-            walk.sorted((a, b) -> b.compareTo(a)).forEach(p -> {
-                try {
-                    Files.deleteIfExists(p);
-                } catch (IOException ignored) {
-                }
-            });
-        } catch (IOException ignored) {
         }
     }
 
