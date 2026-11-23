@@ -140,6 +140,11 @@ public final class DistributionWorkerClient implements AutoCloseable {
         }
     }
 
+    /** The worker cache, or {@code null} before the first {@link #start()}. */
+    WorkerFileCache workerCache() {
+        return workerCache;
+    }
+
     /** The shared blob client, or {@code null} before the first {@link #start()}. */
     BrokerBlobClient blobClient() {
         return blobClient;
@@ -182,8 +187,9 @@ public final class DistributionWorkerClient implements AutoCloseable {
     }
 
     /**
-     * Cancels and drains in-flight work, disconnects, waits (bounded) for the partition thread to finish, then closes
-     * the blob client, the HTTP client and finally the worker cache. Idempotent.
+     * Cancels and drains in-flight work, disconnects, waits (bounded) for the partition thread to finish, killing the
+     * forked partition JVMs it left running when it does not stop in time, then closes the blob client, the HTTP client
+     * and finally the worker cache. Idempotent.
      */
     @Override
     public void close() {
@@ -206,8 +212,13 @@ public final class DistributionWorkerClient implements AutoCloseable {
             partitionExecutor.shutdownNow();
             try {
                 if (!partitionExecutor.awaitTermination(5, TimeUnit.SECONDS)) {
-                    LOG.warn("Partition thread of worker {} did not stop within 5 seconds; releasing its cache anyway",
-                            config.workerId());
+                    LOG.warn("Partition thread of worker {} did not stop within 5 seconds; killing its forked partition "
+                            + "JVMs and releasing its cache anyway", config.workerId());
+                    ForkedPartitionRunner forked = forkedRunner;
+                    if (forked != null) {
+                        // No child may keep reading or writing the cache directory once another worker may own it.
+                        forked.killActiveForks();
+                    }
                 }
                 scheduler.awaitTermination(1, TimeUnit.SECONDS);
             } catch (InterruptedException e) {
@@ -218,17 +229,28 @@ public final class DistributionWorkerClient implements AutoCloseable {
         }
     }
 
-    private synchronized void closeResources() {
+    /**
+     * Captures the resources under this client's monitor (after which {@link #openCache()} sees {@code closed} and
+     * opens nothing new), then closes them outside it: {@link WorkerFileCache#close()} may wait for an in-flight
+     * eviction, which must not block other users of the monitor such as {@link #sendMessageSafe}.
+     */
+    private void closeResources() {
+        BrokerBlobClient blobs;
+        WorkerFileCache cache;
+        synchronized (this) {
+            blobs = blobClient;
+            cache = workerCache;
+        }
         try {
-            if (blobClient != null) {
-                blobClient.close();
+            if (blobs != null) {
+                blobs.close();
             }
         } finally {
             try {
                 httpClient.shutdownNow();
             } finally {
-                if (workerCache != null) {
-                    workerCache.close();
+                if (cache != null) {
+                    cache.close();
                 }
             }
         }
@@ -326,7 +348,8 @@ public final class DistributionWorkerClient implements AutoCloseable {
 
     /**
      * Evicts down to the free space buffer now that the partition's pins are released, and reports the new cache
-     * statistics. Runs on the partition thread, so eviction never overlaps with a partition pinning its blobs.
+     * statistics. Runs on the single partition thread after the partition ended; pinning and eviction also exclude each
+     * other through the cache's eviction lock, so this holds even if another thread pins or evicts.
      */
     private void afterPartition() {
         WorkerFileCache cache = workerCache;

@@ -17,12 +17,15 @@
 package org.citrusframework.distribution.worker;
 
 import java.io.File;
+import java.io.IOException;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Clock;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -31,6 +34,7 @@ import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import org.citrusframework.distribution.broker.DistributionBrokerConfig;
 import org.citrusframework.distribution.broker.DistributionBrokerServer;
@@ -52,6 +56,7 @@ import org.junit.jupiter.api.io.TempDir;
 import org.junit.platform.engine.CancellationToken;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatNoException;
 
 class ForkedPartitionRunnerTest {
 
@@ -299,6 +304,79 @@ class ForkedPartitionRunnerTest {
         assertThat(grandchild.isAlive()).as("grandchild process terminated").isFalse();
         assertThat(partitionRoot).doesNotExist();
         assertThat(partitionTmp).doesNotExist();
+    }
+
+    @Test
+    void shouldRunAWarmForkedPartitionWithoutRehashingClasspathOrInputBlobs() throws Exception {
+        DistributionWorkerConfig config = workerConfig(tempDir.resolve("worker-cache"), "http://127.0.0.1:9");
+        BlobCacheDirectory seeding = new BlobCacheDirectory(config.cacheDir());
+        Path module = Files.createDirectories(tempDir.resolve("module/src/test/resources")).getParent().getParent().getParent();
+        Files.writeString(module.resolve("src/test/resources/greeting.txt"), "hello");
+        List<WorkspaceFileSet> inputs = List.of(
+                WorkspacePackager.packageInputToCache(seeding, module, "src/test/resources", false).orElseThrow());
+        PartitionAssignPayload cold = assignment(seeding, Map.of(), inputs, List.of(), unit(PlainFixture.class, "passes"));
+        PartitionAssignPayload warm = assignment(seeding, Map.of(), inputs, List.of(), unit(PlainFixture.class, "passes"));
+
+        AtomicInteger hashes = new AtomicInteger();
+        try (WorkerFileCache cache = WorkerFileCache.open(config.cacheDir(), false, 0L, null, Clock.systemUTC(),
+                FileChannel::tryLock, root -> new BlobCacheDirectory(root) {
+                    @Override
+                    public boolean isIntact(String sha256) throws IOException {
+                        hashes.incrementAndGet();
+                        return super.isIntact(sha256);
+                    }
+
+                    @Override
+                    public Path getVerifiedPath(String sha256) {
+                        throw new AssertionError("blobs are verified through WorkerFileCache only");
+                    }
+                });
+             BrokerBlobClient blobs = new BrokerBlobClient(config, cache)) {
+            ForkedPartitionRunner runner = new ForkedPartitionRunner(config, cache, blobs);
+            IsolatedPartitionRunner.PartitionExecutionResult first = runner.execute(cold, CancellationToken.create(), e -> { });
+            assertThat(first.success()).as(first.errorMessage()).isTrue();
+            assertThat(hashes).as("each blob found on disk is verified once")
+                    .hasValue(cold.classpathArtifacts().size() + inputs.size());
+
+            IsolatedPartitionRunner.PartitionExecutionResult second = runner.execute(warm, CancellationToken.create(), e -> { });
+            assertThat(second.success()).as(second.errorMessage()).isTrue();
+            assertThat(hashes).as("a warm partition re-hashes nothing")
+                    .hasValue(cold.classpathArtifacts().size() + inputs.size());
+        }
+    }
+
+    @Test
+    @DisabledOnOs(OS.WINDOWS)
+    void shouldKillTheRunningForkWhenAskedToKillActiveForks() throws Exception {
+        DistributionWorkerConfig config = workerConfig(tempDir.resolve("worker-cache"), "http://127.0.0.1:9");
+        BlobCacheDirectory cache = new BlobCacheDirectory(config.cacheDir());
+        Path info = tempDir.resolve("kill-info.txt");
+        PartitionAssignPayload blocking = assignment(cache, Map.of("fixture.info", info.toString()), List.of(),
+                List.of(), unit(BlockingFixture.class, "spawnGrandchildAndBlock"));
+        ForkedPartitionRunner runner = new ForkedPartitionRunner(config);
+        CompletableFuture<IsolatedPartitionRunner.PartitionExecutionResult> running = CompletableFuture.supplyAsync(() ->
+                runner.execute(blocking, CancellationToken.create(), e -> { }));
+
+        long deadline = System.currentTimeMillis() + 30_000;
+        while (!Files.exists(info) && System.currentTimeMillis() < deadline) {
+            Thread.sleep(50);
+        }
+        assertThat(info).as("fixture started").exists();
+        List<String> lines = Files.readAllLines(info);
+        ProcessHandle child = ProcessHandle.of(Long.parseLong(lines.get(0))).orElseThrow();
+        ProcessHandle grandchild = ProcessHandle.of(Long.parseLong(lines.get(1))).orElseThrow();
+
+        runner.killActiveForks();
+        IsolatedPartitionRunner.PartitionExecutionResult result = running.get(20, TimeUnit.SECONDS);
+
+        assertThat(result.success()).isFalse();
+        assertThat(child.isAlive()).isFalse();
+        long until = System.currentTimeMillis() + 5_000;
+        while (grandchild.isAlive() && System.currentTimeMillis() < until) {
+            Thread.sleep(50);
+        }
+        assertThat(grandchild.isAlive()).as("grandchild process terminated").isFalse();
+        assertThatNoException().as("nothing left to kill").isThrownBy(runner::killActiveForks);
     }
 
     @Test

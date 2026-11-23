@@ -24,8 +24,12 @@ import java.io.PrintWriter;
 import java.io.Reader;
 import java.io.UncheckedIOException;
 import java.io.Writer;
+import java.net.MalformedURLException;
+import java.net.URI;
 import java.net.URL;
 import java.net.URLClassLoader;
+import java.net.URLConnection;
+import java.net.URLStreamHandler;
 import java.nio.charset.Charset;
 import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
@@ -169,8 +173,9 @@ public final class IsolatedPartitionRunner implements PartitionRunner {
 
             List<URL> urls = new ArrayList<>();
             for (ArtifactRef artifact : classpathArtifacts) {
-                blobs.ensureCached(artifact);
-                urls.add(cache.blobCache().materializeForClasspath(artifact, partitionRoot).toUri().toURL());
+                // ensureCached returns a verified blob: materializing it hashes nothing again
+                Path verified = blobs.ensureCached(artifact);
+                urls.add(cache.materializeForClasspath(artifact, verified, partitionRoot).toUri().toURL());
             }
 
             Map<String, String> overrides = partitionOverrides(assignment.systemProperties(), workspaceDir);
@@ -762,6 +767,11 @@ public final class IsolatedPartitionRunner implements PartitionRunner {
      * else is loaded from the partition, falling back only to the JVM's own platform and bootstrap loaders: a class or
      * resource the partition does not ship must not leak in from the worker's application classpath (for example the
      * worker's own Citrus jars), or it would link against a second copy of the same classes.
+     * <p>
+     * {@code jar:} URLs of partition resources open their connections without the JDK's JarFile cache: a cached
+     * JarFile stays open until the worker JVM exits, which would keep the disk space of an evicted named jar in use
+     * (and prevent deleting it on Windows). The loader's own jar handles are released when it is closed after the
+     * partition.
      */
     static final class PartitionClassLoader extends URLClassLoader {
 
@@ -794,6 +804,28 @@ public final class IsolatedPartitionRunner implements PartitionRunner {
         /** Jars of the worker JVM's own {@code -javaagent} arguments. */
         private static final List<Path> WORKER_JAVA_AGENTS = javaAgentPaths(
                 java.lang.management.ManagementFactory.getRuntimeMXBean().getInputArguments());
+
+        /**
+         * Opens {@code jar:} URLs like the JDK does, but with {@code useCaches=false}: the JarFile then belongs to the
+         * connection and is closed with its input stream instead of being cached for the JVM's lifetime. URLs derived
+         * from a partition resource URL ({@code new URL(resource, "sibling")}) keep this handler.
+         */
+        private static final URLStreamHandler UNCACHED_JAR_HANDLER = new URLStreamHandler() {
+            @Override
+            protected URLConnection openConnection(URL url) throws IOException {
+                URLConnection connection = toJdkJarUrl(url).openConnection();
+                connection.setUseCaches(false);
+                return connection;
+            }
+
+            private URL toJdkJarUrl(URL url) throws MalformedURLException {
+                try {
+                    return URI.create(url.toExternalForm()).toURL();
+                } catch (IllegalArgumentException e) {
+                    throw new MalformedURLException("Invalid jar URL " + url + ": " + e.getMessage());
+                }
+            }
+        };
 
         private final ClassLoader jdkLoader;
         private final ClassLoader agentHost;
@@ -922,6 +954,33 @@ public final class IsolatedPartitionRunner implements PartitionRunner {
                     resolveClass(loaded);
                 }
                 return loaded;
+            }
+        }
+
+        @Override
+        public URL findResource(String name) {
+            return uncached(super.findResource(name));
+        }
+
+        @Override
+        public Enumeration<URL> findResources(String name) throws IOException {
+            List<URL> urls = new ArrayList<>();
+            for (URL url : Collections.list(super.findResources(name))) {
+                urls.add(uncached(url));
+            }
+            return Collections.enumeration(urls);
+        }
+
+        /** {@code url} with {@link #UNCACHED_JAR_HANDLER} if it is a {@code jar:} URL, else unchanged. */
+        private static URL uncached(URL url) {
+            if (url == null || !"jar".equals(url.getProtocol())) {
+                return url;
+            }
+            try {
+                return URL.of(URI.create(url.toExternalForm()), UNCACHED_JAR_HANDLER);
+            } catch (IllegalArgumentException | MalformedURLException e) {
+                // not expressible as a URI: keep the JDK's own (caching) handler rather than losing the resource
+                return url;
             }
         }
 

@@ -16,17 +16,22 @@
 
 package org.citrusframework.distribution.broker;
 
+import java.io.IOException;
 import java.util.concurrent.TimeUnit;
 
 import io.vertx.core.Vertx;
 import org.citrusframework.distribution.cache.BlobCacheDirectory;
 import org.citrusframework.distribution.store.DistributionStore;
 import org.citrusframework.distribution.store.JdbcDistributionStore;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Embeddable and standalone lifecycle manager for the Citrus Test Distribution Broker.
  */
 public final class DistributionBrokerServer implements AutoCloseable {
+
+    private static final Logger LOG = LoggerFactory.getLogger(DistributionBrokerServer.class);
 
     private final DistributionBrokerConfig config;
     private Vertx vertx;
@@ -48,6 +53,12 @@ public final class DistributionBrokerServer implements AutoCloseable {
         }
 
         BlobCacheDirectory blobCache = new BlobCacheDirectory(config.cacheDir());
+        try {
+            // Lets a worker refuse this directory; an existing owner is kept and never makes the coordinator refuse it.
+            BlobCacheDirectory.recordOwnerIfAbsent(blobCache.getRootDir(), BlobCacheDirectory.OWNER_COORDINATOR);
+        } catch (IOException e) {
+            LOG.warn("Could not mark blob cache {} as owned by the coordinator: {}", blobCache.getRootDir(), e.toString());
+        }
         BrokerEventStreamHub eventHub = new BrokerEventStreamHub();
         BrokerSessionCoordinator coordinator = new BrokerSessionCoordinator(config, store, eventHub);
 

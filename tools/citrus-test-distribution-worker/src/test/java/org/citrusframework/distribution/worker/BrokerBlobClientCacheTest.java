@@ -18,9 +18,12 @@ package org.citrusframework.distribution.worker;
 
 import java.io.FilterOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.net.URL;
+import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -35,6 +38,9 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.jar.JarEntry;
+import java.util.jar.JarOutputStream;
 import java.util.stream.Stream;
 
 import com.sun.net.httpserver.HttpExchange;
@@ -78,6 +84,23 @@ class BrokerBlobClientCacheTest {
     public static class TrivialFixture {
         @Test
         void passes() {
+        }
+    }
+
+    /** Runs in the partition class loader and reads a resource of a partition jar like libraries do. */
+    public static class JarResourceFixture {
+        @Test
+        void readsJarResource() throws IOException {
+            URL resource = JarResourceFixture.class.getClassLoader().getResource("cache-probe/resource.txt");
+            if (resource == null) {
+                throw new AssertionError("partition jar resource not found");
+            }
+            try (InputStream in = resource.openStream()) {
+                String content = new String(in.readAllBytes(), StandardCharsets.UTF_8);
+                if (!"probe".equals(content)) {
+                    throw new AssertionError("unexpected resource content: " + content);
+                }
+            }
         }
     }
 
@@ -283,9 +306,117 @@ class BrokerBlobClientCacheTest {
             IsolatedPartitionRunner.PartitionExecutionResult recovered = runner.execute(assignment, CancellationToken.create(), events::add);
             assertThat(recovered.success()).as(recovered.errorMessage()).isTrue();
             assertThat(events).anySatisfy(e -> assertThat(e.status()).isEqualTo(TestOutcomeStatus.PASSED));
-            assertThat(cache.blobCache().resolveBlobPath(packaged.ref().sha256())).exists();
+            assertThat(new BlobCacheDirectory(cache.rootDir()).resolveBlobPath(packaged.ref().sha256())).exists();
             assertThat(tmpFiles(cache)).isEmpty();
             assertThat(cache.isPinned(packaged.ref().sha256())).as("pins released after the partition").isFalse();
+        }
+    }
+
+    @Test
+    void shouldRunAWarmInProcessPartitionWithoutRehashingItsCachedBlobs() throws Exception {
+        ClasspathPackager.PackagedArtifact classes = ClasspathPackager.packagePath(
+                Paths.get(TrivialFixture.class.getProtectionDomain().getCodeSource().getLocation().toURI()));
+        ClasspathPackager.PackagedArtifact jar = ClasspathPackager.packagePath(resourceJar(tempDir.resolve("probe.jar")));
+        assertThat(classes.ref().kind()).isEqualTo(ArtifactKind.DIRECTORY_ZIP);
+        assertThat(jar.ref().kind()).isEqualTo(ArtifactKind.JAR);
+        serve(classes, jar);
+
+        Path cacheDir = tempDir.resolve("cache-warm");
+        DistributionWorkerConfig config = config(cacheDir);
+        AtomicInteger hashes = new AtomicInteger();
+        try (WorkerFileCache cache = WorkerFileCache.open(cacheDir, true, 0L, null, Clock.systemUTC(), FileChannel::tryLock,
+                root -> new BlobCacheDirectory(root) {
+                    @Override
+                    public boolean isIntact(String sha256) throws IOException {
+                        hashes.incrementAndGet();
+                        return super.isIntact(sha256);
+                    }
+
+                    @Override
+                    public Path getVerifiedPath(String sha256) {
+                        throw new AssertionError("blobs are verified through WorkerFileCache only");
+                    }
+                });
+             BrokerBlobClient blobs = new BrokerBlobClient(config, cache)) {
+            IsolatedPartitionRunner runner = new IsolatedPartitionRunner(config, cache, blobs);
+            for (int run = 0; run < 2; run++) {
+                PartitionAssignPayload assignment = new PartitionAssignPayload("p-" + UUID.randomUUID(), "s1", 1,
+                        List.of(classes.ref(), jar.ref()), Map.of(), List.of(unit(JarResourceFixture.class, "readsJarResource")));
+                IsolatedPartitionRunner.PartitionExecutionResult result = runner.execute(assignment, CancellationToken.create(), e -> { });
+                assertThat(result.success()).as(result.errorMessage()).isTrue();
+            }
+            assertThat(blobGets).as("downloaded once").hasValue(2);
+            assertThat(hashes).as("downloads are verified while stored, warm blobs are never re-hashed").hasValue(0);
+        }
+    }
+
+    @Test
+    void shouldReleaseNamedJarFileHandlesAfterAnInProcessPartition() throws Exception {
+        ClasspathPackager.PackagedArtifact classes = ClasspathPackager.packagePath(
+                Paths.get(TrivialFixture.class.getProtectionDomain().getCodeSource().getLocation().toURI()));
+        ClasspathPackager.PackagedArtifact jar = ClasspathPackager.packagePath(resourceJar(tempDir.resolve("handles.jar")));
+        serve(classes, jar);
+
+        Path cacheDir = tempDir.resolve("cache-handles");
+        DistributionWorkerConfig config = config(cacheDir);
+        AtomicLong usable = new AtomicLong(Long.MAX_VALUE);
+        try (WorkerFileCache cache = WorkerFileCache.open(cacheDir, true, 1L, p -> usable.get(), Clock.systemUTC());
+             BrokerBlobClient blobs = new BrokerBlobClient(config, cache)) {
+            PartitionAssignPayload assignment = new PartitionAssignPayload("p-" + UUID.randomUUID(), "s1", 1,
+                    List.of(classes.ref(), jar.ref()), Map.of(), List.of(unit(JarResourceFixture.class, "readsJarResource")));
+            IsolatedPartitionRunner.PartitionExecutionResult result = new IsolatedPartitionRunner(config, cache, blobs)
+                    .execute(assignment, CancellationToken.create(), e -> { });
+            assertThat(result.success()).as(result.errorMessage()).isTrue();
+
+            Path jarBlob = new BlobCacheDirectory(cache.rootDir()).resolveBlobPath(jar.ref().sha256());
+            Path namedJarDir = cache.rootDir().resolve("classpath").resolve(jar.ref().sha256());
+            Path namedJar = namedJarDir.resolve(jar.ref().name());
+            assertThat(namedJar).exists();
+
+            usable.set(0L);
+            cache.evictAfterPartition();
+
+            assertThat(cache.evictionDeleteFailureCount()).isZero();
+            assertThat(jarBlob).doesNotExist();
+            assertThat(namedJarDir).doesNotExist();
+            Path fdDir = Path.of("/proc/self/fd");
+            if (Files.isDirectory(fdDir)) {
+                try (Stream<Path> fds = Files.list(fdDir)) {
+                    List<String> openJar = fds.map(BrokerBlobClientCacheTest::linkTarget)
+                            .filter(target -> target.startsWith(namedJar.toString()) || target.startsWith(jarBlob.toString()))
+                            .toList();
+                    assertThat(openJar).as("no open handle keeps the evicted jar's inode alive").isEmpty();
+                }
+            }
+        }
+    }
+
+    private void serve(ClasspathPackager.PackagedArtifact... artifacts) {
+        Map<String, byte[]> blobsBySha = new java.util.HashMap<>();
+        for (ClasspathPackager.PackagedArtifact artifact : artifacts) {
+            blobsBySha.put(artifact.ref().sha256(), artifact.bytes());
+        }
+        blobHandler = exchange -> {
+            String path = exchange.getRequestURI().getPath();
+            byte[] body = blobsBySha.get(path.substring(path.lastIndexOf('/') + 1));
+            respond(exchange, body != null ? 200 : 404, body != null ? body : new byte[0]);
+        };
+    }
+
+    private static Path resourceJar(Path jar) throws IOException {
+        try (JarOutputStream out = new JarOutputStream(Files.newOutputStream(jar))) {
+            out.putNextEntry(new JarEntry("cache-probe/resource.txt"));
+            out.write("probe".getBytes(StandardCharsets.UTF_8));
+            out.closeEntry();
+        }
+        return jar;
+    }
+
+    private static String linkTarget(Path fd) {
+        try {
+            return Files.readSymbolicLink(fd).toString();
+        } catch (IOException | UnsupportedOperationException e) {
+            return "";
         }
     }
 
@@ -335,7 +466,7 @@ class BrokerBlobClientCacheTest {
 
     private static void assertNothingStored(WorkerFileCache cache) throws IOException {
         assertThat(tmpFiles(cache)).as("temporary files").isEmpty();
-        assertThat(cache.blobCache().listBlobs()).as("stored blobs").isEmpty();
+        assertThat(new BlobCacheDirectory(cache.rootDir()).listBlobs()).as("stored blobs").isEmpty();
     }
 
     private static List<Path> tmpFiles(WorkerFileCache cache) throws IOException {

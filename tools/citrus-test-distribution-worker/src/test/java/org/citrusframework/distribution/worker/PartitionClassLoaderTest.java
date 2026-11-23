@@ -17,11 +17,17 @@
 package org.citrusframework.distribution.worker;
 
 import java.io.InputStream;
+import java.net.JarURLConnection;
 import java.net.URL;
+import java.net.URLConnection;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Collections;
 import java.util.List;
+import java.util.jar.JarEntry;
+import java.util.jar.JarFile;
+import java.util.jar.JarOutputStream;
 
 import org.citrusframework.distribution.model.TestOutcomeStatus;
 import org.citrusframework.distribution.model.WorkerTestEventPayload;
@@ -175,6 +181,55 @@ class PartitionClassLoaderTest {
         try (IsolatedPartitionRunner.PartitionClassLoader loader = loaderOver(partition)) {
             assertThat(loader.loadClass(filter).getClassLoader()).isSameAs(loader);
         }
+    }
+
+    @Test
+    @SuppressWarnings("deprecation")
+    void shouldOpenPartitionJarResourcesWithoutTheJdkJarFileCache() throws Exception {
+        // The JDK caches the JarFile of a jar: URL connection until the JVM exits, which would keep an evicted named
+        // jar's disk space in use (and block deleting it on Windows).
+        Path jar = tempDir.resolve("resources.jar");
+        try (JarOutputStream out = new JarOutputStream(Files.newOutputStream(jar))) {
+            for (String name : List.of("probe/data.txt", "probe/other.txt")) {
+                out.putNextEntry(new JarEntry(name));
+                out.write(name.getBytes(StandardCharsets.UTF_8));
+                out.closeEntry();
+            }
+        }
+
+        try (IsolatedPartitionRunner.PartitionClassLoader loader = new IsolatedPartitionRunner.PartitionClassLoader(
+                new URL[] {jar.toUri().toURL()}, WORKER)) {
+            URL resource = loader.getResource("probe/data.txt");
+            assertThat(resource.getProtocol()).isEqualTo("jar");
+            try (java.net.URLClassLoader plain = new java.net.URLClassLoader(new URL[] {jar.toUri().toURL()}, null)) {
+                assertThat(resource.toExternalForm()).as("the URL itself is unchanged")
+                        .isEqualTo(plain.getResource("probe/data.txt").toExternalForm());
+            }
+
+            URLConnection first = resource.openConnection();
+            URLConnection second = resource.openConnection();
+            assertThat(first).isInstanceOf(JarURLConnection.class);
+            assertThat(first.getUseCaches()).isFalse();
+            try (JarFile a = ((JarURLConnection) first).getJarFile(); JarFile b = ((JarURLConnection) second).getJarFile()) {
+                assertThat(a).as("no shared, cached JarFile").isNotSameAs(b);
+            }
+            try (InputStream in = resource.openStream()) {
+                assertThat(new String(in.readAllBytes(), StandardCharsets.UTF_8)).isEqualTo("probe/data.txt");
+            }
+            URL sibling = new URL(resource, "other.txt");
+            assertThat(sibling.openConnection().getUseCaches()).isFalse();
+            try (InputStream in = sibling.openStream()) {
+                assertThat(new String(in.readAllBytes(), StandardCharsets.UTF_8)).isEqualTo("probe/other.txt");
+            }
+            assertThat(Collections.list(loader.getResources("probe/data.txt")))
+                    .singleElement().satisfies(url -> assertThat(url.openConnection().getUseCaches()).isFalse());
+            try (InputStream in = loader.getResourceAsStream("probe/other.txt")) {
+                assertThat(in).isNotNull();
+            }
+        }
+
+        Files.delete(jar);
+        assertThat(jar).doesNotExist();
     }
 
     @Test

@@ -44,10 +44,13 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Consumer;
+import java.util.function.Function;
 
 import org.citrusframework.distribution.cache.BlobCacheDirectory;
 import org.citrusframework.distribution.cache.BlobCacheDirectory.BlobEntry;
 import org.citrusframework.distribution.cache.WorkspacePackager;
+import org.citrusframework.distribution.cache.WorkspacePackager.MaterializedEntry;
+import org.citrusframework.distribution.model.ArtifactRef;
 import org.citrusframework.distribution.model.WorkerCacheStats;
 import org.citrusframework.distribution.model.WorkspaceFileSet;
 import org.slf4j.Logger;
@@ -58,13 +61,17 @@ import org.slf4j.LoggerFactory;
  * {@code .lock} file, with active-partition pinning and least recently used eviction that keeps a free space buffer
  * on the cache volume.
  * <ul>
- *     <li>{@link #open} locks the directory (in this JVM and across processes), sweeps leftovers of interrupted writes
- *     and, when cleanup is enabled, evicts down to the buffer. The lock file is never deleted, so concurrent openers
- *     always contend on the same inode; the operating system releases the lock if the worker dies.</li>
+ *     <li>{@link #open} refuses a directory whose {@link BlobCacheDirectory#OWNER_MARKER_FILE} names another component
+ *     (the coordinator's or the launcher's cache), locks the directory (in this JVM and across processes), records the
+ *     worker as owner when no marker exists yet, sweeps leftovers of interrupted writes and, when cleanup is enabled,
+ *     evicts down to the buffer. The lock file is never deleted, so concurrent openers always contend on the same
+ *     inode; the operating system releases the lock if the worker dies.</li>
  *     <li>Blobs verified once are stamped with their size, modification time and file key, so later lookups re-hash
- *     only when the file changed on disk.</li>
- *     <li>Promotion of downloads, staging of forked partition outputs and eviction run under one lock, so a newly
- *     stored blob is stamped and pinned before eviction can see it.</li>
+ *     only when the file changed on disk. Callers materialize the path {@link #verifyOrInvalidate} returned without
+ *     hashing it again.</li>
+ *     <li>Promotion of downloads, staging of forked partition outputs, pinning, touching blobs on lookup, deleting
+ *     corrupted blobs and eviction run under one lock, so a newly stored blob is stamped and pinned before eviction can
+ *     see it, and no blob is pinned while an eviction is deciding what to delete.</li>
  *     <li>Removing a digest always removes its named jar directory as well, since a hard-linked named jar keeps the
  *     blob's disk space in use.</li>
  *     <li>Once closed, the cache never mutates its directory again (another worker may own it by then): eviction
@@ -153,14 +160,27 @@ final class WorkerFileCache implements AutoCloseable {
     private final AtomicLong cachedBytes = new AtomicLong();
     private final AtomicLong evictedBlobsTotal = new AtomicLong();
 
-    // Low disk warning state, mutated under evictionLock only.
+    /** Why the last low disk warning could not restore the free space buffer. */
+    enum LowDiskReason {
+        /** Every remaining blob is pinned by a running partition. */
+        NO_UNPINNED_BLOBS,
+        /** Unpinned blobs were left whose deletion failed. */
+        DELETES_FAILED
+    }
+
+    // Warning state and counters, mutated under evictionLock only.
     private volatile boolean lowDiskWarningActive;
     private volatile int lowDiskWarningCount;
+    private volatile LowDiskReason lowDiskWarningReason;
+    private volatile boolean probeFailureActive;
+    private volatile int probeFailureWarningCount;
+    private volatile int evictionDeleteFailureCount;
+    private volatile int corruptedBlobRemovals;
 
     private volatile BlobIndex blobIndex;
 
     private WorkerFileCache(Path canonicalDir, boolean cacheCleanup, long freeSpaceBufferBytes, DiskSpaceProbe spaceProbe,
-                            Clock clock, FileChannel lockChannel, FileLock fileLock) {
+                            Clock clock, FileChannel lockChannel, FileLock fileLock, BlobCacheDirectory store) {
         this.canonicalDir = canonicalDir;
         this.cacheCleanup = cacheCleanup;
         this.freeSpaceBufferBytes = freeSpaceBufferBytes;
@@ -168,8 +188,7 @@ final class WorkerFileCache implements AutoCloseable {
         this.clock = clock;
         this.lockChannel = lockChannel;
         this.fileLock = fileLock;
-        this.blobCache = new BlobCacheDirectory(canonicalDir);
-        BlobCacheDirectory store = blobCache;
+        this.blobCache = store;
         this.blobIndex = new BlobIndex() {
             @Override
             public List<BlobEntry> listBlobs() throws IOException {
@@ -197,6 +216,15 @@ final class WorkerFileCache implements AutoCloseable {
 
     static WorkerFileCache open(Path cacheDir, boolean cacheCleanup, long freeSpaceBufferBytes,
                                 DiskSpaceProbe spaceProbe, Clock clock, LockAcquirer lockAcquirer) {
+        return open(cacheDir, cacheCleanup, freeSpaceBufferBytes, spaceProbe, clock, lockAcquirer, BlobCacheDirectory::new);
+    }
+
+    /**
+     * @param storeFactory creates the blob store for the canonical cache directory; a test seam
+     */
+    static WorkerFileCache open(Path cacheDir, boolean cacheCleanup, long freeSpaceBufferBytes,
+                                DiskSpaceProbe spaceProbe, Clock clock, LockAcquirer lockAcquirer,
+                                Function<Path, BlobCacheDirectory> storeFactory) {
         if (freeSpaceBufferBytes < 0) {
             throw new IllegalArgumentException("Worker cache free space buffer must not be negative: " + freeSpaceBufferBytes);
         }
@@ -206,6 +234,8 @@ final class WorkerFileCache implements AutoCloseable {
         } catch (IOException e) {
             throw new IllegalStateException("Cannot create worker local file cache directory '" + cacheDir + "': " + e, e);
         }
+        // Before anything is written: the directory may be another component's cache.
+        refuseForeignOwner(canonicalDir, readOwner(canonicalDir));
         if (!ACTIVE_JVM_LOCKS.add(canonicalDir)) {
             throw alreadyLocked(canonicalDir);
         }
@@ -230,7 +260,7 @@ final class WorkerFileCache implements AutoCloseable {
 
             DiskSpaceProbe probe = spaceProbe != null ? spaceProbe : fileStoreProbe(canonicalDir);
             WorkerFileCache cache = new WorkerFileCache(canonicalDir, cacheCleanup, freeSpaceBufferBytes, probe,
-                    clock, channel, lock);
+                    clock, channel, lock, storeFactory.apply(canonicalDir));
             cache.initialize();
             return cache;
         } catch (Throwable t) {
@@ -268,12 +298,33 @@ final class WorkerFileCache implements AutoCloseable {
                 + "same host is not supported; " + CACHE_DIR_GUIDANCE + ", or run each worker in its own container.");
     }
 
+    private static Optional<String> readOwner(Path canonicalDir) {
+        try {
+            return BlobCacheDirectory.readOwner(canonicalDir);
+        } catch (IOException e) {
+            throw new IllegalStateException("Cannot read the owner marker " + BlobCacheDirectory.OWNER_MARKER_FILE
+                    + " of worker local file cache directory '" + canonicalDir + "': " + e, e);
+        }
+    }
+
+    /** Refuses a directory recorded as owned by another component; one without an owner is a legacy worker cache. */
+    private static void refuseForeignOwner(Path canonicalDir, Optional<String> owner) {
+        if (owner.isPresent() && !BlobCacheDirectory.OWNER_WORKER.equals(owner.get())) {
+            throw new IllegalStateException("Worker local file cache directory '" + canonicalDir + "' belongs to the "
+                    + "Citrus Test Distribution " + owner.get() + " (recorded in " + BlobCacheDirectory.OWNER_MARKER_FILE
+                    + ") and must not be used as a worker cache; " + CACHE_DIR_GUIDANCE + ".");
+        }
+    }
+
     private static DiskSpaceProbe fileStoreProbe(Path canonicalDir) throws IOException {
         FileStore store = Files.getFileStore(canonicalDir);
         return dir -> store.getUsableSpace();
     }
 
     private void initialize() throws IOException {
+        // Under the file lock; a cache without a marker (created before markers existed) becomes the worker's.
+        refuseForeignOwner(canonicalDir,
+                Optional.of(BlobCacheDirectory.recordOwnerIfAbsent(canonicalDir, BlobCacheDirectory.OWNER_WORKER)));
         Files.createDirectories(canonicalDir.resolve("blobs"));
         Files.createDirectories(canonicalDir.resolve("tmp"));
         int sweptTemp = blobCache.sweepTempFiles();
@@ -300,17 +351,50 @@ final class WorkerFileCache implements AutoCloseable {
         return canonicalDir;
     }
 
-    BlobCacheDirectory blobCache() {
-        return blobCache;
-    }
-
-    /** Pins {@code sha256Digests} (duplicates count once) until the returned lease is closed. */
+    /**
+     * Pins {@code sha256Digests} (duplicates count once) until the returned lease is closed. Waits for an in-flight
+     * eviction, so a digest is either pinned before eviction lists its candidates or after it finished deleting.
+     *
+     * @throws IllegalArgumentException on an invalid digest; nothing stays pinned then
+     */
     PinLease pinAll(Collection<String> sha256Digests) {
         Lease lease = new Lease();
-        for (String sha256 : sha256Digests) {
-            lease.pin(sha256);
+        evictionLock.lock();
+        try {
+            for (String sha256 : sha256Digests) {
+                lease.pin(sha256);
+            }
+        } catch (RuntimeException e) {
+            lease.close();
+            throw e;
+        } finally {
+            evictionLock.unlock();
         }
         return lease;
+    }
+
+    /**
+     * Places a classpath artifact from the blob {@link #verifyOrInvalidate} (or a store operation) returned, without
+     * hashing it again (see {@link BlobCacheDirectory#materializeForClasspath(ArtifactRef, Path, Path)}). The digest
+     * must be pinned, so eviction cannot remove its named jar while it is in use.
+     *
+     * @throws IllegalStateException if the cache is closed
+     */
+    Path materializeForClasspath(ArtifactRef artifact, Path verifiedBlob, Path workspaceDir) throws IOException {
+        ensureOpen();
+        return blobCache.materializeForClasspath(artifact, verifiedBlob, workspaceDir);
+    }
+
+    /**
+     * Places a workspace input from the blob {@link #verifyOrInvalidate} (or a store operation) returned, without
+     * hashing it again (see {@link WorkspacePackager#materializeIntoDirectory(BlobCacheDirectory, WorkspaceFileSet, Path, Path)}).
+     *
+     * @throws IllegalStateException if the cache is closed
+     */
+    List<MaterializedEntry> materializeIntoDirectory(WorkspaceFileSet fileSet, Path verifiedBlob, Path targetRoot)
+            throws IOException {
+        ensureOpen();
+        return WorkspacePackager.materializeIntoDirectory(blobCache, fileSet, verifiedBlob, targetRoot);
     }
 
     boolean isPinned(String sha256) {
@@ -320,9 +404,14 @@ final class WorkerFileCache implements AutoCloseable {
     /**
      * Returns the path of a valid blob for {@code sha256} and records the access, or {@code null} when the blob is
      * absent or corrupted. A blob whose size, modification time or file key no longer match its verification stamp
-     * is re-hashed; a corrupted one is removed together with its named jars.
+     * is re-hashed (outside the eviction lock); a corrupted one is then removed together with its named jars under the
+     * lock, while one that vanished in the meantime is only forgotten.
      */
     Path verifyOrInvalidate(String sha256) throws IOException {
+        return verifyOrInvalidate(sha256, true);
+    }
+
+    private Path verifyOrInvalidate(String sha256, boolean retryWhenChanged) throws IOException {
         ensureOpen();
         Path blob = blobCache.resolveBlobPath(sha256);
         BasicFileAttributes attrs = readAttributes(blob);
@@ -332,37 +421,59 @@ final class WorkerFileCache implements AutoCloseable {
         }
         VerifiedBlobStamp stamp = verifiedStamps.get(sha256);
         if (stamp != null && stamp.matches(attrs)) {
-            recordAccess(sha256, blob);
-            return blob;
+            evictionLock.lock();
+            try {
+                ensureOpen();
+                BasicFileAttributes current = readAttributes(blob);
+                if (current != null && stamp.matches(current)) {
+                    recordAccess(sha256, blob);
+                    return blob;
+                }
+                verifiedStamps.remove(sha256, stamp);
+            } finally {
+                evictionLock.unlock();
+            }
+            // evicted or changed since the first look: verify from scratch
+            return verifyOrInvalidate(sha256, retryWhenChanged);
         }
 
         verifiedStamps.remove(sha256);
-        Path verified;
+        boolean intact;
         try {
-            verified = blobCache.getVerifiedPath(sha256);
+            intact = blobCache.isIntact(sha256);
         } catch (NoSuchFileException e) {
-            verified = null;
+            intact = false;
         }
         evictionLock.lock();
         try {
             ensureOpen();
-            if (verified == null) {
-                LOG.warn("Removing corrupted blob {} from worker cache {}", sha256, canonicalDir);
-                blobIndex.delete(sha256);
-                forgetBlob(sha256);
-                return null;
-            }
-            BasicFileAttributes current = readAttributes(verified);
+            BasicFileAttributes current = readAttributes(blob);
             if (current == null) {
+                LOG.debug("Blob {} vanished from worker cache {} while it was verified", sha256, canonicalDir);
                 forgetBlob(sha256);
                 return null;
             }
-            registerBlob(sha256, current.size());
-            recordAccess(sha256, verified);
-            return verified;
+            if (VerifiedBlobStamp.of(attrs).matches(current)) {
+                if (!intact) {
+                    corruptedBlobRemovals++;
+                    LOG.warn("Removing corrupted blob {} from worker cache {}", sha256, canonicalDir);
+                    blobIndex.delete(sha256);
+                    forgetBlob(sha256);
+                    return null;
+                }
+                registerBlob(sha256, current.size());
+                recordAccess(sha256, blob);
+                return blob;
+            }
+            if (!retryWhenChanged) {
+                LOG.debug("Blob {} in worker cache {} keeps changing while it is verified", sha256, canonicalDir);
+                return null;
+            }
         } finally {
             evictionLock.unlock();
         }
+        // replaced while it was hashed: neither trust nor delete what was hashed, verify the current file once more
+        return verifyOrInvalidate(sha256, false);
     }
 
     /** A new empty file under {@code tmp/} for a download; the caller deletes it when done. */
@@ -477,6 +588,7 @@ final class WorkerFileCache implements AutoCloseable {
 
         long deletedSinceProbe = 0;
         int deletionsSinceProbe = 0;
+        int failedDeletes = 0;
         boolean confirmed = false;
         for (BlobEntry entry : candidates) {
             String sha256 = entry.sha256();
@@ -488,6 +600,8 @@ final class WorkerFileCache implements AutoCloseable {
             try {
                 existed = blobIndex.delete(sha256);
             } catch (IOException | RuntimeException e) {
+                failedDeletes++;
+                evictionDeleteFailureCount++;
                 LOG.warn("Could not evict blob {} from worker cache {}: {}", sha256, canonicalDir, e.toString());
                 continue;
             }
@@ -526,17 +640,35 @@ final class WorkerFileCache implements AutoCloseable {
         } else if (!lowDiskWarningActive) {
             lowDiskWarningActive = true;
             lowDiskWarningCount++;
-            LOG.warn("Worker cache {} has {} usable bytes, {} short of the {} byte free space buffer plus {} required bytes, "
-                            + "and no unpinned blobs are left to evict",
-                    canonicalDir, usable, deficit, freeSpaceBufferBytes, additionalBytes);
+            if (failedDeletes > 0) {
+                lowDiskWarningReason = LowDiskReason.DELETES_FAILED;
+                LOG.warn("Worker cache {} has {} usable bytes, {} short of the {} byte free space buffer plus {} required "
+                                + "bytes, because {} unpinned blobs could not be deleted (see the previous warnings)",
+                        canonicalDir, usable, deficit, freeSpaceBufferBytes, additionalBytes, failedDeletes);
+            } else {
+                lowDiskWarningReason = LowDiskReason.NO_UNPINNED_BLOBS;
+                LOG.warn("Worker cache {} has {} usable bytes, {} short of the {} byte free space buffer plus {} required "
+                                + "bytes, and no unpinned blobs are left to evict",
+                        canonicalDir, usable, deficit, freeSpaceBufferBytes, additionalBytes);
+            }
         }
     }
 
+    /** Probes under {@code evictionLock}; a failure is warned about once per episode of consecutive failures. */
     private Long probeUsable() {
         try {
-            return spaceProbe.usableBytes(canonicalDir);
+            long usable = spaceProbe.usableBytes(canonicalDir);
+            probeFailureActive = false;
+            return usable;
         } catch (IOException e) {
-            LOG.warn("Cannot determine usable disk space of worker cache {}: {}", canonicalDir, e.toString());
+            if (!probeFailureActive) {
+                probeFailureActive = true;
+                probeFailureWarningCount++;
+                LOG.warn("Cannot determine usable disk space of worker cache {}, skipping eviction until a probe succeeds: {}",
+                        canonicalDir, e.toString());
+            } else {
+                LOG.debug("Cannot determine usable disk space of worker cache {}: {}", canonicalDir, e.toString());
+            }
             return null;
         }
     }
@@ -584,6 +716,34 @@ final class WorkerFileCache implements AutoCloseable {
 
     int lowDiskWarningCount() {
         return lowDiskWarningCount;
+    }
+
+    /** Cause named by the last low disk warning, or {@code null} before the first one. */
+    LowDiskReason lowDiskWarningReason() {
+        return lowDiskWarningReason;
+    }
+
+    /** Free space probe failures warned about: one per episode of consecutive failures. */
+    int probeFailureWarningCount() {
+        return probeFailureWarningCount;
+    }
+
+    /** Evictions whose delete failed and was warned about. */
+    int evictionDeleteFailureCount() {
+        return evictionDeleteFailureCount;
+    }
+
+    /** Corrupted blobs removed (and warned about) by {@link #verifyOrInvalidate}. */
+    int corruptedBlobRemovals() {
+        return corruptedBlobRemovals;
+    }
+
+    boolean evictionLockHeldByCurrentThread() {
+        return evictionLock.isHeldByCurrentThread();
+    }
+
+    boolean hasThreadsWaitingForEvictionLock() {
+        return evictionLock.hasQueuedThreads();
     }
 
     void blobIndex(BlobIndex blobIndex) {
@@ -712,18 +872,26 @@ final class WorkerFileCache implements AutoCloseable {
         private final ConcurrentHashMap.KeySetView<String, Boolean> digests = ConcurrentHashMap.newKeySet();
         private final AtomicBoolean leaseClosed = new AtomicBoolean();
 
+        /** Takes {@code evictionLock} before this lease's monitor (never the other way round), waiting for an eviction. */
         @Override
-        public synchronized void pin(String sha256) {
+        public void pin(String sha256) {
             BlobCacheDirectory.validateDigest(sha256);
-            if (leaseClosed.get()) {
-                throw new IllegalStateException("Pin lease is closed");
-            }
-            if (digests.add(sha256)) {
-                pinCounts.compute(sha256, (key, count) -> {
-                    AtomicInteger next = count != null ? count : new AtomicInteger();
-                    next.incrementAndGet();
-                    return next;
-                });
+            evictionLock.lock();
+            try {
+                synchronized (this) {
+                    if (leaseClosed.get()) {
+                        throw new IllegalStateException("Pin lease is closed");
+                    }
+                    if (digests.add(sha256)) {
+                        pinCounts.compute(sha256, (key, count) -> {
+                            AtomicInteger next = count != null ? count : new AtomicInteger();
+                            next.incrementAndGet();
+                            return next;
+                        });
+                    }
+                }
+            } finally {
+                evictionLock.unlock();
             }
         }
 

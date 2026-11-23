@@ -19,6 +19,7 @@ package org.citrusframework.distribution.worker;
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
+import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -36,7 +37,10 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
@@ -57,7 +61,8 @@ import org.junit.jupiter.api.io.TempDir;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatNoException;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
-import static org.junit.jupiter.api.Assumptions.assumeFalse;
+import static org.assertj.core.api.Assertions.catchThrowable;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 class WorkerFileCacheTest {
 
@@ -117,6 +122,12 @@ class WorkerFileCacheTest {
                 WorkerFileCacheLockHolderMain.class.getName(), dir.toString())
                 .redirectErrorStream(true)
                 .start();
+        boolean childLocked;
+        Throwable secondOpen = null;
+        Path canonical = null;
+        boolean jvmLockRolledBack = false;
+        boolean leftoverKept = false;
+        boolean childGone;
         try {
             BufferedReader reader = new BufferedReader(new InputStreamReader(child.getInputStream(), StandardCharsets.UTF_8));
             CompletableFuture<Boolean> locked = CompletableFuture.supplyAsync(() -> {
@@ -132,18 +143,25 @@ class WorkerFileCacheTest {
                     return false;
                 }
             });
-            assertThat(locked.get(60, TimeUnit.SECONDS)).as("child JVM acquired the cache lock").isTrue();
-
-            Path canonical = dir.toRealPath();
-            assertThatThrownBy(() -> WorkerFileCache.open(dir, true, 0L, PLENTY, FIXED_CLOCK))
-                    .isInstanceOf(IllegalStateException.class)
-                    .hasMessageContaining(canonical.toString())
-                    .hasMessageContaining("--cache-dir");
-            assertThat(WorkerFileCache.ACTIVE_JVM_LOCKS).doesNotContain(canonical);
-            assertThat(canonical.resolve("tmp").resolve("dl-4711.tmp")).exists();
+            childLocked = locked.get(60, TimeUnit.SECONDS);
+            if (childLocked) {
+                canonical = dir.toRealPath();
+                secondOpen = catchThrowable(() -> WorkerFileCache.open(dir, true, 0L, PLENTY, FIXED_CLOCK).close());
+                jvmLockRolledBack = !WorkerFileCache.ACTIVE_JVM_LOCKS.contains(canonical);
+                leftoverKept = Files.exists(canonical.resolve("tmp").resolve("dl-4711.tmp"));
+            }
         } finally {
-            assertThat(child.destroyForcibly().waitFor(30, TimeUnit.SECONDS)).isTrue();
+            childGone = child.destroyForcibly().waitFor(30, TimeUnit.SECONDS);
         }
+
+        assertThat(childLocked).as("child JVM acquired the cache lock").isTrue();
+        assertThat(secondOpen)
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining(canonical.toString())
+                .hasMessageContaining("--cache-dir");
+        assertThat(jvmLockRolledBack).isTrue();
+        assertThat(leftoverKept).as("a locked cache is not swept").isTrue();
+        assertThat(childGone).isTrue();
 
         try (WorkerFileCache cache = WorkerFileCache.open(dir, true, 0L, PLENTY, FIXED_CLOCK)) {
             assertThat(cache.rootDir().resolve("tmp").resolve("dl-4711.tmp")).doesNotExist();
@@ -239,8 +257,8 @@ class WorkerFileCacheTest {
         AtomicReference<WorkerFileCache.DiskSpaceProbe> probe = new AtomicReference<>(PLENTY);
         try (WorkerFileCache cache = WorkerFileCache.open(tempDir, true, GIB, p -> probe.get().usableBytes(p), FIXED_CLOCK)) {
             jarBlob = promote(cache, jarBytes);
-            namedJar = cache.blobCache().materializeForClasspath(
-                    new ArtifactRef("lib-1.0.jar", jarSha, ArtifactKind.JAR, jarBytes.length), tempDir.resolve("ws"));
+            namedJar = cache.materializeForClasspath(new ArtifactRef("lib-1.0.jar", jarSha, ArtifactKind.JAR, jarBytes.length),
+                    cache.verifyOrInvalidate(jarSha), tempDir.resolve("ws"));
             assertThat(namedJar.getParent().getFileName().toString()).isEqualTo(jarSha);
             assertThat((Integer) Files.getAttribute(jarBlob, "unix:nlink")).isEqualTo(2);
             for (int i = 0; i < 3; i++) {
@@ -258,8 +276,8 @@ class WorkerFileCacheTest {
 
             // A pinned digest keeps its named jar even when every other blob is evicted.
             promote(cache, jarBytes);
-            Path pinnedJar = cache.blobCache().materializeForClasspath(
-                    new ArtifactRef("lib-1.0.jar", jarSha, ArtifactKind.JAR, jarBytes.length), tempDir.resolve("ws"));
+            Path pinnedJar = cache.materializeForClasspath(new ArtifactRef("lib-1.0.jar", jarSha, ArtifactKind.JAR, jarBytes.length),
+                    cache.verifyOrInvalidate(jarSha), tempDir.resolve("ws"));
             try (WorkerFileCache.PinLease lease = cache.pinAll(List.of(jarSha))) {
                 probe.set(p -> 0L);
                 cache.evictAfterPartition();
@@ -349,7 +367,6 @@ class WorkerFileCacheTest {
     @Test
     @DisabledOnOs(OS.WINDOWS)
     void shouldContinueEvictionWhenSingleBlobDeleteFailsAndRateLimitTightDiskWarning() throws Exception {
-        assumeFalse("root".equals(System.getProperty("user.name")), "root ignores directory permissions");
         byte[] first = null;
         byte[] second = null;
         for (int i = 0; first == null || second == null; i++) {
@@ -369,10 +386,12 @@ class WorkerFileCacheTest {
             Path firstParent = firstBlob.getParent();
             Files.setPosixFilePermissions(firstParent, PosixFilePermissions.fromString("r-xr-xr-x"));
             try {
+                assumeTrue(!Files.isWritable(firstParent), "directory permissions are enforced for this user");
                 probe.set(p -> Files.exists(secondBlob) ? GIB : 3 * GIB);
                 cache.evictAfterPartition();
                 assertThat(firstBlob).as("delete failed, blob survives").exists();
                 assertThat(secondBlob).as("eviction continued with the next candidate").doesNotExist();
+                assertThat(cache.evictionDeleteFailureCount()).as("the failed delete was warned about").isEqualTo(1);
             } finally {
                 Files.setPosixFilePermissions(firstParent, PosixFilePermissions.fromString("rwxr-xr-x"));
             }
@@ -526,11 +545,11 @@ class WorkerFileCacheTest {
         assertThat(oldBlob).as("no eviction after close").exists();
 
         assertThatThrownBy(() -> cache.promoteDownload(freshSha, tmp)).isInstanceOf(IllegalStateException.class);
-        assertThat(cache.blobCache().resolveBlobPath(freshSha)).doesNotExist();
+        assertThat(store(cache).resolveBlobPath(freshSha)).doesNotExist();
         assertThat(tmp).as("the caller still owns its temporary file").exists();
         assertThatThrownBy(() -> cache.stageAndPinOutput(workspace.getParent(), "out", Map.of(), sha -> { }))
                 .isInstanceOf(IllegalStateException.class);
-        assertThat(cache.blobCache().listBlobs()).extracting(BlobEntry::sha256).containsExactly(oldSha);
+        assertThat(store(cache).listBlobs()).extracting(BlobEntry::sha256).containsExactly(oldSha);
         assertThatThrownBy(cache::newDownloadTempFile).isInstanceOf(IllegalStateException.class);
 
         Files.writeString(oldBlob, "corrupted");
@@ -570,14 +589,14 @@ class WorkerFileCacheTest {
             assertThat(cache.statsSnapshot().blobCount()).isEqualTo(1);
 
             cache.evictAfterPartition();
-            assertThat(cache.blobCache().resolveBlobPath(sha)).as("pinned output survives eviction").exists();
+            assertThat(store(cache).resolveBlobPath(sha)).as("pinned output survives eviction").exists();
             assertThat(cache.stageAndPinOutput(workspace, "missing", baseline, lease::pin)).isEmpty();
 
             lease.close();
             assertThat(cache.isPinned(sha)).isFalse();
             assertThatThrownBy(() -> lease.pin(sha)).isInstanceOf(IllegalStateException.class);
             cache.evictAfterPartition();
-            assertThat(cache.blobCache().resolveBlobPath(sha)).doesNotExist();
+            assertThat(store(cache).resolveBlobPath(sha)).doesNotExist();
         }
     }
 
@@ -627,6 +646,253 @@ class WorkerFileCacheTest {
             assertThat(cache.verifyOrInvalidate(stampedSha)).isEqualTo(stampedBlob);
             assertThat(cache.statsSnapshot().blobCount()).isEqualTo(1);
         }
+    }
+
+    @Test
+    void shouldForgetAVanishedBlobQuietlyAndRemoveACorruptedOneOnlyUnderTheEvictionLock() throws Exception {
+        byte[] vanishing = "blob that vanishes while it is hashed".getBytes(StandardCharsets.UTF_8);
+        byte[] vanishingLate = "blob that vanishes after it was hashed".getBytes(StandardCharsets.UTF_8);
+        byte[] corrupted = "blob that is corrupted on disk".getBytes(StandardCharsets.UTF_8);
+        BlobCacheDirectory seeding = new BlobCacheDirectory(tempDir);
+        for (byte[] content : List.of(vanishing, vanishingLate, corrupted)) {
+            seeding.put(ClasspathPackager.sha256Hex(content), content);
+        }
+        String vanishingSha = ClasspathPackager.sha256Hex(vanishing);
+        String vanishingLateSha = ClasspathPackager.sha256Hex(vanishingLate);
+        String corruptedSha = ClasspathPackager.sha256Hex(corrupted);
+        Path corruptedBlob = corruptInPlace(seeding.resolveBlobPath(corruptedSha));
+
+        AtomicReference<WorkerFileCache> owner = new AtomicReference<>();
+        List<Boolean> deletesUnderLock = new ArrayList<>();
+        try (WorkerFileCache cache = WorkerFileCache.open(tempDir, true, 0L, PLENTY, FIXED_CLOCK, FileChannel::tryLock,
+                root -> new BlobCacheDirectory(root) {
+                    @Override
+                    public boolean isIntact(String sha256) throws IOException {
+                        if (sha256.equals(vanishingSha)) {
+                            Files.delete(resolveBlobPath(sha256));
+                        }
+                        boolean intact = super.isIntact(sha256);
+                        if (sha256.equals(vanishingLateSha)) {
+                            Files.delete(resolveBlobPath(sha256));
+                            return false;
+                        }
+                        return intact;
+                    }
+
+                    @Override
+                    public Path getVerifiedPath(String sha256) {
+                        throw new AssertionError("getVerifiedPath deletes blobs outside the eviction lock");
+                    }
+
+                    @Override
+                    public boolean delete(String sha256) throws IOException {
+                        deletesUnderLock.add(owner.get().evictionLockHeldByCurrentThread());
+                        return super.delete(sha256);
+                    }
+                })) {
+            owner.set(cache);
+            assertThat(cache.statsSnapshot().blobCount()).isEqualTo(3);
+
+            assertThat(cache.verifyOrInvalidate(vanishingSha)).isNull();
+            assertThat(cache.verifyOrInvalidate(vanishingLateSha)).isNull();
+            assertThat(cache.corruptedBlobRemovals()).as("a vanished blob is not reported as corrupted").isZero();
+            assertThat(cache.statsSnapshot().blobCount()).isEqualTo(1);
+
+            assertThat(cache.verifyOrInvalidate(corruptedSha)).isNull();
+            assertThat(corruptedBlob).doesNotExist();
+            assertThat(cache.corruptedBlobRemovals()).isEqualTo(1);
+            assertThat(cache.statsSnapshot().blobCount()).isZero();
+            assertThat(cache.statsSnapshot().cachedBytes()).isZero();
+            assertThat(deletesUnderLock).isNotEmpty().containsOnly(true);
+        }
+    }
+
+    @Test
+    void shouldWaitForAnInFlightEvictionBeforePinning() throws Exception {
+        String sha = ClasspathPackager.sha256Hex("pinned after eviction".getBytes(StandardCharsets.UTF_8));
+        String other = ClasspathPackager.sha256Hex("added to a lease after eviction".getBytes(StandardCharsets.UTF_8));
+        CountDownLatch listing = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        try (WorkerFileCache cache = WorkerFileCache.open(tempDir, true, GIB, p -> 0L, FIXED_CLOCK);
+             WorkerFileCache.PinLease lease = cache.pinAll(List.of())) {
+            cache.blobIndex(new WorkerFileCache.BlobIndex() {
+                @Override
+                public List<BlobEntry> listBlobs() {
+                    listing.countDown();
+                    awaitQuietly(release);
+                    return List.of();
+                }
+
+                @Override
+                public boolean delete(String sha256) {
+                    return false;
+                }
+            });
+            CompletableFuture<Void> eviction = CompletableFuture.runAsync(cache::evictAfterPartition);
+            assertThat(listing.await(10, TimeUnit.SECONDS)).isTrue();
+
+            CompletableFuture<WorkerFileCache.PinLease> pinAll = CompletableFuture.supplyAsync(() -> cache.pinAll(List.of(sha)));
+            CompletableFuture<Void> pin = CompletableFuture.runAsync(() -> lease.pin(other));
+            assertThatThrownBy(() -> pinAll.get(300, TimeUnit.MILLISECONDS)).isInstanceOf(TimeoutException.class);
+            assertThat(pin).as("pinning waits for the eviction").isNotDone();
+            assertThat(cache.isPinned(sha)).isFalse();
+
+            release.countDown();
+            eviction.get(10, TimeUnit.SECONDS);
+            pin.get(10, TimeUnit.SECONDS);
+            try (WorkerFileCache.PinLease pinned = pinAll.get(10, TimeUnit.SECONDS)) {
+                assertThat(cache.isPinned(sha)).isTrue();
+                assertThat(cache.isPinned(other)).isTrue();
+                assertThat(pinned).isNotNull();
+            }
+        } finally {
+            release.countDown();
+        }
+    }
+
+    @Test
+    void shouldNotTouchAWarmBlobAfterCloseCompleted() throws Exception {
+        byte[] content = "warm blob touched on lookup".getBytes(StandardCharsets.UTF_8);
+        String sha = ClasspathPackager.sha256Hex(content);
+        AtomicReference<Runnable> onTouch = new AtomicReference<>(() -> { });
+        Clock clock = new Clock() {
+            @Override
+            public ZoneOffset getZone() {
+                return ZoneOffset.UTC;
+            }
+
+            @Override
+            public Clock withZone(java.time.ZoneId zone) {
+                return this;
+            }
+
+            @Override
+            public Instant instant() {
+                onTouch.getAndSet(() -> { }).run();
+                return FIXED_CLOCK.instant();
+            }
+        };
+        WorkerFileCache cache = WorkerFileCache.open(tempDir, false, 0L, PLENTY, clock);
+        AtomicReference<CompletableFuture<Void>> closing = new AtomicReference<>();
+        AtomicBoolean closedBeforeTouch = new AtomicBoolean();
+        try {
+            Path blob = promote(cache, content);
+            assertThat(cache.verifyOrInvalidate(sha)).as("stamped").isEqualTo(blob);
+
+            onTouch.set(() -> {
+                closing.set(CompletableFuture.runAsync(cache::close));
+                try {
+                    closing.get().get(300, TimeUnit.MILLISECONDS);
+                    closedBeforeTouch.set(true);
+                } catch (TimeoutException expected) {
+                    // close waits for the warm lookup that is touching the blob
+                } catch (Exception e) {
+                    throw new IllegalStateException(e);
+                }
+            });
+            assertThat(cache.verifyOrInvalidate(sha)).isEqualTo(blob);
+            assertThat(closedBeforeTouch).as("a warm lookup touched the blob after close").isFalse();
+            closing.get().get(10, TimeUnit.SECONDS);
+            assertThatThrownBy(() -> cache.verifyOrInvalidate(sha)).isInstanceOf(IllegalStateException.class);
+        } finally {
+            cache.close();
+        }
+    }
+
+    @Test
+    void shouldRefuseCacheDirectoriesOfOtherComponentsAndMarkOwnAndLegacyDirectories() throws Exception {
+        for (String foreignOwner : List.of(BlobCacheDirectory.OWNER_COORDINATOR, BlobCacheDirectory.OWNER_LAUNCHER)) {
+            Path foreign = Files.createDirectories(tempDir.resolve(foreignOwner + "-cache"));
+            BlobCacheDirectory.recordOwnerIfAbsent(foreign, foreignOwner);
+            Path canonical = foreign.toRealPath();
+
+            assertThatThrownBy(() -> WorkerFileCache.open(foreign, true, 0L, PLENTY, FIXED_CLOCK))
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining(canonical.toString())
+                    .hasMessageContaining(foreignOwner)
+                    .hasMessageContaining("--cache-dir");
+            assertThat(WorkerFileCache.ACTIVE_JVM_LOCKS).doesNotContain(canonical);
+            assertThat(canonical.resolve(".lock")).as("nothing written to a foreign directory").doesNotExist();
+            assertThat(canonical.resolve("tmp")).doesNotExist();
+            assertThat(BlobCacheDirectory.readOwner(canonical)).contains(foreignOwner);
+        }
+
+        // A worker cache from before owner markers: adopted and marked, its blobs kept.
+        Path legacy = tempDir.resolve("legacy-cache");
+        byte[] content = "legacy blob".getBytes(StandardCharsets.UTF_8);
+        String sha = ClasspathPackager.sha256Hex(content);
+        Path blob = new BlobCacheDirectory(legacy).put(sha, content).toRealPath();
+        try (WorkerFileCache cache = WorkerFileCache.open(legacy, true, 0L, PLENTY, FIXED_CLOCK)) {
+            assertThat(BlobCacheDirectory.readOwner(cache.rootDir())).contains(BlobCacheDirectory.OWNER_WORKER);
+            assertThat(cache.verifyOrInvalidate(sha)).isEqualTo(blob);
+        }
+        try (WorkerFileCache cache = WorkerFileCache.open(legacy, true, 0L, PLENTY, FIXED_CLOCK)) {
+            assertThat(cache.verifyOrInvalidate(sha)).as("its own marker is accepted").isEqualTo(blob);
+        }
+    }
+
+    @Test
+    void shouldWarnOncePerProbeFailureEpisodeAndTellWhyLowDiskSpaceRemains() throws Exception {
+        AtomicReference<WorkerFileCache.DiskSpaceProbe> probe = new AtomicReference<>(PLENTY);
+        WorkerFileCache.DiskSpaceProbe failing = p -> {
+            throw new IOException("simulated probe failure");
+        };
+        try (WorkerFileCache cache = WorkerFileCache.open(tempDir, true, GIB, p -> probe.get().usableBytes(p), FIXED_CLOCK)) {
+            probe.set(failing);
+            cache.evictAfterPartition();
+            cache.ensureFreeSpaceForDownload(1024);
+            cache.evictAfterPartition();
+            assertThat(cache.probeFailureWarningCount()).as("one warning per failure episode").isEqualTo(1);
+
+            probe.set(PLENTY);
+            cache.evictAfterPartition();
+            probe.set(failing);
+            cache.evictAfterPartition();
+            assertThat(cache.probeFailureWarningCount()).as("a successful probe ends the episode").isEqualTo(2);
+
+            // Only pinned blobs left.
+            byte[] pinnedContent = "pinned under pressure".getBytes(StandardCharsets.UTF_8);
+            promote(cache, pinnedContent);
+            try (WorkerFileCache.PinLease lease = cache.pinAll(List.of(ClasspathPackager.sha256Hex(pinnedContent)))) {
+                probe.set(p -> 0L);
+                cache.evictAfterPartition();
+                assertThat(cache.lowDiskWarningReason()).isEqualTo(WorkerFileCache.LowDiskReason.NO_UNPINNED_BLOBS);
+                assertThat(lease).isNotNull();
+            }
+
+            // Unpinned blobs whose deletes fail.
+            probe.set(PLENTY);
+            cache.evictAfterPartition();
+            String undeletable = "f".repeat(64);
+            cache.blobIndex(new WorkerFileCache.BlobIndex() {
+                @Override
+                public List<BlobEntry> listBlobs() {
+                    return List.of(new BlobEntry(undeletable, tempDir.resolve("undeletable"), 1L, 1L));
+                }
+
+                @Override
+                public boolean delete(String sha256) throws IOException {
+                    throw new IOException("simulated delete failure");
+                }
+            });
+            probe.set(p -> 0L);
+            cache.evictAfterPartition();
+            assertThat(cache.lowDiskWarningReason()).isEqualTo(WorkerFileCache.LowDiskReason.DELETES_FAILED);
+            assertThat(cache.lowDiskWarningCount()).isEqualTo(2);
+            assertThat(cache.evictionDeleteFailureCount()).isEqualTo(1);
+        }
+    }
+
+    private static void awaitQuietly(CountDownLatch latch) {
+        try {
+            latch.await(10, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    private static BlobCacheDirectory store(WorkerFileCache cache) {
+        return new BlobCacheDirectory(cache.rootDir());
     }
 
     private static Path corruptInPlace(Path blob) throws IOException {

@@ -593,6 +593,9 @@ public class DistributedLauncher implements Launcher {
 
             List<DistributionSettings.DeclaredPathSpec> declaredInputs = DistributionSettings.parseDeclaredPaths(
                     setting(DistributionSettings.INPUTS_PROPERTY, DistributionSettings.INPUTS_ENV));
+            if (!declaredInputs.isEmpty()) {
+                markLauncherOwned(cache);
+            }
             List<WorkspaceFileSet> inputs = new ArrayList<>();
             for (DistributionSettings.DeclaredPathSpec input : declaredInputs) {
                 try {
@@ -614,6 +617,9 @@ public class DistributedLauncher implements Launcher {
                             + "' passes through a symbolic link or junction: " + link);
                 }
             }
+            if (!outputs.isEmpty()) {
+                markLauncherOwned(cache);
+            }
             boolean fork = DistributionSettings.parseForkWorkspace(
                     setting(DistributionSettings.FORK_PROPERTY, DistributionSettings.FORK_ENV));
             PartitionPolicy policy = DistributionSettings.parsePartitionPolicy(
@@ -622,6 +628,18 @@ public class DistributedLauncher implements Launcher {
             return new WorkspaceSettings(hostBaseDir, cache, List.copyOf(inputs), outputs,
                     fork || !declaredInputs.isEmpty() || !outputs.isEmpty(), policy,
                     relativeWorkingDirectory(hostBaseDir, Path.of(System.getProperty("user.dir", ""))));
+        }
+
+        /**
+         * Records the launcher as owner of the host cache, which it only creates once inputs or outputs are declared,
+         * so a worker refuses the directory. An existing owner is kept and never makes the launcher refuse it.
+         */
+        private static void markLauncherOwned(BlobCacheDirectory cache) {
+            try {
+                BlobCacheDirectory.recordOwnerIfAbsent(cache.getRootDir(), BlobCacheDirectory.OWNER_LAUNCHER);
+            } catch (IOException e) {
+                LOG.warn("Could not mark host cache {} as owned by the launcher: {}", cache.getRootDir(), e.toString());
+            }
         }
 
         /**

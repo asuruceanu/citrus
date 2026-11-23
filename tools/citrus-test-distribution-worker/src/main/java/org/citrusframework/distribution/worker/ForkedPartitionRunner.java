@@ -111,6 +111,8 @@ final class ForkedPartitionRunner implements PartitionRunner {
     }
 
     private final DistributionWorkerConfig config;
+    /** Forks of this runner; {@code ACTIVE_FORKS} holds those of every runner for the shutdown hook. */
+    private final Set<ActiveFork> forks = ConcurrentHashMap.newKeySet();
     private final WorkerFileCache sharedCache;
     private final BrokerBlobClient sharedBlobs;
     private final long handshakeTimeoutMs;
@@ -171,6 +173,7 @@ final class ForkedPartitionRunner implements PartitionRunner {
                                                                      BrokerBlobClient blobs) {
         ActiveFork fork = new ActiveFork();
         ACTIVE_FORKS.add(fork);
+        forks.add(fork);
         WorkerFileCache.PinLease pins = null;
         try {
             List<ArtifactRef> classpathArtifacts = assignment.classpathArtifacts() != null
@@ -186,15 +189,15 @@ final class ForkedPartitionRunner implements PartitionRunner {
             Path ipc = createOwnerOnlyDirectory(fork.partitionRoot.resolve("ipc"));
             fork.tmpDir = createChildTmpDir(fork.partitionRoot);
 
-            BlobCacheDirectory blobCache = cache.blobCache();
+            // ensureCached returns verified blobs: materializing them hashes nothing again
             List<Path> classpath = new ArrayList<>();
             for (ArtifactRef artifact : classpathArtifacts) {
-                blobs.ensureCached(artifact);
-                classpath.add(blobCache.materializeForClasspath(artifact, fork.partitionRoot));
+                Path verified = blobs.ensureCached(artifact);
+                classpath.add(cache.materializeForClasspath(artifact, verified, fork.partitionRoot));
             }
             for (WorkspaceFileSet input : assignment.inputArtifacts()) {
-                blobs.ensureCached(input.artifact());
-                WorkspacePackager.materializeIntoDirectory(blobCache, input, workspace);
+                Path verified = blobs.ensureCached(input.artifact());
+                cache.materializeIntoDirectory(input, verified, workspace);
             }
             Map<String, String> baseline = WorkspacePackager.snapshotBaselineHashes(workspace, assignment.outputPaths());
             Path workingDirectory = childWorkingDirectory(workspace, assignment.workingDirectory());
@@ -258,12 +261,23 @@ final class ForkedPartitionRunner implements PartitionRunner {
             try {
                 fork.cleanUp();
                 ACTIVE_FORKS.remove(fork);
+                forks.remove(fork);
             } finally {
                 if (pins != null) {
                     // The child's process tree is gone and the outputs are uploaded: the blobs may be evicted again.
                     pins.close();
                 }
             }
+        }
+    }
+
+    /**
+     * Kills the process trees of this runner's running forks, for example when the worker closes while a partition
+     * thread does not stop in time. The partitions then fail and clean up as after a crash.
+     */
+    void killActiveForks() {
+        for (ActiveFork fork : forks) {
+            fork.killAll();
         }
     }
 

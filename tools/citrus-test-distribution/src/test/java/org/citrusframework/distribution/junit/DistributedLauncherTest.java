@@ -375,6 +375,20 @@ class DistributedLauncherTest {
     }
 
     @Test
+    void shouldMarkTheHostCacheAsLauncherOwnedWhenItIsUsed() throws Exception {
+        Path module = tempDir.resolve("module-owner");
+        Files.createDirectories(module.resolve("src/test/resources"));
+        Files.writeString(module.resolve("src/test/resources/data.txt"), "data");
+        System.setProperty(DistributionSettings.BASEDIR_PROPERTY, module.toString());
+        System.setProperty(DistributionSettings.INPUTS_PROPERTY, "src/test/resources");
+
+        DistributedLauncher.WorkspaceSettings settings = DistributedLauncher.WorkspaceSettings.resolve();
+
+        assertThat(org.citrusframework.distribution.cache.BlobCacheDirectory.readOwner(settings.cache().getRootDir()))
+                .contains(org.citrusframework.distribution.cache.BlobCacheDirectory.OWNER_LAUNCHER);
+    }
+
+    @Test
     void shouldForkWhenOnlyMissingOptionalInputsAreDeclared() {
         Path module = tempDir.resolve("module-optional");
         System.setProperty(DistributionSettings.BASEDIR_PROPERTY, module.toString());

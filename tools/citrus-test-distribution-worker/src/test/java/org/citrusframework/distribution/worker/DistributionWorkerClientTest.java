@@ -28,6 +28,8 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -409,8 +411,8 @@ class DistributionWorkerClientTest {
                 String sha = ClasspathPackager.sha256Hex(jar);
                 Path tmp = cache.newDownloadTempFile();
                 Files.write(tmp, jar);
-                cache.promoteDownload(sha, tmp);
-                cache.blobCache().materializeForClasspath(new ArtifactRef("lib.jar", sha, ArtifactKind.JAR, jar.length),
+                Path stored = cache.promoteDownload(sha, tmp);
+                cache.materializeForClasspath(new ArtifactRef("lib.jar", sha, ArtifactKind.JAR, jar.length), stored,
                         tempDir.resolve("partition"));
 
                 assertThat(unexcluded.changedEntries(IsolatedPartitionRunner.WorkingDirectorySnapshot.take(cwd)))
@@ -419,6 +421,64 @@ class DistributionWorkerClientTest {
                         IsolatedPartitionRunner.WorkingDirectorySnapshot.take(cwd, configured, cache.rootDir())))
                         .as("cache writes are excluded for %s", configured).isEmpty();
             }
+        }
+    }
+
+    @Test
+    void shouldNotHoldTheClientMonitorWhileCloseWaitsForTheCache() throws Exception {
+        DistributionWorkerConfig config = DistributionWorkerConfig.builder()
+                .workerId("worker-close-latency")
+                .brokerUrl("http://127.0.0.1:9")
+                .cacheDir(tempDir.resolve("close-latency-cache"))
+                .cacheCleanup(true)
+                .cacheFreeSpaceBufferBytes(Long.MAX_VALUE / 2)
+                .cwdCheckMode(DistributionSettings.WorkerCwdCheckMode.OFF)
+                .build();
+        DistributionWorkerClient client = new DistributionWorkerClient(config);
+        CountDownLatch evicting = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        try {
+            client.start();
+            WorkerFileCache cache = client.workerCache();
+            cache.blobIndex(new WorkerFileCache.BlobIndex() {
+                @Override
+                public List<BlobCacheDirectory.BlobEntry> listBlobs() {
+                    evicting.countDown();
+                    try {
+                        release.await(10, TimeUnit.SECONDS);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                    return List.of();
+                }
+
+                @Override
+                public boolean delete(String sha256) {
+                    return false;
+                }
+            });
+            CompletableFuture<Void> eviction = CompletableFuture.runAsync(cache::evictAfterPartition);
+            assertThat(evicting.await(10, TimeUnit.SECONDS)).isTrue();
+
+            CompletableFuture<Void> closing = CompletableFuture.runAsync(client::close);
+            long deadline = System.currentTimeMillis() + 15_000L;
+            while (!cache.hasThreadsWaitingForEvictionLock() && System.currentTimeMillis() < deadline) {
+                Thread.sleep(20L);
+            }
+            assertThat(cache.hasThreadsWaitingForEvictionLock()).as("close waits for the eviction").isTrue();
+            CompletableFuture<Void> monitor = CompletableFuture.runAsync(() -> {
+                synchronized (client) {
+                    assertThat(closing).isNotDone();
+                }
+            });
+            monitor.get(2, TimeUnit.SECONDS);
+
+            release.countDown();
+            eviction.get(10, TimeUnit.SECONDS);
+            closing.get(10, TimeUnit.SECONDS);
+        } finally {
+            release.countDown();
+            client.close();
         }
     }
 

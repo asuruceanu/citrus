@@ -31,6 +31,7 @@ import java.util.concurrent.CompletionStage;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 
+import org.citrusframework.distribution.cache.BlobCacheDirectory;
 import org.citrusframework.distribution.cache.ClasspathPackager;
 import org.citrusframework.distribution.config.DistributionJson;
 import org.citrusframework.distribution.model.ArtifactKind;
@@ -506,6 +507,27 @@ class DistributionBrokerServerTest {
         WorkerWsMessage pollMessage(long timeoutMs) throws InterruptedException {
             return messages.poll(timeoutMs, TimeUnit.MILLISECONDS);
         }
+    }
+
+    @Test
+    void shouldMarkItsBlobCacheAsCoordinatorOwnedButKeepAnExistingOwner() throws Exception {
+        Path fresh = tempDir.resolve("owned-cache");
+        Path adopted = java.nio.file.Files.createDirectories(tempDir.resolve("adopted-cache"));
+        java.nio.file.Files.writeString(adopted.resolve(BlobCacheDirectory.OWNER_MARKER_FILE), "worker\n");
+
+        for (Path cacheDir : List.of(fresh, adopted)) {
+            DistributionBrokerConfig config = DistributionBrokerConfig.builder()
+                    .port(0)
+                    .cacheDir(cacheDir)
+                    .jdbcUrl("jdbc:hsqldb:mem:broker_owner_" + System.nanoTime())
+                    .build();
+            try (DistributionBrokerServer server = new DistributionBrokerServer(config)) {
+                server.start();
+            }
+        }
+
+        assertThat(BlobCacheDirectory.readOwner(fresh)).contains(BlobCacheDirectory.OWNER_COORDINATOR);
+        assertThat(BlobCacheDirectory.readOwner(adopted)).as("never overwritten, never refused").contains("worker");
     }
 
     @Test
