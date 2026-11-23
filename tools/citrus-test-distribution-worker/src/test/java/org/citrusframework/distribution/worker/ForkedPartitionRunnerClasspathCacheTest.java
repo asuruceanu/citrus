@@ -102,6 +102,24 @@ class ForkedPartitionRunnerClasspathCacheTest {
     }
 
     @Test
+    void shouldRejectCorruptZipClasspathEntryAndRecoverWhenReplaced() throws IOException {
+        Path library = writeJar(tempDir.resolve("library.zip"),
+                "org/junit/platform/engine/TestEngine.class",
+                "org/junit/platform/engine/CancellationToken.class");
+        List<Path> partitionClasspath = List.of(library);
+        ForkedPartitionRunner.verifyJUnitPlatform(partitionClasspath);
+
+        Files.writeString(library, "corrupt archive");
+        assertThatThrownBy(() -> ForkedPartitionRunner.verifyJUnitPlatform(partitionClasspath))
+                .isInstanceOf(UncheckedIOException.class)
+                .hasMessageContaining("library.zip");
+
+        writeJar(library, "org/junit/platform/engine/TestEngine.class",
+                "org/junit/platform/engine/CancellationToken.class", "resource.txt");
+        ForkedPartitionRunner.verifyJUnitPlatform(partitionClasspath);
+    }
+
+    @Test
     void shouldBoundJarResourceCacheAtMaxEntries() throws IOException {
         Path first = writeJar(tempDir.resolve("first.jar"));
         Path second = writeJar(tempDir.resolve("second.jar"));

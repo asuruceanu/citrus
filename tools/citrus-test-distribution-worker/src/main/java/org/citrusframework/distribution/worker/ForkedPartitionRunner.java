@@ -45,7 +45,6 @@ import java.util.HashSet;
 import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
@@ -486,9 +485,8 @@ final class ForkedPartitionRunner implements PartitionRunner {
     }
 
     private static void collectJarResources(Path entry, Set<String> resources, List<String> unwatched, Set<String> found) {
-        Path real = entry;
         try {
-            real = entry.toRealPath();
+            Path real = entry.toRealPath();
             BasicFileAttributes attrs = Files.readAttributes(real, BasicFileAttributes.class);
             if (!attrs.isRegularFile()) {
                 return;
@@ -510,10 +508,7 @@ final class ForkedPartitionRunner implements PartitionRunner {
         } catch (NoSuchFileException e) {
             LOG.debug("Could not inspect missing classpath entry {}", entry, e);
         } catch (IOException e) {
-            if (hasJarSuffix(entry) || hasJarSuffix(real)) {
-                throw new UncheckedIOException("Could not inspect classpath JAR " + entry, e);
-            }
-            LOG.debug("Could not inspect classpath entry {}", entry, e);
+            throw new UncheckedIOException("Could not inspect classpath archive " + entry, e);
         }
     }
 
@@ -532,11 +527,6 @@ final class ForkedPartitionRunner implements PartitionRunner {
         Path classpathName = classpath != null ? classpath.getFileName() : null;
         return classpathName != null && "classpath".equals(classpathName.toString())
                 && BlobCacheDirectory.SHA256_HEX_PATTERN.matcher(digest.getFileName().toString()).matches();
-    }
-
-    private static boolean hasJarSuffix(Path path) {
-        Path name = path.getFileName();
-        return name != null && name.toString().toLowerCase(Locale.ROOT).endsWith(".jar");
     }
 
     private record JarResourceCacheKey(Path realPath, long size, long lastModifiedMillis, Object fileKey,
