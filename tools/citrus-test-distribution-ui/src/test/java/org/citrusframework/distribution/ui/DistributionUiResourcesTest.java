@@ -74,6 +74,10 @@ class DistributionUiResourcesTest {
                     .contains("/abort")
                     .contains("POLL_INTERVAL_MS")
                     .contains("EventSource.CLOSED")
+                    .contains("state.authTokenDraft = state.authToken;", "value=${state.authTokenDraft}")
+                    .contains("onInput=${e => { state.authTokenDraft = e.target.value; }}")
+                    .contains("onClick=${() => commitAuthToken('')}",
+                            "onClick=${() => commitAuthToken(state.authTokenDraft.trim())}")
                     .contains("forkWorkspace")
                     .contains("inputPaths")
                     .contains("producedOutputs")

@@ -21,6 +21,7 @@ const state = {
   mobileMenuOpen: false,
   theme: localStorage.getItem(STORAGE_THEME_KEY) || 'light',
   authToken: localStorage.getItem(STORAGE_TOKEN_KEY) || '',
+  authTokenDraft: '',
   showAuthModal: false,
   authError: '',
   sseConnected: false,
@@ -134,6 +135,32 @@ function setView(view, detailTab = null) {
   }
 }
 
+function openAuthModal() {
+  if (!state.showAuthModal) {
+    state.authTokenDraft = state.authToken;
+    state.showAuthModal = true;
+  }
+  renderApp();
+}
+
+function closeAuthModal() {
+  state.showAuthModal = false;
+  state.authTokenDraft = '';
+}
+
+function commitAuthToken(token) {
+  if (token) {
+    localStorage.setItem(STORAGE_TOKEN_KEY, token);
+  } else {
+    localStorage.removeItem(STORAGE_TOKEN_KEY);
+  }
+  state.authToken = token;
+  state.authError = '';
+  closeAuthModal();
+  connectSse();
+  refreshAll();
+}
+
 function apiHeaders() {
   const headers = { 'Accept': 'application/json' };
   if (state.authToken) {
@@ -147,9 +174,8 @@ async function apiGet(path) {
   const res = await fetch(path, { headers: apiHeaders() });
   if (res.status === 401) {
     if (authToken === state.authToken) {
-      state.showAuthModal = true;
       state.authError = 'Bearer token required to access broker API.';
-      renderApp();
+      openAuthModal();
     }
     throw new Error('Unauthorized');
   }
@@ -166,9 +192,8 @@ async function apiPost(path, body = {}) {
     body: JSON.stringify(body)
   });
   if (res.status === 401) {
-    state.showAuthModal = true;
     state.authError = 'Bearer token required to access broker API.';
-    renderApp();
+    openAuthModal();
     throw new Error('Unauthorized');
   }
   if (!res.ok) {
@@ -507,7 +532,7 @@ function renderTopbar() {
         </button>
         <button
           class="icon-btn"
-          onClick=${() => { state.showAuthModal = true; renderApp(); }}
+          onClick=${openAuthModal}
           aria-label="Configure Bearer token"
         >
           🔑 ${state.authToken ? 'Auth Set' : 'Auth'}
@@ -1803,11 +1828,11 @@ function renderModals() {
 
   if (state.showAuthModal) {
     return html`
-      <div class="modal-backdrop" onClick=${() => { state.showAuthModal = false; renderApp(); }}>
+      <div class="modal-backdrop" onClick=${() => { closeAuthModal(); renderApp(); }}>
         <div class="modal-panel" style="max-width:440px" onClick=${e => e.stopPropagation()}>
           <div class="modal-header">
             <strong style="font-size:16px">Broker Bearer Authentication</strong>
-            <button class="btn btn-sm" onClick=${() => { state.showAuthModal = false; renderApp(); }}>✕</button>
+            <button class="btn btn-sm" onClick=${() => { closeAuthModal(); renderApp(); }}>✕</button>
           </div>
           <div class="modal-body">
             ${state.authError ? html`<div style="margin-bottom:12px;padding:8px 12px;border-radius:8px;background:var(--rose-bg);color:var(--rose-text);font-weight:600">${state.authError}</div>` : null}
@@ -1819,30 +1844,17 @@ function renderModals() {
               style="width:100%;margin-bottom:16px"
               type="password"
               placeholder="Enter broker --auth-token value…"
-              value=${state.authToken}
-              onInput=${e => { state.authToken = e.target.value; }}
+              value=${state.authTokenDraft}
+              onInput=${e => { state.authTokenDraft = e.target.value; }}
             />
             <div style="display:flex;justify-content:flex-end;gap:8px">
               <button
                 class="btn"
-                onClick=${() => {
-                  state.authToken = '';
-                  localStorage.removeItem(STORAGE_TOKEN_KEY);
-                  state.showAuthModal = false;
-                  connectSse();
-                  refreshAll();
-                }}
+                onClick=${() => commitAuthToken('')}
               >Clear</button>
               <button
                 class="btn btn-primary"
-                onClick=${() => {
-                  localStorage.setItem(STORAGE_TOKEN_KEY, state.authToken.trim());
-                  state.authToken = state.authToken.trim();
-                  state.showAuthModal = false;
-                  state.authError = '';
-                  connectSse();
-                  refreshAll();
-                }}
+                onClick=${() => commitAuthToken(state.authTokenDraft.trim())}
               >Save & Connect</button>
             </div>
           </div>
@@ -1923,7 +1935,7 @@ window.addEventListener('keydown', e => {
   if (e.key === 'Escape' && (state.selectedPartition || state.selectedTestExecution || state.showAuthModal)) {
     state.selectedPartition = null;
     state.selectedTestExecution = null;
-    state.showAuthModal = false;
+    closeAuthModal();
     renderApp();
   }
 });
