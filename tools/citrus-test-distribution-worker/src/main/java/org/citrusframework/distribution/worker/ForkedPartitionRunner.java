@@ -21,6 +21,7 @@ import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.io.UncheckedIOException;
 import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
@@ -30,17 +31,21 @@ import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.FileSystems;
 import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.nio.file.attribute.PosixFilePermissions;
 import java.security.SecureRandom;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.Deque;
 import java.util.HashSet;
 import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
@@ -48,10 +53,13 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.Consumer;
 import java.util.jar.JarFile;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 import org.citrusframework.distribution.cache.BlobCacheDirectory;
 import org.citrusframework.distribution.cache.WorkspacePackager;
@@ -83,6 +91,9 @@ final class ForkedPartitionRunner implements PartitionRunner {
     private static final int MAX_EVENT_LINE = 64 * 1024 * 1024;
     private static final int STDERR_TAIL_LINES = 50;
     private static final long POST_RESULT_EXIT_WAIT_MS = 10_000L;
+    private static final int MAX_JAR_RESOURCE_CACHE_ENTRIES = 4_096;
+    private static final String TEST_ENGINE_RESOURCE = "org/junit/platform/engine/TestEngine.class";
+    private static final String CANCELLATION_TOKEN_RESOURCE = "org/junit/platform/engine/CancellationToken.class";
 
     /**
      * Classes the child needs from the worker runtime, added to its classpath only when the partition classpath does
@@ -101,6 +112,22 @@ final class ForkedPartitionRunner implements PartitionRunner {
             "org.junit.platform.commons.JUnitException",
             "org.opentest4j.TestAbortedException",
             "org.slf4j.LoggerFactory");
+
+    private static final Set<String> RUNTIME_ANCHOR_RESOURCES = RUNTIME_ANCHORS.stream()
+            .map(ForkedPartitionRunner::classResourceName)
+            .collect(Collectors.toUnmodifiableSet());
+    private static final Set<String> WATCHED_RESOURCES = Stream.concat(RUNTIME_ANCHOR_RESOURCES.stream(),
+            Stream.of(CANCELLATION_TOKEN_RESOURCE)).collect(Collectors.toUnmodifiableSet());
+
+    private static final Map<JarResourceCacheKey, Set<String>> JAR_RESOURCE_CACHE =
+            Collections.synchronizedMap(new LinkedHashMap<>(256, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<JarResourceCacheKey, Set<String>> eldest) {
+                    return size() > MAX_JAR_RESOURCE_CACHE_ENTRIES;
+                }
+            });
+    private static final Map<String, Optional<Path>> CODE_SOURCE_CACHE = new ConcurrentHashMap<>();
+    private static final LongAdder JAR_OPEN_COUNT = new LongAdder();
 
     private static final Set<ActiveFork> ACTIVE_FORKS = ConcurrentHashMap.newKeySet();
     private static final ReentrantReadWriteLock JVM_FORK_START_FENCE = new ReentrantReadWriteLock();
@@ -389,9 +416,8 @@ final class ForkedPartitionRunner implements PartitionRunner {
      */
     static void verifyJUnitPlatform(List<Path> partitionClasspath) {
         Set<String> found = presentResources(partitionClasspath,
-                List.of("org/junit/platform/engine/TestEngine.class", "org/junit/platform/engine/CancellationToken.class"));
-        if (found.contains("org/junit/platform/engine/TestEngine.class")
-                && !found.contains("org/junit/platform/engine/CancellationToken.class")) {
+                Set.of(TEST_ENGINE_RESOURCE, CANCELLATION_TOKEN_RESOURCE));
+        if (found.contains(TEST_ENGINE_RESOURCE) && !found.contains(CANCELLATION_TOKEN_RESOURCE)) {
             throw new IllegalStateException("The partition's test classpath provides a JUnit Platform without "
                     + "org.junit.platform.engine.CancellationToken; forked partitions need JUnit Platform 6 or newer");
         }
@@ -427,21 +453,25 @@ final class ForkedPartitionRunner implements PartitionRunner {
         List<Path> result = new ArrayList<>();
         WORKER_RUNTIME.forEach(anchor -> codeSource(anchor).filter(location -> !result.contains(location)).ifPresent(result::add));
         partitionClasspath.stream().filter(entry -> !result.contains(entry)).forEach(result::add);
-        Set<String> provided = presentResources(partitionClasspath,
-                RUNTIME_ANCHORS.stream().map(anchor -> anchor.replace('.', '/') + ".class").toList());
+        Set<String> provided = presentResources(partitionClasspath, RUNTIME_ANCHOR_RESOURCES);
         for (String anchor : RUNTIME_ANCHORS) {
-            if (!provided.contains(anchor.replace('.', '/') + ".class")) {
+            if (!provided.contains(classResourceName(anchor))) {
                 codeSource(anchor).filter(location -> !result.contains(location)).ifPresent(result::add);
             }
         }
         return result;
     }
 
+    private static String classResourceName(String className) {
+        return className.replace('.', '/') + ".class";
+    }
+
     /**
-     * Which of {@code resources} at least one classpath entry contains; each entry is opened once.
+     * Which of {@code resources} at least one classpath entry contains.
      */
-    private static Set<String> presentResources(List<Path> classpath, List<String> resources) {
+    private static Set<String> presentResources(List<Path> classpath, Set<String> resources) {
         Set<String> found = new HashSet<>();
+        List<String> unwatched = resources.stream().filter(resource -> !WATCHED_RESOURCES.contains(resource)).toList();
         for (Path entry : classpath) {
             if (found.size() == resources.size()) {
                 break;
@@ -450,16 +480,82 @@ final class ForkedPartitionRunner implements PartitionRunner {
                 resources.stream().filter(r -> Files.isRegularFile(entry.resolve(r))).forEach(found::add);
                 continue;
             }
-            try (JarFile jar = new JarFile(entry.toFile())) {
-                resources.stream().filter(r -> jar.getEntry(r) != null).forEach(found::add);
-            } catch (IOException e) {
-                LOG.debug("Could not inspect classpath entry {}", entry, e);
-            }
+            collectJarResources(entry, resources, unwatched, found);
         }
         return found;
     }
 
+    private static void collectJarResources(Path entry, Set<String> resources, List<String> unwatched, Set<String> found) {
+        Path real = entry;
+        try {
+            real = entry.toRealPath();
+            BasicFileAttributes attrs = Files.readAttributes(real, BasicFileAttributes.class);
+            if (!attrs.isRegularFile()) {
+                return;
+            }
+            boolean contentAddressed = isContentAddressedCacheJar(entry) || isContentAddressedCacheJar(real);
+            // WorkerFileCache updates mtime on access, including on the inode shared with a named cache JAR.
+            JarResourceCacheKey key = new JarResourceCacheKey(real, attrs.size(),
+                    contentAddressed ? 0L : attrs.lastModifiedTime().toMillis(), attrs.fileKey(),
+                    contentAddressed && attrs.fileKey() == null ? attrs.creationTime().toMillis() : 0L);
+            Set<String> present = JAR_RESOURCE_CACHE.get(key);
+            if (present == null || !unwatched.isEmpty()) {
+                present = scanJarResources(real, unwatched);
+                Set<String> watched = unwatched.isEmpty() ? present : present.stream()
+                        .filter(WATCHED_RESOURCES::contains)
+                        .collect(Collectors.toUnmodifiableSet());
+                JAR_RESOURCE_CACHE.put(key, watched);
+            }
+            present.stream().filter(resources::contains).forEach(found::add);
+        } catch (NoSuchFileException e) {
+            LOG.debug("Could not inspect missing classpath entry {}", entry, e);
+        } catch (IOException e) {
+            if (hasJarSuffix(entry) || hasJarSuffix(real)) {
+                throw new UncheckedIOException("Could not inspect classpath JAR " + entry, e);
+            }
+            LOG.debug("Could not inspect classpath entry {}", entry, e);
+        }
+    }
+
+    private static Set<String> scanJarResources(Path real, List<String> unwatched) throws IOException {
+        JAR_OPEN_COUNT.increment();
+        try (JarFile jar = new JarFile(real.toFile())) {
+            return Stream.concat(WATCHED_RESOURCES.stream(), unwatched.stream())
+                    .filter(resource -> jar.getEntry(resource) != null)
+                    .collect(Collectors.toUnmodifiableSet());
+        }
+    }
+
+    private static boolean isContentAddressedCacheJar(Path path) {
+        Path digest = path.getParent();
+        Path classpath = digest != null ? digest.getParent() : null;
+        Path classpathName = classpath != null ? classpath.getFileName() : null;
+        return classpathName != null && "classpath".equals(classpathName.toString())
+                && BlobCacheDirectory.SHA256_HEX_PATTERN.matcher(digest.getFileName().toString()).matches();
+    }
+
+    private static boolean hasJarSuffix(Path path) {
+        Path name = path.getFileName();
+        return name != null && name.toString().toLowerCase(Locale.ROOT).endsWith(".jar");
+    }
+
+    private record JarResourceCacheKey(Path realPath, long size, long lastModifiedMillis, Object fileKey,
+                                       long creationMillis) {
+    }
+
+    static long jarOpenCountForTesting() {
+        return JAR_OPEN_COUNT.sum();
+    }
+
+    static int jarResourceCacheSizeForTesting() {
+        return JAR_RESOURCE_CACHE.size();
+    }
+
     private static Optional<Path> codeSource(String className) {
+        return CODE_SOURCE_CACHE.computeIfAbsent(className, ForkedPartitionRunner::resolveCodeSource);
+    }
+
+    private static Optional<Path> resolveCodeSource(String className) {
         try {
             Class<?> type = Class.forName(className, false, ForkedPartitionRunner.class.getClassLoader());
             if (type.getProtectionDomain().getCodeSource() == null) {
