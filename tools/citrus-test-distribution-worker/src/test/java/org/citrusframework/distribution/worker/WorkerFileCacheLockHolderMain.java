@@ -34,7 +34,7 @@ public final class WorkerFileCacheLockHolderMain {
     public static void main(String[] args) throws Exception {
         Path dir = Path.of(args[0]);
         WorkerFileCache cache = WorkerFileCache.open(dir, false, 0L);
-        Files.writeString(cache.rootDir().resolve("tmp").resolve("dl-orphan.tmp"), "partial");
+        Files.writeString(cache.rootDir().resolve("tmp").resolve("dl-4711.tmp"), "partial");
         System.out.println(LOCKED_MARKER);
         System.out.flush();
         Thread.sleep(120_000L);

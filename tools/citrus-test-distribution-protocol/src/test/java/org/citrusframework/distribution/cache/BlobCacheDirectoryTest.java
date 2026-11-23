@@ -40,6 +40,8 @@ import org.junit.jupiter.api.io.TempDir;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.junit.jupiter.api.Assumptions.assumeFalse;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 class BlobCacheDirectoryTest {
 
@@ -175,9 +177,8 @@ class BlobCacheDirectoryTest {
         byte[] bytes = "kept".getBytes();
         Path blob = cache.put(sha(bytes), bytes);
         Path tmpDir = Files.createDirectories(cache.getRootDir().resolve("tmp"));
-        Path leftover = Files.writeString(tmpDir.resolve("abc.tmp"), "x");
-        Path nested = Files.createDirectories(tmpDir.resolve("dir"));
-        Files.writeString(nested.resolve("inner.tmp"), "x");
+        Path download = cache.newTempFile("dl-");
+        Path staged = cache.newTempFile(sha(bytes).substring(0, 8) + "-");
         Path classpath = Files.createDirectories(cache.getRootDir().resolve("classpath").resolve("c"));
         Path jar = Files.writeString(classpath.resolve("x.jar"), "x");
         Path lock = Files.writeString(cache.getRootDir().resolve(".lock"), "");
@@ -185,13 +186,67 @@ class BlobCacheDirectoryTest {
         assertThat(cache.sweepTempFiles()).isEqualTo(2);
 
         assertThat(tmpDir).isDirectory();
-        assertThat(leftover).doesNotExist();
-        assertThat(nested).doesNotExist();
+        assertThat(download).doesNotExist();
+        assertThat(staged).doesNotExist();
         assertThat(blob).exists();
         assertThat(jar).exists();
         assertThat(lock).exists();
         assertThat(cache.sweepTempFiles()).isZero();
         assertThat(new BlobCacheDirectory(tempDir.resolve("fresh")).sweepTempFiles()).isZero();
+    }
+
+    @Test
+    void shouldOnlySweepCacheCreatedTempFilesAndLeaveForeignEntriesAlone() throws Exception {
+        // --cache-dir may point at an existing directory whose tmp/ belongs to someone else.
+        BlobCacheDirectory cache = new BlobCacheDirectory(tempDir.resolve("cache"));
+        Path tmpDir = Files.createDirectories(cache.getRootDir().resolve("tmp"));
+        Path cacheMade = cache.newTempFile("ws-");
+        Path unrelated = Files.writeString(tmpDir.resolve("notes.txt"), "keep");
+        Path unrelatedTmp = Files.writeString(tmpDir.resolve("session.tmp"), "keep");
+        Path subdir = Files.createDirectories(tmpDir.resolve("dl-1.tmp"));
+        Path subdirContent = Files.writeString(subdir.resolve("inner-1.tmp"), "keep");
+        Path outside = Files.writeString(tempDir.resolve("outside-target.txt"), "keep");
+        Path link = tmpDir.resolve("dl-2.tmp");
+        boolean symlinks = createSymlink(link, outside);
+
+        assertThat(cache.sweepTempFiles()).isEqualTo(1);
+
+        assertThat(cacheMade).doesNotExist();
+        assertThat(unrelated).hasContent("keep");
+        assertThat(unrelatedTmp).hasContent("keep");
+        assertThat(subdir).isDirectory();
+        assertThat(subdirContent).hasContent("keep");
+        assertThat(outside).hasContent("keep");
+        if (symlinks) {
+            assertThat(Files.isSymbolicLink(link)).isTrue();
+        }
+    }
+
+    @Test
+    void shouldWarnAndContinueWhenATempFileCannotBeDeleted() throws Exception {
+        assumeFalse("root".equals(System.getProperty("user.name")), "root ignores directory permissions");
+        BlobCacheDirectory cache = new BlobCacheDirectory(tempDir.resolve("cache"));
+        Path first = cache.newTempFile("dl-");
+        Path second = cache.newTempFile("ws-");
+        Path tmpDir = first.getParent();
+        assumeTrue(tmpDir.toFile().setWritable(false), "file system supports read-only directories");
+        try {
+            assertThat(cache.sweepTempFiles()).isZero();
+            assertThat(first).exists();
+            assertThat(second).exists();
+        } finally {
+            tmpDir.toFile().setWritable(true);
+        }
+        assertThat(cache.sweepTempFiles()).isEqualTo(2);
+    }
+
+    private static boolean createSymlink(Path link, Path target) {
+        try {
+            Files.createSymbolicLink(link, target);
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
     }
 
     @Test

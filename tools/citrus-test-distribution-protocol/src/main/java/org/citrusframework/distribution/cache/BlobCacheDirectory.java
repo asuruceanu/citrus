@@ -60,6 +60,9 @@ public class BlobCacheDirectory {
 
     public static final Pattern SHA256_HEX_PATTERN = Pattern.compile("^[a-f0-9]{64}$");
 
+    /** Names of the files {@link #newTempFile(String)} creates: {@code <prefix>-<random digits>.tmp}. */
+    private static final Pattern CACHE_TEMP_FILE_PATTERN = Pattern.compile("^[a-z0-9]{1,32}-[0-9]+\\.tmp$");
+
     /** Maximum number of entries (files and directories) in one extracted or packaged ZIP archive. */
     public static final int MAX_ZIP_ENTRIES = 50_000;
     /** Maximum total uncompressed bytes of one ZIP archive (2 GiB), counted while streaming. */
@@ -302,10 +305,13 @@ public class BlobCacheDirectory {
     }
 
     /**
-     * Removes the children of {@code tmp/} (leftovers of interrupted writes), keeping {@code tmp/} itself and never
-     * touching blobs, named jars or the lock file. A child that cannot be deleted is logged and skipped.
+     * Removes temporary files left in {@code tmp/} by interrupted writes, keeping {@code tmp/} itself and never
+     * touching blobs, named jars or the lock file. Only regular files whose names match what
+     * {@link #newTempFile(String)} creates ({@code <prefix>-<digits>.tmp}) are deleted: the cache directory may be
+     * an existing directory chosen by the user, so directories, symbolic links and any other file in {@code tmp/}
+     * are left alone. A file that cannot be deleted is logged and skipped.
      *
-     * @return the number of top-level entries removed
+     * @return the number of files removed
      */
     public int sweepTempFiles() throws IOException {
         Path tmpDir = rootDir.resolve("tmp");
@@ -315,11 +321,16 @@ public class BlobCacheDirectory {
         int removed = 0;
         try (var children = Files.newDirectoryStream(tmpDir)) {
             for (Path child : children) {
+                if (!CACHE_TEMP_FILE_PATTERN.matcher(child.getFileName().toString()).matches()
+                        || !Files.isRegularFile(child, LinkOption.NOFOLLOW_LINKS)) {
+                    continue;
+                }
                 try {
-                    deleteRecursively(child);
-                    removed++;
+                    if (Files.deleteIfExists(child)) {
+                        removed++;
+                    }
                 } catch (IOException e) {
-                    LOG.warn("Could not delete temporary cache entry {}: {}", child, e.toString());
+                    LOG.warn("Could not delete temporary cache file {}: {}", child, e.toString());
                 }
             }
         }

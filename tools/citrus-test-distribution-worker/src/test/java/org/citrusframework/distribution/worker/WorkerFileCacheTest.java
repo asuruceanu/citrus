@@ -139,13 +139,13 @@ class WorkerFileCacheTest {
                     .hasMessageContaining(canonical.toString())
                     .hasMessageContaining("--cache-dir");
             assertThat(WorkerFileCache.ACTIVE_JVM_LOCKS).doesNotContain(canonical);
-            assertThat(canonical.resolve("tmp").resolve("dl-orphan.tmp")).exists();
+            assertThat(canonical.resolve("tmp").resolve("dl-4711.tmp")).exists();
         } finally {
             assertThat(child.destroyForcibly().waitFor(30, TimeUnit.SECONDS)).isTrue();
         }
 
         try (WorkerFileCache cache = WorkerFileCache.open(dir, true, 0L, PLENTY, FIXED_CLOCK)) {
-            assertThat(cache.rootDir().resolve("tmp").resolve("dl-orphan.tmp")).doesNotExist();
+            assertThat(cache.rootDir().resolve("tmp").resolve("dl-4711.tmp")).doesNotExist();
             assertThat(cache.rootDir().resolve(".lock")).exists();
         }
     }
@@ -176,7 +176,7 @@ class WorkerFileCacheTest {
         byte[] content = "valid blob".getBytes(StandardCharsets.UTF_8);
         String sha = ClasspathPackager.sha256Hex(content);
         Path blob = new BlobCacheDirectory(tempDir).put(sha, content);
-        Path stale = Files.createDirectories(tempDir.resolve("tmp")).resolve("dl-stale.tmp");
+        Path stale = Files.createDirectories(tempDir.resolve("tmp")).resolve("dl-4712.tmp");
         Files.writeString(stale, "partial");
 
         try (WorkerFileCache cache = WorkerFileCache.open(tempDir, false, 2 * GIB, p -> 0L, FIXED_CLOCK)) {
