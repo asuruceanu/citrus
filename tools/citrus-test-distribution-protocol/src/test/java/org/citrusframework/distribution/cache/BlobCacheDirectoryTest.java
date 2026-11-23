@@ -18,18 +18,28 @@ package org.citrusframework.distribution.cache;
 
 import java.io.ByteArrayOutputStream;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.security.MessageDigest;
 import java.util.HexFormat;
+import java.util.List;
+import java.util.Map;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
 
+import org.citrusframework.distribution.config.DistributionJson;
 import org.citrusframework.distribution.model.ArtifactKind;
 import org.citrusframework.distribution.model.ArtifactRef;
+import org.citrusframework.distribution.model.WorkerCacheStats;
+import org.citrusframework.distribution.model.WorkerHeartbeatPayload;
+import org.citrusframework.distribution.model.WorkerRecord;
+import org.citrusframework.distribution.model.WorkerRegisterPayload;
+import org.citrusframework.distribution.model.WorkerState;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class BlobCacheDirectoryTest {
 
@@ -66,6 +76,161 @@ class BlobCacheDirectoryTest {
 
         assertThat(onClasspath.getFileName().toString()).endsWith(".jar").doesNotContain("/").doesNotContain("..");
         assertThat(onClasspath.startsWith(cache.getRootDir())).isTrue();
+    }
+
+    @Test
+    void shouldListStoredBlobsIgnoringStrayFilesAndSymlinks() throws Exception {
+        BlobCacheDirectory cache = new BlobCacheDirectory(tempDir.resolve("cache"));
+        byte[] first = "first".getBytes();
+        byte[] second = "second".getBytes();
+        String firstSha = sha(first);
+        String secondSha = sha(second);
+        Path firstPath = cache.put(firstSha, first);
+        Path secondPath = cache.put(secondSha, second);
+
+        Path blobs = cache.getRootDir().resolve("blobs");
+        Files.writeString(blobs.resolve(".DS_Store"), "x");
+        Path prefixDir = Files.createDirectories(blobs.resolve("aa"));
+        Files.writeString(prefixDir.resolve("not-a-digest.txt"), "x");
+        // a digest-named file under the wrong prefix is not a blob either
+        Path wrongPrefix = Files.createDirectories(blobs.resolve("bb"));
+        Files.writeString(wrongPrefix.resolve(firstSha), "x");
+        boolean posix = cache.getRootDir().getFileSystem().supportedFileAttributeViews().contains("posix");
+        if (posix) {
+            String linkSha = sha("link".getBytes());
+            Path linkDir = Files.createDirectories(blobs.resolve(linkSha.substring(0, 2)));
+            Files.createSymbolicLink(linkDir.resolve(linkSha), firstPath);
+        }
+
+        List<BlobCacheDirectory.BlobEntry> entries = cache.listBlobs();
+
+        assertThat(entries).containsExactlyInAnyOrder(
+                entry(firstSha, firstPath, first.length),
+                entry(secondSha, secondPath, second.length));
+    }
+
+    @Test
+    void shouldListNothingForAnEmptyCache() throws Exception {
+        assertThat(new BlobCacheDirectory(tempDir.resolve("empty")).listBlobs()).isEmpty();
+    }
+
+    @Test
+    void shouldDeleteExistingBlobAndReturnFalseWhenMissing() throws Exception {
+        BlobCacheDirectory cache = new BlobCacheDirectory(tempDir.resolve("cache"));
+        byte[] bytes = "payload".getBytes();
+        String sha = sha(bytes);
+        Path path = cache.put(sha, bytes);
+        assertThat(path).isEqualTo(cache.getRootDir().resolve("blobs").resolve(sha.substring(0, 2)).resolve(sha));
+
+        assertThat(cache.delete(sha)).isTrue();
+        assertThat(path).doesNotExist();
+        assertThat(cache.delete(sha)).isFalse();
+
+        assertThatThrownBy(() -> cache.delete("../etc")).isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> cache.delete(null)).isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> cache.delete(sha.toUpperCase())).isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void shouldDeleteNamedJarDirectoryWithBlobAndSweepOrphanStaging() throws Exception {
+        byte[] jar = jarWith("a.txt", "a");
+        String sha = sha(jar);
+        BlobCacheDirectory cache = new BlobCacheDirectory(tempDir.resolve("cache"));
+        Path blob = cache.put(sha, jar);
+        Path named = cache.materializeForClasspath(new ArtifactRef("lib.jar", sha, ArtifactKind.JAR, jar.length),
+                tempDir.resolve("partition"));
+        assertThat(named).exists();
+
+        Path otherDir = Files.createDirectories(cache.getRootDir().resolve("classpath").resolve("0".repeat(64)));
+        Path orphan = Files.writeString(otherDir.resolve(".staging-x.jar"), "partial");
+        Path published = Files.writeString(otherDir.resolve("published.jar"), "ok");
+
+        boolean unix = cache.getRootDir().getFileSystem().supportedFileAttributeViews().contains("unix");
+        // a probe link outside the cache lets us observe the inode's link count after both cache links are gone
+        Path probe = tempDir.resolve("probe");
+        if (unix) {
+            Files.createLink(probe, blob);
+            assertThat(((Number) Files.getAttribute(probe, "unix:nlink")).intValue()).isEqualTo(3);
+        }
+
+        assertThat(cache.delete(sha)).isTrue();
+
+        assertThat(blob).doesNotExist();
+        assertThat(named).doesNotExist();
+        assertThat(named.getParent()).doesNotExist();
+        if (unix) {
+            assertThat(((Number) Files.getAttribute(probe, "unix:nlink")).intValue())
+                    .as("no surviving hard link inside the cache").isEqualTo(1);
+        }
+
+        assertThat(cache.sweepClasspathStaging()).isEqualTo(1);
+        assertThat(orphan).doesNotExist();
+        assertThat(published).exists();
+        assertThat(cache.sweepClasspathStaging()).isZero();
+    }
+
+    @Test
+    void shouldSweepTempFilesButKeepBlobsClasspathAndLock() throws Exception {
+        BlobCacheDirectory cache = new BlobCacheDirectory(tempDir.resolve("cache"));
+        byte[] bytes = "kept".getBytes();
+        Path blob = cache.put(sha(bytes), bytes);
+        Path tmpDir = Files.createDirectories(cache.getRootDir().resolve("tmp"));
+        Path leftover = Files.writeString(tmpDir.resolve("abc.tmp"), "x");
+        Path nested = Files.createDirectories(tmpDir.resolve("dir"));
+        Files.writeString(nested.resolve("inner.tmp"), "x");
+        Path classpath = Files.createDirectories(cache.getRootDir().resolve("classpath").resolve("c"));
+        Path jar = Files.writeString(classpath.resolve("x.jar"), "x");
+        Path lock = Files.writeString(cache.getRootDir().resolve(".lock"), "");
+
+        assertThat(cache.sweepTempFiles()).isEqualTo(2);
+
+        assertThat(tmpDir).isDirectory();
+        assertThat(leftover).doesNotExist();
+        assertThat(nested).doesNotExist();
+        assertThat(blob).exists();
+        assertThat(jar).exists();
+        assertThat(lock).exists();
+        assertThat(cache.sweepTempFiles()).isZero();
+        assertThat(new BlobCacheDirectory(tempDir.resolve("fresh")).sweepTempFiles()).isZero();
+    }
+
+    @Test
+    void shouldRoundTripWorkerCacheStatsAndLegacyPayloadsWithoutCacheStats() {
+        WorkerCacheStats stats = new WorkerCacheStats(true, 2_147_483_648L, 3, 1234L, 99_999L, 7L, true);
+        Map<String, String> caps = Map.of("docker", "true");
+
+        WorkerRegisterPayload register = new WorkerRegisterPayload("w1", "h", caps, stats);
+        assertThat(DistributionJson.fromJson(DistributionJson.toJson(register), WorkerRegisterPayload.class))
+                .isEqualTo(register);
+        WorkerHeartbeatPayload heartbeat = new WorkerHeartbeatPayload("w1", "p1", stats);
+        assertThat(DistributionJson.fromJson(DistributionJson.toJson(heartbeat), WorkerHeartbeatPayload.class))
+                .isEqualTo(heartbeat);
+        WorkerRecord record = new WorkerRecord("w1", "h", caps, WorkerState.IDLE, null, 5L, 4L, stats);
+        assertThat(DistributionJson.fromJson(DistributionJson.toJson(record), WorkerRecord.class)).isEqualTo(record);
+
+        WorkerRegisterPayload legacyRegister = DistributionJson.fromJson(
+                "{\"workerId\":\"w1\",\"host\":\"h\",\"capabilities\":{\"docker\":\"true\"}}",
+                WorkerRegisterPayload.class);
+        assertThat(legacyRegister.cacheStats()).isNull();
+        assertThat(legacyRegister).isEqualTo(new WorkerRegisterPayload("w1", "h", caps));
+        WorkerHeartbeatPayload legacyHeartbeat = DistributionJson.fromJson(
+                "{\"workerId\":\"w1\",\"activePartitionId\":\"p1\"}", WorkerHeartbeatPayload.class);
+        assertThat(legacyHeartbeat.cacheStats()).isNull();
+        assertThat(legacyHeartbeat).isEqualTo(new WorkerHeartbeatPayload("w1", "p1"));
+        WorkerRecord legacyRecord = DistributionJson.fromJson(
+                "{\"workerId\":\"w1\",\"host\":\"h\",\"capabilities\":{},\"state\":\"IDLE\","
+                        + "\"lastHeartbeatAt\":5,\"registeredAt\":4}", WorkerRecord.class);
+        assertThat(legacyRecord.cacheStats()).isNull();
+        assertThat(legacyRecord.registeredAt()).isEqualTo(4L);
+    }
+
+    private static BlobCacheDirectory.BlobEntry entry(String sha, Path path, long size) throws Exception {
+        return new BlobCacheDirectory.BlobEntry(sha, path, size,
+                Files.getLastModifiedTime(path, LinkOption.NOFOLLOW_LINKS).toMillis());
+    }
+
+    private static String sha(byte[] bytes) throws Exception {
+        return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(bytes));
     }
 
     private static byte[] jarWith(String entry, String content) throws Exception {

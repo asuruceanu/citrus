@@ -18,6 +18,11 @@ package org.citrusframework.distribution.model;
 
 public record WorkerHeartbeatPayload(
         String workerId,
-        String activePartitionId
+        String activePartitionId,
+        WorkerCacheStats cacheStats
 ) {
+
+    public WorkerHeartbeatPayload(String workerId, String activePartitionId) {
+        this(workerId, activePartitionId, null);
+    }
 }

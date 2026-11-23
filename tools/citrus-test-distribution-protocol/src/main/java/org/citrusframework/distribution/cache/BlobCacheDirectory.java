@@ -25,6 +25,8 @@ import java.nio.file.InvalidPathException;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.nio.file.FileVisitResult;
+import java.nio.file.SimpleFileVisitor;
 import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.security.DigestInputStream;
@@ -42,6 +44,8 @@ import java.util.zip.ZipInputStream;
 
 import org.citrusframework.distribution.model.ArtifactKind;
 import org.citrusframework.distribution.model.ArtifactRef;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Content-addressed local directory store indexed by validated 64-char lowercase SHA-256 hex digests.
@@ -51,6 +55,8 @@ import org.citrusframework.distribution.model.ArtifactRef;
  * interrupted write never leaves a partial blob or an orphaned temporary file behind.
  */
 public class BlobCacheDirectory {
+
+    private static final Logger LOG = LoggerFactory.getLogger(BlobCacheDirectory.class);
 
     public static final Pattern SHA256_HEX_PATTERN = Pattern.compile("^[a-f0-9]{64}$");
 
@@ -69,6 +75,17 @@ public class BlobCacheDirectory {
      * @param file         absolute path of the written file
      */
     public record ExtractedFile(String relativePath, String sha256, Path file) {
+    }
+
+    /**
+     * A blob in the store.
+     *
+     * @param sha256             digest the blob is stored under
+     * @param path               absolute path of the blob file
+     * @param sizeBytes          size of the blob file
+     * @param lastModifiedMillis last modification time of the blob file
+     */
+    public record BlobEntry(String sha256, Path path, long sizeBytes, long lastModifiedMillis) {
     }
 
     private final Path rootDir;
@@ -205,6 +222,132 @@ public class BlobCacheDirectory {
         return null;
     }
 
+    /**
+     * Lists the blobs in the store: regular files {@code blobs/<prefix>/<sha256>} whose name is a valid digest
+     * starting with the parent directory's two-character prefix. Stray files and symbolic links are ignored.
+     */
+    public List<BlobEntry> listBlobs() throws IOException {
+        Path blobsDir = rootDir.resolve("blobs");
+        List<BlobEntry> entries = new ArrayList<>();
+        if (!Files.isDirectory(blobsDir, LinkOption.NOFOLLOW_LINKS)) {
+            return entries;
+        }
+        Files.walkFileTree(blobsDir, Set.of(), 2, new SimpleFileVisitor<>() {
+            @Override
+            public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
+                String name = file.getFileName().toString();
+                Path parent = file.getParent();
+                if (attrs.isRegularFile() && !attrs.isSymbolicLink() && !blobsDir.equals(parent)
+                        && SHA256_HEX_PATTERN.matcher(name).matches()
+                        && name.startsWith(parent.getFileName().toString())
+                        && parent.getFileName().toString().length() == 2) {
+                    entries.add(new BlobEntry(name, file, attrs.size(), attrs.lastModifiedTime().toMillis()));
+                }
+                return FileVisitResult.CONTINUE;
+            }
+
+            @Override
+            public FileVisitResult visitFileFailed(Path file, IOException exc) {
+                LOG.warn("Skipping unreadable cache entry {}: {}", file, exc.toString());
+                return FileVisitResult.CONTINUE;
+            }
+        });
+        return entries;
+    }
+
+    /**
+     * Deletes the blob for {@code sha256} together with its {@code classpath/<sha256>/} directory of named jars.
+     *
+     * @return {@code true} if the blob existed
+     * @throws IllegalArgumentException on an invalid digest
+     */
+    public boolean delete(String sha256) throws IOException {
+        Path blob = resolveBlobPath(sha256);
+        Path classpathDir = rootDir.resolve("classpath").resolve(sha256).normalize();
+        if (!classpathDir.startsWith(rootDir)) {
+            throw new IllegalArgumentException("Classpath path escapes cache root: " + sha256);
+        }
+        boolean existed = Files.deleteIfExists(blob);
+        deleteRecursively(classpathDir);
+        return existed;
+    }
+
+    /**
+     * Removes orphaned {@code classpath/<sha256>/.staging-*.jar} files left by an interrupted publish.
+     *
+     * @return the number of files removed
+     */
+    public int sweepClasspathStaging() throws IOException {
+        Path classpathRoot = rootDir.resolve("classpath");
+        if (!Files.isDirectory(classpathRoot, LinkOption.NOFOLLOW_LINKS)) {
+            return 0;
+        }
+        int removed = 0;
+        try (var dirs = Files.newDirectoryStream(classpathRoot)) {
+            for (Path dir : dirs) {
+                if (!Files.isDirectory(dir, LinkOption.NOFOLLOW_LINKS)) {
+                    continue;
+                }
+                try (var staged = Files.newDirectoryStream(dir, ".staging-*.jar")) {
+                    for (Path orphan : staged) {
+                        if (Files.isRegularFile(orphan, LinkOption.NOFOLLOW_LINKS)
+                                && Files.deleteIfExists(orphan)) {
+                            removed++;
+                        }
+                    }
+                }
+            }
+        }
+        return removed;
+    }
+
+    /**
+     * Removes the children of {@code tmp/} (leftovers of interrupted writes), keeping {@code tmp/} itself and never
+     * touching blobs, named jars or the lock file. A child that cannot be deleted is logged and skipped.
+     *
+     * @return the number of top-level entries removed
+     */
+    public int sweepTempFiles() throws IOException {
+        Path tmpDir = rootDir.resolve("tmp");
+        if (!Files.isDirectory(tmpDir, LinkOption.NOFOLLOW_LINKS)) {
+            return 0;
+        }
+        int removed = 0;
+        try (var children = Files.newDirectoryStream(tmpDir)) {
+            for (Path child : children) {
+                try {
+                    deleteRecursively(child);
+                    removed++;
+                } catch (IOException e) {
+                    LOG.warn("Could not delete temporary cache entry {}: {}", child, e.toString());
+                }
+            }
+        }
+        return removed;
+    }
+
+    private static void deleteRecursively(Path path) throws IOException {
+        if (!Files.exists(path, LinkOption.NOFOLLOW_LINKS)) {
+            return;
+        }
+        Files.walkFileTree(path, new SimpleFileVisitor<>() {
+            @Override
+            public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
+                Files.deleteIfExists(file);
+                return FileVisitResult.CONTINUE;
+            }
+
+            @Override
+            public FileVisitResult postVisitDirectory(Path dir, IOException exc) throws IOException {
+                if (exc != null) {
+                    throw exc;
+                }
+                Files.deleteIfExists(dir);
+                return FileVisitResult.CONTINUE;
+            }
+        });
+    }
+
     public byte[] readBytes(String sha256) throws IOException {
         return Files.readAllBytes(resolveBlobPath(sha256));
     }
@@ -243,7 +386,7 @@ public class BlobCacheDirectory {
 
     /**
      * The cached jar under its original file name ({@code classpath/<sha256>/<name>.jar}, a hard link to the blob, or
-     * a copy where links are unsupported), shared by every partition. Libraries inspect classpath file names: for
+     * a copy where links are unsupported), shared by every partition of this worker. Libraries inspect classpath file names: for
      * example Testcontainers' {@code MountableFile} extracts a resource from an archive only when its URL contains
      * {@code .jar!}, and would copy the whole archive from a digest-named blob instead.
      */
@@ -269,8 +412,8 @@ public class BlobCacheDirectory {
                 return named;
             }
             Files.createDirectories(dir);
-            // Several worker JVMs may share the cache directory: stage under a unique name, and treat any failure to
-            // publish as fine once another process has published the same digest.
+            // Stage under a unique name, and treat any failure to publish as fine once a concurrent caller
+            // has published the same digest.
             Path staging = Files.createTempFile(dir, ".staging-", ".jar");
             try {
                 Files.delete(staging);
@@ -468,10 +611,19 @@ public class BlobCacheDirectory {
 
     private static void moveIntoPlace(Path tmp, Path target) throws IOException {
         Files.createDirectories(target.getParent());
+        boolean targetExisted = Files.exists(target, LinkOption.NOFOLLOW_LINKS);
         try {
             Files.move(tmp, target, StandardCopyOption.ATOMIC_MOVE);
         } catch (AtomicMoveNotSupportedException e) {
-            Files.move(tmp, target, StandardCopyOption.REPLACE_EXISTING);
+            try {
+                Files.move(tmp, target, StandardCopyOption.REPLACE_EXISTING);
+            } catch (IOException moveFailed) {
+                if (!targetExisted) {
+                    // a non-atomic move can leave a partial target behind
+                    Files.deleteIfExists(target);
+                }
+                throw moveFailed;
+            }
         }
     }
 }

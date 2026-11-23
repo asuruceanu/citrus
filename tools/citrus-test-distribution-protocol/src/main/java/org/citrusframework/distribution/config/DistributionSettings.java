@@ -16,12 +16,17 @@
 
 package org.citrusframework.distribution.config;
 
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.function.UnaryOperator;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import org.citrusframework.distribution.model.PartitionPolicy;
 
@@ -89,6 +94,24 @@ public final class DistributionSettings {
     public static final String CACHE_DIR_PROPERTY = "citrus.test.distribution.cacheDir";
     public static final String CACHE_DIR_ENV = "CITRUS_DIST_CACHE_DIR";
     public static final String DEFAULT_CACHE_DIR = ".citrus-dist/cache";
+
+    public static final String WORKER_CACHE_DIR_PROPERTY = "citrus.test.distribution.worker.cacheDir";
+    public static final String WORKER_CACHE_DIR_ENV = "CITRUS_DIST_WORKER_CACHE_DIR";
+    public static final String AGENT_CACHE_DIR_ENV = "TEST_DISTRIBUTION_AGENT_CACHE_DIR";
+
+    public static final String WORKER_CACHE_CLEANUP_PROPERTY = "citrus.test.distribution.worker.cacheCleanup";
+    public static final String WORKER_CACHE_CLEANUP_ENV = "CITRUS_DIST_WORKER_CACHE_CLEANUP";
+    public static final String AGENT_CACHE_CLEANUP_ENV = "TEST_DISTRIBUTION_AGENT_CACHE_CLEANUP";
+    public static final boolean DEFAULT_WORKER_CACHE_CLEANUP = true;
+
+    public static final String WORKER_CACHE_FREE_SPACE_BUFFER_SIZE_PROPERTY =
+            "citrus.test.distribution.worker.cacheFreeSpaceBufferSize";
+    public static final String WORKER_CACHE_FREE_SPACE_BUFFER_SIZE_ENV = "CITRUS_DIST_WORKER_CACHE_FREE_SPACE_BUFFER_SIZE";
+    public static final String AGENT_CACHE_FREE_SPACE_BUFFER_SIZE_ENV = "TEST_DISTRIBUTION_AGENT_CACHE_FREE_SPACE_BUFFER_SIZE";
+    public static final long DEFAULT_WORKER_CACHE_FREE_SPACE_BUFFER_BYTES = 2L * 1024 * 1024 * 1024;
+
+    private static final Pattern BYTE_SIZE_PATTERN = Pattern.compile("^\\s*(\\d+)\\s*(KiB|MiB|GiB)?\\s*$",
+            Pattern.CASE_INSENSITIVE);
 
     /** Worker capability advertised by workspace-aware workers and required by workspace partitions. */
     public static final String WORKSPACE_CAPABILITY_KEY = "citrus.workspace.v1";
@@ -368,6 +391,114 @@ public final class DistributionSettings {
 
     public static String getCacheDir() {
         return getString(CACHE_DIR_PROPERTY, CACHE_DIR_ENV, DEFAULT_CACHE_DIR);
+    }
+
+    /** Default worker file cache directory, private to one worker host account. */
+    public static Path defaultWorkerCacheDir() {
+        return Paths.get(System.getProperty("user.home", ".")).resolve(".citrus-test-distribution-agent")
+                .resolve("file-cache");
+    }
+
+    /**
+     * Resolves the worker file cache directory: system property, then {@code CITRUS_DIST_WORKER_CACHE_DIR}, then
+     * {@code TEST_DISTRIBUTION_AGENT_CACHE_DIR}, then {@link #defaultWorkerCacheDir()}. Deliberately independent of
+     * the coordinator's {@link #CACHE_DIR_PROPERTY}.
+     */
+    public static Path getWorkerCacheDir() {
+        return resolveWorkerCacheDir(System::getProperty, System::getenv);
+    }
+
+    /** Whether the worker evicts least-recently-used blobs to keep free disk space; defaults to enabled. */
+    public static boolean isWorkerCacheCleanupEnabled() {
+        return resolveWorkerCacheCleanup(System::getProperty, System::getenv);
+    }
+
+    /** Free disk space in bytes the worker keeps available when cache cleanup is enabled. */
+    public static long getWorkerCacheFreeSpaceBufferBytes() {
+        return resolveWorkerCacheFreeSpaceBufferBytes(System::getProperty, System::getenv);
+    }
+
+    static Path resolveWorkerCacheDir(UnaryOperator<String> prop, UnaryOperator<String> env) {
+        String[] resolved = resolveFirstNonBlank(prop, env, WORKER_CACHE_DIR_PROPERTY, WORKER_CACHE_DIR_ENV,
+                AGENT_CACHE_DIR_ENV);
+        return resolved == null ? defaultWorkerCacheDir() : Paths.get(resolved[0]);
+    }
+
+    static boolean resolveWorkerCacheCleanup(UnaryOperator<String> prop, UnaryOperator<String> env) {
+        String[] resolved = resolveFirstNonBlank(prop, env, WORKER_CACHE_CLEANUP_PROPERTY, WORKER_CACHE_CLEANUP_ENV,
+                AGENT_CACHE_CLEANUP_ENV);
+        return resolved == null ? DEFAULT_WORKER_CACHE_CLEANUP : parseBooleanStrict(resolved[0], resolved[1]);
+    }
+
+    static long resolveWorkerCacheFreeSpaceBufferBytes(UnaryOperator<String> prop, UnaryOperator<String> env) {
+        String[] resolved = resolveFirstNonBlank(prop, env, WORKER_CACHE_FREE_SPACE_BUFFER_SIZE_PROPERTY,
+                WORKER_CACHE_FREE_SPACE_BUFFER_SIZE_ENV, AGENT_CACHE_FREE_SPACE_BUFFER_SIZE_ENV);
+        return resolved == null ? DEFAULT_WORKER_CACHE_FREE_SPACE_BUFFER_BYTES
+                : parseByteSize(resolved[0], resolved[1]);
+    }
+
+    /** Returns {@code {trimmedValue, sourceKey}} of the first non-blank tier, or {@code null} when none is set. */
+    private static String[] resolveFirstNonBlank(UnaryOperator<String> prop, UnaryOperator<String> env,
+                                                 String propKey, String primaryEnvKey, String aliasEnvKey) {
+        String value = prop.apply(propKey);
+        if (value != null && !value.isBlank()) {
+            return new String[] {value.trim(), propKey};
+        }
+        for (String envKey : new String[] {primaryEnvKey, aliasEnvKey}) {
+            value = env.apply(envKey);
+            if (value != null && !value.isBlank()) {
+                return new String[] {value.trim(), envKey};
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Parses a byte size: a non-negative integer with an optional case-insensitive {@code KiB}, {@code MiB} or
+     * {@code GiB} suffix. SI units, decimals and overflow are rejected.
+     *
+     * @param source the setting the value came from, named in error messages
+     * @throws IllegalArgumentException for a missing, malformed or overflowing value
+     */
+    public static long parseByteSize(String raw, String source) {
+        Matcher matcher = raw == null ? null : BYTE_SIZE_PATTERN.matcher(raw);
+        if (matcher == null || !matcher.matches()) {
+            throw new IllegalArgumentException("Invalid byte size '" + raw + "' for " + source
+                    + " - expected an integer number of bytes or a value with unit KiB, MiB, GiB");
+        }
+        long multiplier = 1L;
+        String unit = matcher.group(2);
+        if (unit != null) {
+            multiplier = switch (unit.toLowerCase(Locale.ROOT)) {
+                case "kib" -> 1024L;
+                case "mib" -> 1024L * 1024;
+                default -> 1024L * 1024 * 1024;
+            };
+        }
+        try {
+            return Math.multiplyExact(Long.parseLong(matcher.group(1)), multiplier);
+        } catch (NumberFormatException | ArithmeticException e) {
+            throw new IllegalArgumentException("Byte size '" + raw.trim() + "' for " + source
+                    + " is too large - expected an integer number of bytes or a value with unit KiB, MiB, GiB", e);
+        }
+    }
+
+    /**
+     * Parses a boolean strictly: only {@code true} or {@code false} (case-insensitive, surrounding whitespace
+     * ignored) are accepted.
+     *
+     * @param source the setting the value came from, named in error messages
+     * @throws IllegalArgumentException for any other value, including {@code null}
+     */
+    public static boolean parseBooleanStrict(String raw, String source) {
+        String value = raw == null ? null : raw.trim();
+        if ("true".equalsIgnoreCase(value)) {
+            return true;
+        }
+        if ("false".equalsIgnoreCase(value)) {
+            return false;
+        }
+        throw new IllegalArgumentException("Invalid value '" + raw + "' for " + source + " - expected true or false");
     }
 
     public static String getString(String prop, String env, String defaultValue) {

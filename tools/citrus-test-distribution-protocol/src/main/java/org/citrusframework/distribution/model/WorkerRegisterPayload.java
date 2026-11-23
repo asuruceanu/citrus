@@ -21,6 +21,11 @@ import java.util.Map;
 public record WorkerRegisterPayload(
         String workerId,
         String host,
-        Map<String, String> capabilities
+        Map<String, String> capabilities,
+        WorkerCacheStats cacheStats
 ) {
+
+    public WorkerRegisterPayload(String workerId, String host, Map<String, String> capabilities) {
+        this(workerId, host, capabilities, null);
+    }
 }

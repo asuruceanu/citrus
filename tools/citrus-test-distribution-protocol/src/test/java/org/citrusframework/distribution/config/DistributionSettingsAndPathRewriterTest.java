@@ -19,9 +19,11 @@ package org.citrusframework.distribution.config;
 import java.io.File;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.function.UnaryOperator;
 
 import org.citrusframework.distribution.config.DistributionSettings.DeclaredPathSpec;
 import org.citrusframework.distribution.model.ArtifactKind;
@@ -362,5 +364,110 @@ class DistributionSettingsAndPathRewriterTest {
                 DistributionSettings.WorkerCwdCheckMode.WARN,
                 DistributionSettings.WorkerCwdCheckMode.OFF);
         assertThat(ArtifactKind.valueOf("REGULAR_FILE")).isEqualTo(ArtifactKind.REGULAR_FILE);
+    }
+
+    @Test
+    void shouldParseByteSizeUnitsAndRejectInvalidInputs() {
+        assertThat(DistributionSettings.parseByteSize("0", "opt")).isZero();
+        assertThat(DistributionSettings.parseByteSize("4096", "opt")).isEqualTo(4096L);
+        assertThat(DistributionSettings.parseByteSize("512KiB", "opt")).isEqualTo(524_288L);
+        assertThat(DistributionSettings.parseByteSize(" 256 MiB ", "opt")).isEqualTo(268_435_456L);
+        assertThat(DistributionSettings.parseByteSize("2GiB", "opt")).isEqualTo(2_147_483_648L);
+        assertThat(DistributionSettings.parseByteSize("2gib", "opt")).isEqualTo(2_147_483_648L);
+        assertThat(DistributionSettings.parseByteSize("512mib", "opt")).isEqualTo(536_870_912L);
+        assertThat(DistributionSettings.parseByteSize("1024KIB", "opt")).isEqualTo(1_048_576L);
+
+        for (String invalid : new String[] {null, "", "   ", "-1", "2GB", "MB", "KB", "1TiB", "1.5GiB", "abc",
+                "9999999999GiB", "99999999999999999999"}) {
+            assertThatThrownBy(() -> DistributionSettings.parseByteSize(invalid, "my.option"))
+                    .as("input %s", invalid)
+                    .isInstanceOf(IllegalArgumentException.class)
+                    .hasMessageContaining("my.option")
+                    .hasMessageContaining("KiB, MiB, GiB");
+        }
+    }
+
+    @Test
+    void shouldParseBooleanStrictAndRejectInvalidTokens() {
+        assertThat(DistributionSettings.parseBooleanStrict("true", "opt")).isTrue();
+        assertThat(DistributionSettings.parseBooleanStrict("TRUE", "opt")).isTrue();
+        assertThat(DistributionSettings.parseBooleanStrict(" false ", "opt")).isFalse();
+
+        for (String invalid : new String[] {null, "", "flase", "1", "yes"}) {
+            assertThatThrownBy(() -> DistributionSettings.parseBooleanStrict(invalid, "my.option"))
+                    .as("input %s", invalid)
+                    .isInstanceOf(IllegalArgumentException.class)
+                    .hasMessageContaining("my.option");
+        }
+    }
+
+    @Test
+    void shouldResolveWorkerCacheSettingsWithPrecedenceBlankFallthroughAndGlobalIsolation() {
+        UnaryOperator<String> none = key -> null;
+        Path defaultDir = DistributionSettings.defaultWorkerCacheDir();
+        assertThat(defaultDir).isEqualTo(Paths.get(System.getProperty("user.home", "."))
+                .resolve(".citrus-test-distribution-agent").resolve("file-cache"));
+        assertThat(DistributionSettings.resolveWorkerCacheDir(none, none)).isEqualTo(defaultDir);
+        assertThat(DistributionSettings.resolveWorkerCacheCleanup(none, none)).isTrue();
+        assertThat(DistributionSettings.resolveWorkerCacheFreeSpaceBufferBytes(none, none))
+                .isEqualTo(DistributionSettings.DEFAULT_WORKER_CACHE_FREE_SPACE_BUFFER_BYTES);
+
+        Map<String, String> props = new HashMap<>();
+        Map<String, String> env = new HashMap<>();
+        env.put(DistributionSettings.AGENT_CACHE_DIR_ENV, "/agent");
+        env.put(DistributionSettings.AGENT_CACHE_CLEANUP_ENV, "false");
+        env.put(DistributionSettings.AGENT_CACHE_FREE_SPACE_BUFFER_SIZE_ENV, "1GiB");
+        assertThat(DistributionSettings.resolveWorkerCacheDir(props::get, env::get)).isEqualTo(Paths.get("/agent"));
+        assertThat(DistributionSettings.resolveWorkerCacheCleanup(props::get, env::get)).isFalse();
+        assertThat(DistributionSettings.resolveWorkerCacheFreeSpaceBufferBytes(props::get, env::get))
+                .isEqualTo(1024L * 1024 * 1024);
+
+        env.put(DistributionSettings.WORKER_CACHE_DIR_ENV, "/citrus");
+        env.put(DistributionSettings.WORKER_CACHE_CLEANUP_ENV, "true");
+        env.put(DistributionSettings.WORKER_CACHE_FREE_SPACE_BUFFER_SIZE_ENV, "2MiB");
+        assertThat(DistributionSettings.resolveWorkerCacheDir(props::get, env::get)).isEqualTo(Paths.get("/citrus"));
+        assertThat(DistributionSettings.resolveWorkerCacheCleanup(props::get, env::get)).isTrue();
+        assertThat(DistributionSettings.resolveWorkerCacheFreeSpaceBufferBytes(props::get, env::get))
+                .isEqualTo(2L * 1024 * 1024);
+
+        props.put(DistributionSettings.WORKER_CACHE_DIR_PROPERTY, "/prop");
+        props.put(DistributionSettings.WORKER_CACHE_CLEANUP_PROPERTY, "false");
+        props.put(DistributionSettings.WORKER_CACHE_FREE_SPACE_BUFFER_SIZE_PROPERTY, "3KiB");
+        assertThat(DistributionSettings.resolveWorkerCacheDir(props::get, env::get)).isEqualTo(Paths.get("/prop"));
+        assertThat(DistributionSettings.resolveWorkerCacheCleanup(props::get, env::get)).isFalse();
+        assertThat(DistributionSettings.resolveWorkerCacheFreeSpaceBufferBytes(props::get, env::get))
+                .isEqualTo(3072L);
+
+        // blank values fall through to the next tier
+        props.put(DistributionSettings.WORKER_CACHE_DIR_PROPERTY, "");
+        props.put(DistributionSettings.WORKER_CACHE_CLEANUP_PROPERTY, "  ");
+        props.put(DistributionSettings.WORKER_CACHE_FREE_SPACE_BUFFER_SIZE_PROPERTY, "");
+        env.put(DistributionSettings.WORKER_CACHE_DIR_ENV, "  ");
+        assertThat(DistributionSettings.resolveWorkerCacheDir(props::get, env::get)).isEqualTo(Paths.get("/agent"));
+        assertThat(DistributionSettings.resolveWorkerCacheCleanup(props::get, env::get)).isTrue();
+        assertThat(DistributionSettings.resolveWorkerCacheFreeSpaceBufferBytes(props::get, env::get))
+                .isEqualTo(2L * 1024 * 1024);
+
+        // an invalid non-blank higher tier is an error, not a fall-through
+        env.put(DistributionSettings.WORKER_CACHE_FREE_SPACE_BUFFER_SIZE_ENV, "bad");
+        assertThatThrownBy(() -> DistributionSettings.resolveWorkerCacheFreeSpaceBufferBytes(props::get, env::get))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining(DistributionSettings.WORKER_CACHE_FREE_SPACE_BUFFER_SIZE_ENV);
+        env.put(DistributionSettings.WORKER_CACHE_CLEANUP_ENV, "maybe");
+        assertThatThrownBy(() -> DistributionSettings.resolveWorkerCacheCleanup(props::get, env::get))
+                .isInstanceOf(IllegalArgumentException.class);
+
+        // the global coordinator cache dir does not affect the worker cache dir
+        String previous = System.getProperty(DistributionSettings.CACHE_DIR_PROPERTY);
+        System.setProperty(DistributionSettings.CACHE_DIR_PROPERTY, "/tmp/global-cache");
+        try {
+            assertThat(DistributionSettings.getWorkerCacheDir().toString()).doesNotContain("global-cache");
+        } finally {
+            if (previous == null) {
+                System.clearProperty(DistributionSettings.CACHE_DIR_PROPERTY);
+            } else {
+                System.setProperty(DistributionSettings.CACHE_DIR_PROPERTY, previous);
+            }
+        }
     }
 }
