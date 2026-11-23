@@ -32,6 +32,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 import org.citrusframework.distribution.config.DistributionJson;
 import org.citrusframework.distribution.model.WorkUnitSpec;
+import org.citrusframework.distribution.workspace.WorkspaceLease;
 import org.junit.platform.engine.CancellationToken;
 
 /**
@@ -150,6 +151,7 @@ public final class ForkedPartitionMain {
      * and {@code user.dir*} properties alone.
      */
     static void applySystemProperties(Map<String, String> properties) {
+        System.clearProperty(WorkspaceLease.TICKET_PROPERTY);
         if (properties == null) {
             return;
         }

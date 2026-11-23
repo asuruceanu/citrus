@@ -46,6 +46,7 @@ import org.citrusframework.distribution.cache.BlobCacheDirectory;
 import org.citrusframework.distribution.cache.ClasspathPackager;
 import org.citrusframework.distribution.config.DistributionJson;
 import org.citrusframework.distribution.config.DistributionSettings;
+import org.citrusframework.distribution.workspace.WorkspaceLease;
 import org.citrusframework.distribution.model.ArtifactRef;
 import org.citrusframework.distribution.model.CreateSessionRequest;
 import org.citrusframework.distribution.model.PartitionPolicy;
@@ -656,6 +657,8 @@ class DistributedLauncherTest {
         source.setProperty("surefire.real.class.path", "/host/target/surefirebooter.jar");
         source.setProperty("maven.multiModuleProjectDirectory", "/host/workspace");
         source.setProperty("basedir", "/host/workspace/module");
+        source.setProperty(WorkspaceLease.ENABLED_PROPERTY, "true");
+        source.setProperty(WorkspaceLease.TICKET_PROPERTY, "/host/local-ticket");
         source.setProperty("localRepository", "/host/.m2/repository");
 
         java.util.Map<String, String> forwarded = DistributedLauncher.collectPropagatedProperties(source);
@@ -664,7 +667,9 @@ class DistributedLauncherTest {
                 .containsEntry("citrus.default.timeout", "15000")
                 .containsEntry("spring.profiles.active", "integration")
                 .containsEntry("custom.service.port", "19090")
+                .containsEntry(WorkspaceLease.ENABLED_PROPERTY, "true")
                 .doesNotContainKeys(
+                        WorkspaceLease.TICKET_PROPERTY,
                         "citrus.test.distribution.broker.url",
                         "junit.platform.launcher.interceptors.enabled",
                         "java.home",

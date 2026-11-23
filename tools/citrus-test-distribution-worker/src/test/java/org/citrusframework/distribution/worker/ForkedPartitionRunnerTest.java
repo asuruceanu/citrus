@@ -52,12 +52,14 @@ import org.citrusframework.distribution.model.TestOutcomeStatus;
 import org.citrusframework.distribution.model.WorkUnitSpec;
 import org.citrusframework.distribution.model.WorkerTestEventPayload;
 import org.citrusframework.distribution.model.WorkspaceFileSet;
+import org.citrusframework.distribution.workspace.WorkspaceLease;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.DisabledOnOs;
 import org.junit.jupiter.api.condition.OS;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.platform.engine.CancellationToken;
 
+import static java.nio.file.StandardCopyOption.ATOMIC_MOVE;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatNoException;
 
@@ -74,6 +76,11 @@ class ForkedPartitionRunnerTest {
             check("hello".equals(greeting.trim()), "relative input readable from CWD, got " + greeting);
             Path basedir = Path.of(System.getProperty("basedir"));
             check(Path.of("").toRealPath().equals(basedir.toRealPath()), "CWD is the workspace");
+            String ticket = System.getProperty(WorkspaceLease.TICKET_PROPERTY);
+            check(ticket != null, "opted-in partition receives a workspace lease ticket");
+            try (WorkspaceLease lease = WorkspaceLease.acquire(Path.of(ticket))) {
+                check(lease.workspace().equals(basedir), "lease resolves to the workspace");
+            }
             check(System.getProperty("custom.dir").equals(basedir + File.separator + "conf"), "token expanded: "
                     + System.getProperty("custom.dir"));
             String tmp = System.getProperty("java.io.tmpdir");
@@ -91,11 +98,32 @@ class ForkedPartitionRunnerTest {
         }
     }
 
+    /** Gives an independently started helper a chance to claim its ticket before this fork finishes. */
+    public static class WorkspaceLeaseFixture {
+        @Test
+        void offerWorkspaceToHelper() throws Exception {
+            Path info = Path.of(System.getProperty("fixture.info"));
+            Path workspace = Path.of(System.getProperty("basedir"));
+            Files.writeString(workspace.resolve(WorkerWorkspaceLeaseTest.SENTINEL), WorkerWorkspaceLeaseTest.SENTINEL);
+            Path staging = Files.write(info.resolveSibling("lease.pending"), List.of(
+                    System.getProperty(WorkspaceLease.TICKET_PROPERTY), workspace.toString(), System.getProperty("java.io.tmpdir")));
+            Files.move(staging, info, ATOMIC_MOVE);
+
+            Path resume = info.resolveSibling("lease-acquired");
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
+            while (!Files.exists(resume) && System.nanoTime() < deadline) {
+                Thread.sleep(20);
+            }
+            check(Files.exists(resume), "independent helper acquired the lease before the fork completed");
+        }
+    }
+
     /** Expects the module's Surefire working directory (target/) inside the workspace. */
     public static class WorkingDirectoryFixture {
         @Test
         void runInTargetDirectory() throws Exception {
             Path basedir = Path.of(System.getProperty("basedir")).toRealPath();
+            check(System.getProperty(WorkspaceLease.TICKET_PROPERTY) == null, "no ticket without opt-in");
             check(Path.of("").toRealPath().equals(basedir.resolve("target")), "CWD is <workspace>/target: " + Path.of("").toRealPath());
             Files.writeString(Path.of("relative-output.txt"), "written relative to the working directory");
         }
@@ -347,7 +375,8 @@ class ForkedPartitionRunnerTest {
 
             List<WorkerTestEventPayload> events = new CopyOnWriteArrayList<>();
             IsolatedPartitionRunner.PartitionExecutionResult result = new ForkedPartitionRunner(config).execute(
-                    assignment(cache, Map.of("custom.dir", DistributionSettings.WORKSPACE_TOKEN + "/conf"), inputs,
+                    assignment(cache, Map.of("custom.dir", DistributionSettings.WORKSPACE_TOKEN + "/conf",
+                            WorkspaceLease.ENABLED_PROPERTY, "true"), inputs,
                             List.of("target/docs"), unit(WorkspaceFixture.class, "readInputsAndWriteOutputs"),
                             unit(WorkspaceFixture.class, "failingAssertion")),
                     CancellationToken.create(), events::add);
@@ -371,6 +400,55 @@ class ForkedPartitionRunnerTest {
                     broker.baseUrl() + "/api/v1/cache/blobs/" + result.outputArtifacts().getFirst().artifact().sha256())).GET().build(),
                     HttpResponse.BodyHandlers.discarding());
             assertThat(uploaded.statusCode()).as("output blob uploaded to the coordinator").isEqualTo(200);
+        }
+    }
+
+    @Test
+    void shouldKeepWorkspaceForIndependentLeaseHolderAfterTheForkCompletes() throws Exception {
+        Path info = tempDir.resolve("lease-info.txt");
+        DistributionWorkerConfig config = workerConfig(tempDir.resolve("worker-cache"), "http://127.0.0.1:9");
+        PartitionAssignPayload partition = assignment(new BlobCacheDirectory(config.cacheDir()),
+                Map.of("fixture.info", info.toString(), WorkspaceLease.ENABLED_PROPERTY, "true"),
+                List.of(), List.of(), unit(WorkspaceLeaseFixture.class, "offerWorkspaceToHelper"));
+        CancellationToken token = CancellationToken.create();
+        List<WorkerTestEventPayload> events = new CopyOnWriteArrayList<>();
+        ForkedPartitionRunner runner = new ForkedPartitionRunner(config);
+        CompletableFuture<IsolatedPartitionRunner.PartitionExecutionResult> running =
+                CompletableFuture.supplyAsync(() -> runner.execute(partition, token, events::add));
+        try {
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
+            while (!Files.exists(info) && !running.isDone() && System.nanoTime() < deadline) {
+                Thread.sleep(20);
+            }
+            assertThat(info).as("fork published the ticket").exists();
+            List<String> paths = Files.readAllLines(info);
+            Path ticket = Path.of(paths.get(0));
+            try (var helper = WorkerWorkspaceLeaseTest.startLeaseHolder(tempDir, ticket)) {
+                // Launch from the test JVM so the worker's fork descendant cleanup never owns this process.
+                helper.awaitOutput(WorkerWorkspaceLeaseTest.LEASE_ACQUIRED);
+                Files.createFile(tempDir.resolve("lease-acquired"));
+                var result = running.get(30, TimeUnit.SECONDS);
+                assertThat(result.success()).as(result.errorMessage()).isTrue();
+                assertThat(finished(events)).singleElement().satisfies(event ->
+                        assertThat(event.status()).as(event.errorMessage()).isEqualTo(TestOutcomeStatus.PASSED));
+
+                WorkerWorkspaceLeaseTest.assertRetired(ticket);
+                assertThat(Path.of(paths.get(2))).isDirectory();
+                helper.signal();
+                helper.awaitOutput(WorkerWorkspaceLeaseTest.SENTINEL);
+                helper.signal();
+                helper.assertExit(0);
+            }
+        } finally {
+            if (!running.isDone()) {
+                token.cancel();
+                running.get(30, TimeUnit.SECONDS);
+            }
+            if (Files.exists(info)) {
+                List<String> paths = Files.readAllLines(info);
+                WorkerWorkspaceLeaseTest.deleteTestTree(Path.of(paths.get(2)));
+                WorkerWorkspaceLeaseTest.deleteTestTree(Path.of(paths.get(1)).getParent());
+            }
         }
     }
 

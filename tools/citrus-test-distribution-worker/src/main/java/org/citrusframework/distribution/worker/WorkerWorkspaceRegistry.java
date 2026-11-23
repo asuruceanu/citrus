@@ -45,6 +45,7 @@ import java.util.Objects;
 import java.util.Properties;
 import java.util.regex.Pattern;
 
+import org.citrusframework.distribution.workspace.WorkspaceLeaseGate;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -115,7 +116,7 @@ final class WorkerWorkspaceRegistry {
         }
     }
 
-    Workspace create(boolean forked) throws IOException {
+    Workspace create(boolean forked, boolean leased) throws IOException {
         Workspace workspace = reserve(forked);
         try {
             Path root = workspace.root();
@@ -138,6 +139,11 @@ final class WorkerWorkspaceRegistry {
             if (forked && workspace.record.shortTempKey().isEmpty()) {
                 Files.createDirectory(workspace.childTmpDir(), privatePermissions("rwx------"));
             }
+            if (leased) {
+                Path workspaceDir = Files.createDirectory(root.resolve("workspace"));
+                WorkspaceLeaseGate.create(leaseTicket(workspace.record), workspaceDir);
+                workspace.publish(workspace.record.withLease());
+            }
             return workspace;
         } catch (IOException | RuntimeException e) {
             try {
@@ -159,7 +165,7 @@ final class WorkerWorkspaceRegistry {
                 continue;
             }
             Record record = new Record(randomHex(16), tempKey, forked ? shortTempKey : "", processScope,
-                    worker, linuxWorkerStart, LaunchState.PREPARING, null);
+                    worker, linuxWorkerStart, false, LaunchState.PREPARING, null);
             try {
                 writeRecord(entry, record);
             } catch (IOException | RuntimeException e) {
@@ -179,6 +185,13 @@ final class WorkerWorkspaceRegistry {
         Path entry = journal.resolve(id);
         Path root = tempBase.resolve("cdist-" + id);
         Path shortTemp = record.shortTempKey().isEmpty() ? null : shortTempBase.resolve("cdtmp-" + id);
+        Path ticket = leaseTicket(record);
+        boolean rootsAbsent = Files.notExists(root, LinkOption.NOFOLLOW_LINKS)
+                && (shortTemp == null || Files.notExists(shortTemp, LinkOption.NOFOLLOW_LINKS));
+        if (!WorkspaceLeaseGate.tryRetire(ticket, record.leased() && !rootsAbsent)) {
+            LOG.debug("Deferring cleanup of leased partition workspace {}", id);
+            return;
+        }
         List<Path> ownedRoots = new ArrayList<>(2);
         if (ownedDirectory(root, entry, record.token(), rootIdentity) != null) {
             ownedRoots.add(root);
@@ -205,8 +218,13 @@ final class WorkerWorkspaceRegistry {
         boolean tempRemoved = shortTemp == null || deleteOwnedDirectory(shortTemp, entry, record.token(), shortTempIdentity);
         boolean rootRemoved = deleteOwnedDirectory(root, entry, record.token(), rootIdentity);
         if (tempRemoved && rootRemoved) {
+            WorkspaceLeaseGate.removeRetired(ticket);
             Files.deleteIfExists(entry);
         }
+    }
+
+    private Path leaseTicket(Record record) {
+        return journal.resolve(".lease-" + record.token());
     }
 
     private static DirectoryIdentity ownedDirectory(Path root, Path entry, String token, DirectoryIdentity created)
@@ -341,6 +359,9 @@ final class WorkerWorkspaceRegistry {
             properties.setProperty("scope", record.processScope());
             properties.setProperty("state", record.state().name());
             record.worker().write(properties, "worker");
+            if (record.leased()) {
+                properties.setProperty("lease", "true");
+            }
             if (record.linuxWorkerStart() != null) {
                 properties.setProperty("workerLinuxStart", record.linuxWorkerStart().encode());
             }
@@ -370,12 +391,15 @@ final class WorkerWorkspaceRegistry {
         LaunchState state = LaunchState.valueOf(properties.getProperty("state", ""));
         String scope = properties.getProperty("scope");
         String workerStart = properties.getProperty("workerLinuxStart");
+        String lease = properties.getProperty("lease");
+        boolean leased = "true".equals(lease);
         int requiredProperties = state == LaunchState.LAUNCHED ? 10 : 8;
-        if (scope == null || properties.size() != requiredProperties + (workerStart == null ? 0 : 1)) {
+        if (scope == null || (lease != null && !leased)
+                || properties.size() != requiredProperties + (workerStart == null ? 0 : 1) + (leased ? 1 : 0)) {
             return null;
         }
         return new Record(token, temp, shortTemp, scope,
-                ProcessIdentity.read(properties, "worker"), LinuxWorkspaceReferences.StartTicks.parse(workerStart), state,
+                ProcessIdentity.read(properties, "worker"), LinuxWorkspaceReferences.StartTicks.parse(workerStart), leased, state,
                 state == LaunchState.LAUNCHED ? ProcessIdentity.read(properties, "child") : null);
     }
 
@@ -448,6 +472,10 @@ final class WorkerWorkspaceRegistry {
             return tempBase.resolve("cdist-" + id);
         }
 
+        Path leaseTicket() {
+            return record.leased() ? WorkerWorkspaceRegistry.this.leaseTicket(record) : null;
+        }
+
         Path childTmpDir() {
             if (!forked) {
                 throw new IllegalStateException("This workspace has no child JVM");
@@ -507,14 +535,19 @@ final class WorkerWorkspaceRegistry {
 
     private record Record(String token, String tempKey, String shortTempKey, String processScope,
                           ProcessIdentity worker, LinuxWorkspaceReferences.StartTicks linuxWorkerStart,
-                          LaunchState state, ProcessIdentity child) {
+                          boolean leased, LaunchState state, ProcessIdentity child) {
 
         Record withLaunch(LaunchState updatedState, ProcessIdentity updatedChild) {
-            return new Record(token, tempKey, shortTempKey, processScope, worker, linuxWorkerStart, updatedState, updatedChild);
+            return new Record(token, tempKey, shortTempKey, processScope, worker, linuxWorkerStart,
+                    leased, updatedState, updatedChild);
         }
 
         Record withoutShortTemp() {
-            return new Record(token, tempKey, "", processScope, worker, linuxWorkerStart, state, child);
+            return new Record(token, tempKey, "", processScope, worker, linuxWorkerStart, leased, state, child);
+        }
+
+        Record withLease() {
+            return new Record(token, tempKey, shortTempKey, processScope, worker, linuxWorkerStart, true, state, child);
         }
 
         boolean canRecover() {

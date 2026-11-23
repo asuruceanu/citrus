@@ -47,6 +47,7 @@ import org.citrusframework.distribution.model.SubmitWorkResponse;
 import org.citrusframework.distribution.model.WorkUnitSpec;
 import org.citrusframework.distribution.model.WorkerTestEventPayload;
 import org.citrusframework.distribution.model.WorkspaceFileSet;
+import org.citrusframework.distribution.workspace.WorkspaceLease;
 import org.junit.platform.launcher.Launcher;
 import org.junit.platform.launcher.LauncherDiscoveryListener;
 import org.junit.platform.launcher.LauncherDiscoveryRequest;
@@ -510,7 +511,7 @@ public class DistributedLauncher implements Launcher {
     }
 
     private static boolean isHostOrInternalProperty(String key) {
-        if (HOST_SYSTEM_PROPERTY_KEYS.contains(key)) {
+        if (HOST_SYSTEM_PROPERTY_KEYS.contains(key) || WorkspaceLease.TICKET_PROPERTY.equals(key)) {
             return true;
         }
         for (String prefix : HOST_SYSTEM_PROPERTY_PREFIXES) {

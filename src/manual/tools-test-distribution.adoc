@@ -582,6 +582,39 @@ cannot establish whether a listener still owns them.
 On other platforms, the worker defers startup recovery and uses the platform's filesystem behavior during normal cleanup.
 A process that only retains a path for future use has no current filesystem reference for the worker to check.
 
+[[tools-test-distribution-workspace-lease]]
+=== Workspace leases for background helpers
+
+Set the test JVM system property `citrus.dist.workspace.lease.enabled=true` to let same-host Java helpers hold a
+partition workspace after the partition ends. The enabled worker publishes an opaque local ticket as
+`citrus.dist.workspace.lease.ticket` in the forked or isolated partition. Send the helper only this ticket, and wait for
+it to acknowledge acquisition before allowing the partition to finish or forwarding any workspace path. A helper that
+receives the ticket after cleanup starts may fail to acquire it and should stop the operation.
+
+Use `org.citrusframework:citrus-test-distribution-protocol` on the helper's classpath. With the ticket as its first
+argument, the helper can acquire the lease and get the workspace path as follows.
+
+[source,java]
+----
+import java.nio.file.Path;
+import org.citrusframework.distribution.workspace.WorkspaceLease;
+
+try (WorkspaceLease lease = WorkspaceLease.acquire(Path.of(args[0]))) {
+    Path workspace = lease.workspace();
+    // Keep the lease open through every idle period and every use of the path.
+}
+----
+
+Each helper acquires its own lease. The ticket and lease are local to the worker host and must be used by cooperating
+processes under the worker's account on a filesystem with atomic file moves and cross-process file locking. Keep the
+ticket private and close the lease when finished. The lease extends the lifetime of the workspace and its fork temp
+directory. A helper that needs to survive a forked partition must run independently of its process tree. The worker
+can terminate fork descendants on successful completion or cancellation.
+
+If a helper exits abruptly, the operating system releases its lock. Cleanup closes admission to new leases. On Linux
+and macOS, a later worker startup can reclaim deferred workspaces once the leases and filesystem references have
+cleared. Startup recovery on other platforms retains orphaned workspaces.
+
 [[tools-test-distribution-external-resources-compat]]
 === Requirements and caveats
 

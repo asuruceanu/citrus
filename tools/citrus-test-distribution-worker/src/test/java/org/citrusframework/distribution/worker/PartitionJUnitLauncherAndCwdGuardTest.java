@@ -16,6 +16,7 @@
 
 package org.citrusframework.distribution.worker;
 
+import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
@@ -34,6 +35,7 @@ import org.citrusframework.distribution.model.PartitionAssignPayload;
 import org.citrusframework.distribution.model.TestOutcomeStatus;
 import org.citrusframework.distribution.model.WorkUnitSpec;
 import org.citrusframework.distribution.model.WorkerTestEventPayload;
+import org.citrusframework.distribution.workspace.WorkspaceLease;
 import org.citrusframework.dsl.TestActionSupport;
 import org.citrusframework.endpoint.Endpoint;
 import org.citrusframework.endpoint.direct.annotation.DirectEndpointConfig;
@@ -109,7 +111,7 @@ class PartitionJUnitLauncherAndCwdGuardTest {
     /** Writes a file into the worker's CWD when asked to, and checks the per-partition property redirection. */
     public static class WorkspaceFixture {
         @Test
-        void checkRedirectedProperties() {
+        void checkRedirectedProperties() throws IOException {
             String basedir = System.getProperty("basedir");
             assertThat(basedir).endsWith("workspace");
             assertThat(Path.of(basedir)).isDirectory();
@@ -119,6 +121,11 @@ class PartitionJUnitLauncherAndCwdGuardTest {
             assertThat(System.getProperty("citrus.message.trace.directory"))
                     .isEqualTo(Path.of(basedir, "custom/traces").toString());
             assertThat(System.getProperty("custom.dir")).isEqualTo(basedir + java.io.File.separator + "conf");
+            String ticket = System.getProperty(WorkspaceLease.TICKET_PROPERTY);
+            assertThat(ticket).isNotBlank();
+            try (WorkspaceLease lease = WorkspaceLease.acquire(Path.of(ticket))) {
+                assertThat(lease.workspace()).isEqualTo(Path.of(basedir));
+            }
         }
 
         @Test
@@ -300,7 +307,8 @@ class PartitionJUnitLauncherAndCwdGuardTest {
         IsolatedPartitionRunner.PartitionExecutionResult result = runner(WorkerCwdCheckMode.FAIL).execute(
                 assignment(Map.of(
                         "custom.dir", DistributionSettings.WORKSPACE_TOKEN + "/conf",
-                        "citrus.message.trace.directory", "custom/traces"),
+                        "citrus.message.trace.directory", "custom/traces",
+                        WorkspaceLease.ENABLED_PROPERTY, "true"),
                         unit(WorkspaceFixture.class, "checkRedirectedProperties")),
                 CancellationToken.create(), events::add);
 
@@ -312,6 +320,7 @@ class PartitionJUnitLauncherAndCwdGuardTest {
                 .satisfiesAnyOf(b -> assertThat(b).isNull(), b -> assertThat(b).doesNotContain("cdist-"));
         assertThat(System.getProperty("citrus.report.directory")).isNull();
         assertThat(System.getProperty("custom.dir")).isNull();
+        assertThat(System.getProperty(WorkspaceLease.TICKET_PROPERTY)).isNull();
     }
 
     @Test

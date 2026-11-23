@@ -365,10 +365,14 @@ final class WorkerFileCache implements AutoCloseable {
     }
 
     WorkerWorkspaceRegistry.Workspace createWorkspace(boolean forked) throws IOException {
+        return createWorkspace(forked, false);
+    }
+
+    WorkerWorkspaceRegistry.Workspace createWorkspace(boolean forked, boolean leased) throws IOException {
         evictionLock.lock();
         try {
             ensureOpen();
-            return workspaceRegistry.create(forked);
+            return workspaceRegistry.create(forked, leased);
         } finally {
             evictionLock.unlock();
         }

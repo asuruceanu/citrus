@@ -205,7 +205,8 @@ final class ForkedPartitionRunner implements PartitionRunner {
                 if (jvmStopping) {
                     return cancelledResult();
                 }
-                fork.workspace = cache.createWorkspace(true);
+                fork.workspace = cache.createWorkspace(true,
+                        IsolatedPartitionRunner.workspaceLeaseRequested(assignment.systemProperties()));
                 fork.partitionRoot = fork.workspace.root();
                 fork.tmpDir = fork.workspace.childTmpDir();
                 workspace = Files.createDirectories(fork.partitionRoot.resolve("workspace"));
@@ -242,6 +243,7 @@ final class ForkedPartitionRunner implements PartitionRunner {
             String token = HexFormat.of().formatHex(secret);
             Map<String, String> properties = new LinkedHashMap<>(
                     IsolatedPartitionRunner.workspaceOverrides(assignment.systemProperties(), workspace));
+            IsolatedPartitionRunner.addWorkspaceLeaseTicket(properties, fork.workspace);
             properties.put(DistributionSettings.ROLE_PROPERTY, DistributionSettings.ROLE_WORKER);
             String requestJson = DistributionJson.toJson(new ForkedPartitionMain.ForkRequest(assignment.partitionId(),
                     assignment.sessionId(), assignment.attempt(), token, properties, assignment.workUnits()));

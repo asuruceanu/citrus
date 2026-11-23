@@ -68,6 +68,7 @@ import org.citrusframework.distribution.model.ArtifactRef;
 import org.citrusframework.distribution.model.PartitionAssignPayload;
 import org.citrusframework.distribution.model.WorkerTestEventPayload;
 import org.citrusframework.distribution.model.WorkspaceFileSet;
+import org.citrusframework.distribution.workspace.WorkspaceLease;
 import org.junit.platform.engine.CancellationToken;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -174,7 +175,7 @@ public final class IsolatedPartitionRunner implements PartitionRunner {
                     ? assignment.classpathArtifacts() : List.of();
             pins = cache.pinAll(classpathArtifacts.stream().map(ArtifactRef::sha256).toList());
 
-            workspace = cache.createWorkspace(false);
+            workspace = cache.createWorkspace(false, workspaceLeaseRequested(assignment.systemProperties()));
             Path partitionRoot = workspace.root();
             Path workspaceDir = Files.createDirectories(partitionRoot.resolve("workspace"));
             Files.createDirectories(workspaceDir.resolve("target"));
@@ -187,6 +188,7 @@ public final class IsolatedPartitionRunner implements PartitionRunner {
             }
 
             Map<String, String> overrides = partitionOverrides(assignment.systemProperties(), workspaceDir);
+            addWorkspaceLeaseTicket(overrides, workspace);
             WorkingDirectorySnapshot before = null;
             synchronized (WORKER_JVM_LOCK) {
                 if (config.cwdCheckMode() != WorkerCwdCheckMode.OFF) {
@@ -295,6 +297,19 @@ public final class IsolatedPartitionRunner implements PartitionRunner {
                 assigned != null ? assigned : Map.of(), workspaceDir);
         overrides.put("basedir", workspaceDir.toAbsolutePath().normalize().toString());
         return overrides;
+    }
+
+    static boolean workspaceLeaseRequested(Map<String, String> assigned) {
+        return assigned != null && Boolean.parseBoolean(assigned.get(WorkspaceLease.ENABLED_PROPERTY));
+    }
+
+    static void addWorkspaceLeaseTicket(Map<String, String> properties, WorkerWorkspaceRegistry.Workspace workspace) {
+        Path ticket = workspace.leaseTicket();
+        if (ticket == null) {
+            properties.remove(WorkspaceLease.TICKET_PROPERTY);
+        } else {
+            properties.put(WorkspaceLease.TICKET_PROPERTY, ticket.toString());
+        }
     }
 
     /**
@@ -492,6 +507,7 @@ public final class IsolatedPartitionRunner implements PartitionRunner {
                 }
             }
             snapshot.putAll(base);
+            snapshot.remove(WorkspaceLease.TICKET_PROPERTY);
             if (partitionOverrides != null) {
                 for (Map.Entry<String, String> entry : partitionOverrides.entrySet()) {
                     String key = entry.getKey();
