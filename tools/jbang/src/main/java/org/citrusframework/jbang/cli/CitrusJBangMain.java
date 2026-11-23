@@ -32,6 +32,7 @@ import org.citrusframework.CitrusVersion;
 import org.citrusframework.jbang.cli.commands.Agent;
 import org.citrusframework.jbang.cli.commands.Complete;
 import org.citrusframework.jbang.cli.commands.Dist;
+import org.citrusframework.jbang.cli.commands.DistWorkerStart;
 import org.citrusframework.jbang.cli.commands.Init;
 import org.citrusframework.jbang.cli.commands.Inspect;
 import org.citrusframework.jbang.cli.commands.ListTests;
@@ -60,13 +61,21 @@ public class CitrusJBangMain implements GroupCommand<CommandInvocation> {
     }
 
     public int execute(String... args) {
+        String[] normalizedArgs;
+        try {
+            normalizedArgs = DistWorkerStart.normalizeWorkerStartArgs(args);
+        } catch (IllegalArgumentException e) {
+            getOut().println(e.getMessage());
+            return CommandResult.FAILURE.getExitCode();
+        }
+
         // Dispatch through a canonical root so subclasses (e.g. test doubles
         // overriding quit/getOut, which do not inherit @CommandDefinition)
         // still resolve command metadata. Only mutable state is the printer.
         CitrusJBangMain root = new CitrusJBangMain().withPrinter(getOut());
         CommandResult result = AeshRuntimeRunner.builder()
                 .command(root)
-                .args(args)
+                .args(normalizedArgs)
                 .execute();
         return result.getExitCode();
     }

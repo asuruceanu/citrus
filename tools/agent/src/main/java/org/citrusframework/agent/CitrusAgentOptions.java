@@ -20,6 +20,7 @@ import java.util.Arrays;
 import java.util.LinkedList;
 
 import org.citrusframework.api.agent.CitrusAgentConfiguration;
+import org.citrusframework.distribution.config.DistributionSettings;
 import org.citrusframework.exceptions.CitrusRuntimeException;
 import org.citrusframework.main.CitrusAppOptions;
 import org.citrusframework.util.StringUtils;
@@ -76,12 +77,28 @@ public class CitrusAgentOptions extends CitrusAppOptions<CitrusAgentConfiguratio
             }
         });
 
-        options.add(new CliOption<>(null, "cache-dir", "Worker blob cache directory") {
+        options.add(new ValueOption("cache-dir", "Worker local file cache directory") {
             @Override
             protected void doProcess(CitrusAgentConfiguration configuration, String arg, String value, LinkedList<String> remainingArgs) {
-                configuration.setCacheDir(value != null ? value : "");
+                configuration.setCacheDir(value);
             }
         });
+
+        options.add(new CacheCleanupOption("cache-cleanup", "Enable or disable cleanup of the worker local file cache (true/false)", false));
+        options.add(new CacheCleanupOption("no-cache-cleanup", "Disable cleanup of the worker local file cache", true));
+
+        options.add(new ValueOption("cache-free-space-buffer-size", "Minimum free space to keep on the worker cache drive (e.g. 2GiB, 512MiB, or bytes)") {
+            @Override
+            protected void doProcess(CitrusAgentConfiguration configuration, String arg, String value, LinkedList<String> remainingArgs) {
+                DistributionSettings.parseByteSize(value, getFullName());
+                configuration.setCacheFreeSpaceBufferSize(value);
+            }
+        });
+    }
+
+    @Override
+    public CitrusAgentConfiguration apply(String[] arguments) {
+        return apply(new CitrusAgentConfiguration(), arguments);
     }
 
     public CitrusAgentConfiguration apply(CitrusAgentConfiguration configuration, String[] arguments) {
@@ -90,13 +107,94 @@ public class CitrusAgentOptions extends CitrusAppOptions<CitrusAgentConfiguratio
         while (!args.isEmpty()) {
             String arg = args.removeFirst();
 
+            boolean processed = false;
             for (CliOption<CitrusAgentConfiguration> option : options) {
                 if (option.processOption(configuration, arg, args)) {
+                    processed = true;
                     break;
                 }
+            }
+
+            if (!processed && (arg.startsWith("--cache") || arg.startsWith("--no-cache"))) {
+                throw new IllegalArgumentException("Unknown cache option: " + arg);
             }
         }
 
         return configuration;
+    }
+
+    /**
+     * Option matching its exact name only, either as {@code --name value} or {@code --name=value}.
+     * The value must be present and non-blank and a following option token is never consumed as value.
+     */
+    private abstract static class ValueOption extends CliOption<CitrusAgentConfiguration> {
+
+        ValueOption(String name, String description) {
+            super("", name, description);
+        }
+
+        @Override
+        public boolean processOption(CitrusAgentConfiguration configuration, String arg, LinkedList<String> remainingArgs) {
+            String value;
+            if (arg.equals(getFullName())) {
+                String next = remainingArgs.peekFirst();
+                if (next == null || next.startsWith("-")) {
+                    throw new IllegalArgumentException("Missing parameter value for " + getFullName() + " option");
+                }
+                value = remainingArgs.removeFirst();
+            } else if (arg.startsWith(getFullName() + "=")) {
+                value = arg.substring(getFullName().length() + 1);
+            } else {
+                return false;
+            }
+
+            if (!StringUtils.hasText(value)) {
+                throw new IllegalArgumentException("Missing parameter value for " + getFullName() + " option");
+            }
+
+            doProcess(configuration, arg, value.trim(), remainingArgs);
+            return true;
+        }
+    }
+
+    /**
+     * Exact match boolean option {@code --[no-]cache-cleanup[=true|false]}. When given without {@code =} a following
+     * token that does not start with {@code -} is consumed as the boolean value and validated strictly.
+     */
+    private static final class CacheCleanupOption extends CliOption<CitrusAgentConfiguration> {
+
+        private static final String SOURCE = "--[no-]cache-cleanup";
+
+        private final boolean negated;
+
+        CacheCleanupOption(String name, String description, boolean negated) {
+            super("", name, description);
+            this.negated = negated;
+        }
+
+        @Override
+        public boolean processOption(CitrusAgentConfiguration configuration, String arg, LinkedList<String> remainingArgs) {
+            boolean value;
+            if (arg.equals(getFullName())) {
+                String next = remainingArgs.peekFirst();
+                if (next != null && !next.startsWith("-")) {
+                    value = DistributionSettings.parseBooleanStrict(remainingArgs.removeFirst(), SOURCE);
+                } else {
+                    value = true;
+                }
+            } else if (arg.startsWith(getFullName() + "=")) {
+                value = DistributionSettings.parseBooleanStrict(arg.substring(getFullName().length() + 1), SOURCE);
+            } else {
+                return false;
+            }
+
+            configuration.setCacheCleanup(negated != value);
+            return true;
+        }
+
+        @Override
+        protected void doProcess(CitrusAgentConfiguration configuration, String arg, String value, LinkedList<String> remainingArgs) {
+            // processing is done in processOption
+        }
     }
 }
