@@ -27,6 +27,21 @@ import static org.assertj.core.api.Assertions.assertThat;
 class ProtocolModelSerializationTest {
 
     @Test
+    void shouldRoundTripHistoricalDurationsDtos() {
+        HistoricalDurationsRequest request = new HistoricalDurationsRequest(List.of("pkg.A"), 10);
+        HistoricalDurationsResponse response = new HistoricalDurationsResponse(Map.of("pkg.A", 450L));
+
+        assertThat(DistributionJson.fromJson(DistributionJson.toJson(request), HistoricalDurationsRequest.class))
+                .isEqualTo(request);
+        assertThat(DistributionJson.fromJson(DistributionJson.toJson(response), HistoricalDurationsResponse.class))
+                .isEqualTo(response);
+        assertThat(DistributionJson.fromJson("{\"testKeys\":null}", HistoricalDurationsRequest.class).testKeys())
+                .isEmpty();
+        assertThat(DistributionJson.fromJson("{\"durationsMs\":null}", HistoricalDurationsResponse.class).durationsMs())
+                .isEmpty();
+    }
+
+    @Test
     void shouldRoundTripExtendedTestHistorySummaryAndSupportLegacyConstructor() {
         TestHistorySummary full = new TestHistorySummary(
                 "OrderIT#createOrder",

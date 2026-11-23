@@ -16,6 +16,8 @@
 
 package org.citrusframework.distribution.scheduler;
 
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.stream.IntStream;
@@ -81,7 +83,7 @@ class LptPartitionSchedulerTest {
 
     @Test
     void shouldSpreadTheSlowestUnitsAcrossPartitionsInsteadOfGroupingThem() {
-        List<WorkUnitSpec> units = new java.util.ArrayList<>();
+        List<WorkUnitSpec> units = new ArrayList<>();
         for (int i = 20; i >= 1; i--) {
             units.add(new WorkUnitSpec(String.format("U%02d", i), "com.example.U" + i, null, null, Map.of(), i * 1000L));
         }
@@ -94,6 +96,78 @@ class LptPartitionSchedulerTest {
         assertThat(partitions).as("the two slowest units run in parallel").allSatisfy(p ->
                 assertThat(p.workUnits()).extracting(WorkUnitSpec::key).containsAnyOf("U20", "U19")
                         .doesNotContain(p.workUnits().stream().anyMatch(u -> u.key().equals("U20")) ? "U19" : "U20"));
+    }
+
+    @Test
+    void shouldPackFastModuleIntoFewerPartitionsWhenMinPartitionDurationFloorApplies() {
+        List<WorkUnitSpec> units = units("Fast", 19, Map.of(), 150L);
+
+        List<PartitionRecord> partitions = new LptPartitionScheduler()
+                .schedule("s1", units, Map.of(), 1_000L, 5, PartitionPolicy.LPT, 5_000L, 2, caps -> 6);
+
+        assertThat(partitions).singleElement().satisfies(partition -> assertThat(partition.workUnits()).hasSize(19));
+    }
+
+    @Test
+    void shouldCapColdMultiWaveExplosionUsingMaxWavesPerWorker() {
+        List<WorkUnitSpec> units = units("Cold", 185, Map.of(), 0L);
+
+        List<PartitionRecord> partitions = new LptPartitionScheduler()
+                .schedule("s1", units, Map.of(), 1_000L, 5, PartitionPolicy.LPT, 5_000L, 2, caps -> 6);
+
+        assertThat(partitions).hasSize(12)
+                .allSatisfy(partition -> assertThat(partition.workUnits()).hasSizeLessThanOrEqualTo(16));
+        assertThat(partitions.stream().flatMap(partition -> partition.workUnits().stream()).map(WorkUnitSpec::key))
+                .containsExactlyInAnyOrderElementsOf(units.stream().map(WorkUnitSpec::key).toList());
+    }
+
+    @Test
+    void shouldEvaluateEligibleWorkersPerCapabilityGroupIndependently() {
+        Map<String, String> requiresDocker = Map.of("docker", "true");
+        List<WorkUnitSpec> units = new ArrayList<>(units("Plain", 20, Map.of(), 1_000L));
+        units.addAll(units("Docker", 20, requiresDocker, 1_000L));
+
+        List<PartitionRecord> partitions = new LptPartitionScheduler()
+                .schedule("s1", units, Map.of(), 1_000L, 5, PartitionPolicy.LPT, 5_000L, 2,
+                        caps -> caps.isEmpty() ? 6 : 1);
+
+        assertThat(partitions).filteredOn(partition -> partition.requiredCapabilities().isEmpty()).hasSize(4);
+        assertThat(partitions).filteredOn(partition -> partition.requiredCapabilities().equals(requiresDocker)).hasSize(2);
+    }
+
+    @Test
+    void shouldPreserveLegacyBehaviorWhenAdaptiveParametersAreDisabled() {
+        List<WorkUnitSpec> units = units("Fast", 7, Map.of(), 150L);
+        List<WorkUnitSpec> skewed = new ArrayList<>(units);
+        skewed.add(new WorkUnitSpec("Slow", "pkg.Slow", null, null, Map.of(), 10_000L));
+        LptPartitionScheduler scheduler = new LptPartitionScheduler();
+
+        List<PartitionRecord> partitions = scheduler
+                .schedule("s1", skewed, Map.of(), 1_000L, 7, PartitionPolicy.LPT, 0L, 0, caps -> 0);
+
+        assertThat(partitions).extracting(partition -> partition.workUnits().size()).containsExactly(1, 7);
+        assertThat(partitions).extracting(PartitionRecord::workUnits).containsExactlyElementsOf(
+                scheduler.schedule("s1", skewed, Map.of(), 1_000L, 7).stream().map(PartitionRecord::workUnits).toList());
+    }
+
+    @Test
+    void shouldFillAdaptivePartitionsEvenWithZeroDurationHistory() {
+        List<WorkUnitSpec> units = units("Test", 25, Map.of(), 0L);
+        Map<String, Long> history = new HashMap<>();
+        units.forEach(unit -> history.put(unit.key(), 0L));
+        history.put("Test0", 120L);
+
+        List<PartitionRecord> partitions = new LptPartitionScheduler()
+                .schedule("s1", units, history, 1_000L, 1, PartitionPolicy.LPT, 10L, 0, null);
+
+        assertThat(partitions).hasSize(12)
+                .allSatisfy(partition -> assertThat(partition.workUnits()).isNotEmpty());
+    }
+
+    private static List<WorkUnitSpec> units(String prefix, int count, Map<String, String> capabilities, long durationMs) {
+        return IntStream.range(0, count)
+                .mapToObj(i -> new WorkUnitSpec(prefix + i, "pkg." + prefix + i, null, null, capabilities, durationMs))
+                .toList();
     }
 
     @Test

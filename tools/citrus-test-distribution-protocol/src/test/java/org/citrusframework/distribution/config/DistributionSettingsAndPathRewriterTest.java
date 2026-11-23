@@ -44,6 +44,40 @@ class DistributionSettingsAndPathRewriterTest {
     private static final String TOKEN = DistributionSettings.WORKSPACE_TOKEN;
 
     @Test
+    void shouldReturnOnlyExplicitPositiveMaxPartitionSizes() {
+        UnaryOperator<String> unset = key -> null;
+        assertThat(DistributionSettings.findConfiguredMaxPartitionSize(unset, unset)).isEmpty();
+        for (String invalid : List.of("invalid", "-1", "0", "2147483648")) {
+            assertThat(DistributionSettings.findConfiguredMaxPartitionSize(key -> invalid, unset)).isEmpty();
+        }
+
+        assertThat(DistributionSettings.findConfiguredMaxPartitionSize(
+                Map.of(DistributionSettings.MAX_PARTITION_SIZE_PROPERTY, " 12 ")::get, key -> "24")).hasValue(12);
+        assertThat(DistributionSettings.findConfiguredMaxPartitionSize(unset,
+                Map.of(DistributionSettings.MAX_PARTITION_SIZE_ENV, "12")::get)).hasValue(12);
+    }
+
+    @Test
+    void shouldReadAndClampMinRemoteThresholds() {
+        UnaryOperator<String> unset = key -> null;
+        assertThat(DistributionSettings.getMinRemoteDurationMs(unset, unset)).isEqualTo(2_000L);
+        assertThat(DistributionSettings.getMinRemoteColdUnits(unset, unset)).isZero();
+
+        assertThat(DistributionSettings.getMinRemoteDurationMs(
+                Map.of(DistributionSettings.MIN_REMOTE_DURATION_MS_PROPERTY, " 3000 ")::get, key -> "9000"))
+                .isEqualTo(3_000L);
+        assertThat(DistributionSettings.getMinRemoteDurationMs(unset,
+                Map.of(DistributionSettings.MIN_REMOTE_DURATION_MS_ENV, "9000")::get)).isEqualTo(9_000L);
+        assertThat(DistributionSettings.getMinRemoteColdUnits(
+                Map.of(DistributionSettings.MIN_REMOTE_COLD_UNITS_PROPERTY, "4")::get, key -> "3")).isEqualTo(4);
+        assertThat(DistributionSettings.getMinRemoteColdUnits(unset,
+                Map.of(DistributionSettings.MIN_REMOTE_COLD_UNITS_ENV, "3")::get)).isEqualTo(3);
+
+        assertThat(DistributionSettings.getMinRemoteDurationMs(key -> "-1", unset)).isZero();
+        assertThat(DistributionSettings.getMinRemoteColdUnits(unset, key -> "-1")).isZero();
+    }
+
+    @Test
     void shouldParseDeclaredPathsWithNoneEscapeOptionalAndAncestorDedup() {
         assertThat(DistributionSettings.parseDeclaredPaths("NONE")).isEmpty();
         assertThat(DistributionSettings.parseDeclaredPaths("./none"))
