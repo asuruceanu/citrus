@@ -25,6 +25,7 @@ import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -158,6 +159,24 @@ public class DistributedLauncher implements Launcher {
         BrokerHttpClient client = new BrokerHttpClient(
                 brokerUrl, authToken, DistributionSettings.getConnectTimeoutMs());
 
+        if (shouldBypassRemoteDistribution(extracted, workspace, client)) {
+            List<WorkUnitSpec> units = new ArrayList<>(extracted.localUnits());
+            units.addAll(extracted.remoteUnits());
+            var stats = LocalFallbackExecutor.executeTestPlanLocally(delegate, testPlan, units,
+                    combineListeners(callListeners).toArray(TestExecutionListener[]::new));
+            if (!ownsSession && !stats.executions().isEmpty()) {
+                try {
+                    client.reportLocalTests(externalSessionId, new ReportLocalTestsRequest("local-host", stats.executions()));
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    LOG.warn("Interrupted while reporting local test executions to session {}", externalSessionId);
+                } catch (IOException | RuntimeException e) {
+                    LOG.warn("Failed to report local test executions to session {}: {}", externalSessionId, e.getMessage());
+                }
+            }
+            return;
+        }
+
         String sessionId = externalSessionId;
         try {
             if (ownsSession) {
@@ -167,7 +186,7 @@ public class DistributedLauncher implements Launcher {
                         "local",
                         "HEAD",
                         List.of(),
-                        DistributionSettings.getMaxPartitionSize(),
+                        DistributionSettings.findConfiguredMaxPartitionSize().orElse(0),
                         DistributionSettings.getMaxRetries()));
                 sessionId = created.sessionId();
             }
@@ -322,6 +341,40 @@ public class DistributedLauncher implements Launcher {
             }
             throw new IllegalStateException("Distributed test execution failed for session " + sessionId, e);
         }
+    }
+
+    private static boolean shouldBypassRemoteDistribution(DiscoveredWorkExtractor.ExtractedWork extracted,
+                                                          WorkspaceSettings workspace, BrokerHttpClient client) {
+        if (extracted.hasRemoteOnlyUnits() || workspace.forkWorkspace()
+                || extracted.remoteUnits().stream().anyMatch(unit ->
+                        unit.requiredCapabilities() != null && !unit.requiredCapabilities().isEmpty())) {
+            return false;
+        }
+
+        long minRemoteDurationMs = DistributionSettings.getMinRemoteDurationMs();
+        int minRemoteColdUnits = DistributionSettings.getMinRemoteColdUnits();
+        if (minRemoteDurationMs == 0 && minRemoteColdUnits == 0) {
+            return false;
+        }
+
+        List<String> remoteKeys = extracted.remoteUnits().stream().map(WorkUnitSpec::key).toList();
+        Optional<Map<String, Long>> history = minRemoteDurationMs > 0
+                ? client.findHistoricalDurations(remoteKeys, 10) : Optional.empty();
+        if (history.isPresent()) {
+            Map<String, Long> durations = history.get();
+            if (remoteKeys.stream().allMatch(key -> durations.get(key) != null && durations.get(key) >= 0)) {
+                long remaining = minRemoteDurationMs;
+                for (String key : remoteKeys) {
+                    long duration = durations.get(key);
+                    if (duration >= remaining) {
+                        return false;
+                    }
+                    remaining -= duration;
+                }
+                return true;
+            }
+        }
+        return minRemoteColdUnits > 0 && remoteKeys.size() <= minRemoteColdUnits;
     }
 
     private static void completeOwnedSessionOnFailure(

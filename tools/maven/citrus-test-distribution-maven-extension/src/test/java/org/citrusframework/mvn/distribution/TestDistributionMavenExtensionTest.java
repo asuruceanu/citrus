@@ -16,10 +16,15 @@
 
 package org.citrusframework.mvn.distribution;
 
+import java.net.InetSocketAddress;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
+import java.util.concurrent.atomic.AtomicReference;
+
+import com.sun.net.httpserver.HttpServer;
 
 import org.apache.maven.execution.MavenExecutionResult;
 import org.apache.maven.execution.MavenSession;
@@ -28,8 +33,10 @@ import org.apache.maven.model.Plugin;
 import org.apache.maven.project.MavenProject;
 import org.citrusframework.distribution.broker.DistributionBrokerConfig;
 import org.citrusframework.distribution.broker.DistributionBrokerServer;
+import org.citrusframework.distribution.config.DistributionJson;
 import org.citrusframework.distribution.config.DistributionSettings;
 import org.citrusframework.distribution.model.BuildSessionRecord;
+import org.citrusframework.distribution.model.CreateSessionRequest;
 import org.citrusframework.distribution.model.SessionStatus;
 import org.codehaus.plexus.util.xml.Xpp3Dom;
 import org.junit.jupiter.api.Test;
@@ -104,6 +111,56 @@ class TestDistributionMavenExtensionTest {
             participant.afterSessionEnd(session);
             BuildSessionRecord record = broker.store().findSession(sessionId).orElseThrow();
             assertThat(record.status()).isEqualTo(SessionStatus.PASSED);
+        }
+    }
+
+    @Test
+    void shouldOmitMaxPartitionSizeWhenUnsetAndPropagateMinRemoteThresholds() throws Exception {
+        AtomicReference<CreateSessionRequest> created = new AtomicReference<>();
+        HttpServer broker = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        broker.createContext("/api/v1/sessions", exchange -> {
+            try (exchange) {
+                if (exchange.getRequestURI().getPath().equals("/api/v1/sessions")) {
+                    created.set(DistributionJson.fromJson(
+                            new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8),
+                            CreateSessionRequest.class));
+                    byte[] body = "{\"sessionId\":\"test-session\"}".getBytes(StandardCharsets.UTF_8);
+                    exchange.sendResponseHeaders(200, body.length);
+                    exchange.getResponseBody().write(body);
+                    return;
+                }
+                exchange.sendResponseHeaders(204, -1);
+            }
+        });
+        broker.start();
+        MavenProject project = createSampleProject("module-a", tempDir.resolve("module-a"));
+        MavenProject root = createSampleProject("root", tempDir);
+        root.setFile(tempDir.resolve("pom.xml").toFile());
+        root.getProperties().setProperty(DistributionSettings.MIN_REMOTE_DURATION_MS_PROPERTY, "3000");
+        root.getProperties().setProperty(DistributionSettings.MIN_REMOTE_COLD_UNITS_PROPERTY, "2");
+        Properties userProps = new Properties();
+        userProps.setProperty(DistributionSettings.ENABLED_PROPERTY, "true");
+        userProps.setProperty(DistributionSettings.BROKER_URL_PROPERTY, "http://127.0.0.1:" + broker.getAddress().getPort());
+        userProps.setProperty(DistributionSettings.MIN_REMOTE_DURATION_MS_PROPERTY, "2000");
+        MavenSession session = mockSession(List.of(project), userProps);
+        when(session.getAllProjects()).thenReturn(List.of(root, project));
+        TestDistributionLifecycleParticipant participant = new TestDistributionLifecycleParticipant();
+        try {
+            participant.afterProjectsRead(session);
+
+            assertThat(created.get()).isNotNull();
+            assertThat(created.get().maxPartitionSize()).isZero();
+            for (String plugin : List.of("maven-surefire-plugin", "maven-failsafe-plugin")) {
+                Xpp3Dom configuration = (Xpp3Dom) project.getBuild().getPluginsAsMap()
+                        .get("org.apache.maven.plugins:" + plugin).getConfiguration();
+                Xpp3Dom properties = configuration.getChild("systemPropertyVariables");
+                assertThat(properties.getChild(DistributionSettings.MAX_PARTITION_SIZE_PROPERTY)).isNull();
+                assertThat(value(properties, DistributionSettings.MIN_REMOTE_DURATION_MS_PROPERTY)).isEqualTo("2000");
+                assertThat(value(properties, DistributionSettings.MIN_REMOTE_COLD_UNITS_PROPERTY)).isEqualTo("2");
+            }
+        } finally {
+            participant.afterSessionEnd(session);
+            broker.stop(0);
         }
     }
 

@@ -80,8 +80,16 @@ TIP: Projects that do not use the Maven extension can add `org.citrusframework:c
 |`true`
 
 |`citrus.test.distribution.maxPartitionSize` / `CITRUS_DIST_MAX_PARTITION_SIZE`
-|Maximum work units grouped into a single partition under the `LPT` policy.
-|`5`
+|Explicit maximum work units grouped into one `LPT` partition. Leave unset to let the broker size partitions adaptively, starting from its configured default size.
+|unset
+
+|`citrus.test.distribution.minRemoteDurationMs` / `CITRUS_DIST_MIN_REMOTE_DURATION_MS`
+|Run an eligible module locally when the sum of its remote units' historical durations is strictly below this threshold in milliseconds. Every remote unit needs a duration. The broker estimates each duration from up to 10 recent runs. Set to `0` to disable the duration check.
+|`2000`
+
+|`citrus.test.distribution.minRemoteColdUnits` / `CITRUS_DIST_MIN_REMOTE_COLD_UNITS`
+|Run an eligible module locally when history is missing, partial, or disabled and the number of remote units is at most this value. Set to `0` to disable this fallback.
+|`0`
 
 |`citrus.test.distribution.maxRetries` / `CITRUS_DIST_MAX_RETRIES`
 |Maximum automatic coordinator retries when a worker disconnects or stalls mid-partition.
@@ -104,12 +112,29 @@ TIP: Projects that do not use the Maven extension can add `org.citrusframework:c
 |`.citrus-dist/cache`
 |===
 
+Local bypass applies when the selection has no `@RemoteOnly` tests, remote capability requirements, declared workspace inputs or outputs, or explicit workspace fork. The launcher runs the discovered tests directly and reports the results to an existing Maven reactor session, when present.
+
 For module-level workspace and isolation settings (`inputs`, `outputs`, `fork`, `partitionPolicy`, `skip`), see <<tools-test-distribution-external-resources>>.
 
 [[tools-test-distribution-coordinator]]
 == Coordinator, CLI, and REST API
 
 The coordinator (`citrus-test-distribution-coordinator`) runs an embedded Vert.x HTTP/WebSocket server backed by a content-addressed filesystem blob cache and a JDBC telemetry store (`HSQLDB` by default, or `PostgreSQL` for shared CI deployments).
+
+[cols="3,5,1",options="header"]
+|===
+|Property / environment variable |Description |Default
+
+|`citrus.test.distribution.broker.minPartitionDurationMs` / `CITRUS_DIST_BROKER_MIN_PARTITION_DURATION_MS`
+|Target minimum estimated duration of an adaptive LPT partition in milliseconds. Set to `0` to disable the duration target.
+|`5000`
+
+|`citrus.test.distribution.broker.maxWavesPerWorker` / `CITRUS_DIST_BROKER_MAX_WAVES_PER_WORKER`
+|Target maximum number of adaptive LPT partitions per eligible worker. Set to `0` to disable the wave target.
+|`2`
+|===
+
+Adaptive sizing applies to LPT submissions that do not declare workspace outputs and leave `maxPartitionSize` unset.
 
 === JBang CLI Commands
 
@@ -575,7 +600,11 @@ verified. On Linux, recovery also requires the same boot and process namespace.
 On Linux and macOS, the worker checks both directories for current filesystem references before removing a partition
 workspace. An open file or working directory can keep both directories in place even after the worker and partition JVMs
 exit. Linux uses `/proc` to check visible processes running under the worker's user identity and macOS uses the
-system `lsof` command. Cleanup is deferred if the check cannot complete. On Linux, a process that denies inspection
+system `lsof` command. On a clean forked workspace close, macOS checks surviving processes started at or after the
+partition launch with targeted `lsof -p` calls and skips the full-host scan when none survive. This check excludes
+processes that predate the launch. Use <<tools-test-distribution-workspace-lease,workspace leases>> for existing
+long-lived helpers that use a workspace. Startup recovery, leased workspaces, in-process runs, and inconclusive targeted
+checks still use full `lsof +D` scans. Cleanup is deferred if the check cannot complete. On Linux, a process that denies inspection
 defers cleanup unless comparable kernel start times show that it predates the worker that created the workspace.
 Such older processes are outside the check when they deny inspection. Unix socket paths are retained when the worker
 cannot establish whether a listener still owns them.

@@ -29,6 +29,11 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.function.Predicate;
 
 import org.citrusframework.distribution.cache.ClasspathPackager;
@@ -37,26 +42,35 @@ import org.citrusframework.distribution.model.BrokerEvent;
 import org.citrusframework.distribution.model.BuildSessionResponse;
 import org.citrusframework.distribution.model.CompleteSessionRequest;
 import org.citrusframework.distribution.model.CreateSessionRequest;
+import org.citrusframework.distribution.model.HistoricalDurationsRequest;
+import org.citrusframework.distribution.model.HistoricalDurationsResponse;
 import org.citrusframework.distribution.model.MissingDigestsRequest;
 import org.citrusframework.distribution.model.MissingDigestsResponse;
 import org.citrusframework.distribution.model.ReportLocalTestsRequest;
 import org.citrusframework.distribution.model.SubmitWorkRequest;
 import org.citrusframework.distribution.model.SubmitWorkResponse;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import tools.jackson.core.JacksonException;
 
 /**
  * HTTP/SSE client used by the JUnit Platform coordinator and Maven extension to communicate with the broker.
  */
 public class BrokerHttpClient {
 
+    private static final Logger LOG = LoggerFactory.getLogger(BrokerHttpClient.class);
+
     private final String baseUrl;
     private final String authToken;
     private final HttpClient httpClient;
+    private final Duration historyTimeout;
 
     public BrokerHttpClient(String baseUrl, String authToken, long connectTimeoutMs) {
         this.baseUrl = baseUrl.endsWith("/") ? baseUrl.substring(0, baseUrl.length() - 1) : baseUrl;
         this.authToken = authToken;
+        this.historyTimeout = Duration.ofMillis(Math.max(500L, connectTimeoutMs));
         this.httpClient = HttpClient.newBuilder()
-                .connectTimeout(Duration.ofMillis(Math.max(500L, connectTimeoutMs)))
+                .connectTimeout(historyTimeout)
                 .build();
     }
 
@@ -64,6 +78,32 @@ public class BrokerHttpClient {
         HttpResponse<String> resp = sendJsonPost("/api/v1/sessions", request);
         ensureSuccess(resp, "createSession");
         return DistributionJson.fromJson(resp.body(), BuildSessionResponse.class);
+    }
+
+    public Optional<Map<String, Long>> findHistoricalDurations(List<String> workUnitKeys, int recentLimit) {
+        if (workUnitKeys == null || workUnitKeys.isEmpty()) {
+            return Optional.of(Map.of());
+        }
+        try {
+            var response = sendHistoryRequest(new HistoricalDurationsRequest(workUnitKeys, recentLimit));
+            if (response.statusCode() == 200) {
+                var history = DistributionJson.fromJson(response.body(), HistoricalDurationsResponse.class);
+                if (history != null) {
+                    return Optional.of(history.durationsMs());
+                }
+                LOG.debug("Historical test durations unavailable (empty broker response)");
+            } else {
+                LOG.debug("Historical test durations unavailable (broker HTTP {})", response.statusCode());
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            LOG.debug("Historical test duration lookup interrupted", e);
+        } catch (TimeoutException e) {
+            LOG.debug("Historical test duration lookup timed out", e);
+        } catch (ExecutionException | JacksonException | IllegalArgumentException e) {
+            LOG.debug("Historical test durations unavailable", e);
+        }
+        return Optional.empty();
     }
 
     public List<String> findMissingDigests(List<String> digests) throws IOException, InterruptedException {
@@ -209,12 +249,28 @@ public class BrokerHttpClient {
         throw new IOException("Timed out waiting for distributed partitions in session " + sessionId);
     }
 
+    private HttpResponse<String> sendHistoryRequest(HistoricalDurationsRequest body)
+            throws InterruptedException, ExecutionException, TimeoutException {
+        var pending = httpClient.sendAsync(jsonPost("/api/v1/history/durations", body), HttpResponse.BodyHandlers.ofString());
+        try {
+            // An HTTP request timeout alone does not bound the time spent reading the response body.
+            return pending.get(historyTimeout.toMillis(), TimeUnit.MILLISECONDS);
+        } finally {
+            if (!pending.isDone()) {
+                pending.cancel(true);
+            }
+        }
+    }
+
     private HttpResponse<String> sendJsonPost(String path, Object body) throws IOException, InterruptedException {
-        HttpRequest req = requestBuilder(path)
+        return httpClient.send(jsonPost(path, body), HttpResponse.BodyHandlers.ofString());
+    }
+
+    private HttpRequest jsonPost(String path, Object body) {
+        return requestBuilder(path)
                 .header("Content-Type", "application/json")
                 .POST(HttpRequest.BodyPublishers.ofString(DistributionJson.toJson(body)))
                 .build();
-        return httpClient.send(req, HttpResponse.BodyHandlers.ofString());
     }
 
     private HttpRequest.Builder requestBuilder(String path) {

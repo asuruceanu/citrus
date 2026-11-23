@@ -18,10 +18,12 @@ package org.citrusframework.distribution.junit;
 
 import java.io.File;
 import java.io.IOException;
+import java.net.InetSocketAddress;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -32,12 +34,15 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Predicate;
 import java.util.stream.Stream;
 
+import com.sun.net.httpserver.HttpServer;
 import org.citrusframework.distribution.annotations.LocalOnly;
 import org.citrusframework.distribution.annotations.RemoteOnly;
 import org.citrusframework.distribution.broker.DistributionBrokerConfig;
@@ -59,6 +64,10 @@ import org.citrusframework.distribution.model.WorkerTestEventPayload;
 import org.citrusframework.distribution.worker.DistributionWorkerClient;
 import org.citrusframework.distribution.worker.DistributionWorkerConfig;
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.DynamicContainer;
+import org.junit.jupiter.api.DynamicTest;
+import org.junit.jupiter.api.Nested;
+import org.junit.jupiter.api.TestFactory;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.platform.engine.TestExecutionResult;
@@ -91,6 +100,8 @@ class DistributedLauncherTest {
         System.clearProperty(DistributionSettings.INPUTS_PROPERTY);
         System.clearProperty(DistributionSettings.OUTPUTS_PROPERTY);
         System.clearProperty(DistributionSettings.MAX_PARTITION_SIZE_PROPERTY);
+        System.clearProperty(DistributionSettings.MIN_REMOTE_DURATION_MS_PROPERTY);
+        System.clearProperty(DistributionSettings.MIN_REMOTE_COLD_UNITS_PROPERTY);
         System.clearProperty("custom.data.dir");
     }
 
@@ -563,6 +574,187 @@ class DistributedLauncherTest {
     }
 
     @Test
+    void shouldRunSmallModuleLocallyOnWarmHistorySkipRemoteDispatchAndReportLocalTests() throws Exception {
+        try (Cluster cluster = Cluster.start(tempDir)) {
+            System.setProperty(DistributionSettings.BROKER_URL_PROPERTY, cluster.broker.baseUrl());
+            System.setProperty(DistributionSettings.MIN_REMOTE_DURATION_MS_PROPERTY, "2000");
+            System.setProperty(DistributionSettings.BASEDIR_PROPERTY, tempDir.toString());
+            RemoteSampleFixture.EXECUTED_IN_COORDINATOR.set(false);
+
+            assertThat(run(RemoteSampleFixture.class)).isEqualTo(new Outcome(1, 0));
+            assertThat(RemoteSampleFixture.EXECUTED_IN_COORDINATOR.get()).isFalse();
+            String key = RemoteSampleFixture.class.getName();
+            assertThat(cluster.broker.store().findHistoricalDurationsMs(List.of(key), 10).get(key))
+                    .isNotNull().isLessThan(2_000L);
+
+            String sessionId = cluster.createSession();
+            System.setProperty(DistributionSettings.SESSION_ID_PROPERTY, sessionId);
+            Path reportDir = tempDir.resolve("warm-reports");
+            System.setProperty(DistributionSettings.REPORT_DIR_PROPERTY, reportDir.toString());
+            RemoteSampleFixture.EXECUTED_IN_COORDINATOR.set(false);
+
+            assertThat(run(RemoteSampleFixture.class)).isEqualTo(new Outcome(1, 0));
+            assertThat(RemoteSampleFixture.EXECUTED_IN_COORDINATOR.get()).isTrue();
+            assertThat(cluster.broker.store().listPartitions(sessionId)).isEmpty();
+            assertThat(cluster.broker.store().listTestExecutions(sessionId)).singleElement().satisfies(execution -> {
+                assertThat(execution.partitionId()).isEqualTo("local");
+                assertThat(execution.workUnitKey()).isEqualTo(key);
+            });
+            assertThat(Files.readString(reportDir.resolve("TEST-" + key + ".xml")))
+                    .contains("shouldRunOnRemoteWorker");
+        }
+    }
+
+    @Test
+    void shouldKeepDistributingWhenRemoteOnlyPresentOrHistoryEndpointUnavailable() throws Exception {
+        try (Cluster cluster = Cluster.start(tempDir)) {
+            System.setProperty(DistributionSettings.BROKER_URL_PROPERTY, cluster.broker.baseUrl());
+            System.setProperty(DistributionSettings.MIN_REMOTE_DURATION_MS_PROPERTY, "2000");
+            System.setProperty(DistributionSettings.BASEDIR_PROPERTY, tempDir.toString());
+            assertThat(run(StrictRemoteOnlyFixture.class)).isEqualTo(new Outcome(1, 0));
+
+            String seededSession = cluster.broker.store().listSessions(1).getFirst().sessionId();
+            String key = cluster.broker.store().listPartitions(seededSession).getFirst().workUnits().getFirst().key();
+            assertThat(cluster.broker.store().findHistoricalDurationsMs(List.of(key), 10).get(key))
+                    .isNotNull().isLessThan(2_000L);
+            String sessionId = cluster.createSession();
+            System.setProperty(DistributionSettings.SESSION_ID_PROPERTY, sessionId);
+            assertThat(run(StrictRemoteOnlyFixture.class)).isEqualTo(new Outcome(1, 0));
+            assertThat(cluster.broker.store().listPartitions(sessionId)).hasSize(1);
+
+            AtomicInteger historyRequests = new AtomicInteger();
+            AtomicReference<SubmitWorkRequest> submission = new AtomicReference<>();
+            HttpServer oldBroker = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+            oldBroker.createContext("/api/v1/history/durations", exchange -> {
+                try (exchange) {
+                    historyRequests.incrementAndGet();
+                    exchange.sendResponseHeaders(404, -1);
+                }
+            });
+            oldBroker.createContext("/api/v1/cache/missing", exchange -> {
+                try (exchange) {
+                    byte[] body = "{\"missing\":[]}".getBytes(StandardCharsets.UTF_8);
+                    exchange.sendResponseHeaders(200, body.length);
+                    exchange.getResponseBody().write(body);
+                }
+            });
+            oldBroker.createContext("/api/v1/sessions/" + sessionId + "/work", exchange -> {
+                try (exchange) {
+                    submission.set(DistributionJson.fromJson(
+                            new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8),
+                            SubmitWorkRequest.class));
+                    byte[] body = "{\"partitionIds\":[]}".getBytes(StandardCharsets.UTF_8);
+                    exchange.sendResponseHeaders(200, body.length);
+                    exchange.getResponseBody().write(body);
+                }
+            });
+            oldBroker.start();
+            try {
+                String oldBrokerUrl = "http://127.0.0.1:" + oldBroker.getAddress().getPort();
+                System.setProperty(DistributionSettings.BROKER_URL_PROPERTY, oldBrokerUrl);
+                assertThat(new BrokerHttpClient(oldBrokerUrl, "", 500).findHistoricalDurations(List.of(key), 10)).isEmpty();
+                RemoteSampleFixture.EXECUTED_IN_COORDINATOR.set(false);
+                run(RemoteSampleFixture.class);
+                assertThat(RemoteSampleFixture.EXECUTED_IN_COORDINATOR.get()).isFalse();
+                assertThat(historyRequests.get()).isEqualTo(2);
+                assertThat(submission.get()).isNotNull();
+                assertThat(submission.get().workUnits()).extracting(WorkUnitSpec::key)
+                        .containsExactly(RemoteSampleFixture.class.getName());
+            } finally {
+                oldBroker.stop(0);
+            }
+        }
+    }
+
+    @Test
+    void shouldBypassOnColdHistoryWhenMinRemoteColdUnitsThresholdMatches() throws Exception {
+        try (Cluster cluster = Cluster.start(tempDir)) {
+            System.setProperty(DistributionSettings.BROKER_URL_PROPERTY, cluster.broker.baseUrl());
+            System.setProperty(DistributionSettings.MIN_REMOTE_COLD_UNITS_PROPERTY, "2");
+            System.setProperty(DistributionSettings.BASEDIR_PROPERTY, tempDir.toString());
+            RemoteSampleFixture.EXECUTED_IN_COORDINATOR.set(false);
+
+            assertThat(run(RemoteSampleFixture.class)).isEqualTo(new Outcome(1, 0));
+            assertThat(RemoteSampleFixture.EXECUTED_IN_COORDINATOR.get()).isTrue();
+            assertThat(cluster.broker.store().listSessions(10)).isEmpty();
+            assertThat(tempDir.resolve("target/.citrus-dist")).doesNotExist();
+        }
+    }
+
+    @Test
+    void shouldIgnoreMalformedHistoryAndTimeOutEvenAfterResponseHeadersArrive() throws Exception {
+        AtomicBoolean stall = new AtomicBoolean();
+        CountDownLatch releaseBody = new CountDownLatch(1);
+        HttpServer broker = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        broker.createContext("/api/v1/history/durations", exchange -> {
+            try (exchange) {
+                if (stall.get()) {
+                    exchange.sendResponseHeaders(200, 0);
+                    exchange.getResponseBody().write('{');
+                    exchange.getResponseBody().flush();
+                    releaseBody.await(5, TimeUnit.SECONDS);
+                    exchange.getResponseBody().write('}');
+                } else {
+                    byte[] body = "invalid JSON".getBytes(StandardCharsets.UTF_8);
+                    exchange.sendResponseHeaders(200, body.length);
+                    exchange.getResponseBody().write(body);
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        });
+        broker.start();
+        try {
+            BrokerHttpClient client = new BrokerHttpClient("http://127.0.0.1:" + broker.getAddress().getPort(), "", 500);
+            assertThat(client.findHistoricalDurations(List.of("test"), 10)).isEmpty();
+            stall.set(true);
+            long start = System.nanoTime();
+            assertThat(client.findHistoricalDurations(List.of("test"), 10)).isEmpty();
+            assertThat(Duration.ofNanos(System.nanoTime() - start)).isLessThan(Duration.ofSeconds(4));
+        } finally {
+            releaseBody.countDown();
+            broker.stop(0);
+        }
+    }
+
+    @Test
+    void shouldResolveTestPlanWorkUnitsFromFactoryAndNestedClassAncestry() {
+        Launcher launcher = LauncherFactory.create();
+        TestPlan plan = launcher.discover(LauncherDiscoveryRequestBuilder.request().selectors(
+                DiscoverySelectors.selectClass(PlanMappingFixture.class),
+                DiscoverySelectors.selectClass(FirstDerivedPlanFixture.class),
+                DiscoverySelectors.selectClass(SecondDerivedPlanFixture.class),
+                DiscoverySelectors.selectClass(LocalPinnedFixture.class)).build());
+        Class<?> factory = PlanMappingFixture.class;
+        Class<?> nested = BasePlanFixture.NestedPlanFixture.class;
+        List<WorkUnitSpec> units = List.of(
+                new WorkUnitSpec("first-source", factory.getName(), "firstFactory", "source", Map.of(), 0L),
+                new WorkUnitSpec("second-source", factory.getName(), "secondFactory", "source", Map.of(), 0L),
+                new WorkUnitSpec("first-nested", nested.getName(), null, null, Map.of(), 0L,
+                        List.of(FirstDerivedPlanFixture.class.getName())),
+                new WorkUnitSpec("second-nested", nested.getName(), null, null, Map.of(), 0L,
+                        List.of(SecondDerivedPlanFixture.class.getName())));
+        List<TestPlan> runningPlans = new ArrayList<>();
+        var stats = LocalFallbackExecutor.executeTestPlanLocally(launcher, plan, units, new TestExecutionListener[] {
+                new TestExecutionListener() {
+                    @Override
+                    public void testPlanExecutionStarted(TestPlan runningPlan) {
+                        runningPlans.add(runningPlan);
+                    }
+                }
+        });
+
+        assertThat(runningPlans).singleElement().satisfies(running -> assertThat(running.getRoots()).isEqualTo(plan.getRoots()));
+        assertThat(stats.passed()).isEqualTo(6);
+        assertThat(stats.executions()).extracting(WorkerTestEventPayload::workUnitKey)
+                .containsExactlyInAnyOrder("first-source", "second-source", "first-nested", "second-nested", null, null);
+        assertThat(stats.executions())
+                .filteredOn(execution -> execution.testName().equals("source-more")
+                        || execution.className().equals(LocalPinnedFixture.class.getName()))
+                .hasSize(2).allSatisfy(execution -> assertThat(execution.workUnitKey()).isNull());
+    }
+
+    @Test
     void shouldReportLocalOnlyModuleExecutionsInSharedReactorSession() throws Exception {
         try (Cluster cluster = Cluster.start(tempDir)) {
             String sessionId = cluster.createSession();
@@ -1006,6 +1198,35 @@ class DistributedLauncherTest {
         void fails() {
             throw new AssertionError("expected remote failure");
         }
+    }
+
+    public static class PlanMappingFixture {
+        @TestFactory
+        DynamicContainer firstFactory() {
+            return DynamicContainer.dynamicContainer("factory group", List.of(
+                    DynamicTest.dynamicTest("source", () -> {}),
+                    DynamicTest.dynamicTest("source-more", () -> {})));
+        }
+
+        @TestFactory
+        DynamicTest secondFactory() {
+            return DynamicTest.dynamicTest("source", () -> {});
+        }
+    }
+
+    abstract static class BasePlanFixture {
+        @Nested
+        class NestedPlanFixture {
+            @Test
+            void runsInEachSubclass() {
+            }
+        }
+    }
+
+    static class FirstDerivedPlanFixture extends BasePlanFixture {
+    }
+
+    static class SecondDerivedPlanFixture extends BasePlanFixture {
     }
 
     public static class RemoteSampleFixture {

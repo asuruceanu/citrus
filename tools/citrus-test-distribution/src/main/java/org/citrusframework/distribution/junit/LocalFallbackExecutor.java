@@ -16,8 +16,11 @@
 
 package org.citrusframework.distribution.junit;
 
+import java.io.IOException;
 import java.io.PrintWriter;
 import java.io.StringWriter;
+import java.io.UncheckedIOException;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedHashMap;
@@ -27,10 +30,13 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BiFunction;
+import java.util.function.Consumer;
+import java.util.stream.Collectors;
 
 import org.citrusframework.distribution.config.CitrusEndpointCollector;
+import org.citrusframework.distribution.config.DistributionSettings;
 import org.citrusframework.distribution.model.TestOutcomeStatus;
 import org.citrusframework.distribution.model.WorkUnitSpec;
 import org.citrusframework.distribution.model.WorkerTestEventPayload;
@@ -44,6 +50,7 @@ import org.junit.platform.launcher.Launcher;
 import org.junit.platform.launcher.LauncherDiscoveryRequest;
 import org.junit.platform.launcher.TestExecutionListener;
 import org.junit.platform.launcher.TestIdentifier;
+import org.junit.platform.launcher.TestPlan;
 import org.junit.platform.launcher.core.LauncherDiscoveryRequestBuilder;
 
 /**
@@ -91,106 +98,12 @@ public final class LocalFallbackExecutor {
             }
         }
 
-        AtomicInteger passed = new AtomicInteger();
-        AtomicInteger failed = new AtomicInteger();
-        AtomicInteger skipped = new AtomicInteger();
-        List<WorkerTestEventPayload> executions = Collections.synchronizedList(new ArrayList<>());
-        Map<String, Long> testStartTimes = new ConcurrentHashMap<>();
         AtomicReference<String> activeDynamicUnitKey = new AtomicReference<>();
-        long startNs = System.nanoTime();
-
-        try (CitrusEndpointCollector endpointCollector =
-                     CitrusEndpointCollector.install(Thread.currentThread().getContextClassLoader())) {
-            TestExecutionListener countingListener = new TestExecutionListener() {
-                @Override
-                public void executionStarted(TestIdentifier testIdentifier) {
-                    if (testIdentifier.isTest()) {
-                        endpointCollector.startTest();
-                        testStartTimes.put(testIdentifier.getUniqueId(), System.currentTimeMillis());
-                    }
-                }
-
-                @Override
-                public void executionSkipped(TestIdentifier testIdentifier, String reason) {
-                    if (testIdentifier.isTest() || testIdentifier.getSource().isPresent()) {
-                        skipped.incrementAndGet();
-                        String className = resolveClassName(testIdentifier, unitKeysByClass);
-                        String workUnitKey = resolveWorkUnitKey(
-                                testIdentifier, className, activeDynamicUnitKey.get(), unitKeysByMethod, unitKeysByClass);
-                        executions.add(new WorkerTestEventPayload(
-                                "local",
-                                "",
-                                1,
-                                workUnitKey,
-                                className,
-                                testIdentifier.getDisplayName(),
-                                TestOutcomeStatus.SKIPPED,
-                                0L,
-                                reason,
-                                null,
-                                List.of(), testIdentifier.getUniqueId()));
-                    }
-                }
-
-                @Override
-                public void executionFinished(TestIdentifier testIdentifier, TestExecutionResult result) {
-                    if (!testIdentifier.isTest()) {
-                        if (result.getStatus() == TestExecutionResult.Status.FAILED) {
-                            failed.incrementAndGet();
-                            String className = resolveClassName(testIdentifier, unitKeysByClass);
-                            String workUnitKey = resolveWorkUnitKey(
-                                    testIdentifier, className, activeDynamicUnitKey.get(), unitKeysByMethod, unitKeysByClass);
-                            executions.add(new WorkerTestEventPayload(
-                                    "local",
-                                    "",
-                                    1,
-                                    workUnitKey,
-                                    className,
-                                    testIdentifier.getDisplayName(),
-                                    TestOutcomeStatus.FAILED,
-                                    0L,
-                                    result.getThrowable().map(Throwable::getMessage).orElse("Container failed"),
-                                    result.getThrowable().map(LocalFallbackExecutor::formatStackTrace).orElse(null),
-                                    endpointCollector.drainEndpoints(), testIdentifier.getUniqueId()));
-                        }
-                        return;
-                    }
-                    long startedAt = testStartTimes.getOrDefault(testIdentifier.getUniqueId(), System.currentTimeMillis());
-                    long elapsed = Math.max(0L, System.currentTimeMillis() - startedAt);
-                    TestOutcomeStatus outcomeStatus = switch (result.getStatus()) {
-                        case SUCCESSFUL -> {
-                            passed.incrementAndGet();
-                            yield TestOutcomeStatus.PASSED;
-                        }
-                        case FAILED -> {
-                            failed.incrementAndGet();
-                            yield TestOutcomeStatus.FAILED;
-                        }
-                        case ABORTED -> {
-                            skipped.incrementAndGet();
-                            yield TestOutcomeStatus.SKIPPED;
-                        }
-                    };
-                    String className = resolveClassName(testIdentifier, unitKeysByClass);
-                    String workUnitKey = resolveWorkUnitKey(
-                            testIdentifier, className, activeDynamicUnitKey.get(), unitKeysByMethod, unitKeysByClass);
-                    executions.add(new WorkerTestEventPayload(
-                            "local",
-                            "",
-                            1,
-                            workUnitKey,
-                            className,
-                            testIdentifier.getDisplayName(),
-                            outcomeStatus,
-                            elapsed,
-                            result.getThrowable().map(Throwable::getMessage).orElse(null),
-                            result.getThrowable().map(LocalFallbackExecutor::formatStackTrace).orElse(null),
-                            endpointCollector.drainEndpoints(), testIdentifier.getUniqueId()));
-                }
-            };
-
-            TestExecutionListener[] merged = mergeListeners(additionalListeners, countingListener);
-
+        return collectExecutions(additionalListeners, (plan, identifier) -> {
+            String className = resolveClassName(identifier, unitKeysByClass);
+            return new ExecutionUnit(className, resolveWorkUnitKey(
+                    identifier, className, activeDynamicUnitKey.get(), unitKeysByMethod, unitKeysByClass));
+        }, merged -> {
             List<DiscoverySelector> regularSelectors = new ArrayList<>();
             List<WorkUnitSpec> dynamicUnits = new ArrayList<>();
 
@@ -222,10 +135,185 @@ public final class LocalFallbackExecutor {
                     activeDynamicUnitKey.set(null);
                 }
             }
+        });
+    }
+
+    public static LocalExecutionStats executeTestPlanLocally(Launcher delegate,
+                                                             TestPlan testPlan,
+                                                             List<WorkUnitSpec> units,
+                                                             TestExecutionListener[] additionalListeners) {
+        Map<String, List<WorkUnitSpec>> unitsByClass = units.stream()
+                .collect(Collectors.groupingBy(WorkUnitSpec::className));
+        LocalExecutionStats stats = collectExecutions(additionalListeners,
+                (plan, identifier) -> resolvePlanUnit(plan, identifier, unitsByClass),
+                merged -> delegate.execute(testPlan, merged));
+
+        String reportDir = System.getProperty(DistributionSettings.REPORT_DIR_PROPERTY);
+        if (reportDir != null && !reportDir.isBlank()) {
+            SurefireReportWriter writer = new SurefireReportWriter();
+            stats.executions().forEach(writer::record);
+            try {
+                writer.writeReports(Path.of(reportDir));
+            } catch (IOException e) {
+                throw new UncheckedIOException("Failed to write local test reports", e);
+            }
+        }
+        return stats;
+    }
+
+    private record ExecutionUnit(String className, String key) {
+    }
+
+    private static ExecutionUnit resolvePlanUnit(TestPlan plan, TestIdentifier identifier,
+                                                 Map<String, List<WorkUnitSpec>> unitsByClass) {
+        List<String> classes = new ArrayList<>();
+        MethodSource method = null;
+        for (TestIdentifier current = identifier; current != null; current = plan.getParent(current).orElse(null)) {
+            TestSource source = current.getSource().orElse(null);
+            if (source instanceof ClassSource classSource) {
+                classes.add(classSource.getClassName());
+            } else if (classes.isEmpty() && method == null && source instanceof MethodSource methodSource) {
+                method = methodSource;
+            }
+        }
+        if (classes.isEmpty()) {
+            return new ExecutionUnit(method != null ? method.getClassName() : "local", null);
         }
 
-        AtomicLong durationMs = new AtomicLong(Math.max(1L, (System.nanoTime() - startNs) / 1_000_000L));
-        return new LocalExecutionStats(passed.get(), failed.get(), skipped.get(), durationMs.get(), executions);
+        String className = classes.getFirst();
+        List<String> enclosing = classes.subList(1, classes.size()).reversed();
+        String classKey = null;
+        for (WorkUnitSpec unit : unitsByClass.getOrDefault(className, List.of())) {
+            if (!unit.enclosingClassNames().equals(enclosing)) {
+                continue;
+            }
+            if (unit.dynamicSourceName() != null && !unit.dynamicSourceName().isBlank()) {
+                // Factory units use their leaf display name as the source name, scoped to the actual factory method.
+                if (method != null && matchesMethod(unit, method) && identifier.isTest()
+                        && unit.dynamicSourceName().equals(identifier.getDisplayName())) {
+                    return new ExecutionUnit(className, unit.key());
+                }
+            } else if (unit.methodName() == null || unit.methodName().isBlank()) {
+                classKey = unit.key();
+            } else if (method != null && matchesMethod(unit, method)) {
+                return new ExecutionUnit(className, unit.key());
+            }
+        }
+        return new ExecutionUnit(className, classKey);
+    }
+
+    private static boolean matchesMethod(WorkUnitSpec unit, MethodSource method) {
+        String parameters = method.getMethodParameterTypes();
+        return (parameters.isBlank() && method.getMethodName().equals(unit.methodName()))
+                || (method.getMethodName() + "(" + parameters + ")").equals(unit.methodName());
+    }
+
+    private static LocalExecutionStats collectExecutions(TestExecutionListener[] additionalListeners,
+                                                          BiFunction<TestPlan, TestIdentifier, ExecutionUnit> resolver,
+                                                          Consumer<TestExecutionListener[]> execute) {
+        AtomicInteger passed = new AtomicInteger();
+        AtomicInteger failed = new AtomicInteger();
+        AtomicInteger skipped = new AtomicInteger();
+        List<WorkerTestEventPayload> executions = Collections.synchronizedList(new ArrayList<>());
+        Map<String, Long> testStartTimes = new ConcurrentHashMap<>();
+        long startNs = System.nanoTime();
+
+        try (CitrusEndpointCollector endpointCollector =
+                     CitrusEndpointCollector.install(Thread.currentThread().getContextClassLoader())) {
+            TestExecutionListener countingListener = new TestExecutionListener() {
+                private volatile TestPlan plan;
+
+                @Override
+                public void testPlanExecutionStarted(TestPlan currentPlan) {
+                    this.plan = currentPlan;
+                }
+
+                @Override
+                public void executionStarted(TestIdentifier testIdentifier) {
+                    if (testIdentifier.isTest()) {
+                        endpointCollector.startTest();
+                        testStartTimes.put(testIdentifier.getUniqueId(), System.currentTimeMillis());
+                    }
+                }
+
+                @Override
+                public void executionSkipped(TestIdentifier testIdentifier, String reason) {
+                    if (testIdentifier.isTest() || testIdentifier.getSource().isPresent()) {
+                        skipped.incrementAndGet();
+                        ExecutionUnit unit = resolver.apply(plan, testIdentifier);
+                        executions.add(new WorkerTestEventPayload(
+                                "local",
+                                "",
+                                1,
+                                unit.key(),
+                                unit.className(),
+                                testIdentifier.getDisplayName(),
+                                TestOutcomeStatus.SKIPPED,
+                                0L,
+                                reason,
+                                null,
+                                List.of(), testIdentifier.getUniqueId()));
+                    }
+                }
+
+                @Override
+                public void executionFinished(TestIdentifier testIdentifier, TestExecutionResult result) {
+                    if (!testIdentifier.isTest()) {
+                        if (result.getStatus() == TestExecutionResult.Status.FAILED) {
+                            failed.incrementAndGet();
+                            ExecutionUnit unit = resolver.apply(plan, testIdentifier);
+                            executions.add(new WorkerTestEventPayload(
+                                    "local",
+                                    "",
+                                    1,
+                                    unit.key(),
+                                    unit.className(),
+                                    testIdentifier.getDisplayName(),
+                                    TestOutcomeStatus.FAILED,
+                                    0L,
+                                    result.getThrowable().map(Throwable::getMessage).orElse("Container failed"),
+                                    result.getThrowable().map(LocalFallbackExecutor::formatStackTrace).orElse(null),
+                                    endpointCollector.drainEndpoints(), testIdentifier.getUniqueId()));
+                        }
+                        return;
+                    }
+                    Long startedAt = testStartTimes.remove(testIdentifier.getUniqueId());
+                    long elapsed = startedAt != null ? Math.max(0L, System.currentTimeMillis() - startedAt) : 0L;
+                    TestOutcomeStatus outcomeStatus = switch (result.getStatus()) {
+                        case SUCCESSFUL -> {
+                            passed.incrementAndGet();
+                            yield TestOutcomeStatus.PASSED;
+                        }
+                        case FAILED -> {
+                            failed.incrementAndGet();
+                            yield TestOutcomeStatus.FAILED;
+                        }
+                        case ABORTED -> {
+                            skipped.incrementAndGet();
+                            yield TestOutcomeStatus.SKIPPED;
+                        }
+                    };
+                    ExecutionUnit unit = resolver.apply(plan, testIdentifier);
+                    executions.add(new WorkerTestEventPayload(
+                            "local",
+                            "",
+                            1,
+                            unit.key(),
+                            unit.className(),
+                            testIdentifier.getDisplayName(),
+                            outcomeStatus,
+                            elapsed,
+                            result.getThrowable().map(Throwable::getMessage).orElse(null),
+                            result.getThrowable().map(LocalFallbackExecutor::formatStackTrace).orElse(null),
+                            endpointCollector.drainEndpoints(), testIdentifier.getUniqueId()));
+                }
+            };
+
+            execute.accept(mergeListeners(additionalListeners, countingListener));
+        }
+
+        long durationMs = Math.max(1L, (System.nanoTime() - startNs) / 1_000_000L);
+        return new LocalExecutionStats(passed.get(), failed.get(), skipped.get(), durationMs, executions);
     }
 
     private static String resolveClassName(TestIdentifier identifier, Map<String, String> unitKeysByClass) {

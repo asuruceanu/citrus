@@ -22,6 +22,8 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
+import java.util.OptionalInt;
 import java.util.Properties;
 
 import javax.inject.Named;
@@ -67,9 +69,11 @@ public class TestDistributionLifecycleParticipant extends AbstractMavenLifecycle
         boolean fallbackLocal = Boolean.parseBoolean(resolveProperty(
                 session, DistributionSettings.FALLBACK_LOCAL_PROPERTY,
                 Boolean.toString(DistributionSettings.isFallbackLocal())));
-        int maxPartitionSize = Integer.parseInt(resolveProperty(
-                session, DistributionSettings.MAX_PARTITION_SIZE_PROPERTY,
-                Integer.toString(DistributionSettings.getMaxPartitionSize())));
+        Properties rootProperties = Optional.ofNullable(executionRootProject(session))
+                .map(MavenProject::getProperties).orElseGet(Properties::new);
+        Properties mergedProps = reactorProperties(session, rootProperties);
+        OptionalInt maxPartitionSize = DistributionSettings.findConfiguredMaxPartitionSize(
+                mergedProps::getProperty, System::getenv);
         int maxRetries = Integer.parseInt(resolveProperty(
                 session, DistributionSettings.MAX_RETRIES_PROPERTY,
                 Integer.toString(DistributionSettings.getMaxRetries())));
@@ -105,7 +109,7 @@ public class TestDistributionLifecycleParticipant extends AbstractMavenLifecycle
                     gitInfo.branch(),
                     gitInfo.commit(),
                     gitInfo.changedFiles(),
-                    maxPartitionSize,
+                    maxPartitionSize.orElse(0),
                     maxRetries));
             sessionId = created.sessionId();
             this.activeSessionId = sessionId;
@@ -129,7 +133,18 @@ public class TestDistributionLifecycleParticipant extends AbstractMavenLifecycle
             sharedProps.put(DistributionSettings.AUTH_TOKEN_PROPERTY, authToken);
         }
         sharedProps.put(DistributionSettings.FALLBACK_LOCAL_PROPERTY, Boolean.toString(fallbackLocal));
-        sharedProps.put(DistributionSettings.MAX_PARTITION_SIZE_PROPERTY, Integer.toString(maxPartitionSize));
+        maxPartitionSize.ifPresent(value ->
+                sharedProps.put(DistributionSettings.MAX_PARTITION_SIZE_PROPERTY, Integer.toString(value)));
+        if (isConfigured(mergedProps, DistributionSettings.MIN_REMOTE_DURATION_MS_PROPERTY,
+                DistributionSettings.MIN_REMOTE_DURATION_MS_ENV)) {
+            sharedProps.put(DistributionSettings.MIN_REMOTE_DURATION_MS_PROPERTY,
+                    Long.toString(DistributionSettings.getMinRemoteDurationMs(mergedProps::getProperty, System::getenv)));
+        }
+        if (isConfigured(mergedProps, DistributionSettings.MIN_REMOTE_COLD_UNITS_PROPERTY,
+                DistributionSettings.MIN_REMOTE_COLD_UNITS_ENV)) {
+            sharedProps.put(DistributionSettings.MIN_REMOTE_COLD_UNITS_PROPERTY,
+                    Integer.toString(DistributionSettings.getMinRemoteColdUnits(mergedProps::getProperty, System::getenv)));
+        }
         sharedProps.put(DistributionSettings.MAX_RETRIES_PROPERTY, Integer.toString(maxRetries));
         sharedProps.put(DistributionSettings.PROJECT_NAME_PROPERTY, projectName);
 
@@ -263,18 +278,40 @@ public class TestDistributionLifecycleParticipant extends AbstractMavenLifecycle
      * {@code ./mvnw -pl a,b,c test}), else Maven's top-level project, which with {@code -pl} is just the first module.
      */
     static String defaultProjectName(MavenSession session) {
+        MavenProject rootProject = executionRootProject(session);
+        return rootProject != null ? rootProject.getArtifactId() : "maven-reactor";
+    }
+
+    private static MavenProject executionRootProject(MavenSession session) {
         String rootDir = session.getExecutionRootDirectory();
         if (rootDir != null && session.getAllProjects() != null) {
             Path root = Path.of(rootDir).toAbsolutePath().normalize();
             for (MavenProject project : session.getAllProjects()) {
                 if (project.getBasedir() != null
                         && project.getBasedir().toPath().toAbsolutePath().normalize().equals(root)) {
-                    return project.getArtifactId();
+                    return project;
                 }
             }
         }
-        MavenProject topProject = session.getTopLevelProject();
-        return topProject != null ? topProject.getArtifactId() : "maven-reactor";
+        return session.getTopLevelProject();
+    }
+
+    private static Properties reactorProperties(MavenSession session, Properties rootProperties) {
+        Properties merged = new Properties(rootProperties);
+        for (String key : List.of(DistributionSettings.MAX_PARTITION_SIZE_PROPERTY,
+                DistributionSettings.MIN_REMOTE_DURATION_MS_PROPERTY, DistributionSettings.MIN_REMOTE_COLD_UNITS_PROPERTY)) {
+            String value = resolveProperty(session, key, null);
+            if (value != null) {
+                merged.setProperty(key, value);
+            }
+        }
+        return merged;
+    }
+
+    private static boolean isConfigured(Properties properties, String key, String envKey) {
+        String property = properties.getProperty(key);
+        String environment = System.getenv(envKey);
+        return (property != null && !property.isBlank()) || (environment != null && !environment.isBlank());
     }
 
     private static boolean isInterruptedBuild(MavenSession session) {
