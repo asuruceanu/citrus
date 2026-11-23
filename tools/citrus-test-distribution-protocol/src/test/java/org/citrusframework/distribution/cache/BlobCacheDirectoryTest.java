@@ -17,13 +17,17 @@
 package org.citrusframework.distribution.cache;
 
 import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.security.MessageDigest;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Stream;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
 
@@ -40,7 +44,6 @@ import org.junit.jupiter.api.io.TempDir;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
-import static org.junit.jupiter.api.Assumptions.assumeFalse;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 class BlobCacheDirectoryTest {
@@ -160,7 +163,6 @@ class BlobCacheDirectoryTest {
 
     @Test
     void shouldKeepBlobWhenItsNamedJarDirectoryCannotBeDeleted() throws Exception {
-        assumeFalse("root".equals(System.getProperty("user.name")), "root ignores directory permissions");
         byte[] jar = jarWith("b.txt", "b");
         String sha = sha(jar);
         BlobCacheDirectory cache = new BlobCacheDirectory(tempDir.resolve("cache"));
@@ -170,6 +172,7 @@ class BlobCacheDirectoryTest {
         Path namedDir = named.getParent();
         assumeTrue(namedDir.toFile().setWritable(false), "file system supports read-only directories");
         try {
+            assumeTrue(!Files.isWritable(namedDir), "directory permissions are enforced for this user");
             assertThatThrownBy(() -> cache.delete(sha)).isInstanceOf(java.io.IOException.class);
             assertThat(blob).as("blob kept so callers' bookkeeping stays accurate").exists();
         } finally {
@@ -271,13 +274,13 @@ class BlobCacheDirectoryTest {
 
     @Test
     void shouldWarnAndContinueWhenATempFileCannotBeDeleted() throws Exception {
-        assumeFalse("root".equals(System.getProperty("user.name")), "root ignores directory permissions");
         BlobCacheDirectory cache = new BlobCacheDirectory(tempDir.resolve("cache"));
         Path first = cache.newTempFile("dl-");
         Path second = cache.newTempFile("ws-");
         Path tmpDir = first.getParent();
         assumeTrue(tmpDir.toFile().setWritable(false), "file system supports read-only directories");
         try {
+            assumeTrue(!Files.isWritable(tmpDir), "directory permissions are enforced for this user");
             assertThat(cache.sweepTempFiles()).isZero();
             assertThat(first).exists();
             assertThat(second).exists();
@@ -285,6 +288,92 @@ class BlobCacheDirectoryTest {
             tmpDir.toFile().setWritable(true);
         }
         assertThat(cache.sweepTempFiles()).isEqualTo(2);
+    }
+
+    @Test
+    void shouldSweepOnlyTheTemporaryFilePrefixesTheCacheCreates() throws Exception {
+        BlobCacheDirectory cache = new BlobCacheDirectory(tempDir.resolve("cache"));
+        Path tmpDir = Files.createDirectories(cache.getRootDir().resolve("tmp"));
+        List<Path> cacheMade = List.of(
+                cache.newTempFile("0a1b2c3d-"),
+                cache.newTempFile("dl-"),
+                cache.newTempFile("ws-"),
+                cache.newTempFile("output-"));
+        List<Path> foreign = List.of(
+                Files.writeString(tmpDir.resolve("backup-2024.tmp"), "keep"),
+                Files.writeString(tmpDir.resolve("report-1.tmp"), "keep"),
+                Files.writeString(tmpDir.resolve("abcdefgh-1.tmp"), "keep"),
+                Files.writeString(tmpDir.resolve("0A1B2C3D-1.tmp"), "keep"),
+                Files.writeString(tmpDir.resolve("0a1b2c3-1.tmp"), "keep"),
+                Files.writeString(tmpDir.resolve("dl-.tmp"), "keep"),
+                Files.writeString(tmpDir.resolve("dl-12x.tmp"), "keep"));
+
+        assertThat(cache.sweepTempFiles()).isEqualTo(cacheMade.size());
+
+        assertThat(cacheMade).allSatisfy(path -> assertThat(path).doesNotExist());
+        assertThat(foreign).allSatisfy(path -> assertThat(path).hasContent("keep"));
+        assertThatThrownBy(() -> cache.newTempFile("backup-"))
+                .as("every temporary file prefix must be one the sweep recognizes")
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void shouldRemoveAPartialTargetWhenTheNonAtomicFallbackMoveFails() throws Exception {
+        BlobCacheDirectory cache = new BlobCacheDirectory(tempDir.resolve("cache"));
+        byte[] bytes = "moved without atomic rename".getBytes();
+        String sha = sha(bytes);
+        cache.fileMover((source, target, options) -> {
+            if (List.of(options).contains(StandardCopyOption.ATOMIC_MOVE)) {
+                throw new AtomicMoveNotSupportedException(source.toString(), target.toString(), "simulated");
+            }
+            Files.writeString(target, "partial");
+            throw new IOException("simulated copy failure");
+        });
+
+        assertThatThrownBy(() -> cache.put(sha, bytes))
+                .isInstanceOf(IOException.class)
+                .hasMessageContaining("simulated copy failure");
+        assertThat(cache.resolveBlobPath(sha)).as("partial target removed").doesNotExist();
+        assertThat(tmpFiles(cache)).isEmpty();
+
+        cache.fileMover((source, target, options) -> {
+            if (List.of(options).contains(StandardCopyOption.ATOMIC_MOVE)) {
+                throw new AtomicMoveNotSupportedException(source.toString(), target.toString(), "simulated");
+            }
+            Files.move(source, target, options);
+        });
+        assertThat(cache.put(sha, bytes)).as("non-atomic fallback").hasBinaryContent(bytes);
+        assertThat(tmpFiles(cache)).isEmpty();
+    }
+
+    @Test
+    void shouldRecordTheFirstCacheOwnerAndNeverOverwriteIt() throws Exception {
+        Path root = tempDir.resolve("owned");
+        assertThat(BlobCacheDirectory.readOwner(root)).isEmpty();
+
+        assertThat(BlobCacheDirectory.recordOwnerIfAbsent(root, BlobCacheDirectory.OWNER_COORDINATOR))
+                .isEqualTo(BlobCacheDirectory.OWNER_COORDINATOR);
+        assertThat(root.resolve(BlobCacheDirectory.OWNER_MARKER_FILE)).hasContent(BlobCacheDirectory.OWNER_COORDINATOR);
+        assertThat(BlobCacheDirectory.recordOwnerIfAbsent(root, BlobCacheDirectory.OWNER_WORKER))
+                .as("an existing owner is kept").isEqualTo(BlobCacheDirectory.OWNER_COORDINATOR);
+        assertThat(BlobCacheDirectory.readOwner(root)).contains(BlobCacheDirectory.OWNER_COORDINATOR);
+
+        Path blank = Files.createDirectories(tempDir.resolve("blank"));
+        Files.writeString(blank.resolve(BlobCacheDirectory.OWNER_MARKER_FILE), " \n");
+        assertThat(BlobCacheDirectory.readOwner(blank)).as("a blank marker records no owner").isEmpty();
+        assertThat(BlobCacheDirectory.recordOwnerIfAbsent(blank, BlobCacheDirectory.OWNER_LAUNCHER))
+                .isEqualTo(BlobCacheDirectory.OWNER_LAUNCHER);
+        assertThat(BlobCacheDirectory.readOwner(blank)).contains(BlobCacheDirectory.OWNER_LAUNCHER);
+    }
+
+    private static List<Path> tmpFiles(BlobCacheDirectory cache) throws IOException {
+        Path tmp = cache.getRootDir().resolve("tmp");
+        if (!Files.isDirectory(tmp)) {
+            return List.of();
+        }
+        try (Stream<Path> files = Files.list(tmp)) {
+            return files.toList();
+        }
     }
 
     private static boolean createSymlink(Path link, Path target) {
