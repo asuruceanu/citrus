@@ -16,6 +16,9 @@
 
 package org.citrusframework.distribution.worker;
 
+import java.io.Closeable;
+import java.io.FilePermission;
+import java.io.FilterInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -24,6 +27,7 @@ import java.io.PrintWriter;
 import java.io.Reader;
 import java.io.UncheckedIOException;
 import java.io.Writer;
+import java.net.JarURLConnection;
 import java.net.MalformedURLException;
 import java.net.URL;
 import java.net.URLClassLoader;
@@ -36,10 +40,12 @@ import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.SimpleFileVisitor;
 import java.nio.file.attribute.BasicFileAttributes;
+import java.security.Permission;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Enumeration;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -51,6 +57,8 @@ import java.util.function.BiConsumer;
 import java.util.function.BiFunction;
 import java.util.function.Consumer;
 import java.util.function.Function;
+import java.util.jar.JarEntry;
+import java.util.jar.JarFile;
 import java.util.stream.Stream;
 
 import org.citrusframework.distribution.config.DistributionSettings;
@@ -759,22 +767,218 @@ public final class IsolatedPartitionRunner implements PartitionRunner {
     }
 
     /**
-     * The JDK's {@code jar:} URL handling with {@code useCaches=false}: every operation is delegated to an equivalent
-     * URL of the JDK's own jar handler, so parsing (including {@code /absolute} and {@code ../} specs relative to a
-     * jar entry), {@code equals}, {@code hashCode} and {@code sameFile} behave exactly as for JDK jar URLs. Only
-     * connections differ: their JarFile belongs to the connection and is closed with its input stream instead of being
-     * cached until the JVM exits.
-     * <p>
-     * Every connection opens a fresh JAR, which can repeat signature verification. A caller that uses a connection
-     * only for metadata without opening and closing its stream can leave the JAR open until JDK cleanup.
+     * Uses the JDK's {@code jar:} URL parsing and comparison and owns the uncached JarFiles opened by its connections.
+     * Closing an entry stream closes its JarFile promptly. Closing the handler releases the remaining JarFiles,
+     * including those opened just for metadata.
      */
-    static final class UncachedJarHandler extends URLStreamHandler {
+    static final class UncachedJarHandler extends URLStreamHandler implements Closeable {
+
+        private final Set<JarFile> openJars = new HashSet<>();
+        private boolean closed;
 
         @Override
         protected URLConnection openConnection(URL url) throws IOException {
-            URLConnection connection = jdkUrl(url).openConnection();
-            connection.setUseCaches(false);
-            return connection;
+            checkOpen();
+            return new OwnedJarConnection(url, (JarURLConnection) jdkUrl(url).openConnection());
+        }
+
+        private synchronized void checkOpen() throws IOException {
+            if (closed) {
+                throw new IOException("Partition JAR handler is closed");
+            }
+        }
+
+        private synchronized JarFile openLocalJar(JarURLConnection connection) throws IOException {
+            checkOpen();
+            return retain(connection.getJarFile());
+        }
+
+        private synchronized JarFile retain(JarFile jar) throws IOException {
+            if (closed) {
+                // A connection can finish opening while the partition is closing.
+                try (jar) {
+                    checkOpen();
+                }
+            }
+            openJars.add(jar);
+            return jar;
+        }
+
+        private synchronized void release(JarFile jar) {
+            openJars.remove(jar);
+        }
+
+        @Override
+        public synchronized void close() throws IOException {
+            closed = true;
+            IOException failure = null;
+            for (JarFile jar : openJars) {
+                try {
+                    jar.close();
+                } catch (IOException e) {
+                    if (failure == null) {
+                        failure = e;
+                    } else {
+                        failure.addSuppressed(e);
+                    }
+                }
+            }
+            openJars.clear();
+            if (failure != null) {
+                throw failure;
+            }
+        }
+
+        private final class OwnedJarConnection extends JarURLConnection {
+
+            private final JarURLConnection delegate;
+            private JarFile jar;
+
+            private OwnedJarConnection(URL url, JarURLConnection delegate) throws MalformedURLException {
+                super(url);
+                this.delegate = delegate;
+                delegate.setUseCaches(false);
+                useCaches = false;
+            }
+
+            @Override
+            public synchronized void connect() throws IOException {
+                if (!connected) {
+                    checkOpen();
+                    // Wait for local file opens during shutdown. Remote downloads can finish independently.
+                    jar = isLocalFile() ? openLocalJar(delegate) : retain(delegate.getJarFile());
+                    connected = true;
+                }
+            }
+
+            @Override
+            public void setUseCaches(boolean useCaches) {
+                super.setUseCaches(false);
+            }
+
+            @Override
+            public JarFile getJarFile() throws IOException {
+                connect();
+                return jar;
+            }
+
+            @Override
+            public JarEntry getJarEntry() throws IOException {
+                connect();
+                return delegate.getJarEntry();
+            }
+
+            @Override
+            public InputStream getInputStream() throws IOException {
+                connect();
+                return new FilterInputStream(delegate.getInputStream()) {
+                    @Override
+                    public void close() throws IOException {
+                        super.close();
+                        release(jar);
+                    }
+                };
+            }
+
+            @Override
+            public Object getContent() throws IOException {
+                return getEntryName() == null ? getJarFile() : super.getContent();
+            }
+
+            @Override
+            public int getContentLength() {
+                long length = getContentLengthLong();
+                return length > Integer.MAX_VALUE ? -1 : (int) length;
+            }
+
+            @Override
+            public long getContentLengthLong() {
+                try {
+                    connect();
+                    if (getEntryName() == null && isLocalFile()) {
+                        return getHeaderFieldLong("content-length", -1);
+                    }
+                    return delegate.getContentLengthLong();
+                } catch (IOException e) {
+                    return -1;
+                }
+            }
+
+            @Override
+            public String getContentType() {
+                try {
+                    if (getEntryName() != null) {
+                        connect();
+                    }
+                    return delegate.getContentType();
+                } catch (IOException e) {
+                    return Objects.requireNonNullElse(guessContentTypeFromName(getEntryName()), "content/unknown");
+                }
+            }
+
+            @Override
+            public String getHeaderField(String name) {
+                try {
+                    checkOpen();
+                    if (!isLocalFile()) {
+                        return delegate.getHeaderField(name);
+                    }
+                    synchronized (UncachedJarHandler.this) {
+                        checkOpen();
+                        // The JDK opens a file stream when reading headers. Scope that stream to this call.
+                        URLConnection file = getJarFileURL().openConnection();
+                        try (InputStream stream = file.getInputStream()) {
+                            return file.getHeaderField(name);
+                        }
+                    }
+                } catch (IOException e) {
+                    return null;
+                }
+            }
+
+            private boolean isLocalFile() throws IOException {
+                return "file".equals(getJarFileURL().getProtocol()) && getPermission() instanceof FilePermission;
+            }
+
+            @Override
+            public Permission getPermission() throws IOException {
+                return delegate.getPermission();
+            }
+
+            @Override
+            public void setAllowUserInteraction(boolean allowUserInteraction) {
+                delegate.setAllowUserInteraction(allowUserInteraction);
+            }
+
+            @Override
+            public boolean getAllowUserInteraction() {
+                return delegate.getAllowUserInteraction();
+            }
+
+            @Override
+            public void setIfModifiedSince(long ifModifiedSince) {
+                delegate.setIfModifiedSince(ifModifiedSince);
+            }
+
+            @Override
+            public void setRequestProperty(String key, String value) {
+                delegate.setRequestProperty(key, value);
+            }
+
+            @Override
+            public void addRequestProperty(String key, String value) {
+                delegate.addRequestProperty(key, value);
+            }
+
+            @Override
+            public String getRequestProperty(String key) {
+                return delegate.getRequestProperty(key);
+            }
+
+            @Override
+            public Map<String, List<String>> getRequestProperties() {
+                return delegate.getRequestProperties();
+            }
         }
 
         /**
@@ -881,9 +1085,7 @@ public final class IsolatedPartitionRunner implements PartitionRunner {
         private static final List<Path> WORKER_JAVA_AGENTS = javaAgentPaths(
                 java.lang.management.ManagementFactory.getRuntimeMXBean().getInputArguments());
 
-        /** Opens partition {@code jar:} URLs without the JDK's JarFile cache, see {@link UncachedJarHandler}. */
-        private static final URLStreamHandler UNCACHED_JAR_HANDLER = new UncachedJarHandler();
-
+        private final UncachedJarHandler jarHandler = new UncachedJarHandler();
         private final ClassLoader jdkLoader;
         private final ClassLoader agentHost;
         private final List<Path> agentLocations;
@@ -1028,17 +1230,24 @@ public final class IsolatedPartitionRunner implements PartitionRunner {
             return Collections.enumeration(urls);
         }
 
-        /** {@code url} with {@link #UNCACHED_JAR_HANDLER} if it is a {@code jar:} URL, else unchanged. */
+        /** Attaches the partition's handler to its {@code jar:} URLs. */
         @SuppressWarnings("deprecation") // URL(URL, String, URLStreamHandler): the only way to attach a handler without a URI
-        private static URL uncached(URL url) {
+        private URL uncached(URL url) {
             if (url == null || !"jar".equals(url.getProtocol())) {
                 return url;
             }
             try {
-                return new URL(null, url.toExternalForm(), UNCACHED_JAR_HANDLER);
+                return new URL(null, url.toExternalForm(), jarHandler);
             } catch (MalformedURLException e) {
                 // keep the JDK's own (caching) handler rather than losing the resource
                 return url;
+            }
+        }
+
+        @Override
+        public void close() throws IOException {
+            try (jarHandler) {
+                super.close();
             }
         }
 

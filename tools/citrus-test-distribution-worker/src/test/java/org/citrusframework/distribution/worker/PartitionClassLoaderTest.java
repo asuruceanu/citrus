@@ -16,6 +16,7 @@
 
 package org.citrusframework.distribution.worker;
 
+import java.io.IOException;
 import java.io.InputStream;
 import java.net.JarURLConnection;
 import java.net.URL;
@@ -209,12 +210,18 @@ class PartitionClassLoaderTest {
             URLConnection first = resource.openConnection();
             URLConnection second = resource.openConnection();
             assertThat(first).isInstanceOf(JarURLConnection.class);
+            first.setUseCaches(true);
             assertThat(first.getUseCaches()).isFalse();
             try (JarFile a = ((JarURLConnection) first).getJarFile(); JarFile b = ((JarURLConnection) second).getJarFile()) {
                 assertThat(a).as("no shared, cached JarFile").isNotSameAs(b);
             }
-            try (InputStream in = resource.openStream()) {
-                assertThat(new String(in.readAllBytes(), StandardCharsets.UTF_8)).isEqualTo("probe/data.txt");
+            JarURLConnection streaming = (JarURLConnection) resource.openConnection();
+            try (JarFile streamedJar = streaming.getJarFile()) {
+                try (InputStream in = streaming.getInputStream()) {
+                    assertThat(new String(in.readAllBytes(), StandardCharsets.UTF_8)).isEqualTo("probe/data.txt");
+                }
+                assertThatThrownBy(() -> streamedJar.getJarEntry("probe/data.txt"))
+                        .isInstanceOf(IllegalStateException.class);
             }
             URL sibling = new URL(resource, "other.txt");
             assertThat(sibling.openConnection().getUseCaches()).isFalse();
@@ -230,6 +237,37 @@ class PartitionClassLoaderTest {
 
         Files.delete(jar);
         assertThat(jar).doesNotExist();
+    }
+
+    @Test
+    @SuppressWarnings("deprecation")
+    void shouldCloseJarOpenedForMetadataWhenThePartitionCloses() throws Exception {
+        Path jar = tempDir.resolve("metadata.jar");
+        try (JarOutputStream out = new JarOutputStream(Files.newOutputStream(jar))) {
+            out.putNextEntry(new JarEntry("probe/metadata.txt"));
+            out.write(new byte[] {1, 2, 3});
+            out.closeEntry();
+        }
+
+        try (IsolatedPartitionRunner.PartitionClassLoader loader = loaderOver(jar)) {
+            URL resource = loader.getResource("probe/metadata.txt");
+            JarURLConnection connection = (JarURLConnection) resource.openConnection();
+            JarURLConnection unused = (JarURLConnection) resource.openConnection();
+            JarURLConnection archive = (JarURLConnection) new URL(resource, "/").openConnection();
+            assertThat(connection.getContentLengthLong()).isEqualTo(3);
+            assertThat(archive.getContentLengthLong()).isEqualTo(Files.size(jar));
+            try (JarFile openedJar = connection.getJarFile(); JarFile openedArchive = (JarFile) archive.getContent()) {
+                assertThat(connection.getJarEntry().getName()).isEqualTo("probe/metadata.txt");
+                assertThat(openedJar.getJarEntry("probe/metadata.txt")).isNotNull();
+
+                loader.close();
+
+                assertThatThrownBy(() -> openedJar.getJarEntry(connection.getEntryName()))
+                        .isInstanceOf(IllegalStateException.class);
+                assertThatThrownBy(openedArchive::size).isInstanceOf(IllegalStateException.class);
+                assertThatThrownBy(unused::getJarFile).isInstanceOf(IOException.class);
+            }
+        }
     }
 
     @Test
