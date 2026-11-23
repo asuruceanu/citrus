@@ -25,10 +25,14 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Stream;
 
+import io.vertx.core.Context;
+import io.vertx.core.Vertx;
 import org.citrusframework.api.agent.CitrusAgentConfiguration;
 import org.citrusframework.distribution.config.DistributionSettings;
 import org.citrusframework.distribution.worker.DistributionWorkerClient;
@@ -338,6 +342,7 @@ class CitrusAgentWorkerOptionsTest {
             try {
                 assertThatThrownBy(server::start).isInstanceOf(CitrusRuntimeException.class)
                         .hasMessageContaining("Could not start HTTP listener on port " + occupiedPort.getLocalPort());
+                assertThat(server.completed.get(5, TimeUnit.SECONDS)).isTrue();
                 assertThat(server.isRunning()).isFalse();
 
                 try (DistributionWorkerClient worker = new DistributionWorkerClient(
@@ -348,6 +353,79 @@ class CitrusAgentWorkerOptionsTest {
                 server.stop();
             }
         } finally {
+            System.setOut(originalOutput);
+        }
+    }
+
+    @Test
+    @ResourceLock(Resources.SYSTEM_OUT)
+    void shouldKeepOneWorkerAndListenerAcrossConcurrentStarts() throws Exception {
+        PrintStream originalOutput = System.out;
+        CitrusAgentConfiguration configuration = parse("--mode", "worker", "--port", "0", "--duration", "-1",
+                "--broker-url", "http://127.0.0.1:1", "--cache-dir", tempDir.resolve("repeat-start-cache").toString());
+        AtomicInteger routesCreated = new AtomicInteger();
+        CountDownLatch buildingRoutes = new CountDownLatch(1);
+        CompletableFuture<Void> allowListen = new CompletableFuture<>();
+        CitrusAgentServer server = new CitrusAgentServer(configuration, List.of(router -> {
+            routesCreated.incrementAndGet();
+            buildingRoutes.countDown();
+            allowListen.orTimeout(5, TimeUnit.SECONDS).join();
+        }));
+        try {
+            CompletableFuture<Void> firstStart = CompletableFuture.runAsync(server::start);
+            assertThat(buildingRoutes.await(5, TimeUnit.SECONDS)).isTrue();
+            CompletableFuture.runAsync(server::start).get(5, TimeUnit.SECONDS);
+            allowListen.complete(null);
+            firstStart.get(5, TimeUnit.SECONDS);
+            server.start();
+
+            assertThat(routesCreated.get()).isEqualTo(1);
+            try (DistributionWorkerClient secondWorker = new DistributionWorkerClient(
+                    DistributionWorkerBridge.buildWorkerConfig(configuration))) {
+                assertThatThrownBy(secondWorker::start).isInstanceOf(IllegalStateException.class)
+                        .hasMessageContaining("--cache-dir");
+            }
+
+            server.stop();
+            assertThat(server.completed.get(5, TimeUnit.SECONDS)).isTrue();
+            try (DistributionWorkerClient replacement = new DistributionWorkerClient(
+                    DistributionWorkerBridge.buildWorkerConfig(configuration))) {
+                replacement.start();
+            }
+        } finally {
+            allowListen.complete(null);
+            server.stop();
+            System.setOut(originalOutput);
+        }
+    }
+
+    @Test
+    @ResourceLock(Resources.SYSTEM_OUT)
+    void shouldCompleteOnlyAfterShutdownOnTheHttpEventLoop() throws Exception {
+        PrintStream originalOutput = System.out;
+        CitrusAgentConfiguration configuration = parse("--port", "0", "--duration", "-1", "--skipTests", "true");
+        CompletableFuture<Context> httpContext = new CompletableFuture<>();
+        CompletableFuture<Void> allowEventLoopToExit = new CompletableFuture<>();
+        CountDownLatch stopReturned = new CountDownLatch(1);
+        CitrusAgentServer server = new CitrusAgentServer(configuration,
+                List.of(router -> httpContext.complete(Vertx.currentContext())));
+
+        try {
+            server.start();
+            httpContext.get(5, TimeUnit.SECONDS).runOnContext(ignored -> {
+                server.stop();
+                stopReturned.countDown();
+                allowEventLoopToExit.orTimeout(5, TimeUnit.SECONDS).join();
+            });
+            assertThat(stopReturned.await(5, TimeUnit.SECONDS)).isTrue();
+            server.stop();
+            assertThat(server.completed).isNotDone();
+
+            allowEventLoopToExit.complete(null);
+            assertThat(server.completed.get(5, TimeUnit.SECONDS)).isTrue();
+        } finally {
+            allowEventLoopToExit.complete(null);
+            server.stop();
             System.setOut(originalOutput);
         }
     }

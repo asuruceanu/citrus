@@ -27,6 +27,7 @@ import java.util.concurrent.TimeoutException;
 import java.util.function.Consumer;
 import java.util.function.IntConsumer;
 
+import io.vertx.core.Context;
 import io.vertx.core.Future;
 import io.vertx.core.Vertx;
 import io.vertx.core.VertxOptions;
@@ -62,6 +63,10 @@ public class CitrusAgentServer implements Server {
     private final List<Consumer<Router>> routerCustomizations;
 
     private Vertx vertx;
+
+    private boolean startRequested;
+
+    private volatile boolean stopRequested;
 
     private DistributionWorkerBridge workerBridge;
 
@@ -136,6 +141,7 @@ public class CitrusAgentServer implements Server {
             server.start(true);
         } catch (RuntimeException e) {
             err.println("Failed to start Citrus agent: " + e.getMessage());
+            server.completed.join();
             exit.accept(STARTUP_FAILURE_EXIT_CODE);
             return;
         }
@@ -186,7 +192,7 @@ public class CitrusAgentServer implements Server {
                         .execute(this::stop);
             }
 
-            if (!configuration.isWorkerMode() && !completed.isDone()) {
+            if (!configuration.isWorkerMode() && !stopRequested && !completed.isDone()) {
                 runStandaloneStartup();
             }
 
@@ -204,9 +210,10 @@ public class CitrusAgentServer implements Server {
     }
 
     private synchronized Future<String> startServices() {
-        if (completed.isDone()) {
+        if (startRequested || stopRequested || completed.isDone()) {
             return null;
         }
+        startRequested = true;
         ConfigurationHelper.resolveArtifacts(configuration);
         configuration.addDefaultProperty(CitrusSettings.DEFAULT_MESSAGE_TYPE_PROPERTY, MessageType.JSON.name(), false);
         configuration.setDefaultProperties();
@@ -250,7 +257,7 @@ public class CitrusAgentServer implements Server {
             new RunService().run(configuration);
 
             if (configuration.isSystemExit()) {
-                System.exit(0);
+                stop();
             } else {
                 logger.info("Startup done - waiting for requests to run further tests");
             }
@@ -276,36 +283,72 @@ public class CitrusAgentServer implements Server {
     }
 
     /**
-     * Stops the server instance.
+     * Initiates shutdown. {@link #waitForCompletion()} reports the result after the HTTP server and Vert.x have closed.
      */
     @Override
-    public synchronized void stop() {
-        try {
-            stopWorker();
-        } finally {
-            try {
-                if (vertx != null) {
-                    vertx.close();
-                    vertx = null;
-                }
-            } finally {
-                complete();
+    public void stop() {
+        synchronized (this) {
+            if (stopRequested) {
+                return;
             }
+            stopRequested = true;
+        }
+        if (Context.isOnEventLoopThread()) {
+            // Worker drain can block. Vert.x must also be able to run its own shutdown callbacks.
+            CompletableFuture.runAsync(this::closeServices);
+        } else {
+            closeServices();
         }
     }
 
-    private synchronized void stopWorker() {
-        if (workerShutdownHook != null) {
-            try {
-                Runtime.getRuntime().removeShutdownHook(workerShutdownHook);
-            } catch (IllegalStateException ignored) {
-                // JVM is already shutting down.
-            }
-            workerShutdownHook = null;
+    private void closeServices() {
+        boolean workerClosed = closeWorker();
+        if (vertx == null) {
+            completed.complete(workerClosed);
+            return;
         }
-        if (workerBridge != null) {
-            workerBridge.close();
+        try {
+            vertx.close().onComplete(result -> {
+                if (result.failed()) {
+                    logger.warn("Failed to close the Citrus agent HTTP server", result.cause());
+                }
+                completed.complete(workerClosed && result.succeeded());
+            });
+        } catch (RuntimeException | Error e) {
+            logger.warn("Failed to close the Citrus agent HTTP server", e);
+            completed.complete(false);
+        }
+    }
+
+    private boolean closeWorker() {
+        try {
+            stopWorker();
+            return true;
+        } catch (RuntimeException | Error e) {
+            logger.warn("Failed to close the Citrus agent distribution worker", e);
+            return false;
+        }
+    }
+
+    private void stopWorker() {
+        Thread hook;
+        DistributionWorkerBridge bridge;
+        synchronized (this) {
+            hook = workerShutdownHook;
+            workerShutdownHook = null;
+            bridge = workerBridge;
             workerBridge = null;
+        }
+        try {
+            if (hook != null) {
+                Runtime.getRuntime().removeShutdownHook(hook);
+            }
+        } catch (IllegalStateException ignored) {
+            // JVM is already shutting down.
+        } finally {
+            if (bridge != null) {
+                bridge.close();
+            }
         }
     }
 

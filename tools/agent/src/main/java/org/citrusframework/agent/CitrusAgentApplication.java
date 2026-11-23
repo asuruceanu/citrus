@@ -21,7 +21,6 @@ import io.vertx.core.AbstractVerticle;
 import io.vertx.core.Future;
 import io.vertx.core.Handler;
 import io.vertx.core.Promise;
-import io.vertx.core.Vertx;
 import io.vertx.core.http.HttpHeaders;
 import io.vertx.core.http.HttpMethod;
 import io.vertx.core.http.HttpServerResponse;
@@ -428,9 +427,6 @@ public class CitrusAgentApplication extends AbstractVerticle implements CitrusIn
             logger.info("Closing Citrus and its application context");
             citrus.close();
         });
-
-        Optional.ofNullable(getVertx())
-                .ifPresent(Vertx::close);
     }
 
     private static String createReport(TestResults results) {
