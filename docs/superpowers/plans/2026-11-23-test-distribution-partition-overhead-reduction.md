@@ -264,7 +264,7 @@ Expected: FAIL (9-arg `schedule`, `minPartitionDurationMs` / `/api/v1/history/du
      ORDER BY last_recorded_at DESC, run_attempt DESC
      ```
    - Iterate rows in order: for non-empty `sess_key`, skip if already seen in `seenSessions` (keeping only the latest attempt); include rows with `total_duration_ms > 0` (or floor positive runs at `1L` when row matched `PASSED`/`FAILED`) up to `Math.max(1, recentLimit)` session runs, and put `Math.max(1L, Math.round((double) sum / count))` into `result` when `count > 0`.
-3. In `DistributionBrokerConfig`: add `minPartitionDurationMs` (default `5_000L`, `Math.max(0L, ...)`) and `maxWavesPerWorker` (default `2`, `Math.max(0, ...)`), wired in `Builder` and `fromSettings()`.
+3. In `DistributionBrokerConfig`: add `minPartitionDurationMs` (`Math.max(0L, ...)`) and `maxWavesPerWorker` (`Math.max(0, ...)`), with `Builder` field defaults initialized from `DistributionSettings.getBrokerMinPartitionDurationMs()` (`5_000L`) and `DistributionSettings.getBrokerMaxWavesPerWorker()` (`2`) (so `DistBrokerStart` CLI also inherits env/sysprop overrides) and wired in `fromSettings()`.
 4. In `BrokerSessionCoordinator`:
    - Track `final int requestedMaxPartitionSize` on `SessionRuntime` (`request.maxPartitionSize()`).
    - Add `countEligibleOnlineWorkers(Map<String, String> requiredCapabilities)` counting distinct `conn.workerId` in `workers.values()` where `(conn.state == WorkerState.IDLE || conn.state == WorkerState.BUSY) && conn.cancelledPartitionId == null && conn.lastHeartbeatAt >= (System.currentTimeMillis() - config.leaseTimeoutMs()) && CapabilityMatcher.matches(requiredCapabilities, conn.capabilities)`.
