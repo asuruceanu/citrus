@@ -501,6 +501,50 @@ class WorkerFileCacheTest {
     }
 
     @Test
+    void shouldNeitherEvictNorStoreNorInvalidateAfterClose() throws Exception {
+        Path dir = tempDir.resolve("closed-cache");
+        byte[] old = "older blob".getBytes(StandardCharsets.UTF_8);
+        String oldSha = ClasspathPackager.sha256Hex(old);
+        Path oldBlob = new BlobCacheDirectory(dir).put(oldSha, old);
+        byte[] fresh = "fresh download".getBytes(StandardCharsets.UTF_8);
+        String freshSha = ClasspathPackager.sha256Hex(fresh);
+        Path workspace = Files.createDirectories(tempDir.resolve("closed-ws/out"));
+        Files.writeString(workspace.resolve("report.txt"), "output");
+
+        AtomicLong usable = new AtomicLong(1024 * GIB);
+        WorkerFileCache cache = WorkerFileCache.open(dir, true, 10 * GIB, p -> usable.get(), FIXED_CLOCK);
+        Path tmp = cache.newDownloadTempFile();
+        Files.write(tmp, fresh);
+        cache.close();
+
+        // A partition thread that outlived close() must not touch a directory another worker may own by now.
+        usable.set(0L);
+        cache.evictAfterPartition();
+        cache.ensureFreeSpaceForDownload(GIB);
+        assertThat(oldBlob).as("no eviction after close").exists();
+
+        assertThatThrownBy(() -> cache.promoteDownload(freshSha, tmp)).isInstanceOf(IllegalStateException.class);
+        assertThat(cache.blobCache().resolveBlobPath(freshSha)).doesNotExist();
+        assertThat(tmp).as("the caller still owns its temporary file").exists();
+        assertThatThrownBy(() -> cache.stageAndPinOutput(workspace.getParent(), "out", Map.of(), sha -> { }))
+                .isInstanceOf(IllegalStateException.class);
+        assertThat(cache.blobCache().listBlobs()).extracting(BlobEntry::sha256).containsExactly(oldSha);
+        assertThatThrownBy(cache::newDownloadTempFile).isInstanceOf(IllegalStateException.class);
+
+        Files.writeString(oldBlob, "corrupted");
+        assertThatThrownBy(() -> cache.verifyOrInvalidate(oldSha)).isInstanceOf(IllegalStateException.class);
+        assertThat(oldBlob).as("no invalidation after close").exists();
+        Files.delete(tmp);
+
+        try (WorkerFileCache owner = WorkerFileCache.open(dir, false, 0L, PLENTY, FIXED_CLOCK);
+             WorkerFileCache.PinLease pins = owner.pinAll(List.of(oldSha))) {
+            cache.evictAfterPartition();
+            assertThat(oldBlob).as("the new owner's directory is left alone").exists();
+            assertThat(pins).isNotNull();
+        }
+    }
+
+    @Test
     void shouldStageForkedOutputAndPinItIntoTheActiveLease() throws Exception {
         Path workspace = Files.createDirectories(tempDir.resolve("workspace"));
         Path outputDir = Files.createDirectories(workspace.resolve("target/out"));

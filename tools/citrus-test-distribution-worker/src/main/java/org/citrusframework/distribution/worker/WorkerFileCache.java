@@ -67,6 +67,9 @@ import org.slf4j.LoggerFactory;
  *     stored blob is stamped and pinned before eviction can see it.</li>
  *     <li>Removing a digest always removes its named jar directory as well, since a hard-linked named jar keeps the
  *     blob's disk space in use.</li>
+ *     <li>Once closed, the cache never mutates its directory again (another worker may own it by then): eviction
+ *     is a no-op, and storing, invalidating or creating temporary files throws {@link IllegalStateException}.
+ *     {@link #close()} waits for an in-flight eviction or store operation to finish.</li>
  * </ul>
  */
 final class WorkerFileCache implements AutoCloseable {
@@ -320,6 +323,7 @@ final class WorkerFileCache implements AutoCloseable {
      * is re-hashed; a corrupted one is removed together with its named jars.
      */
     Path verifyOrInvalidate(String sha256) throws IOException {
+        ensureOpen();
         Path blob = blobCache.resolveBlobPath(sha256);
         BasicFileAttributes attrs = readAttributes(blob);
         if (attrs == null) {
@@ -341,6 +345,7 @@ final class WorkerFileCache implements AutoCloseable {
         }
         evictionLock.lock();
         try {
+            ensureOpen();
             if (verified == null) {
                 LOG.warn("Removing corrupted blob {} from worker cache {}", sha256, canonicalDir);
                 blobIndex.delete(sha256);
@@ -362,6 +367,7 @@ final class WorkerFileCache implements AutoCloseable {
 
     /** A new empty file under {@code tmp/} for a download; the caller deletes it when done. */
     Path newDownloadTempFile() throws IOException {
+        ensureOpen();
         return blobCache.newTempFile("dl-");
     }
 
@@ -374,6 +380,7 @@ final class WorkerFileCache implements AutoCloseable {
     Path promoteDownload(String expectedSha256, Path tempFile) throws IOException {
         evictionLock.lock();
         try {
+            ensureOpen();
             boolean existed = Files.exists(blobCache.resolveBlobPath(expectedSha256), LinkOption.NOFOLLOW_LINKS);
             Path stored = blobCache.putFromFile(expectedSha256, tempFile);
             registerStored(expectedSha256, stored, !existed);
@@ -394,6 +401,7 @@ final class WorkerFileCache implements AutoCloseable {
                                                  Consumer<String> pinRegistrar) throws IOException {
         evictionLock.lock();
         try {
+            ensureOpen();
             Optional<WorkspaceFileSet> output = WorkspacePackager.packageModifiedOutputToCache(blobCache, workspaceDir,
                     rawOutputPath, baselineHashes);
             if (output.isPresent()) {
@@ -429,6 +437,10 @@ final class WorkerFileCache implements AutoCloseable {
         }
         evictionLock.lock();
         try {
+            if (closed.get()) {
+                LOG.debug("Skipping eviction in closed worker cache {}", canonicalDir);
+                return;
+            }
             evictUnderLock(additionalBytes);
         } catch (IOException | RuntimeException e) {
             LOG.warn("Worker cache eviction in {} failed: {}", canonicalDir, e.toString());
@@ -578,11 +590,19 @@ final class WorkerFileCache implements AutoCloseable {
         this.blobIndex = Objects.requireNonNull(blobIndex);
     }
 
-    /** Releases the lock; the {@code .lock} file stays. Idempotent. */
+    /**
+     * Releases the lock; the {@code .lock} file stays. Waits for an in-flight eviction or store operation, after which
+     * no operation mutates the directory any more. Idempotent.
+     */
     @Override
     public void close() {
-        if (!closed.compareAndSet(false, true)) {
-            return;
+        evictionLock.lock();
+        try {
+            if (!closed.compareAndSet(false, true)) {
+                return;
+            }
+        } finally {
+            evictionLock.unlock();
         }
         try {
             fileLock.release();
@@ -596,6 +616,13 @@ final class WorkerFileCache implements AutoCloseable {
             } finally {
                 ACTIVE_JVM_LOCKS.remove(canonicalDir);
             }
+        }
+    }
+
+    /** Mutating operations call this, under {@code evictionLock} where they hold it, so they serialize with close. */
+    private void ensureOpen() {
+        if (closed.get()) {
+            throw new IllegalStateException("Worker local file cache " + canonicalDir + " is closed");
         }
     }
 

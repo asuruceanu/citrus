@@ -140,6 +140,11 @@ public final class DistributionWorkerClient implements AutoCloseable {
         }
     }
 
+    /** The shared blob client, or {@code null} before the first {@link #start()}. */
+    BrokerBlobClient blobClient() {
+        return blobClient;
+    }
+
     public boolean awaitRegistration(long timeout, TimeUnit unit) throws InterruptedException {
         return registeredLatch.await(timeout, unit);
     }
@@ -325,8 +330,9 @@ public final class DistributionWorkerClient implements AutoCloseable {
      */
     private void afterPartition() {
         WorkerFileCache cache = workerCache;
-        if (cache != null) {
+        if (cache != null && !closed.get()) {
             try {
+                // Also a no-op once the cache is closed, e.g. when close() gave up waiting for this thread.
                 cache.evictAfterPartition();
             } catch (RuntimeException e) {
                 LOG.warn("Post-partition cache eviction failed on worker {}", config.workerId(), e);

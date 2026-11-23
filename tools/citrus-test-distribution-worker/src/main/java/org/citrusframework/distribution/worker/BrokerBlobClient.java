@@ -30,6 +30,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Objects;
 import java.util.OptionalLong;
+import java.util.concurrent.atomic.AtomicLong;
 
 import org.citrusframework.distribution.cache.BlobCacheDirectory;
 import org.citrusframework.distribution.cache.ClasspathPackager;
@@ -63,6 +64,7 @@ final class BrokerBlobClient implements AutoCloseable {
     private final DistributionWorkerConfig config;
     private final WorkerFileCache cache;
     private final HttpClient httpClient;
+    private final AtomicLong downloadRequests = new AtomicLong();
     private volatile TempFileOpener tempFileOpener = Files::newOutputStream;
 
     BrokerBlobClient(DistributionWorkerConfig config, WorkerFileCache cache) {
@@ -155,6 +157,7 @@ final class BrokerBlobClient implements AutoCloseable {
      * @throws DigestMismatchException if the downloaded content does not match {@code sha256}
      */
     private Path download(String sha256, long expectedBytes) throws IOException, InterruptedException {
+        downloadRequests.incrementAndGet();
         HttpResponse<InputStream> response = httpClient.send(request("/api/v1/cache/blobs/" + sha256)
                         .timeout(Duration.ofSeconds(60))
                         .GET()
@@ -208,6 +211,11 @@ final class BrokerBlobClient implements AutoCloseable {
             builder.header("Authorization", "Bearer " + config.authToken());
         }
         return builder;
+    }
+
+    /** Blob download requests sent to the coordinator by this client. */
+    long downloadRequests() {
+        return downloadRequests.get();
     }
 
     void tempFileOpener(TempFileOpener opener) {

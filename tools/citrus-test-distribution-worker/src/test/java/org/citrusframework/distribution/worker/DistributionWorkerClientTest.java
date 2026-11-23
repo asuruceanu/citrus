@@ -21,10 +21,8 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.file.Files;
-import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.nio.file.attribute.BasicFileAttributes;
 import java.nio.file.attribute.FileTime;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -325,6 +323,7 @@ class DistributionWorkerClientTest {
                     worker1.start();
                     assertThat(worker1.awaitRegistration(5, TimeUnit.SECONDS)).isTrue();
                     assertCompleted(runPartition(broker, List.of(packaged.ref()), unit, List.of(), List.of()));
+                    assertThat(worker1.blobClient().downloadRequests()).as("cold cache downloads the blob").isEqualTo(1);
 
                     assertThatThrownBy(worker2::start)
                             .isInstanceOf(IllegalStateException.class)
@@ -333,14 +332,11 @@ class DistributionWorkerClientTest {
                     assertThat(worker1.isConnected()).as("the running worker keeps its cache").isTrue();
                 }
 
-                Path blob = new BlobCacheDirectory(sharedCache).resolveBlobPath(packaged.ref().sha256());
-                Object warmFileKey = Files.readAttributes(blob, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS).fileKey();
-
                 worker2.start();
                 assertThat(worker2.awaitRegistration(5, TimeUnit.SECONDS)).isTrue();
                 assertCompleted(runPartition(broker, List.of(packaged.ref()), unit, List.of(), List.of()));
-                assertThat(Files.readAttributes(blob, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS).fileKey())
-                        .as("warm blob reused, not downloaded again").isEqualTo(warmFileKey);
+                assertThat(worker2.blobClient().downloadRequests())
+                        .as("warm blob reused, no blob GET issued to the coordinator").isZero();
             } finally {
                 worker2.close();
             }
