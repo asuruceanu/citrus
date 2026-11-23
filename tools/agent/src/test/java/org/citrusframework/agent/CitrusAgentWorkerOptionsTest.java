@@ -23,6 +23,7 @@ import java.net.ServerSocket;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
@@ -426,6 +427,38 @@ class CitrusAgentWorkerOptionsTest {
         } finally {
             allowEventLoopToExit.complete(null);
             server.stop();
+            System.setOut(originalOutput);
+        }
+    }
+
+    @Test
+    @ResourceLock(Resources.SYSTEM_OUT)
+    void shouldReportInterruptedStartupWhileHttpSetupIsStillBlocked() throws Exception {
+        CountDownLatch configuringRoutes = new CountDownLatch(1);
+        CompletableFuture<Void> releaseRoutes = new CompletableFuture<>();
+        CompletableFuture<Integer> exitCode = new CompletableFuture<>();
+        ByteArrayOutputStream errors = new ByteArrayOutputStream();
+        PrintStream originalOutput = System.out;
+        try (PrintStream err = new PrintStream(errors, true, StandardCharsets.UTF_8)) {
+            Thread startup = Thread.ofVirtual().start(() -> CitrusAgentServer.entrypoint(
+                    new String[] {"--port", "0", "--duration", "-1", "--skipTests", "true"},
+                    List.of(router -> {
+                        configuringRoutes.countDown();
+                        releaseRoutes.orTimeout(10, TimeUnit.SECONDS).join();
+                    }), originalOutput, err, exitCode::complete));
+            try {
+                assertThat(configuringRoutes.await(5, TimeUnit.SECONDS)).isTrue();
+                startup.interrupt();
+
+                assertThat(exitCode.get(2, TimeUnit.SECONDS)).isEqualTo(CitrusAgentServer.STARTUP_FAILURE_EXIT_CODE);
+                assertThat(errors.toString(StandardCharsets.UTF_8))
+                        .contains("Interrupted while starting the Citrus agent HTTP listener");
+                assertThat(releaseRoutes).isNotDone();
+            } finally {
+                releaseRoutes.complete(null);
+                assertThat(startup.join(Duration.ofSeconds(5))).isTrue();
+            }
+        } finally {
             System.setOut(originalOutput);
         }
     }

@@ -64,6 +64,8 @@ public class CitrusAgentServer implements Server {
 
     private Vertx vertx;
 
+    private Future<String> httpDeployment;
+
     private boolean startRequested;
 
     private volatile boolean stopRequested;
@@ -141,7 +143,7 @@ public class CitrusAgentServer implements Server {
             server.start(true);
         } catch (RuntimeException e) {
             err.println("Failed to start Citrus agent: " + e.getMessage());
-            server.completed.join();
+            server.awaitStartupRollback();
             exit.accept(STARTUP_FAILURE_EXIT_CODE);
             return;
         }
@@ -231,7 +233,9 @@ public class CitrusAgentServer implements Server {
         vertx = Vertx.vertx(new VertxOptions()
                 .setMaxEventLoopExecuteTime(600)
                 .setMaxEventLoopExecuteTimeUnit(TimeUnit.SECONDS));
-        return vertx.deployVerticle(new CitrusAgentApplication(configuration, routerCustomizations));
+        httpDeployment = vertx.deployVerticle(new CitrusAgentApplication(configuration, routerCustomizations,
+                () -> stopRequested));
+        return httpDeployment;
     }
 
     private void awaitHttpListener(Future<String> deployment) {
@@ -246,6 +250,17 @@ public class CitrusAgentServer implements Server {
                     + ": " + failure.getMessage(), failure);
         } catch (TimeoutException e) {
             throw new CitrusRuntimeException("Timed out starting HTTP listener on port " + configuration.getPort(), e);
+        }
+    }
+
+    private void awaitStartupRollback() {
+        try {
+            completed.get(5, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            currentThread().interrupt();
+        } catch (ExecutionException | TimeoutException e) {
+            // A stalled router customization can delay Vert.x shutdown as well as startup.
+            logger.debug("Citrus agent startup cleanup did not finish before exit", e);
         }
     }
 
@@ -303,6 +318,15 @@ public class CitrusAgentServer implements Server {
 
     private void closeServices() {
         boolean workerClosed = closeWorker();
+        if (httpDeployment != null && !httpDeployment.isComplete()) {
+            // A pending deployment observes stopRequested and settles before the owning runtime closes.
+            httpDeployment.onComplete(ignored -> closeVertx(workerClosed));
+        } else {
+            closeVertx(workerClosed);
+        }
+    }
+
+    private void closeVertx(boolean workerClosed) {
         if (vertx == null) {
             completed.complete(workerClosed);
             return;

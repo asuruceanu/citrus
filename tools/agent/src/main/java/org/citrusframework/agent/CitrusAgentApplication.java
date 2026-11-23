@@ -67,6 +67,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 import java.util.stream.Stream;
 
@@ -89,6 +90,7 @@ public class CitrusAgentApplication extends AbstractVerticle implements CitrusIn
      * Router customizations
      */
     private final List<Consumer<Router>> routerCustomizations;
+    private final BooleanSupplier startupCancelled;
 
     private final ExecutorService executorService = Executors.newCachedThreadPool();
 
@@ -104,7 +106,13 @@ public class CitrusAgentApplication extends AbstractVerticle implements CitrusIn
      * Constructor with given application configuration and route customizations.
      */
     public CitrusAgentApplication(CitrusAgentConfiguration configuration, List<Consumer<Router>> routerCustomizations) {
+        this(configuration, routerCustomizations, () -> false);
+    }
+
+    CitrusAgentApplication(CitrusAgentConfiguration configuration, List<Consumer<Router>> routerCustomizations,
+                           BooleanSupplier startupCancelled) {
         this.configuration = configuration;
+        this.startupCancelled = startupCancelled;
         this.routerCustomizations = Optional.ofNullable(routerCustomizations)
                 .orElse(Collections.emptyList());
     }
@@ -136,18 +144,31 @@ public class CitrusAgentApplication extends AbstractVerticle implements CitrusIn
                 .handler(wrapThrowingHandler(ctx -> ctx.response().end(agentTestListener.getLogs())));
 
         routerCustomizations.forEach(customization -> customization.accept(router));
+        if (startupCancelled.getAsBoolean()) {
+            startPromise.tryFail("Citrus agent HTTP startup cancelled");
+            return;
+        }
 
         templateEngine = ThymeleafTemplateEngine.create(getVertx());
 
         getVertx().createHttpServer()
                 .requestHandler(router)
                 .listen(configuration.getPort())
-                .<Void>map(server -> {
+                .onSuccess(server -> {
+                    if (startupCancelled.getAsBoolean() || startPromise.future().isComplete()) {
+                        server.close();
+                        startPromise.tryFail("Citrus agent HTTP startup cancelled");
+                        return;
+                    }
                     CitrusInstanceManager.addInstanceProcessor(this);
-                    logger.info("Server started, listening on port {}", server.actualPort());
-                    return null;
+                    if (startPromise.tryComplete()) {
+                        logger.info("Server started, listening on port {}", server.actualPort());
+                    } else {
+                        CitrusInstanceManager.removeInstanceProcessor(this);
+                        server.close();
+                    }
                 })
-                .onComplete(startPromise);
+                .onFailure(startPromise::tryFail);
     }
 
     @Override
