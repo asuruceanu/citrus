@@ -16,13 +16,16 @@
 
 package org.citrusframework.agent;
 
+import java.io.PrintStream;
 import java.util.Collections;
 import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.function.Consumer;
+import java.util.function.IntConsumer;
 
 import io.vertx.core.Vertx;
 import io.vertx.core.VertxOptions;
@@ -42,6 +45,9 @@ public class CitrusAgentServer implements Server {
 
     /** Logger */
     private static final Logger logger = LoggerFactory.getLogger(CitrusAgentServer.class);
+
+    /** Process exit code used when the command line options are invalid. */
+    static final int INVALID_OPTIONS_EXIT_CODE = 1;
 
     private String name = "citrus-agent-server";
 
@@ -98,7 +104,20 @@ public class CitrusAgentServer implements Server {
      * Entrypoint method
      */
     public static void entrypoint(String[] args, List<Consumer<Router>> routerCustomizations) {
-        CitrusAgentServer server = new CitrusAgentServer(args, routerCustomizations);
+        entrypoint(args, routerCustomizations, System.err, System::exit);
+    }
+
+    /**
+     * Entrypoint reporting invalid command line options as a one-line operator error on {@code err} and exiting with
+     * {@link #INVALID_OPTIONS_EXIT_CODE} through {@code exit} instead of starting the server.
+     */
+    static void entrypoint(String[] args, List<Consumer<Router>> routerCustomizations, PrintStream err, IntConsumer exit) {
+        Optional<CitrusAgentConfiguration> configuration = parseOptions(args, err);
+        if (configuration.isEmpty()) {
+            exit.accept(INVALID_OPTIONS_EXIT_CODE);
+            return;
+        }
+        CitrusAgentServer server = new CitrusAgentServer(configuration.get(), routerCustomizations);
 
         if (server.configuration.getTimeToLive() > 0) {
             CompletableFuture.runAsync(() -> {
@@ -121,6 +140,21 @@ public class CitrusAgentServer implements Server {
             }
         } else {
             server.waitForCompletion();
+        }
+    }
+
+    /**
+     * Parses the command line on top of the environment configuration. Invalid options, including worker cache
+     * options, are reported as a single {@code Invalid Citrus agent options: <message>} line without stack trace.
+     *
+     * @return the configuration, or empty when the options are invalid
+     */
+    static Optional<CitrusAgentConfiguration> parseOptions(String[] args, PrintStream err) {
+        try {
+            return Optional.of(new CitrusAgentOptions().apply(ConfigurationHelper.fromEnvVars(), args));
+        } catch (IllegalArgumentException | CitrusRuntimeException e) {
+            err.println("Invalid Citrus agent options: " + e.getMessage());
+            return Optional.empty();
         }
     }
 

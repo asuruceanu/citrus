@@ -20,7 +20,6 @@ import java.nio.file.Paths;
 import java.util.concurrent.TimeUnit;
 
 import org.citrusframework.api.agent.CitrusAgentConfiguration;
-import org.citrusframework.distribution.config.DistributionSettings;
 import org.citrusframework.distribution.worker.DistributionWorkerClient;
 import org.citrusframework.distribution.worker.DistributionWorkerConfig;
 import org.citrusframework.util.StringUtils;
@@ -52,8 +51,7 @@ final class DistributionWorkerBridge implements AutoCloseable {
             builder.cacheCleanup(configuration.getCacheCleanup());
         }
         if (StringUtils.hasText(configuration.getCacheFreeSpaceBufferSize())) {
-            builder.cacheFreeSpaceBufferBytes(DistributionSettings.parseByteSize(
-                    configuration.getCacheFreeSpaceBufferSize(), "cacheFreeSpaceBufferSize"));
+            builder.cacheFreeSpaceBufferSize(configuration.getCacheFreeSpaceBufferSize());
         }
         return builder.build();
     }

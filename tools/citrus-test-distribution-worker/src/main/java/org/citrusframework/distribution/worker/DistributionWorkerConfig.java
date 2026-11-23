@@ -234,6 +234,16 @@ public final class DistributionWorkerConfig {
             return this;
         }
 
+        /**
+         * Sets the free space buffer from a byte size expression such as {@code 2GiB}, {@code 512MiB} or a plain
+         * number of bytes, parsed with {@link DistributionSettings#parseByteSize(String, String)}.
+         *
+         * @throws IllegalArgumentException if {@code size} is {@code null}, blank or not a valid byte size
+         */
+        public Builder cacheFreeSpaceBufferSize(String size) {
+            return cacheFreeSpaceBufferBytes(DistributionSettings.parseByteSize(size, "cacheFreeSpaceBufferSize"));
+        }
+
         public Builder capabilities(Map<String, String> capabilities) {
             if (capabilities != null) {
                 this.capabilities = new LinkedHashMap<>(capabilities);

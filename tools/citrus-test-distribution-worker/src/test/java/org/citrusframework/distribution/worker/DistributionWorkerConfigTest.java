@@ -117,4 +117,27 @@ class DistributionWorkerConfigTest {
                 .isInstanceOf(NullPointerException.class)
                 .hasMessageContaining("cacheDir");
     }
+
+    @Test
+    void shouldParseExplicitFreeSpaceBufferSizeExpression() {
+        System.setProperty(DistributionSettings.WORKER_CACHE_FREE_SPACE_BUFFER_SIZE_PROPERTY, "2GB");
+
+        assertThat(DistributionWorkerConfig.builder().cacheFreeSpaceBufferSize("64MiB").build()
+                .cacheFreeSpaceBufferBytes()).isEqualTo(67_108_864L);
+        assertThat(DistributionWorkerConfig.builder().cacheFreeSpaceBufferSize(" 1 KiB ").build()
+                .cacheFreeSpaceBufferBytes()).isEqualTo(1024L);
+        assertThat(DistributionWorkerConfig.builder().cacheFreeSpaceBufferSize("0").build()
+                .cacheFreeSpaceBufferBytes()).isZero();
+    }
+
+    @Test
+    void shouldRejectMissingOrInvalidFreeSpaceBufferSizeExpression() {
+        DistributionWorkerConfig.Builder builder = DistributionWorkerConfig.builder();
+        for (String invalid : new String[] {null, "", "  ", "2GB", "-1", "1.5GiB"}) {
+            assertThatThrownBy(() -> builder.cacheFreeSpaceBufferSize(invalid))
+                    .as("cacheFreeSpaceBufferSize(%s)", invalid)
+                    .isInstanceOf(IllegalArgumentException.class)
+                    .hasMessageContaining("cacheFreeSpaceBufferSize");
+        }
+    }
 }

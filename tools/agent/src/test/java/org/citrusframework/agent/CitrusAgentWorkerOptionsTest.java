@@ -16,7 +16,11 @@
 
 package org.citrusframework.agent;
 
+import java.io.ByteArrayOutputStream;
+import java.io.PrintStream;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Paths;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.stream.Stream;
 
@@ -117,28 +121,109 @@ class CitrusAgentWorkerOptionsTest {
         }
     }
 
+    @Test
+    void shouldResolveLastCacheCleanupFlagAndKeepOtherOptions() {
+        CitrusAgentConfiguration configuration = parse("--mode", "worker", "--no-cache-cleanup",
+                "--broker-url", "http://broker:9000", "--cache-cleanup=true");
+        assertThat(configuration.getCacheCleanup()).isTrue();
+        assertThat(configuration.getMode()).isEqualTo("worker");
+        assertThat(configuration.getBrokerUrl()).isEqualTo("http://broker:9000");
+    }
+
+    @Test
+    void shouldNotTreatValuesOfOtherOptionsAsCacheOptions() {
+        CitrusAgentConfiguration configuration = parse("--auth-token", "--cache-x", "--broker-url", "--no-cache-cleanup");
+        assertThat(configuration.getAuthToken()).isEqualTo("--cache-x");
+        assertThat(configuration.getBrokerUrl()).isEqualTo("--no-cache-cleanup");
+        assertThat(configuration.getCacheCleanup()).isNull();
+    }
+
+    @Test
+    void shouldValidateCacheOptionsEvenWhenHelpIsRequested() {
+        assertThatThrownBy(() -> parse("--help", "--cache"))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("Unknown cache option: --cache");
+        assertThatThrownBy(() -> parse("-h", "--cache-dir"))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("Missing parameter value for --cache-dir option");
+    }
+
     @TestFactory
     Stream<DynamicTest> shouldRejectInvalidCacheOptions() {
         return Stream.of(
-                List.of("--cache"),
-                List.of("--cache-foo"),
-                List.of("--no-cache"),
-                List.of("--cache-cleanup", "flase"),
-                List.of("--cache-cleanup=flase"),
-                List.of("--cache-cleanup="),
-                List.of("--no-cache-cleanup=maybe"),
-                List.of("--no-cache-cleanup="),
-                List.of("--cache-dir"),
-                List.of("--cache-dir="),
-                List.of("--cache-dir=  "),
-                List.of("--cache-dir", " "),
-                List.of("--cache-dir", "--broker-url", "http://x"),
-                List.of("--cache-free-space-buffer-size"),
-                List.of("--cache-free-space-buffer-size="),
-                List.of("--cache-free-space-buffer-size", "--broker-url", "http://x"),
-                List.of("--cache-free-space-buffer-size=2GB"))
-                .map(args -> DynamicTest.dynamicTest(String.join(" ", args), () ->
-                        assertThatThrownBy(() -> parse(args.toArray(String[]::new)))
-                                .isInstanceOf(IllegalArgumentException.class)));
+                invalidCase("Unknown cache option: --cache", "--cache"),
+                invalidCase("Unknown cache option: --cache-foo", "--cache-foo"),
+                invalidCase("Unknown cache option: --no-cache", "--no-cache"),
+                invalidCase("cache-cleanup", "--cache-cleanup", "flase"),
+                invalidCase("cache-cleanup", "--cache-cleanup=flase"),
+                invalidCase("cache-cleanup", "--cache-cleanup="),
+                invalidCase("cache-cleanup", "--no-cache-cleanup=maybe"),
+                invalidCase("cache-cleanup", "--no-cache-cleanup="),
+                invalidCase("--cache-dir", "--cache-dir"),
+                invalidCase("--cache-dir", "--cache-dir="),
+                invalidCase("--cache-dir", "--cache-dir=  "),
+                invalidCase("--cache-dir", "--cache-dir", " "),
+                invalidCase("--cache-dir", "--cache-dir", "--broker-url", "http://x"),
+                invalidCase("--cache-free-space-buffer-size", "--cache-free-space-buffer-size"),
+                invalidCase("--cache-free-space-buffer-size", "--cache-free-space-buffer-size="),
+                invalidCase("--cache-free-space-buffer-size", "--cache-free-space-buffer-size", "--broker-url", "http://x"),
+                invalidCase("--cache-free-space-buffer-size", "--cache-free-space-buffer-size=2GB"));
+    }
+
+    private static DynamicTest invalidCase(String expectedMessagePart, String... args) {
+        return DynamicTest.dynamicTest(String.join(" ", args) + " -> " + expectedMessagePart, () ->
+                assertThatThrownBy(() -> parse(args))
+                        .isInstanceOf(IllegalArgumentException.class)
+                        .hasMessageContaining(expectedMessagePart));
+    }
+
+    @Test
+    void shouldReportInvalidCacheOptionAsOneLineOperatorError() {
+        ByteArrayOutputStream errors = new ByteArrayOutputStream();
+        PrintStream err = new PrintStream(errors, true, StandardCharsets.UTF_8);
+
+        assertThat(CitrusAgentServer.parseOptions(new String[] {"--mode", "worker", "--cache-dir"}, err)).isEmpty();
+
+        assertThat(errors.toString(StandardCharsets.UTF_8))
+                .isEqualTo("Invalid Citrus agent options: Missing parameter value for --cache-dir option"
+                        + System.lineSeparator());
+    }
+
+    @Test
+    void shouldReportOtherInvalidOptionsTheSameWay() {
+        ByteArrayOutputStream errors = new ByteArrayOutputStream();
+        PrintStream err = new PrintStream(errors, true, StandardCharsets.UTF_8);
+
+        assertThat(CitrusAgentServer.parseOptions(new String[] {"--mode"}, err)).isEmpty();
+
+        assertThat(errors.toString(StandardCharsets.UTF_8))
+                .isEqualTo("Invalid Citrus agent options: Missing parameter value for -m/--mode option"
+                        + System.lineSeparator());
+    }
+
+    @Test
+    void shouldReturnParsedOptionsWithoutOperatorError() {
+        ByteArrayOutputStream errors = new ByteArrayOutputStream();
+        PrintStream err = new PrintStream(errors, true, StandardCharsets.UTF_8);
+
+        assertThat(CitrusAgentServer.parseOptions(new String[] {"--mode", "worker", "--no-cache-cleanup"}, err))
+                .hasValueSatisfying(configuration -> assertThat(configuration.getCacheCleanup()).isFalse());
+        assertThat(errors.toString(StandardCharsets.UTF_8)).isEmpty();
+    }
+
+    @Test
+    void shouldExitNonZeroWithoutStartingServerOnInvalidOptions() {
+        ByteArrayOutputStream errors = new ByteArrayOutputStream();
+        PrintStream err = new PrintStream(errors, true, StandardCharsets.UTF_8);
+        List<Integer> exitCodes = new ArrayList<>();
+
+        CitrusAgentServer.entrypoint(new String[] {"--cache-cleanup", "flase"}, List.of(), err, exitCodes::add);
+
+        assertThat(exitCodes).containsExactly(CitrusAgentServer.INVALID_OPTIONS_EXIT_CODE);
+        assertThat(CitrusAgentServer.INVALID_OPTIONS_EXIT_CODE).isNotZero();
+        assertThat(errors.toString(StandardCharsets.UTF_8))
+                .startsWith("Invalid Citrus agent options: Invalid value 'flase' for --[no-]cache-cleanup")
+                .doesNotContain("\tat ")
+                .hasLineCount(1);
     }
 }

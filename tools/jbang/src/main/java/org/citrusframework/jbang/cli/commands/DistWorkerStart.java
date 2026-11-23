@@ -20,6 +20,7 @@ import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
@@ -29,21 +30,29 @@ import org.aesh.command.invocation.CommandInvocation;
 import org.aesh.command.option.Option;
 import org.aesh.command.option.ParentCommand;
 import org.citrusframework.distribution.config.DistributionSettings;
+import org.citrusframework.distribution.config.WorkerCacheCliOptions;
 import org.citrusframework.distribution.worker.DistributionWorkerClient;
 import org.citrusframework.distribution.worker.DistributionWorkerConfig;
 import org.citrusframework.jbang.cli.CitrusJBangMain;
 
-@CommandDefinition(name = "start", description = "Start a Citrus Test Distribution worker connected to a broker", generateHelp = true)
+@CommandDefinition(name = "start", description = "Start a Citrus Test Distribution worker connected to a broker")
 public class DistWorkerStart extends CitrusCommand {
 
-    private static final String CACHE_DIR = "--cache-dir";
-    private static final String CACHE_CLEANUP = "--cache-cleanup";
-    private static final String NO_CACHE_CLEANUP = "--no-cache-cleanup";
-    private static final String CACHE_CLEANUP_SOURCE = "--[no-]cache-cleanup";
-    private static final String CACHE_FREE_SPACE_BUFFER_SIZE = "--cache-free-space-buffer-size";
+    private static final List<String> COMMAND_WORDS = List.of("dist", "worker", "start");
+
+    /** Options of this command that take a separate value token, which is never parsed as a cache option. */
+    private static final Set<String> VALUE_OPTIONS = Set.of("--broker-url", "-b", "--worker-id", "-w",
+            "--auth-token", "--capabilities", "-C", "--duration-seconds");
+
+    /** Drain timeout plus slack for closing the worker client after a shutdown request. */
+    private static final long SHUTDOWN_TIMEOUT_MILLIS = TimeUnit.SECONDS.toMillis(60);
 
     @ParentCommand
     DistWorker parent;
+
+    // Handled by this command (instead of generated help) so usage goes to the main printer like all other output
+    @Option(name = "help", shortName = 'h', hasValue = false, description = "Display this help and exit")
+    boolean helpRequested;
 
     @Option(name = "broker-url", shortName = 'b', defaultValue = "http://localhost:8765", description = "Broker base URL")
     String brokerUrl;
@@ -63,6 +72,11 @@ public class DistWorkerStart extends CitrusCommand {
     @Option(name = "cache-cleanup", description = "Enable or disable cleanup of the local file cache (true/false)")
     String cacheCleanup;
 
+    /*
+     * Help only: lists the negated form in the generated usage. normalizeWorkerStartArgs rewrites every
+     * --[no-]cache-cleanup form into --cache-cleanup=true|false before the command parser runs, so this field is
+     * only set when the command is bound without normalization.
+     */
     @Option(name = "no-cache-cleanup", hasValue = false, description = "Disable cleanup of the local file cache")
     boolean noCacheCleanup;
 
@@ -90,79 +104,64 @@ public class DistWorkerStart extends CitrusCommand {
 
     /**
      * Validates and normalizes the worker cache options of a {@code dist worker start} command line before it is
-     * handed to the command parser. All {@code --[no-]cache-cleanup[=true|false]} forms collapse into a single
-     * {@code --cache-cleanup=true|false} option (last flag wins), {@code --cache-dir} and
-     * {@code --cache-free-space-buffer-size} must carry a non-blank value and unknown {@code --cache*} or
-     * {@code --no-cache*} options are rejected. Other command lines and help requests are returned unchanged.
+     * handed to the command parser. The {@code dist worker start} command words are located after any leading
+     * option tokens; the options following them are parsed with the shared {@link WorkerCacheCliOptions} parser
+     * (see there for the accepted forms, the help rule and the error messages) and every given cache setting is
+     * re-emitted once in canonical {@code --name=value} form after the other options, so all
+     * {@code --[no-]cache-cleanup[=true|false]} forms collapse into a single {@code --cache-cleanup=true|false}
+     * (last flag wins). Other command lines are returned unchanged.
      *
      * @throws IllegalArgumentException on malformed, blank or unknown cache options
      */
     public static String[] normalizeWorkerStartArgs(String[] args) {
-        if (args == null || args.length < 3
-                || !"dist".equals(args[0]) || !"worker".equals(args[1]) || !"start".equals(args[2])) {
+        int optionsStart = workerStartOptionsIndex(args);
+        if (optionsStart < 0) {
             return args;
         }
-        for (int i = 3; i < args.length; i++) {
-            if ("--help".equals(args[i]) || "-h".equals(args[i])) {
-                return args;
-            }
-        }
 
-        List<String> normalized = new ArrayList<>(Arrays.asList(args).subList(0, 3));
-        Boolean cleanup = null;
-        for (int i = 3; i < args.length; i++) {
-            String arg = args[i];
-            String cleanupName = matchingOption(arg, CACHE_CLEANUP, NO_CACHE_CLEANUP);
-            String valueName = matchingOption(arg, CACHE_DIR, CACHE_FREE_SPACE_BUFFER_SIZE);
-            if (cleanupName != null) {
-                boolean value;
-                if (arg.equals(cleanupName)) {
-                    value = i + 1 < args.length && !args[i + 1].startsWith("-")
-                            ? DistributionSettings.parseBooleanStrict(args[++i], CACHE_CLEANUP_SOURCE)
-                            : true;
-                } else {
-                    value = DistributionSettings.parseBooleanStrict(arg.substring(cleanupName.length() + 1),
-                            CACHE_CLEANUP_SOURCE);
-                }
-                cleanup = NO_CACHE_CLEANUP.equals(cleanupName) != value;
-            } else if (valueName != null) {
-                String value;
-                normalized.add(arg);
-                if (arg.equals(valueName)) {
-                    if (i + 1 >= args.length || args[i + 1].startsWith("-")) {
-                        throw new IllegalArgumentException("Missing parameter value for " + valueName + " option");
-                    }
-                    value = args[++i];
-                    normalized.add(value);
-                } else {
-                    value = arg.substring(valueName.length() + 1);
-                }
-                if (value.isBlank()) {
-                    throw new IllegalArgumentException("Missing parameter value for " + valueName + " option");
-                }
-                if (CACHE_FREE_SPACE_BUFFER_SIZE.equals(valueName)) {
-                    DistributionSettings.parseByteSize(value, CACHE_FREE_SPACE_BUFFER_SIZE);
-                }
-            } else if (arg.startsWith("--cache") || arg.startsWith("--no-cache")) {
-                throw new IllegalArgumentException("Unknown cache option: " + arg);
-            } else {
-                normalized.add(arg);
-            }
-        }
-
-        if (cleanup != null) {
-            normalized.add(CACHE_CLEANUP + "=" + cleanup);
-        }
+        List<String> all = Arrays.asList(args);
+        WorkerCacheCliOptions.Result cache = WorkerCacheCliOptions.parse(all.subList(optionsStart, args.length),
+                VALUE_OPTIONS);
+        List<String> normalized = new ArrayList<>(all.subList(0, optionsStart));
+        normalized.addAll(cache.remainingArgs());
+        normalized.addAll(cache.canonicalArgs());
         return normalized.toArray(String[]::new);
     }
 
-    private static String matchingOption(String arg, String... names) {
-        for (String name : names) {
-            if (arg.equals(name) || arg.startsWith(name + "=")) {
-                return name;
+    /**
+     * Index of the first option after the {@code dist worker start} command words, which may be preceded by option
+     * tokens (e.g. global options), or {@code -1} when the command line is not a worker start command.
+     */
+    private static int workerStartOptionsIndex(String[] args) {
+        if (args == null) {
+            return -1;
+        }
+        int matched = 0;
+        for (int i = 0; i < args.length; i++) {
+            if (COMMAND_WORDS.get(matched).equals(args[i])) {
+                if (++matched == COMMAND_WORDS.size()) {
+                    return i + 1;
+                }
+            } else if (!args[i].startsWith("-")) {
+                return -1;
             }
         }
-        return null;
+        return -1;
+    }
+
+    /**
+     * Shutdown hook that asks the running worker to stop and then holds JVM exit until the worker client has been
+     * closed (releasing the cache lock) or the timeout elapses.
+     */
+    static Thread shutdownHook(CountDownLatch stopLatch, CountDownLatch closedLatch, long timeoutMillis) {
+        return new Thread(() -> {
+            stopLatch.countDown();
+            try {
+                closedLatch.await(timeoutMillis, TimeUnit.MILLISECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }, "citrus-dist-worker-shutdown");
     }
 
     DistributionWorkerConfig buildWorkerConfig() {
@@ -179,19 +178,25 @@ public class DistWorkerStart extends CitrusCommand {
             builder.cacheDir(Paths.get(cacheDir.trim()));
         }
         if (cacheCleanup != null) {
-            builder.cacheCleanup(DistributionSettings.parseBooleanStrict(cacheCleanup, CACHE_CLEANUP_SOURCE));
+            builder.cacheCleanup(DistributionSettings.parseBooleanStrict(cacheCleanup,
+                    WorkerCacheCliOptions.CACHE_CLEANUP_SOURCE));
         } else if (noCacheCleanup) {
             builder.cacheCleanup(false);
         }
         if (cacheFreeSpaceBufferSize != null) {
-            builder.cacheFreeSpaceBufferBytes(
-                    DistributionSettings.parseByteSize(cacheFreeSpaceBufferSize, CACHE_FREE_SPACE_BUFFER_SIZE));
+            builder.cacheFreeSpaceBufferBytes(DistributionSettings.parseByteSize(cacheFreeSpaceBufferSize,
+                    WorkerCacheCliOptions.CACHE_FREE_SPACE_BUFFER_SIZE));
         }
         return builder.build();
     }
 
     @Override
     public CommandResult execute(CommandInvocation invocation) {
+        if (helpRequested) {
+            printer().println(invocation.getHelpInfo());
+            return CommandResult.SUCCESS;
+        }
+
         DistributionWorkerConfig config;
         try {
             config = buildWorkerConfig();
@@ -201,7 +206,8 @@ public class DistWorkerStart extends CitrusCommand {
         }
 
         CountDownLatch stopLatch = new CountDownLatch(1);
-        Thread hook = new Thread(stopLatch::countDown, "citrus-dist-worker-shutdown");
+        CountDownLatch closedLatch = new CountDownLatch(1);
+        Thread hook = shutdownHook(stopLatch, closedLatch, SHUTDOWN_TIMEOUT_MILLIS);
         Runtime.getRuntime().addShutdownHook(hook);
 
         try (DistributionWorkerClient client = new DistributionWorkerClient(config)) {
@@ -221,6 +227,8 @@ public class DistWorkerStart extends CitrusCommand {
             printer().println("Failed to run Citrus Test Distribution Worker: " + e.getMessage());
             return CommandResult.FAILURE;
         } finally {
+            // The client (and with it the cache lock) is closed by now; let a pending shutdown hook finish.
+            closedLatch.countDown();
             try {
                 Runtime.getRuntime().removeShutdownHook(hook);
             } catch (IllegalStateException ignored) {

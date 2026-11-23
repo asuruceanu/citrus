@@ -419,35 +419,40 @@ public final class DistributionSettings {
     }
 
     static Path resolveWorkerCacheDir(UnaryOperator<String> prop, UnaryOperator<String> env) {
-        String[] resolved = resolveFirstNonBlank(prop, env, WORKER_CACHE_DIR_PROPERTY, WORKER_CACHE_DIR_ENV,
+        ResolvedSetting resolved = resolveFirstNonBlank(prop, env, WORKER_CACHE_DIR_PROPERTY, WORKER_CACHE_DIR_ENV,
                 AGENT_CACHE_DIR_ENV);
-        return resolved == null ? defaultWorkerCacheDir() : Paths.get(resolved[0]);
+        return resolved == null ? defaultWorkerCacheDir() : Paths.get(resolved.value());
     }
 
     static boolean resolveWorkerCacheCleanup(UnaryOperator<String> prop, UnaryOperator<String> env) {
-        String[] resolved = resolveFirstNonBlank(prop, env, WORKER_CACHE_CLEANUP_PROPERTY, WORKER_CACHE_CLEANUP_ENV,
-                AGENT_CACHE_CLEANUP_ENV);
-        return resolved == null ? DEFAULT_WORKER_CACHE_CLEANUP : parseBooleanStrict(resolved[0], resolved[1]);
+        ResolvedSetting resolved = resolveFirstNonBlank(prop, env, WORKER_CACHE_CLEANUP_PROPERTY,
+                WORKER_CACHE_CLEANUP_ENV, AGENT_CACHE_CLEANUP_ENV);
+        return resolved == null ? DEFAULT_WORKER_CACHE_CLEANUP
+                : parseBooleanStrict(resolved.value(), resolved.source());
     }
 
     static long resolveWorkerCacheFreeSpaceBufferBytes(UnaryOperator<String> prop, UnaryOperator<String> env) {
-        String[] resolved = resolveFirstNonBlank(prop, env, WORKER_CACHE_FREE_SPACE_BUFFER_SIZE_PROPERTY,
+        ResolvedSetting resolved = resolveFirstNonBlank(prop, env, WORKER_CACHE_FREE_SPACE_BUFFER_SIZE_PROPERTY,
                 WORKER_CACHE_FREE_SPACE_BUFFER_SIZE_ENV, AGENT_CACHE_FREE_SPACE_BUFFER_SIZE_ENV);
         return resolved == null ? DEFAULT_WORKER_CACHE_FREE_SPACE_BUFFER_BYTES
-                : parseByteSize(resolved[0], resolved[1]);
+                : parseByteSize(resolved.value(), resolved.source());
     }
 
-    /** Returns {@code {trimmedValue, sourceKey}} of the first non-blank tier, or {@code null} when none is set. */
-    private static String[] resolveFirstNonBlank(UnaryOperator<String> prop, UnaryOperator<String> env,
-                                                 String propKey, String primaryEnvKey, String aliasEnvKey) {
+    /** Trimmed value of a setting together with the property or environment key it was read from. */
+    private record ResolvedSetting(String value, String source) {
+    }
+
+    /** Returns the first non-blank tier, or {@code null} when none is set. */
+    private static ResolvedSetting resolveFirstNonBlank(UnaryOperator<String> prop, UnaryOperator<String> env,
+                                                        String propKey, String primaryEnvKey, String aliasEnvKey) {
         String value = prop.apply(propKey);
         if (value != null && !value.isBlank()) {
-            return new String[] {value.trim(), propKey};
+            return new ResolvedSetting(value.trim(), propKey);
         }
         for (String envKey : new String[] {primaryEnvKey, aliasEnvKey}) {
             value = env.apply(envKey);
             if (value != null && !value.isBlank()) {
-                return new String[] {value.trim(), envKey};
+                return new ResolvedSetting(value.trim(), envKey);
             }
         }
         return null;
