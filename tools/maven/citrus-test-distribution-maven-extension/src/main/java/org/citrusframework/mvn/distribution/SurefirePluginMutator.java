@@ -111,16 +111,38 @@ public final class SurefirePluginMutator {
         }
         Resolution resolution = new Resolution(cliUserProperties != null ? cliUserProperties : new Properties(),
                 environment != null ? environment : key -> null);
+        if (isSkipped(project, resolution)) {
+            // A skipped module opted out: its tests run locally, exactly as without Test Distribution.
+            return;
+        }
         normalizeCliUserProperties(project, resolution);
         Map<String, Plugin> plugins = project.getBuild().getPluginsAsMap();
         Plugin surefire = plugins.get(SUREFIRE_KEY);
         if (surefire != null) {
-            mutatePlugin(project, surefire, sessionId, extraClasspathJars, sharedProperties, "surefire-reports", resolution);
+            mutatePlugin(project, surefire, sessionId, extraClasspathJars, sharedProperties, resolution);
         }
         Plugin failsafe = plugins.get(FAILSAFE_KEY);
         if (failsafe != null) {
-            mutatePlugin(project, failsafe, sessionId, extraClasspathJars, sharedProperties, "failsafe-reports", resolution);
+            mutatePlugin(project, failsafe, sessionId, extraClasspathJars, sharedProperties, resolution);
         }
+    }
+
+    /**
+     * Whether {@code project} opted out of distribution: the first non-blank value of the command line
+     * ({@code -Dcitrus.test.distribution.skip}), the module's {@code <properties>}, then {@code CITRUS_DIST_SKIP}.
+     */
+    static boolean isSkipped(MavenProject project, Resolution resolution) {
+        String cli = resolution.cliUserProperties().getProperty(DistributionSettings.SKIP_PROPERTY);
+        if (cli != null && !cli.isBlank()) {
+            return Boolean.parseBoolean(cli.trim());
+        }
+        String module = project.getProperties() != null
+                ? project.getProperties().getProperty(DistributionSettings.SKIP_PROPERTY) : null;
+        if (module != null && !module.isBlank()) {
+            return Boolean.parseBoolean(module.trim());
+        }
+        String env = resolution.environment().apply(DistributionSettings.SKIP_ENV);
+        return env != null && Boolean.parseBoolean(env.trim());
     }
 
     /**
@@ -135,6 +157,10 @@ public final class SurefirePluginMutator {
         }
         Resolution resolution = new Resolution(cliUserProperties != null ? cliUserProperties : new Properties(),
                 environment != null ? environment : key -> null);
+        if (isSkipped(project, resolution)) {
+            // A skipped module opted out: its tests run locally, exactly as without Test Distribution.
+            return;
+        }
         for (String key : List.of(SUREFIRE_KEY, FAILSAFE_KEY)) {
             Plugin plugin = project.getBuild().getPluginsAsMap().get(key);
             if (plugin == null) {
@@ -187,18 +213,16 @@ public final class SurefirePluginMutator {
                                      String sessionId,
                                      List<Path> extraClasspathJars,
                                      Map<String, String> sharedProperties,
-                                     String defaultReportFolder,
                                      Resolution resolution) {
         Xpp3Dom config = ensureDom(plugin.getConfiguration());
-        applyDomMutations(project, config, sessionId, extraClasspathJars, sharedProperties, defaultReportFolder, resolution);
+        applyDomMutations(project, config, sessionId, extraClasspathJars, sharedProperties, resolution);
         plugin.setConfiguration(config);
 
         if (plugin.getExecutions() != null) {
             for (PluginExecution execution : plugin.getExecutions()) {
                 if (execution.getConfiguration() != null) {
                     Xpp3Dom execDom = ensureDom(execution.getConfiguration());
-                    applyDomMutations(project, execDom, sessionId, extraClasspathJars, sharedProperties,
-                            defaultReportFolder, resolution);
+                    applyDomMutations(project, execDom, sessionId, extraClasspathJars, sharedProperties, resolution);
                     execution.setConfiguration(execDom);
                 }
             }
@@ -210,7 +234,6 @@ public final class SurefirePluginMutator {
                                           String sessionId,
                                           List<Path> extraClasspathJars,
                                           Map<String, String> sharedProperties,
-                                          String defaultReportFolder,
                                           Resolution resolution) {
         Xpp3Dom additionalCp = getOrCreateChild(config, "additionalClasspathElements");
         for (Path jar : extraClasspathJars) {
@@ -229,10 +252,7 @@ public final class SurefirePluginMutator {
             setChildValue(sysProps, DistributionSettings.SESSION_ID_PROPERTY, sessionId);
         }
         setChildValue(sysProps, DistributionSettings.MODULE_NAME_PROPERTY, project.getArtifactId());
-        if (project.getBuild() != null && project.getBuild().getDirectory() != null) {
-            Path reportDir = Path.of(project.getBuild().getDirectory()).resolve(defaultReportFolder);
-            setChildValue(sysProps, DistributionSettings.REPORT_DIR_PROPERTY, reportDir.toAbsolutePath().toString());
-        }
+        // No REPORT_DIR_PROPERTY: remote results are replayed into Surefire/Failsafe, which write the reports themselves.
         if (sharedProperties != null) {
             sharedProperties.forEach((k, v) -> {
                 if (v != null && !v.isBlank()) {

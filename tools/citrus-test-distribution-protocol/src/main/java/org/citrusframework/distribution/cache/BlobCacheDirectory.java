@@ -218,7 +218,7 @@ public class BlobCacheDirectory {
             throw new IOException("Cached blob does not exist: " + ref.sha256());
         }
         if (ref.kind() == ArtifactKind.JAR) {
-            return blobPath;
+            return namedJar(ref, blobPath);
         }
 
         Path extractDir = workspaceDir.toAbsolutePath().normalize().resolve("extracted").resolve(ref.sha256());
@@ -238,6 +238,56 @@ public class BlobCacheDirectory {
             extractZipSafely(blobPath, extractDir);
             Files.writeString(marker, "ok");
             return extractDir;
+        }
+    }
+
+    /**
+     * The cached jar under its original file name ({@code classpath/<sha256>/<name>.jar}, a hard link to the blob, or
+     * a copy where links are unsupported), shared by every partition. Libraries inspect classpath file names: for
+     * example Testcontainers' {@code MountableFile} extracts a resource from an archive only when its URL contains
+     * {@code .jar!}, and would copy the whole archive from a digest-named blob instead.
+     */
+    private Path namedJar(ArtifactRef ref, Path blobPath) throws IOException {
+        String name = ref.name() != null ? Path.of(ref.name().replace('\\', '/')).getFileName().toString() : "";
+        name = name.replaceAll("[^A-Za-z0-9._+-]", "_");
+        if (name.isBlank() || name.chars().allMatch(c -> c == '.' || c == '_')) {
+            name = ref.sha256();
+        }
+        if (!name.endsWith(".jar")) {
+            name = name + ".jar";
+        }
+        Path dir = rootDir.resolve("classpath").resolve(ref.sha256()).normalize();
+        Path named = dir.resolve(name).normalize();
+        if (!named.startsWith(rootDir)) {
+            throw new IOException("Classpath entry escapes cache root: " + ref.name());
+        }
+        if (Files.isRegularFile(named)) {
+            return named;
+        }
+        synchronized (this) {
+            if (Files.isRegularFile(named)) {
+                return named;
+            }
+            Files.createDirectories(dir);
+            // Several worker JVMs may share the cache directory: stage under a unique name, and treat any failure to
+            // publish as fine once another process has published the same digest.
+            Path staging = Files.createTempFile(dir, ".staging-", ".jar");
+            try {
+                Files.delete(staging);
+                try {
+                    Files.createLink(staging, blobPath);
+                } catch (UnsupportedOperationException | IOException linkFailed) {
+                    Files.copy(blobPath, staging, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                }
+                Files.move(staging, named, java.nio.file.StandardCopyOption.ATOMIC_MOVE);
+            } catch (IOException publishFailed) {
+                if (!Files.isRegularFile(named)) {
+                    throw publishFailed;
+                }
+            } finally {
+                Files.deleteIfExists(staging);
+            }
+            return named;
         }
     }
 

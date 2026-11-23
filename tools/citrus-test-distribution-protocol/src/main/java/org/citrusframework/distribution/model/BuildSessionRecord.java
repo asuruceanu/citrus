@@ -31,6 +31,63 @@ public record BuildSessionRecord(
         int totalBlobs,
         int cachedBlobs,
         long serialDurationMs,
-        long wallDurationMs
+        long wallDurationMs,
+        String failureReason,
+        java.util.List<String> modules
 ) {
+
+    /** Modules (Maven artifact ids) that submitted work, in the order they first started. */
+    public BuildSessionRecord {
+        modules = modules != null ? java.util.List.copyOf(modules) : java.util.List.of();
+    }
+
+    public BuildSessionRecord(
+            String sessionId,
+            String projectName,
+            String gitBranch,
+            String gitCommit,
+            SessionStatus status,
+            long startedAt,
+            long finishedAt,
+            int totalTests,
+            int passedTests,
+            int failedTests,
+            int skippedTests,
+            int totalBlobs,
+            int cachedBlobs,
+            long serialDurationMs,
+            long wallDurationMs,
+            String failureReason) {
+        this(sessionId, projectName, gitBranch, gitCommit, status, startedAt, finishedAt, totalTests, passedTests,
+                failedTests, skippedTests, totalBlobs, cachedBlobs, serialDurationMs, wallDurationMs, failureReason,
+                java.util.List.of());
+    }
+
+    /** Copy listing {@code modules}. */
+    public BuildSessionRecord withModules(java.util.List<String> modules) {
+        return new BuildSessionRecord(sessionId, projectName, gitBranch, gitCommit, status, startedAt, finishedAt,
+                totalTests, passedTests, failedTests, skippedTests, totalBlobs, cachedBlobs, serialDurationMs,
+                wallDurationMs, failureReason, modules);
+    }
+
+    /** Session without a failure reason (running or passed sessions). */
+    public BuildSessionRecord(
+            String sessionId,
+            String projectName,
+            String gitBranch,
+            String gitCommit,
+            SessionStatus status,
+            long startedAt,
+            long finishedAt,
+            int totalTests,
+            int passedTests,
+            int failedTests,
+            int skippedTests,
+            int totalBlobs,
+            int cachedBlobs,
+            long serialDurationMs,
+            long wallDurationMs) {
+        this(sessionId, projectName, gitBranch, gitCommit, status, startedAt, finishedAt, totalTests, passedTests,
+                failedTests, skippedTests, totalBlobs, cachedBlobs, serialDurationMs, wallDurationMs, null);
+    }
 }

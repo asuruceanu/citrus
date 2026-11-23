@@ -132,8 +132,9 @@ class DistributionSettingsAndPathRewriterTest {
                 .hasMessageContaining(DistributionSettings.PARTITION_POLICY_PROPERTY)
                 .hasMessageContaining("LPT, SINGLE");
 
-        assertThat(DistributionSettings.parseWorkerForkMode("")).isEqualTo(DistributionSettings.WorkerForkMode.AUTO);
-        assertThat(DistributionSettings.parseWorkerForkMode("always")).isEqualTo(DistributionSettings.WorkerForkMode.ALWAYS);
+        assertThat(DistributionSettings.parseWorkerForkMode("")).isEqualTo(DistributionSettings.WorkerForkMode.ALWAYS);
+        assertThat(DistributionSettings.parseWorkerForkMode(null)).isEqualTo(DistributionSettings.WorkerForkMode.ALWAYS);
+        assertThat(DistributionSettings.parseWorkerForkMode("auto")).isEqualTo(DistributionSettings.WorkerForkMode.AUTO);
         assertThatThrownBy(() -> DistributionSettings.parseWorkerForkMode("never"))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining(DistributionSettings.WORKER_FORK_MODE_PROPERTY);

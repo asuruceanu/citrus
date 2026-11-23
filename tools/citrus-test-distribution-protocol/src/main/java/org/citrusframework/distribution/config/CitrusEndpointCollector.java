@@ -34,7 +34,8 @@ import java.util.Set;
  */
 public final class CitrusEndpointCollector implements AutoCloseable {
 
-    private final Set<String> currentEndpoints = Collections.synchronizedSet(new LinkedHashSet<>());
+    /** Endpoints of the test running on each thread: tests of one partition may run in parallel. */
+    private final ThreadLocal<Set<String>> currentEndpoints = ThreadLocal.withInitial(LinkedHashSet::new);
     private volatile boolean closed;
     private Runnable cleanup;
 
@@ -132,19 +133,25 @@ public final class CitrusEndpointCollector implements AutoCloseable {
         }
     }
 
+    /** Starts collecting for the test that runs on the calling thread. */
     public void startTest() {
-        currentEndpoints.clear();
+        currentEndpoints.get().clear();
     }
 
+    /** Records an endpoint touched by the test running on the calling thread. */
+    void record(String endpoint) {
+        currentEndpoints.get().add(endpoint);
+    }
+
+    /** Endpoints recorded on the calling thread since {@link #startTest()}; clears them. */
     public List<String> drainEndpoints() {
-        synchronized (currentEndpoints) {
-            if (currentEndpoints.isEmpty()) {
-                return List.of();
-            }
-            List<String> snapshot = List.copyOf(currentEndpoints);
-            currentEndpoints.clear();
-            return snapshot;
+        Set<String> endpoints = currentEndpoints.get();
+        if (endpoints.isEmpty()) {
+            return List.of();
         }
+        List<String> snapshot = List.copyOf(endpoints);
+        endpoints.clear();
+        return snapshot;
     }
 
     @Override
@@ -153,7 +160,7 @@ public final class CitrusEndpointCollector implements AutoCloseable {
         if (cleanup != null) {
             cleanup.run();
         }
-        currentEndpoints.clear();
+        currentEndpoints.remove();
     }
 
     private void recordAction(Object action, Set<Object> visited) {
@@ -165,14 +172,14 @@ public final class CitrusEndpointCollector implements AutoCloseable {
         if (endpoint != null) {
             String name = asNonBlankString(invokeZeroArg(endpoint, "getName"));
             if (name != null) {
-                currentEndpoints.add(name);
+                record(name);
                 foundDirectEndpoint = true;
             }
         }
         if (!foundDirectEndpoint) {
             String uri = asNonBlankString(invokeZeroArg(action, "getEndpointUri"));
             if (uri != null) {
-                currentEndpoints.add(uri);
+                record(uri);
             }
         }
         Object endpoints = invokeZeroArg(action, "getEndpoints");
@@ -180,7 +187,7 @@ public final class CitrusEndpointCollector implements AutoCloseable {
             for (Object ep : list) {
                 String name = asNonBlankString(invokeZeroArg(ep, "getName"));
                 if (name != null) {
-                    currentEndpoints.add(name);
+                    record(name);
                 }
             }
         }
@@ -189,7 +196,7 @@ public final class CitrusEndpointCollector implements AutoCloseable {
             for (Object n : names) {
                 String name = asNonBlankString(n);
                 if (name != null) {
-                    currentEndpoints.add(name);
+                    record(name);
                 }
             }
         }

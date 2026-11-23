@@ -336,6 +336,14 @@ final class ForkedPartitionRunner implements PartitionRunner {
         return Files.createDirectories(directory);
     }
 
+    /**
+     * Fixed system properties of every child JVM. The worker role keeps Citrus' own launcher interceptor passive in
+     * the child; launcher interceptors are not switched off, since modules enable them for their frameworks (e.g.
+     * {@code quarkus-junit5-config}), exactly as Surefire runs them.
+     */
+    static final List<String> CHILD_SYSTEM_PROPERTIES = List.of(
+            "-D" + DistributionSettings.ROLE_PROPERTY + "=" + DistributionSettings.ROLE_WORKER);
+
     private Process launch(Path argfile, Path request, int port, Path workspace, Path workingDirectory, Path tmpDir)
             throws IOException {
         String java = Path.of(System.getProperty("java.home"), "bin",
@@ -345,8 +353,7 @@ final class ForkedPartitionRunner implements PartitionRunner {
         command.add("@" + argfile);
         command.addAll(config.forkJvmArgs());
         command.add("-Djava.io.tmpdir=" + tmpDir);
-        command.add("-D" + DistributionSettings.ROLE_PROPERTY + "=" + DistributionSettings.ROLE_WORKER);
-        command.add("-Djunit.platform.launcher.interceptors.enabled=false");
+        command.addAll(CHILD_SYSTEM_PROPERTIES);
         command.add("-Dbasedir=" + workspace);
         command.add(ForkedPartitionMain.class.getName());
         command.add(request.toString());

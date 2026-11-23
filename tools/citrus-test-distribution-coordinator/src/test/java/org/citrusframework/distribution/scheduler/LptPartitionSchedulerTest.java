@@ -73,10 +73,27 @@ class LptPartitionSchedulerTest {
         assertThat(partitions.get(0).workUnits()).extracting(WorkUnitSpec::key).containsExactly("DockerIT");
         assertThat(partitions.get(0).requiredCapabilities()).containsEntry("docker", "true");
 
-        // Plain tests chunked into 2 + 1
-        assertThat(partitions.get(1).workUnits()).extracting(WorkUnitSpec::key).containsExactly("Plain1IT", "Plain2IT");
-        assertThat(partitions.get(1).estimatedDurationMs()).isEqualTo(900L);
-        assertThat(partitions.get(2).workUnits()).extracting(WorkUnitSpec::key).containsExactly("Plain3IT");
+        // Plain tests balanced over ceil(3 / 2) = 2 partitions: 500 | 400 + 300
+        assertThat(partitions.get(1).workUnits()).extracting(WorkUnitSpec::key).containsExactly("Plain2IT", "Plain3IT");
+        assertThat(partitions.get(1).estimatedDurationMs()).isEqualTo(700L);
+        assertThat(partitions.get(2).workUnits()).extracting(WorkUnitSpec::key).containsExactly("Plain1IT");
+    }
+
+    @Test
+    void shouldSpreadTheSlowestUnitsAcrossPartitionsInsteadOfGroupingThem() {
+        List<WorkUnitSpec> units = new java.util.ArrayList<>();
+        for (int i = 20; i >= 1; i--) {
+            units.add(new WorkUnitSpec(String.format("U%02d", i), "com.example.U" + i, null, null, Map.of(), i * 1000L));
+        }
+
+        List<PartitionRecord> partitions = new LptPartitionScheduler().schedule("session-4", units, Map.of(), 1000L, 10);
+
+        assertThat(partitions).hasSize(2);
+        assertThat(partitions).allSatisfy(p -> assertThat(p.workUnits()).hasSize(10));
+        assertThat(partitions).extracting(PartitionRecord::estimatedDurationMs).containsOnly(105_000L);
+        assertThat(partitions).as("the two slowest units run in parallel").allSatisfy(p ->
+                assertThat(p.workUnits()).extracting(WorkUnitSpec::key).containsAnyOf("U20", "U19")
+                        .doesNotContain(p.workUnits().stream().anyMatch(u -> u.key().equals("U20")) ? "U19" : "U20"));
     }
 
     @Test

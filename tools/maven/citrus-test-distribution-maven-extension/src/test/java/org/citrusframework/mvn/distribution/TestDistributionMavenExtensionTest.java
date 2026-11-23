@@ -96,6 +96,9 @@ class TestDistributionMavenExtensionTest {
                         .isEqualTo(broker.baseUrl());
                 assertThat(dom.getChild("additionalClasspathElements").getChildCount())
                         .isGreaterThanOrEqualTo(2);
+                assertThat(sysProps.getChild(DistributionSettings.REPORT_DIR_PROPERTY))
+                        .as("Surefire writes the reports from the replayed results; a second writer would race it")
+                        .isNull();
             }
 
             participant.afterSessionEnd(session);
@@ -152,6 +155,7 @@ class TestDistributionMavenExtensionTest {
             BuildSessionRecord r2 = broker.store().findSession(sid2).orElseThrow();
             assertThat(r2.status()).isEqualTo(SessionStatus.FAILED);
             assertThat(r2.failedTests()).isZero();
+            assertThat(r2.failureReason()).isEqualTo("Compilation failure");
 
             // 3. Reactor session cancelled via InterruptedException -> ABORTED
             MavenProject modCancel = createSampleProject("citrus-mod-cancel", tempDir.resolve("mod-cancel"));
@@ -163,6 +167,7 @@ class TestDistributionMavenExtensionTest {
             p3.afterSessionEnd(cancelSession);
             BuildSessionRecord r3 = broker.store().findSession(sid3).orElseThrow();
             assertThat(r3.status()).isEqualTo(SessionStatus.ABORTED);
+            assertThat(r3.failureReason()).isEqualTo("Maven build interrupted");
 
             // 4. Custom project.name property + JVM shutdown hook aborts active session on SIGINT/SIGTERM
             Properties customProps = new Properties();
@@ -181,6 +186,146 @@ class TestDistributionMavenExtensionTest {
             BuildSessionRecord r4 = broker.store().findSession(sid4).orElseThrow();
             assertThat(r4.status()).isEqualTo(SessionStatus.ABORTED);
         }
+    }
+
+    @Test
+    void shouldDescribeSurefireForkFailureWithoutStackFramesOrDuplicateLines() {
+        String mojoMessage = "Failed to execute goal org.apache.maven.plugins:maven-surefire-plugin:3.5.6:test "
+                + "(default-test) on project citrus-api: \n\n"
+                + "There was an error in the forked process\n"
+                + "java.lang.NoClassDefFoundError: org/citrusframework/junit/jupiter/CitrusTestFactory\n"
+                + "org.apache.maven.surefire.booter.SurefireBooterForkException: There was an error in the forked process\n"
+                + "java.lang.NoClassDefFoundError: org/citrusframework/junit/jupiter/CitrusTestFactory\n"
+                + "\tat org.apache.maven.plugin.surefire.booterclient.ForkStarter.fork(ForkStarter.java:631)\n"
+                + "\tat org.apache.maven.plugin.surefire.booterclient.ForkStarter.run(ForkStarter.java:285)";
+
+        String reason = TestDistributionLifecycleParticipant.describeBuildFailure(
+                List.of(new RuntimeException(mojoMessage), new RuntimeException(null, new IllegalStateException("second"))));
+
+        assertThat(reason).isEqualTo(
+                "Failed to execute goal org.apache.maven.plugins:maven-surefire-plugin:3.5.6:test (default-test) on project citrus-api:\n"
+                        + "There was an error in the forked process\n"
+                        + "java.lang.NoClassDefFoundError: org/citrusframework/junit/jupiter/CitrusTestFactory\n"
+                        + "org.apache.maven.surefire.booter.SurefireBooterForkException: There was an error in the forked process\n"
+                        + "second");
+    }
+
+    @Test
+    void shouldStopOnCyclicCausesWithoutMessages() {
+        RuntimeException first = new RuntimeException((String) null);
+        RuntimeException second = new RuntimeException((String) null);
+        first.initCause(second);
+        second.initCause(first);
+
+        assertThat(org.junit.jupiter.api.Assertions.assertTimeoutPreemptively(java.time.Duration.ofSeconds(2),
+                () -> TestDistributionLifecycleParticipant.describeBuildFailure(List.of(first)))).isNull();
+    }
+
+    @Test
+    void shouldStripAllTerminalControlSequencesButKeepProseStartingWithAt() {
+        String message = "\u001b[?25lCompilation failure\u001b]0;mvn\u0007\n"
+                + "at least one module failed\n"
+                + "\tat org.example.Foo.bar(Foo.java:12)\n"
+                + "\tat org.example.Foo$Inner.lambda$run$0(Foo.java)";
+
+        assertThat(TestDistributionLifecycleParticipant.describeBuildFailure(List.of(new RuntimeException(message))))
+                .isEqualTo("Compilation failure\nat least one module failed");
+    }
+
+    @Test
+    void shouldNotSplitACharacterWhenTrimmingTheReason() {
+        String message = "a".repeat(3999) + "\uD83D\uDE00";
+
+        String reason = TestDistributionLifecycleParticipant.describeBuildFailure(List.of(new RuntimeException(message)));
+
+        assertThat(reason).hasSize(3999);
+        assertThat(Character.isHighSurrogate(reason.charAt(reason.length() - 1))).isFalse();
+    }
+
+    @Test
+    void shouldNameTheSessionAfterTheExecutionRootRatherThanTheFirstSelectedModule() {
+        MavenProject root = new MavenProject();
+        root.setArtifactId("citrus");
+        root.setFile(tempDir.resolve("repo/pom.xml").toFile());
+        MavenProject module = new MavenProject();
+        module.setArtifactId("citrus-api");
+        module.setFile(tempDir.resolve("repo/core/citrus-api/pom.xml").toFile());
+        MavenSession session = Mockito.mock(MavenSession.class);
+        // ./mvnw test -pl core/citrus-api,... from the repository root
+        when(session.getTopLevelProject()).thenReturn(module);
+        when(session.getAllProjects()).thenReturn(List.of(root, module));
+        when(session.getExecutionRootDirectory()).thenReturn(tempDir.resolve("repo").toString());
+
+        assertThat(TestDistributionLifecycleParticipant.defaultProjectName(session)).isEqualTo("citrus");
+
+        when(session.getAllProjects()).thenReturn(List.of(module));
+        assertThat(TestDistributionLifecycleParticipant.defaultProjectName(session)).isEqualTo("citrus-api");
+    }
+
+    @Test
+    void shouldLeaveModulesThatOptOutRunningTheirTestsLocally() {
+        MavenProject project = createSampleProject("citrus-quarkus-it", tempDir.resolve("quarkus-it"));
+        project.getProperties().setProperty(DistributionSettings.SKIP_PROPERTY, "true");
+        Properties cli = new Properties();
+        cli.setProperty(DistributionSettings.ENABLED_PROPERTY, "true");
+
+        SurefirePluginMutator.configureProject(project, "sess-1", List.of(), Map.of(), cli, key -> null);
+
+        Plugin surefire = project.getBuild().getPluginsAsMap().get("org.apache.maven.plugins:maven-surefire-plugin");
+        assertThat(surefire.getConfiguration()).as("Surefire left exactly as the module configured it").isNull();
+    }
+
+    @Test
+    void shouldTakeTheSkipSettingFromTheCommandLineAndTheEnvironmentLikeTheOtherModuleSettings() {
+        String surefireKey = "org.apache.maven.plugins:maven-surefire-plugin";
+        Properties cli = new Properties();
+        cli.setProperty(DistributionSettings.ENABLED_PROPERTY, "true");
+
+        MavenProject fromEnv = createSampleProject("from-env", tempDir.resolve("from-env"));
+        SurefirePluginMutator.configureProject(fromEnv, "sess-1", List.of(), Map.of(), cli,
+                key -> DistributionSettings.SKIP_ENV.equals(key) ? "true" : null);
+        assertThat(fromEnv.getBuild().getPluginsAsMap().get(surefireKey).getConfiguration())
+                .as("CITRUS_DIST_SKIP=true opts the module out").isNull();
+
+        MavenProject moduleWins = createSampleProject("module-wins", tempDir.resolve("module-wins"));
+        moduleWins.getProperties().setProperty(DistributionSettings.SKIP_PROPERTY, "false");
+        SurefirePluginMutator.configureProject(moduleWins, "sess-1", List.of(), Map.of(), cli,
+                key -> DistributionSettings.SKIP_ENV.equals(key) ? "true" : null);
+        assertThat(moduleWins.getBuild().getPluginsAsMap().get(surefireKey).getConfiguration())
+                .as("the module property outranks the environment").isNotNull();
+
+        MavenProject cliWins = createSampleProject("cli-wins", tempDir.resolve("cli-wins"));
+        cliWins.getProperties().setProperty(DistributionSettings.SKIP_PROPERTY, "true");
+        Properties cliSkipOff = new Properties();
+        cliSkipOff.putAll(cli);
+        cliSkipOff.setProperty(DistributionSettings.SKIP_PROPERTY, "false");
+        SurefirePluginMutator.configureProject(cliWins, "sess-1", List.of(), Map.of(), cliSkipOff, key -> null);
+        assertThat(cliWins.getBuild().getPluginsAsMap().get(surefireKey).getConfiguration())
+                .as("-Dcitrus.test.distribution.skip=false outranks the module property").isNotNull();
+    }
+
+    @Test
+    void shouldInjectJacksonJarsTheLauncherNeedsToTalkToTheBroker() {
+        List<String> jarNames = TestDistributionLifecycleParticipant.resolveInterceptorClasspathJars().stream()
+                .map(path -> path.getFileName().toString())
+                .toList();
+
+        assertThat(jarNames)
+                .anyMatch(name -> name.startsWith("jackson-core-"))
+                .anyMatch(name -> name.startsWith("jackson-databind-"))
+                .anyMatch(name -> name.startsWith("jackson-annotations-"));
+    }
+
+    @Test
+    void shouldStripAnsiColorCodesFromBuildFailureReason() {
+        String colored = "Failed to execute goal \u001b[32morg.apache.maven.plugins:maven-surefire-plugin:3.5.6:test\u001b[m "
+                + "\u001b[1m(default-test)\u001b[m on project \u001b[36mcitrus-api\u001b[m: \u001b[1;31m\n"
+                + "java.lang.NoClassDefFoundError: tools/jackson/databind/ObjectMapper\n\u001b[m";
+
+        assertThat(TestDistributionLifecycleParticipant.describeBuildFailure(List.of(new RuntimeException(colored))))
+                .isEqualTo("Failed to execute goal org.apache.maven.plugins:maven-surefire-plugin:3.5.6:test "
+                        + "(default-test) on project citrus-api:\n"
+                        + "java.lang.NoClassDefFoundError: tools/jackson/databind/ObjectMapper");
     }
 
     @Test

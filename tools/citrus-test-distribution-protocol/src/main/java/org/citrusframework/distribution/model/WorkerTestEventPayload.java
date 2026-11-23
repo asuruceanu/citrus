@@ -29,6 +29,24 @@ public record WorkerTestEventPayload(
         long durationMs,
         String errorMessage,
         String stackTrace,
-        List<String> endpoints
+        List<String> endpoints,
+        String uniqueId
 ) {
+
+    /** Event from a worker that does not report the JUnit unique id. */
+    public WorkerTestEventPayload(
+            String partitionId,
+            String sessionId,
+            int attempt,
+            String workUnitKey,
+            String className,
+            String testName,
+            TestOutcomeStatus status,
+            long durationMs,
+            String errorMessage,
+            String stackTrace,
+            List<String> endpoints) {
+        this(partitionId, sessionId, attempt, workUnitKey, className, testName, status, durationMs, errorMessage,
+                stackTrace, endpoints, null);
+    }
 }

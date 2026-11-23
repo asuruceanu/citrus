@@ -75,7 +75,7 @@ public class TestDistributionLifecycleParticipant extends AbstractMavenLifecycle
                 Integer.toString(DistributionSettings.getMaxRetries())));
 
         MavenProject topProject = session.getTopLevelProject();
-        String defaultProjectName = topProject != null ? topProject.getArtifactId() : "maven-reactor";
+        String defaultProjectName = defaultProjectName(session);
         String projectName = resolveProperty(session, DistributionSettings.PROJECT_NAME_PROPERTY, defaultProjectName);
         if (projectName == null || projectName.isBlank()) {
             projectName = defaultProjectName;
@@ -158,7 +158,8 @@ public class TestDistributionLifecycleParticipant extends AbstractMavenLifecycle
                 return;
             }
             boolean buildFailed = session.getResult() != null && session.getResult().hasExceptions();
-            client.completeSession(sessionId, new CompleteSessionRequest(0, 0, 0, 0L, buildFailed));
+            String failureReason = buildFailed ? describeBuildFailure(session.getResult().getExceptions()) : null;
+            client.completeSession(sessionId, new CompleteSessionRequest(0, 0, 0, 0L, buildFailed, failureReason));
             LOG.info("Completed Citrus Test Distribution reactor session {}", sessionId);
         } catch (Exception e) {
             LOG.warn("Failed to complete Citrus Test Distribution session {}: {}", sessionId, e.getMessage());
@@ -201,6 +202,81 @@ public class TestDistributionLifecycleParticipant extends AbstractMavenLifecycle
         return shutdownHook;
     }
 
+    private static final int MAX_FAILURE_REASON_LENGTH = 4000;
+
+    /** Terminal control sequences: CSI (colors, cursor; including private {@code ESC[?...}) and OSC (titles, links). */
+    private static final java.util.regex.Pattern ANSI_ESCAPE = java.util.regex.Pattern.compile(
+            "\u001B\\[[0-?]*[ -/]*[@-~]|\u001B\\][^\u0007\u001B]*(?:\u0007|\u001B\\\\)");
+
+    /** A stack frame line such as {@code at org.example.Foo.bar(Foo.java:12)}. */
+    private static final java.util.regex.Pattern STACK_FRAME = java.util.regex.Pattern.compile(
+            "at [\\w$.<>/]+\\(.*\\)");
+
+    /**
+     * Summarizes Maven build exceptions for the broker: each exception's message (or its first cause with a message),
+     * without ANSI color codes, blank lines, stack frames, or lines already reported, capped at {@value #MAX_FAILURE_REASON_LENGTH} chars.
+     */
+    static String describeBuildFailure(List<Throwable> exceptions) {
+        if (exceptions == null || exceptions.isEmpty()) {
+            return null;
+        }
+        java.util.LinkedHashSet<String> lines = new java.util.LinkedHashSet<>();
+        for (Throwable t : exceptions) {
+            String message = firstMessage(t);
+            if (message == null) {
+                continue;
+            }
+            for (String line : ANSI_ESCAPE.matcher(message).replaceAll("").split("\\R")) {
+                String trimmed = line.strip();
+                if (!trimmed.isEmpty() && !STACK_FRAME.matcher(trimmed).matches()
+                        && !trimmed.matches("\\.\\.\\. \\d+ more")) {
+                    lines.add(trimmed);
+                }
+            }
+        }
+        if (lines.isEmpty()) {
+            return null;
+        }
+        String reason = String.join("\n", lines);
+        if (reason.length() <= MAX_FAILURE_REASON_LENGTH) {
+            return reason;
+        }
+        int end = MAX_FAILURE_REASON_LENGTH;
+        if (Character.isHighSurrogate(reason.charAt(end - 1))) {
+            end--;
+        }
+        return reason.substring(0, end);
+    }
+
+    private static String firstMessage(Throwable t) {
+        java.util.Set<Throwable> seen = java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
+        for (Throwable cur = t; cur != null && seen.add(cur); cur = cur.getCause()) {
+            if (cur.getMessage() != null && !cur.getMessage().isBlank()) {
+                return cur.getMessage();
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Session name: the project at the directory Maven was started in (the repository root for
+     * {@code ./mvnw -pl a,b,c test}), else Maven's top-level project, which with {@code -pl} is just the first module.
+     */
+    static String defaultProjectName(MavenSession session) {
+        String rootDir = session.getExecutionRootDirectory();
+        if (rootDir != null && session.getAllProjects() != null) {
+            Path root = Path.of(rootDir).toAbsolutePath().normalize();
+            for (MavenProject project : session.getAllProjects()) {
+                if (project.getBasedir() != null
+                        && project.getBasedir().toPath().toAbsolutePath().normalize().equals(root)) {
+                    return project.getArtifactId();
+                }
+            }
+        }
+        MavenProject topProject = session.getTopLevelProject();
+        return topProject != null ? topProject.getArtifactId() : "maven-reactor";
+    }
+
     private static boolean isInterruptedBuild(MavenSession session) {
         if (session == null || session.getResult() == null || session.getResult().getExceptions() == null) {
             return false;
@@ -225,10 +301,18 @@ public class TestDistributionLifecycleParticipant extends AbstractMavenLifecycle
         return GitDiffDetector.runGitSingleLine(dir, args);
     }
 
+    /**
+     * Jars appended to the Surefire/Failsafe test classpath so the launcher interceptor can run in modules that do not
+     * depend on Test Distribution themselves: the launcher, the protocol, and Jackson 3 (the protocol's JSON codec,
+     * including the Jackson 2.x annotations it reuses). JUnit Platform and SLF4J come from the module's own classpath.
+     */
     static List<Path> resolveInterceptorClasspathJars() {
         List<Path> paths = new ArrayList<>();
         addCodeSourceLocation(DistributionLauncherInterceptor.class, paths);
         addCodeSourceLocation(DistributionSettings.class, paths);
+        addCodeSourceLocation(tools.jackson.core.JsonParser.class, paths);
+        addCodeSourceLocation(tools.jackson.databind.ObjectMapper.class, paths);
+        addCodeSourceLocation(com.fasterxml.jackson.annotation.JsonProperty.class, paths);
         return paths;
     }
 

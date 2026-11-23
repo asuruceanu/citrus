@@ -396,7 +396,7 @@ class ForkedPartitionRunnerTest {
 
     @Test
     void shouldRouteWorkspaceAndForcedPartitionsToTheForkedRunner() {
-        DistributionWorkerConfig auto = DistributionWorkerConfig.builder().cacheDir(tempDir).build();
+        DistributionWorkerConfig auto = DistributionWorkerConfig.builder().cacheDir(tempDir).forkMode(WorkerForkMode.AUTO).build();
         DistributionWorkerConfig always = DistributionWorkerConfig.builder().cacheDir(tempDir).forkMode(WorkerForkMode.ALWAYS).build();
         PartitionAssignPayload plain = new PartitionAssignPayload("p", "s", 1, List.of(), Map.of(), List.of());
         PartitionAssignPayload forked = new PartitionAssignPayload("p", "s", 1, List.of(), Map.of(), List.of(), List.of(), List.of(), true);
