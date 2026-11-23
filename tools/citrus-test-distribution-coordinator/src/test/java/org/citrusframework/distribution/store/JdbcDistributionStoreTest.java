@@ -32,12 +32,14 @@ import org.citrusframework.distribution.model.TestExecutionRecord;
 import org.citrusframework.distribution.model.TestHistorySummary;
 import org.citrusframework.distribution.model.TestOutcomeStatus;
 import org.citrusframework.distribution.model.WorkUnitSpec;
+import org.citrusframework.distribution.model.WorkerCacheStats;
 import org.citrusframework.distribution.model.WorkerRecord;
 import org.citrusframework.distribution.model.WorkerState;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.tuple;
 
 class JdbcDistributionStoreTest {
 
@@ -159,6 +161,45 @@ class JdbcDistributionStoreTest {
                     .extracting(BuildSessionRecord::sessionId, BuildSessionRecord::failureReason)
                     .contains(org.assertj.core.groups.Tuple.tuple("sess-fail",
                             "citrus-api: NoClassDefFoundError: org/citrusframework/junit/jupiter/CitrusTestFactory"));
+        }
+    }
+
+    @Test
+    void shouldRoundTripNullAndNonNullWorkerCacheStats() {
+        WorkerCacheStats stats = new WorkerCacheStats(true, 2_048L, 7, 4_096L, 9_999L, 3L, true);
+        try (JdbcDistributionStore store = new JdbcDistributionStore("jdbc:hsqldb:mem:cachestats_" + System.nanoTime(), "SA", "")) {
+            store.initialize();
+            store.upsertWorker(new WorkerRecord("w-old", "h", Map.of(), WorkerState.IDLE, null, 1L, 1L));
+            store.upsertWorker(new WorkerRecord("w-new", "h", Map.of(), WorkerState.IDLE, null, 1L, 2L, stats));
+
+            assertThat(store.listWorkers()).extracting(WorkerRecord::workerId, WorkerRecord::cacheStats)
+                    .containsExactly(tuple("w-old", null), tuple("w-new", stats));
+
+            WorkerCacheStats updated = new WorkerCacheStats(false, 0L, 1, 2L, -1L, 0L, false);
+            store.upsertWorker(new WorkerRecord("w-new", "h", Map.of(), WorkerState.IDLE, null, 2L, 2L, updated));
+            store.upsertWorker(new WorkerRecord("w-old", "h", Map.of(), WorkerState.IDLE, null, 2L, 1L, stats));
+            assertThat(store.listWorkers()).extracting(WorkerRecord::workerId, WorkerRecord::cacheStats)
+                    .containsExactly(tuple("w-old", stats), tuple("w-new", updated));
+        }
+    }
+
+    @Test
+    void shouldAddCacheStatsColumnToLegacyWorkerTable() throws Exception {
+        String jdbcUrl = "jdbc:hsqldb:file:" + tempDir.resolve("db/legacy-workers").toAbsolutePath() + ";shutdown=true";
+        try (java.sql.Connection conn = java.sql.DriverManager.getConnection(jdbcUrl, "SA", "");
+             java.sql.Statement stmt = conn.createStatement()) {
+            stmt.execute("CREATE TABLE dist_workers (worker_id VARCHAR(128) PRIMARY KEY, host VARCHAR(255), "
+                    + "capabilities_json VARCHAR(4096), state VARCHAR(32), active_partition_id VARCHAR(64), "
+                    + "last_heartbeat_at BIGINT, registered_at BIGINT)");
+            stmt.execute("INSERT INTO dist_workers VALUES ('w-legacy', 'h', '{}', 'IDLE', NULL, 1, 1)");
+        }
+
+        WorkerCacheStats stats = new WorkerCacheStats(true, 1L, 2, 3L, 4L, 5L, false);
+        try (JdbcDistributionStore store = new JdbcDistributionStore(jdbcUrl, "SA", "")) {
+            store.initialize();
+            assertThat(store.listWorkers()).singleElement().satisfies(w -> assertThat(w.cacheStats()).isNull());
+            store.upsertWorker(new WorkerRecord("w-legacy", "h", Map.of(), WorkerState.IDLE, null, 2L, 1L, stats));
+            assertThat(store.listWorkers()).singleElement().satisfies(w -> assertThat(w.cacheStats()).isEqualTo(stats));
         }
     }
 

@@ -27,6 +27,7 @@ import org.citrusframework.distribution.model.SessionSummary;
 import org.citrusframework.distribution.model.TestExecutionRecord;
 import org.citrusframework.distribution.model.TestOutcomeStatus;
 import org.citrusframework.distribution.model.WorkUnitSpec;
+import org.citrusframework.distribution.model.WorkerCacheStats;
 import org.citrusframework.distribution.model.WorkerRecord;
 import org.citrusframework.distribution.model.WorkerState;
 import org.citrusframework.distribution.store.DistributionStore;
@@ -51,7 +52,8 @@ public final class DemoDataSeeder {
                 WorkerState.BUSY,
                 "part-944-http",
                 now - 1_800L,
-                now - 3_600_000L));
+                now - 3_600_000L,
+                new WorkerCacheStats(true, 2_147_483_648L, 142, 1_932_735_283L, 48_318_382_080L, 37L, false)));
 
         store.upsertWorker(new WorkerRecord(
                 "k8s-worker-eu-02",
@@ -60,7 +62,8 @@ public final class DemoDataSeeder {
                 WorkerState.IDLE,
                 null,
                 now - 2_400L,
-                now - 3_550_000L));
+                now - 3_550_000L,
+                new WorkerCacheStats(true, 2_147_483_648L, 118, 1_610_612_736L, 52_613_349_376L, 12L, false)));
 
         store.upsertWorker(new WorkerRecord(
                 "k8s-worker-gpu-01",
@@ -69,7 +72,8 @@ public final class DemoDataSeeder {
                 WorkerState.IDLE,
                 null,
                 now - 3_100L,
-                now - 3_400_000L));
+                now - 3_400_000L,
+                new WorkerCacheStats(false, 0L, 203, 3_221_225_472L, 96_636_764_160L, 0L, false)));
 
         store.upsertWorker(new WorkerRecord(
                 "mac-studio-ci-01",
@@ -78,7 +82,8 @@ public final class DemoDataSeeder {
                 WorkerState.BUSY,
                 "part-944-camel",
                 now - 1_200L,
-                now - 7_200_000L));
+                now - 7_200_000L,
+                new WorkerCacheStats(true, 4_294_967_296L, 311, 6_442_450_944L, 3_221_225_472L, 468L, true)));
 
         store.upsertWorker(new WorkerRecord(
                 "k8s-worker-drain-01",
@@ -87,7 +92,8 @@ public final class DemoDataSeeder {
                 WorkerState.DRAINING,
                 null,
                 now - 9_500L,
-                now - 14_400_000L));
+                now - 14_400_000L,
+                new WorkerCacheStats(true, 1_073_741_824L, 64, 805_306_368L, 15_032_385_536L, 9L, false)));
 
         store.upsertWorker(new WorkerRecord(
                 "k8s-worker-spot-lost",
@@ -96,7 +102,8 @@ public final class DemoDataSeeder {
                 WorkerState.OFFLINE,
                 null,
                 now - 420_000L,
-                now - 10_800_000L));
+                now - 10_800_000L,
+                new WorkerCacheStats(false, 0L, 22, 268_435_456L, -1L, 0L, false)));
 
         if (store.findSession("sess-citrus-pr-2108").isPresent()) {
             return 0;

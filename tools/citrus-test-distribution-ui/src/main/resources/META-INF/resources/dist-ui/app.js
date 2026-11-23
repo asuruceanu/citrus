@@ -618,7 +618,10 @@ function renderOverview() {
                       <div class="mono" style="font-weight:700;font-size:12.5px">${w.workerId}</div>
                       <div style="font-size:11.5px;color:var(--text-muted)">${w.host} · heartbeat ${formatAgo(w.lastHeartbeatAt)}</div>
                     </div>
-                    ${statusBadge(w.state)}
+                    <div>
+                      ${isLowDisk(w) ? html`<span class="badge badge-failed">LOW DISK</span> ` : null}
+                      ${statusBadge(w.state)}
+                    </div>
                   </div>
                 `)}
           </div>
@@ -1350,11 +1353,69 @@ function renderSessionDetail() {
   `;
 }
 
+function formatBytes(bytes) {
+  if (typeof bytes !== 'number' || !Number.isFinite(bytes) || bytes < 0) return 'N/A';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let value = bytes;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit++;
+  }
+  return unit === 0 ? `${Math.round(value)} B` : `${value.toFixed(1)} ${units[unit]}`;
+}
+
+function isLowDisk(w) {
+  return !!(w && w.cacheStats && w.cacheStats.lowDiskSpace);
+}
+
+/** Usable disk as a percentage of the free-space buffer, clamped to 0-100; an unknown disk or no buffer reads as full. */
+function cacheDiskPercent(cacheStats) {
+  const buffer = Number(cacheStats.freeSpaceBufferBytes);
+  const usable = Number(cacheStats.usableDiskBytes);
+  if (!Number.isFinite(buffer) || buffer <= 0) return 100;
+  if (!Number.isFinite(usable) || usable < 0) return 0;
+  return Math.max(0, Math.min(100, Math.round((usable / buffer) * 100)));
+}
+
+function renderWorkerCacheTelemetry(w) {
+  const c = w.cacheStats;
+  if (!c) {
+    return html`<div class="worker-cache-panel worker-cache-empty">Local file cache: no telemetry reported</div>`;
+  }
+  const pct = cacheDiskPercent(c);
+  const usableLabel = Number(c.usableDiskBytes) < 0 || !Number.isFinite(Number(c.usableDiskBytes))
+    ? 'N/A'
+    : formatBytes(Number(c.usableDiskBytes));
+  const bufferLabel = Number(c.freeSpaceBufferBytes) > 0 ? formatBytes(Number(c.freeSpaceBufferBytes)) : 'none';
+  return html`
+    <div class=${`worker-cache-panel ${c.lowDiskSpace ? 'low-disk' : ''}`}>
+      <div class="worker-cache-head">
+        <span class="worker-cache-title">Local File Cache</span>
+        <span>
+          <span class=${`badge ${c.cleanupEnabled ? 'badge-idle' : 'badge-offline'}`}>${c.cleanupEnabled ? 'AUTO LRU' : 'NO CLEANUP'}</span>
+          ${c.lowDiskSpace ? html` <span class="badge badge-failed">LOW DISK</span>` : null}
+        </span>
+      </div>
+      <div class="worker-cache-row">
+        <strong>${formatBytes(c.cachedBytes)}</strong> in ${Number(c.blobCount) || 0} blobs
+        · evicted <strong>${Number(c.evictedBlobsTotal) || 0}</strong>
+      </div>
+      <div class="worker-cache-bar" title=${`Usable disk ${usableLabel} vs buffer ${bufferLabel}`}>
+        <div class=${`worker-cache-bar-fill ${c.lowDiskSpace ? 'low-disk' : ''}`} style=${`width:${pct}%`}></div>
+      </div>
+      <div class="worker-cache-row worker-cache-muted">Usable disk ${usableLabel} · buffer ${bufferLabel}</div>
+    </div>
+  `;
+}
+
 function renderWorkersPool() {
-  const states = ['ALL', 'IDLE', 'BUSY', 'DRAINING', 'OFFLINE'];
+  const states = ['ALL', 'IDLE', 'BUSY', 'DRAINING', 'OFFLINE', 'LOW_DISK'];
   const q = state.workerQuery.trim().toLowerCase();
   const filtered = state.workers.filter(w => {
-    if (state.workerStateFilter !== 'ALL' && w.state !== state.workerStateFilter) return false;
+    if (state.workerStateFilter === 'LOW_DISK') {
+      if (!isLowDisk(w)) return false;
+    } else if (state.workerStateFilter !== 'ALL' && w.state !== state.workerStateFilter) return false;
     if (!q) return true;
     const capStr = Object.entries(w.capabilities || {}).map(([k, v]) => `${k}=${v}`).join(' ').toLowerCase();
     return (w.workerId || '').toLowerCase().includes(q)
@@ -1414,6 +1475,8 @@ function renderWorkersPool() {
                     <span class="tag mono">${k}=${v}</span>
                   `)}
                 </div>
+
+                ${renderWorkerCacheTelemetry(w)}
               </div>
             `)}
           </div>

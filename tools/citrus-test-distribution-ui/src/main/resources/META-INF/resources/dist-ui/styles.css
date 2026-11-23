@@ -1042,3 +1042,62 @@ tbody tr.clickable-row:hover {
   opacity: 0.45;
   cursor: default;
 }
+
+/* Worker local file cache telemetry */
+.worker-cache-panel {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: var(--bg-subtle);
+  border: 1px solid var(--border-color);
+  font-size: 12.5px;
+  color: var(--text-secondary);
+}
+
+.worker-cache-panel.low-disk {
+  border-color: var(--rose-text);
+}
+
+.worker-cache-empty {
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+.worker-cache-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.worker-cache-title {
+  font-weight: 700;
+  color: var(--text-primary, inherit);
+}
+
+.worker-cache-row {
+  margin-top: 4px;
+}
+
+.worker-cache-muted {
+  color: var(--text-muted);
+  font-size: 11.5px;
+}
+
+.worker-cache-bar {
+  margin-top: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--border-color);
+  overflow: hidden;
+}
+
+.worker-cache-bar-fill {
+  height: 100%;
+  background: var(--emerald-text);
+}
+
+.worker-cache-bar-fill.low-disk {
+  background: var(--rose-text);
+}

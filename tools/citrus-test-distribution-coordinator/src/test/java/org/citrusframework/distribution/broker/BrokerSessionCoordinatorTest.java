@@ -40,6 +40,7 @@ import org.citrusframework.distribution.model.SubmitWorkRequest;
 import org.citrusframework.distribution.model.TestExecutionRecord;
 import org.citrusframework.distribution.model.TestOutcomeStatus;
 import org.citrusframework.distribution.model.WorkUnitSpec;
+import org.citrusframework.distribution.model.WorkerCacheStats;
 import org.citrusframework.distribution.model.WorkerHeartbeatPayload;
 import org.citrusframework.distribution.model.WorkerRecord;
 import org.citrusframework.distribution.model.WorkerRegisterPayload;
@@ -768,6 +769,56 @@ class BrokerSessionCoordinatorTest {
     }
 
     @Test
+    void shouldStoreWorkerCacheStatsOnRegisterAndKeepThemWhenAHeartbeatReportsNone() {
+        WorkerCacheStats initial = new WorkerCacheStats(true, 100L, 2, 300L, 400L, 0L, false);
+        WorkerCacheStats refreshed = new WorkerCacheStats(true, 100L, 3, 350L, 50L, 1L, true);
+        Worker worker = new Worker("conn-cache");
+        coordinator.registerWorker("conn-cache",
+                new WorkerRegisterPayload("w-cache", "host", Map.of(), initial), worker.received::add);
+        assertThat(storedStats("w-cache")).isEqualTo(initial);
+
+        worker.heartbeat(null, refreshed);
+        assertThat(storedStats("w-cache")).isEqualTo(refreshed);
+
+        worker.heartbeat(null);
+        assertThat(storedStats("w-cache")).as("heartbeat without stats keeps the previous ones").isEqualTo(refreshed);
+        assertThat(coordinator.listWorkers()).singleElement().satisfies(w -> assertThat(w.cacheStats()).isEqualTo(refreshed));
+
+        register("conn-legacy", "w-legacy", Map.of());
+        assertThat(storedStats("w-legacy")).isNull();
+    }
+
+    @Test
+    void shouldPreserveWorkerCacheStatsWhenAbortingASessionResetsAnOrphanedBusyWorker() {
+        WorkerCacheStats stats = new WorkerCacheStats(true, 100L, 2, 300L, 400L, 6L, false);
+        long now = System.currentTimeMillis();
+        store.saveSession(new BuildSessionRecord(
+                "sess-cache-abort", "citrus", "main", "deadbeef",
+                SessionStatus.RUNNING, now - 5_000L, 0L,
+                1, 0, 0, 0, 1, 1, 0L, 0L));
+        store.upsertWorker(new WorkerRecord(
+                "worker-cache-orphan", "host-1", Map.of(),
+                WorkerState.BUSY, "part-cache-run", now, now - 10_000L, stats));
+        store.savePartition(new PartitionRecord(
+                "part-cache-run", "sess-cache-abort", "worker-cache-orphan",
+                PartitionState.RUNNING, 1, 2_000L, now - 3_000L, 0L,
+                Map.of(), List.of(unit("pkg.CacheIT"))));
+
+        coordinator.abortSession("sess-cache-abort", "Aborted from UI");
+
+        assertThat(store.listWorkers()).singleElement().satisfies(w -> {
+            assertThat(w.state()).isEqualTo(WorkerState.IDLE);
+            assertThat(w.cacheStats()).isEqualTo(stats);
+        });
+    }
+
+    private WorkerCacheStats storedStats(String workerId) {
+        return store.listWorkers().stream()
+                .filter(w -> w.workerId().equals(workerId))
+                .findFirst().orElseThrow().cacheStats();
+    }
+
+    @Test
     void shouldAbortPersistedRunningSessionAndMarkPersistedPartitionsLostAfterRehydration() {
         long now = System.currentTimeMillis();
         store.saveSession(new BuildSessionRecord(
@@ -911,8 +962,12 @@ class BrokerSessionCoordinatorTest {
         }
 
         void heartbeat(String activePartitionId) {
+            heartbeat(activePartitionId, null);
+        }
+
+        void heartbeat(String activePartitionId, WorkerCacheStats cacheStats) {
             send(WorkerWsMessage.WORKER_HEARTBEAT, DistributionJson.convert(
-                    new WorkerHeartbeatPayload(connectionId, activePartitionId), Map.class));
+                    new WorkerHeartbeatPayload(connectionId, activePartitionId, cacheStats), Map.class));
         }
 
         void testEvent(PartitionAssignPayload assign, int attempt, String testName) {

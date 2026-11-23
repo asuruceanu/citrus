@@ -45,10 +45,16 @@ class DistributionUiResourcesTest {
                     .contains("--citrus-orange: #f5921d")
                     .contains(".btn-danger")
                     .contains(".session-failure-banner")
-                    .contains(".pager {");
+                    .contains(".pager {")
+                    .contains(".worker-cache-panel");
 
             String appText = new String(app.readAllBytes(), StandardCharsets.UTF_8);
             assertThat(appText)
+                    .contains("renderWorkerCacheTelemetry")
+                    .contains("lowDiskSpace")
+                    .contains("freeSpaceBufferBytes")
+                    .contains("evictedBlobsTotal")
+                    .contains("LOW_DISK")
                     .contains("worker.offline")
                     .contains("session.aborted")
                     .contains("/abort")
