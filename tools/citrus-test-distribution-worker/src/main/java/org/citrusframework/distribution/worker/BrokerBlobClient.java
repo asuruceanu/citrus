@@ -18,7 +18,6 @@ package org.citrusframework.distribution.worker;
 
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.OutputStream;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -63,12 +62,6 @@ final class BrokerBlobClient implements AutoCloseable {
 
     static final int CHUNK_BYTES = 64 * 1024;
 
-    /** Opens the output stream for a download's temporary file; a test seam for write failures. */
-    @FunctionalInterface
-    interface TempFileOpener {
-        OutputStream open(Path tempFile) throws IOException;
-    }
-
     private final DistributionWorkerConfig config;
     private final WorkerFileCache cache;
     private final HttpClient httpClient;
@@ -77,7 +70,7 @@ final class BrokerBlobClient implements AutoCloseable {
     private final Set<InputStream> openBodies = ConcurrentHashMap.newKeySet();
     private final AtomicBoolean closed = new AtomicBoolean();
     private final AtomicLong downloadRequests = new AtomicLong();
-    private volatile TempFileOpener tempFileOpener = Files::newOutputStream;
+    private volatile WorkerFileCache.DownloadFileOpener tempFileOpener = Files::newOutputStream;
 
     BrokerBlobClient(DistributionWorkerConfig config, WorkerFileCache cache) {
         this(config, cache, ClasspathPackager.MAX_BLOB_BYTES);
@@ -216,28 +209,22 @@ final class BrokerBlobClient implements AutoCloseable {
             }
         }
 
-        Path tmp = cache.newDownloadTempFile();
-        try {
+        try (WorkerFileCache.DownloadStaging staging = cache.openDownloadStaging(tempFileOpener)) {
             long total = 0;
-            try (OutputStream out = tempFileOpener.open(tmp)) {
-                byte[] buffer = new byte[CHUNK_BYTES];
-                int read;
-                while ((read = readWithIdleTimeout(body, buffer, sha256)) != -1) {
-                    total += read;
-                    if (total > maxBlobBytes) {
-                        throw new IOException("Blob " + sha256 + " exceeds the maximum of "
-                                + maxBlobBytes + " bytes");
-                    }
-                    out.write(buffer, 0, read);
+            byte[] buffer = new byte[CHUNK_BYTES];
+            int read;
+            while ((read = readWithIdleTimeout(body, buffer, sha256)) != -1) {
+                total += read;
+                if (total > maxBlobBytes) {
+                    throw new IOException("Blob " + sha256 + " exceeds the maximum of " + maxBlobBytes + " bytes");
                 }
+                staging.write(buffer, read);
             }
             try {
-                return cache.promoteDownload(sha256, tmp);
+                return staging.promote(sha256);
             } catch (IllegalArgumentException e) {
                 throw new DigestMismatchException(e);
             }
-        } finally {
-            Files.deleteIfExists(tmp);
         }
     }
 
@@ -296,7 +283,7 @@ final class BrokerBlobClient implements AutoCloseable {
         return downloadRequests.get();
     }
 
-    void tempFileOpener(TempFileOpener opener) {
+    void tempFileOpener(WorkerFileCache.DownloadFileOpener opener) {
         this.tempFileOpener = Objects.requireNonNull(opener);
     }
 

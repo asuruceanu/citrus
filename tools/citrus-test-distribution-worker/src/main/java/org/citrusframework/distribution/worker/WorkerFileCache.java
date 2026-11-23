@@ -17,6 +17,7 @@
 package org.citrusframework.distribution.worker;
 
 import java.io.IOException;
+import java.io.OutputStream;
 import java.io.UncheckedIOException;
 import java.nio.channels.FileChannel;
 import java.nio.channels.FileLock;
@@ -34,6 +35,7 @@ import java.time.Clock;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -159,6 +161,7 @@ final class WorkerFileCache implements AutoCloseable {
     private final AtomicBoolean closed = new AtomicBoolean();
 
     private final ReentrantLock evictionLock = new ReentrantLock();
+    private final Set<DownloadStaging> activeDownloads = new HashSet<>(); // guarded by evictionLock
     private final ConcurrentHashMap<String, AtomicInteger> pinCounts = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, VerifiedBlobStamp> verifiedStamps = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Long> accessSequence = new ConcurrentHashMap<>();
@@ -504,6 +507,108 @@ final class WorkerFileCache implements AutoCloseable {
         return verifyOrInvalidate(sha256, false);
     }
 
+    /** Opens a download's staging output. */
+    @FunctionalInterface
+    interface DownloadFileOpener {
+        OutputStream open(Path file) throws IOException;
+    }
+
+    /**
+     * Local staging writes and cleanup run under the eviction lock, so none can continue after cache ownership is
+     * released. The caller does network reads between writes, outside this lock.
+     */
+    DownloadStaging openDownloadStaging(DownloadFileOpener opener) throws IOException {
+        evictionLock.lock();
+        try {
+            Path file = newDownloadTempFile();
+            try {
+                DownloadStaging staging = new DownloadStaging(file, opener.open(file));
+                activeDownloads.add(staging);
+                return staging;
+            } catch (IOException | RuntimeException | Error failure) {
+                try {
+                    Files.deleteIfExists(file);
+                } catch (IOException | RuntimeException cleanup) {
+                    failure.addSuppressed(cleanup);
+                }
+                throw failure;
+            }
+        } finally {
+            evictionLock.unlock();
+        }
+    }
+
+    final class DownloadStaging implements AutoCloseable {
+        private final Path file;
+        private OutputStream output;
+
+        private DownloadStaging(Path file, OutputStream output) {
+            this.file = file;
+            this.output = output;
+        }
+
+        void write(byte[] bytes, int length) throws IOException {
+            evictionLock.lock();
+            try {
+                ensureOpen();
+                if (output == null) {
+                    throw new IOException("Download staging file is no longer writable");
+                }
+                output.write(bytes, 0, length);
+            } finally {
+                evictionLock.unlock();
+            }
+        }
+
+        Path promote(String sha256) throws IOException {
+            evictionLock.lock();
+            try {
+                ensureOpen();
+                if (output == null) {
+                    throw new IOException("Download staging file is no longer writable");
+                }
+                closeOutput();
+                return promoteDownload(sha256, file);
+            } finally {
+                evictionLock.unlock();
+            }
+        }
+
+        @Override
+        public void close() throws IOException {
+            evictionLock.lock();
+            try {
+                if (activeDownloads.remove(this)) {
+                    dispose();
+                }
+            } finally {
+                evictionLock.unlock();
+            }
+        }
+
+        private void dispose() throws IOException {
+            try {
+                closeOutput();
+            } catch (IOException | RuntimeException e) {
+                try {
+                    Files.deleteIfExists(file);
+                } catch (IOException | RuntimeException cleanup) {
+                    e.addSuppressed(cleanup);
+                }
+                throw e;
+            }
+            Files.deleteIfExists(file);
+        }
+
+        private void closeOutput() throws IOException {
+            OutputStream stream = output;
+            output = null;
+            if (stream != null) {
+                stream.close();
+            }
+        }
+    }
+
     /** A new empty file under {@code tmp/} for a download; the caller deletes it when done. */
     Path newDownloadTempFile() throws IOException {
         evictionLock.lock();
@@ -809,14 +914,31 @@ final class WorkerFileCache implements AutoCloseable {
      */
     @Override
     public void close() {
+        boolean release = false;
         evictionLock.lock();
         try {
             if (!closed.compareAndSet(false, true)) {
                 return;
             }
+            release = true;
+            List<DownloadStaging> pending = List.copyOf(activeDownloads);
+            activeDownloads.clear();
+            for (DownloadStaging staging : pending) {
+                try {
+                    staging.dispose();
+                } catch (IOException | RuntimeException e) {
+                    LOG.warn("Could not clean up download staging file {}: {}", staging.file, e.toString());
+                }
+            }
         } finally {
             evictionLock.unlock();
+            if (release) {
+                releaseOwnership();
+            }
         }
+    }
+
+    private void releaseOwnership() {
         try {
             fileLock.release();
         } catch (IOException e) {

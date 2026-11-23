@@ -36,12 +36,14 @@ import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.jar.JarEntry;
 import java.util.jar.JarOutputStream;
 import java.util.stream.Stream;
@@ -362,6 +364,88 @@ class BrokerBlobClientCacheTest {
             var recovered = runner.execute(assignment, CancellationToken.create(), e -> { });
             assertThat(recovered.success()).as(recovered.errorMessage()).isTrue();
             assertThat(tmpFiles(cache)).isEmpty();
+        }
+    }
+
+    @Test
+    void shouldKeepCacheOwnershipUntilAnInFlightStagingWriteAndCleanupFinish() throws Exception {
+        byte[] content = "broker payload".getBytes(StandardCharsets.UTF_8);
+        blobHandler = exchange -> respond(exchange, 200, content);
+        Path cacheDir = tempDir.resolve("closing-staging-cache");
+        CountDownLatch writing = new CountDownLatch(1);
+        CountDownLatch releaseWrite = new CountDownLatch(1);
+
+        try (WorkerFileCache cache = WorkerFileCache.open(cacheDir, false, 0L);
+             BrokerBlobClient blobs = new BrokerBlobClient(config(cacheDir), cache);
+             ExecutorService executor = Executors.newFixedThreadPool(2)) {
+            blobs.tempFileOpener(tmp -> new FilterOutputStream(Files.newOutputStream(tmp)) {
+                @Override
+                public void write(byte[] bytes, int offset, int length) throws IOException {
+                    writing.countDown();
+                    try {
+                        if (!releaseWrite.await(10, TimeUnit.SECONDS)) {
+                            throw new IOException("Test did not release staging write");
+                        }
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        throw new IOException(e);
+                    }
+                    out.write(bytes, offset, length);
+                }
+            });
+            var download = executor.submit(() -> blobs.ensureCached(ref(content)));
+            try {
+                assertThat(writing.await(5, TimeUnit.SECONDS)).isTrue();
+                blobs.close();
+                var closing = executor.submit(cache::close);
+                long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+                while (!closing.isDone() && !cache.hasThreadsWaitingForEvictionLock() && System.nanoTime() < deadline) {
+                    Thread.sleep(10);
+                }
+                assertThat(cache.hasThreadsWaitingForEvictionLock()).as("cache close waits for the staging write").isTrue();
+                assertThatThrownBy(() -> WorkerFileCache.open(cacheDir, false, 0L))
+                        .isInstanceOf(IllegalStateException.class).hasMessageContaining("--cache-dir");
+
+                releaseWrite.countDown();
+                closing.get(5, TimeUnit.SECONDS);
+                assertThat(tmpFiles(cache)).as("old owner cleaned staging before releasing its lock").isEmpty();
+                try (WorkerFileCache successor = WorkerFileCache.open(cacheDir, false, 0L)) {
+                    assertThatThrownBy(() -> download.get(5, TimeUnit.SECONDS)).isInstanceOf(ExecutionException.class);
+                    assertNothingStored(successor);
+                }
+            } finally {
+                releaseWrite.countDown();
+            }
+        }
+    }
+
+    @Test
+    void shouldDisposeOutstandingStagingBeforeAnotherWorkerOwnsTheCache() throws IOException {
+        Path cacheDir = tempDir.resolve("outstanding-staging-cache");
+        AtomicReference<Path> stagedFile = new AtomicReference<>();
+        AtomicBoolean outputClosed = new AtomicBoolean();
+        try (WorkerFileCache cache = WorkerFileCache.open(cacheDir, false, 0L);
+             WorkerFileCache.DownloadStaging staging = cache.openDownloadStaging(file -> {
+                 stagedFile.set(file);
+                 return new FilterOutputStream(Files.newOutputStream(file)) {
+                     @Override
+                     public void close() throws IOException {
+                         super.close();
+                         outputClosed.set(true);
+                     }
+                 };
+             })) {
+            staging.write(new byte[] {1}, 1);
+            cache.close();
+
+            assertThat(outputClosed).isTrue();
+            assertThat(stagedFile.get()).doesNotExist();
+            try (WorkerFileCache successor = WorkerFileCache.open(cacheDir, false, 0L)) {
+                Files.writeString(stagedFile.get(), "new owner staging");
+                assertThatThrownBy(() -> staging.write(new byte[] {2}, 1)).isInstanceOf(IllegalStateException.class);
+                staging.close();
+                assertThat(stagedFile.get()).hasContent("new owner staging");
+            }
         }
     }
 
