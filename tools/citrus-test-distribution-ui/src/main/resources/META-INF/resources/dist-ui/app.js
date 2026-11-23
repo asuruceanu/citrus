@@ -618,8 +618,8 @@ function renderOverview() {
                       <div class="mono" style="font-weight:700;font-size:12.5px">${w.workerId}</div>
                       <div style="font-size:11.5px;color:var(--text-muted)">${w.host} · heartbeat ${formatAgo(w.lastHeartbeatAt)}</div>
                     </div>
-                    <div>
-                      ${isLowDisk(w) ? html`<span class="badge badge-failed">LOW DISK</span> ` : null}
+                    <div class="overview-worker-badges">
+                      ${isLowDisk(w) ? html`<span class="badge badge-failed">LOW DISK</span>` : null}
                       ${statusBadge(w.state)}
                     </div>
                   </div>
@@ -1370,7 +1370,7 @@ function isLowDisk(w) {
   return !!(w && w.state !== 'OFFLINE' && w.cacheStats && w.cacheStats.lowDiskSpace);
 }
 
-/** Usable disk as a percentage of the free-space buffer, clamped to 0-100; an unknown disk or no buffer reads as full. */
+/** Usable disk as a percentage of the buffer, clamped to 0–100. No buffer shows full; unknown usable space shows empty. */
 function cacheDiskPercent(cacheStats) {
   const buffer = Number(cacheStats.freeSpaceBufferBytes);
   const usable = Number(cacheStats.usableDiskBytes);
@@ -1447,7 +1447,7 @@ function renderWorkersPool() {
             <button
               class=${`filter-pill ${state.workerStateFilter === st ? 'active' : ''}`}
               onClick=${() => { state.workerStateFilter = st; renderApp(); }}
-            >${st}</button>
+            >${st === 'LOW_DISK' ? 'LOW DISK' : st}</button>
           `)}
         </div>
       </div>

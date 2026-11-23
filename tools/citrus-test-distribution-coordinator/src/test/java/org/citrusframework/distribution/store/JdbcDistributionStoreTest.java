@@ -184,6 +184,27 @@ class JdbcDistributionStoreTest {
     }
 
     @Test
+    void shouldListWorkersWhenOneRowContainsMalformedTelemetry() throws Exception {
+        String jdbcUrl = "jdbc:hsqldb:mem:malformed_worker_telemetry_" + System.nanoTime();
+        WorkerCacheStats stats = new WorkerCacheStats(true, 1L, 2, 3L, 4L, 5L, false);
+        Map<String, String> capabilities = Map.of("os", "linux");
+        try (JdbcDistributionStore store = new JdbcDistributionStore(jdbcUrl, "SA", "")) {
+            store.initialize();
+            store.upsertWorker(new WorkerRecord("broken", "h", capabilities, WorkerState.IDLE, null, 1L, 1L, stats));
+            store.upsertWorker(new WorkerRecord("healthy", "h", capabilities, WorkerState.IDLE, null, 1L, 2L, stats));
+            try (Connection conn = DriverManager.getConnection(jdbcUrl, "SA", "");
+                 Statement stmt = conn.createStatement()) {
+                assertThat(stmt.executeUpdate("UPDATE dist_workers SET capabilities_json='{', cache_stats_json='[' "
+                        + "WHERE worker_id='broken'")).isEqualTo(1);
+            }
+
+            assertThat(store.listWorkers())
+                    .extracting(WorkerRecord::workerId, WorkerRecord::capabilities, WorkerRecord::cacheStats)
+                    .containsExactly(tuple("broken", Map.of(), null), tuple("healthy", capabilities, stats));
+        }
+    }
+
+    @Test
     void shouldAddCacheStatsColumnToLegacyWorkerTable() throws Exception {
         String jdbcUrl = "jdbc:hsqldb:file:" + tempDir.resolve("db/legacy-workers").toAbsolutePath() + ";shutdown=true";
         try (java.sql.Connection conn = java.sql.DriverManager.getConnection(jdbcUrl, "SA", "");

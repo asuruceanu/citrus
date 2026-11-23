@@ -16,22 +16,36 @@
 
 package org.citrusframework.distribution.junit;
 
+import java.io.File;
+import java.io.IOException;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Predicate;
 import java.util.stream.Stream;
 
 import org.citrusframework.distribution.annotations.LocalOnly;
 import org.citrusframework.distribution.annotations.RemoteOnly;
 import org.citrusframework.distribution.broker.DistributionBrokerConfig;
 import org.citrusframework.distribution.broker.DistributionBrokerServer;
+import org.citrusframework.distribution.cache.BlobCacheDirectory;
+import org.citrusframework.distribution.cache.ClasspathPackager;
 import org.citrusframework.distribution.config.DistributionJson;
 import org.citrusframework.distribution.config.DistributionSettings;
+import org.citrusframework.distribution.model.ArtifactRef;
 import org.citrusframework.distribution.model.CreateSessionRequest;
 import org.citrusframework.distribution.model.PartitionPolicy;
 import org.citrusframework.distribution.model.SubmitWorkRequest;
@@ -181,7 +195,7 @@ class DistributedLauncherTest {
             System.setProperty(DistributionSettings.ENABLED_PROPERTY, "true");
             System.setProperty(DistributionSettings.BROKER_URL_PROPERTY, cluster.broker.baseUrl());
 
-            List<String> finished = new java.util.concurrent.CopyOnWriteArrayList<>();
+            List<String> finished = new CopyOnWriteArrayList<>();
             DistributedLauncher launcher = new DistributedLauncher(LauncherFactory.create());
             launcher.registerTestExecutionListeners(new TestExecutionListener() {
                 @Override
@@ -232,7 +246,7 @@ class DistributedLauncherTest {
     }
 
     private static String planMethodId(TestPlan plan, Class<?> type, String method) {
-        java.util.List<TestIdentifier> found = new java.util.ArrayList<>();
+        java.util.List<TestIdentifier> found = new ArrayList<>();
         java.util.ArrayDeque<TestIdentifier> queue = new java.util.ArrayDeque<>(plan.getRoots());
         while (!queue.isEmpty()) {
             TestIdentifier id = queue.poll();
@@ -249,11 +263,11 @@ class DistributedLauncherTest {
     /** Mirrors what Surefire's RunListenerAdapter needs: tests from the plan, nested in a started class container. */
     private static final class SurefireLikeListener implements TestExecutionListener {
         private TestPlan plan;
-        private final Set<String> startedContainers = new java.util.HashSet<>();
+        private final Set<String> startedContainers = new HashSet<>();
         private final Map<String, Integer> classStarts = new java.util.concurrent.ConcurrentHashMap<>();
         private final Map<String, TestExecutionResult.Status> finishedTests = new java.util.concurrent.ConcurrentHashMap<>();
         private final Set<String> finishedContainers = java.util.concurrent.ConcurrentHashMap.newKeySet();
-        private final List<String> problems = new java.util.concurrent.CopyOnWriteArrayList<>();
+        private final List<String> problems = new CopyOnWriteArrayList<>();
 
         @Override
         public void testPlanExecutionStarted(TestPlan testPlan) {
@@ -334,8 +348,8 @@ class DistributedLauncherTest {
 
             assertThatThrownBy(() -> run(RemoteWorkspaceFixture.class))
                     .hasMessageContaining("src/test/resources");
-            HttpResponse<String> sessions = java.net.http.HttpClient.newHttpClient().send(
-                    java.net.http.HttpRequest.newBuilder(java.net.URI.create(cluster.broker.baseUrl() + "/api/v1/sessions")).GET().build(),
+            HttpResponse<String> sessions = HttpClient.newHttpClient().send(
+                    HttpRequest.newBuilder(URI.create(cluster.broker.baseUrl() + "/api/v1/sessions")).GET().build(),
                     HttpResponse.BodyHandlers.ofString());
             assertThat(sessions.body()).as("nothing reached the coordinator").isEqualTo("[]");
         }
@@ -384,8 +398,8 @@ class DistributedLauncherTest {
 
         DistributedLauncher.WorkspaceSettings settings = DistributedLauncher.WorkspaceSettings.resolve();
 
-        assertThat(org.citrusframework.distribution.cache.BlobCacheDirectory.readOwner(settings.cache().getRootDir()))
-                .contains(org.citrusframework.distribution.cache.BlobCacheDirectory.OWNER_LAUNCHER);
+        assertThat(BlobCacheDirectory.readOwner(settings.cache().getRootDir()))
+                .contains(BlobCacheDirectory.OWNER_LAUNCHER);
     }
 
     @Test
@@ -435,7 +449,7 @@ class DistributedLauncherTest {
                     .jdbcUrl("jdbc:hsqldb:mem:launcher_ws_" + System.nanoTime())
                     .build());
             broker.start();
-            List<DistributionWorkerClient> workers = new java.util.ArrayList<>();
+            List<DistributionWorkerClient> workers = new ArrayList<>();
             for (int i = 0; i < 2; i++) {
                 DistributionWorkerClient worker = new DistributionWorkerClient(DistributionWorkerConfig.builder()
                         .workerId("ws-worker-" + i)
@@ -444,7 +458,7 @@ class DistributedLauncherTest {
                         .forkJvmArgs(List.of("-Xmx384m"))
                         .build());
                 worker.start();
-                assertThat(worker.awaitRegistration(5, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+                assertThat(worker.awaitRegistration(5, TimeUnit.SECONDS)).isTrue();
                 workers.add(worker);
             }
             return new Cluster(broker, workers, new BrokerHttpClient(broker.baseUrl(), "", 3_000L));
@@ -454,14 +468,14 @@ class DistributedLauncherTest {
          * A sibling submission running {@code fixture} in a forked JVM from this test JVM's classpath, uploaded first.
          */
         SubmitWorkRequest siblingWithOutputs(String sessionId, Class<?> fixture) throws Exception {
-            List<org.citrusframework.distribution.model.ArtifactRef> classpath = new java.util.ArrayList<>();
-            for (String entry : System.getProperty("java.class.path").split(java.io.File.pathSeparator)) {
+            List<ArtifactRef> classpath = new ArrayList<>();
+            for (String entry : System.getProperty("java.class.path").split(File.pathSeparator)) {
                 Path path = Path.of(entry);
                 if (!Files.exists(path)) {
                     continue;
                 }
-                org.citrusframework.distribution.cache.ClasspathPackager.PackagedArtifact packaged =
-                        org.citrusframework.distribution.cache.ClasspathPackager.packagePath(path);
+                ClasspathPackager.PackagedArtifact packaged =
+                        ClasspathPackager.packagePath(path);
                 client.uploadArtifact(packaged);
                 classpath.add(packaged.ref());
             }
@@ -704,7 +718,7 @@ class DistributedLauncherTest {
             // The broker loses every blob: session 2 can only run from the worker's local file cache.
             DistributedLauncher.WorkspaceSettings workspace = DistributedLauncher.WorkspaceSettings.resolve();
             assertThat(workspace.inputArtifacts()).hasSize(1);
-            Path brokerInputBlob = new org.citrusframework.distribution.cache.BlobCacheDirectory(brokerCacheDir)
+            Path brokerInputBlob = new BlobCacheDirectory(brokerCacheDir)
                     .resolveBlobPath(workspace.inputArtifacts().get(0).artifact().sha256());
             assertThat(brokerInputBlob).isRegularFile();
             deleteRecursively(brokerCacheDir.resolve("blobs"));
@@ -716,11 +730,11 @@ class DistributedLauncherTest {
                 WorkerCacheStats restarted = awaitCacheStats(broker.baseUrl(), "warm-worker-2", s -> s.blobCount() > 0);
                 assertThat(restarted.cachedBytes()).as("cache survives the worker restart").isPositive();
 
-                List<org.citrusframework.distribution.model.ArtifactRef> classpath = new java.util.ArrayList<>();
-                for (String entry : System.getProperty("java.class.path").split(java.io.File.pathSeparator)) {
+                List<ArtifactRef> classpath = new ArrayList<>();
+                for (String entry : System.getProperty("java.class.path").split(File.pathSeparator)) {
                     Path path = Path.of(entry);
                     if (!entry.isBlank() && Files.exists(path)) {
-                        classpath.add(org.citrusframework.distribution.cache.ClasspathPackager.packagePath(path).ref());
+                        classpath.add(ClasspathPackager.packagePath(path).ref());
                     }
                 }
                 String sessionId = client.createSession(
@@ -730,9 +744,9 @@ class DistributedLauncherTest {
                         classpath.size() + 1, 0, workspace.inputArtifacts(), List.of(), true, PartitionPolicy.LPT,
                         workspace.workingDirectory())).partitionIds());
 
-                List<String> testStatuses = new java.util.concurrent.CopyOnWriteArrayList<>();
-                List<String> partitionStates = new java.util.concurrent.CopyOnWriteArrayList<>();
-                Set<String> pending = new java.util.HashSet<>(partitions);
+                List<String> testStatuses = new CopyOnWriteArrayList<>();
+                List<String> partitionStates = new CopyOnWriteArrayList<>();
+                Set<String> pending = new HashSet<>(partitions);
                 client.streamSessionEvents(sessionId, 0L, 60_000L, event -> {
                     if (event.partitionId() == null || !partitions.contains(event.partitionId())) {
                         return false;
@@ -802,20 +816,20 @@ class DistributedLauncherTest {
                 .forkJvmArgs(List.of("-Xmx384m"))
                 .build());
         worker.start();
-        assertThat(worker.awaitRegistration(5, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+        assertThat(worker.awaitRegistration(5, TimeUnit.SECONDS)).isTrue();
         return worker;
     }
 
     /** Polls {@code GET /api/v1/workers} until the worker reports cache statistics matching {@code condition}. */
     private static WorkerCacheStats awaitCacheStats(String brokerUrl, String workerId,
-                                                    java.util.function.Predicate<WorkerCacheStats> condition)
+                                                    Predicate<WorkerCacheStats> condition)
             throws Exception {
-        java.net.http.HttpClient http = java.net.http.HttpClient.newHttpClient();
+        HttpClient http = HttpClient.newHttpClient();
         long deadline = System.currentTimeMillis() + 10_000L;
         WorkerCacheStats last = null;
         while (System.currentTimeMillis() < deadline) {
-            HttpResponse<String> resp = http.send(java.net.http.HttpRequest.newBuilder(
-                            java.net.URI.create(brokerUrl + "/api/v1/workers")).GET().build(),
+            HttpResponse<String> resp = http.send(HttpRequest.newBuilder(
+                            URI.create(brokerUrl + "/api/v1/workers")).GET().build(),
                     HttpResponse.BodyHandlers.ofString());
             assertThat(resp.statusCode()).isEqualTo(200);
             for (WorkerRecord worker : DistributionJson.fromJson(resp.body(), WorkerRecord[].class)) {
@@ -831,7 +845,7 @@ class DistributedLauncherTest {
         throw new AssertionError("Worker " + workerId + " did not report matching cache statistics; last: " + last);
     }
 
-    private static List<Path> filesUnder(Path dir) throws java.io.IOException {
+    private static List<Path> filesUnder(Path dir) throws IOException {
         if (!Files.exists(dir)) {
             return List.of();
         }
@@ -840,9 +854,9 @@ class DistributedLauncherTest {
         }
     }
 
-    private static void deleteRecursively(Path dir) throws java.io.IOException {
+    private static void deleteRecursively(Path dir) throws IOException {
         try (Stream<Path> paths = Files.walk(dir)) {
-            for (Path path : paths.sorted(java.util.Comparator.reverseOrder()).toList()) {
+            for (Path path : paths.sorted(Comparator.reverseOrder()).toList()) {
                 Files.delete(path);
             }
         }

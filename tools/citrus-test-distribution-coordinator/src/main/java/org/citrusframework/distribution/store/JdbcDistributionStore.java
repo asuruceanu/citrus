@@ -46,6 +46,7 @@ import org.citrusframework.distribution.model.WorkerRecord;
 import org.citrusframework.distribution.model.WorkerState;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import tools.jackson.core.JacksonException;
 import tools.jackson.core.type.TypeReference;
 
 /**
@@ -503,16 +504,11 @@ public class JdbcDistributionStore implements DistributionStore {
              PreparedStatement ps = conn.prepareStatement(sql);
              ResultSet rs = ps.executeQuery()) {
             while (rs.next()) {
-                String capsRaw = rs.getString("capabilities_json");
-                Map<String, String> caps = capsRaw == null || capsRaw.isBlank()
-                        ? Map.of()
-                        : DistributionJson.fromJson(capsRaw, STRING_MAP_TYPE);
-                String cacheRaw = rs.getString("cache_stats_json");
-                WorkerCacheStats cacheStats = cacheRaw == null || cacheRaw.isBlank()
-                        ? null
-                        : DistributionJson.fromJson(cacheRaw, WorkerCacheStats.class);
+                String workerId = rs.getString("worker_id");
+                Map<String, String> caps = readWorkerCapabilities(rs.getString("capabilities_json"), workerId);
+                WorkerCacheStats cacheStats = readWorkerCacheStats(rs.getString("cache_stats_json"), workerId);
                 workers.add(new WorkerRecord(
-                        rs.getString("worker_id"),
+                        workerId,
                         rs.getString("host"),
                         caps,
                         WorkerState.valueOf(rs.getString("state")),
@@ -526,6 +522,31 @@ public class JdbcDistributionStore implements DistributionStore {
         } catch (SQLException e) {
             throw new IllegalStateException("Failed to list workers", e);
         }
+    }
+
+    private static Map<String, String> readWorkerCapabilities(String json, String workerId) {
+        if (json != null && !json.isBlank()) {
+            try {
+                Map<String, String> capabilities = DistributionJson.fromJson(json, STRING_MAP_TYPE);
+                if (capabilities != null) {
+                    return capabilities;
+                }
+            } catch (JacksonException e) {
+                LOG.warn("Ignoring malformed capabilities JSON for worker {}", workerId);
+            }
+        }
+        return Map.of();
+    }
+
+    private static WorkerCacheStats readWorkerCacheStats(String json, String workerId) {
+        if (json != null && !json.isBlank()) {
+            try {
+                return DistributionJson.fromJson(json, WorkerCacheStats.class);
+            } catch (JacksonException e) {
+                LOG.warn("Ignoring malformed cache statistics JSON for worker {}", workerId);
+            }
+        }
+        return null;
     }
 
     @Override

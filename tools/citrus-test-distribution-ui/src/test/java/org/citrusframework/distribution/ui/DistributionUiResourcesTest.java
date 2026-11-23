@@ -46,7 +46,8 @@ class DistributionUiResourcesTest {
                     .contains(".btn-danger")
                     .contains(".session-failure-banner")
                     .contains(".pager {")
-                    .contains(".worker-cache-panel");
+                    .contains(".worker-cache-panel")
+                    .containsPattern("(?s)\\.overview-worker-badges\\s*\\{[^}]*display:\\s*flex;[^}]*align-items:\\s*center;");
 
             String appText = new String(app.readAllBytes(), StandardCharsets.UTF_8);
             assertThat(appText)
@@ -54,7 +55,11 @@ class DistributionUiResourcesTest {
                     .contains("lowDiskSpace")
                     .contains("freeSpaceBufferBytes")
                     .contains("evictedBlobsTotal")
-                    .contains("LOW_DISK")
+                    .contains("if (state.workerStateFilter === 'LOW_DISK') {", "if (!isLowDisk(w)) return false;")
+                    .contains("state.workerStateFilter = st", "st === 'LOW_DISK' ? 'LOW DISK' : st")
+                    .contains("if (!Number.isFinite(buffer) || buffer <= 0) return 100;")
+                    .containsPattern("usableLabel = Number\\(c\\.usableDiskBytes\\) < 0 [^\\n]+\\s*\\? 'N/A'")
+                    .containsPattern("(?s)<div class=\"overview-worker-badges\">.*?isLowDisk\\(w\\).*?statusBadge\\(w\\.state\\)")
                     .contains("w.state !== 'OFFLINE' && w.cacheStats && w.cacheStats.lowDiskSpace")
                     .contains("worker.offline")
                     .contains("session.aborted")

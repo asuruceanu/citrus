@@ -335,12 +335,15 @@ java -jar citrus-agent.jar \
 Both commands accept the same local file cache options:
 
 * `--cache-dir DIR` — Directory of the worker's local file cache (default `${user.home}/.citrus-test-distribution-agent/file-cache`).
-* `--[no-]cache-cleanup[=true|false]` — Enables (default) or disables automatic eviction of cached files. `--no-cache-cleanup` is the same as `--cache-cleanup=false`; when the flag is given several times, the last one wins.
+* `--[no-]cache-cleanup[=true|false]` — Enables (default) or disables automatic eviction of cached files. Both commands also accept a space-separated Boolean, such as `--cache-cleanup false`. Without a value, `--no-cache-cleanup` disables cleanup. When the flag is given several times, the last one wins.
 * `--cache-free-space-buffer-size SIZE` — Free disk space the worker keeps available on the cache drive when cleanup is enabled (default `2GiB`; `KiB`, `MiB` and `GiB` suffixes in any letter case, or plain bytes).
+
+Both commands validate the cache flags when invoked with `--help` or `-h`.
 
 The worker keeps every classpath jar and declared input it downloads from the coordinator in this cache and reuses it
 across partitions, sessions and worker restarts, so a warm worker only downloads what changed. Cached files are
-verified before reuse; a corrupted file is removed and downloaded again. With cleanup enabled, the worker evicts the
+verified before reuse, and a corrupted file is removed and downloaded again. The worker fails the partition if a blob
+download goes 60 seconds without receiving data and removes the partial download. With cleanup enabled, the worker evicts the
 least recently used files when the usable space on the cache drive falls below the buffer: when it starts, before each
 download and after each partition. Files used by the running partition are never evicted. If evicting everything else
 still does not free enough space, the worker logs a warning and continues; the partition fails only when the disk
@@ -351,7 +354,8 @@ after each partition, so the cache effectively runs cold; on small disks, lower 
 IMPORTANT: Sharing a local file cache directory between several workers is not supported. A worker locks its cache
 directory exclusively (lock file `<cacheDir>/.lock`) and refuses to start when another worker holds that lock. When running
 more than one worker on the same host, give each worker its own `--cache-dir`, or run each worker in its own container.
-The cache directory must be on a local filesystem that supports file locks.
+The cache directory must be on a local filesystem that supports file locks. A worker also refuses a cache directory
+marked as belonging to the coordinator or host launcher.
 
 NOTE: Upgrading from an earlier version: the default worker cache directory moved from `.citrus-dist/cache/worker`
 below the worker's working directory to `${user.home}/.citrus-test-distribution-agent/file-cache`, which is shared by
