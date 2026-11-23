@@ -344,12 +344,20 @@ verified before reuse; a corrupted file is removed and downloaded again. With cl
 least recently used files when the usable space on the cache drive falls below the buffer: when it starts, before each
 download and after each partition. Files used by the running partition are never evicted. If evicting everything else
 still does not free enough space, the worker logs a warning and continues; the partition fails only when the disk
-actually runs full. With cleanup disabled, the cache grows without limit.
+actually runs full. With cleanup disabled, the cache grows without limit. If the usable space on the cache drive is
+already below `--cache-free-space-buffer-size`, the worker evicts every cached file not in use each time it starts and
+after each partition, so the cache effectively runs cold; on small disks, lower the buffer.
 
 IMPORTANT: Sharing a local file cache directory between several workers is not supported. A worker locks its cache
 directory exclusively (lock file `<cacheDir>/.lock`) and refuses to start when another worker holds that lock. When running
 more than one worker on the same host, give each worker its own `--cache-dir`, or run each worker in its own container.
 The cache directory must be on a local filesystem that supports file locks.
+
+NOTE: Upgrading from an earlier version: the default worker cache directory moved from `.citrus-dist/cache/worker`
+below the worker's working directory to `${user.home}/.citrus-test-distribution-agent/file-cache`, which is shared by
+every worker of the same user account and locked by the first one. Old `.citrus-dist/cache/worker` directories are no
+longer used and can be deleted safely. Hosts that run several worker daemons under the same account must now give each
+daemon its own `--cache-dir`; otherwise every daemon after the first fails to start on the cache lock.
 
 Every worker automatically advertises host capabilities (`os`, `arch`, `jdk`, `cpuCores`, `memoryMb`, and `citrus.workspace.v1=true`) merged with any custom `--capabilities` `key=value` pairs. On `SIGTERM` or shutdown, the worker sends `worker.draining` so the coordinator stops assigning new partitions while allowing any in-flight partition to finish within its drain timeout before closing the WebSocket.
 
@@ -548,7 +556,9 @@ environment variables and then their `TEST_DISTRIBUTION_AGENT_*` aliases. Blank 
 stop the worker with an error.
 
 A worker runs one partition at a time; run several worker daemons per machine for more parallelism (tests that bind
-fixed ports can then still collide across daemons on the same machine; use capabilities or separate hosts for them). Cancelling a
+fixed ports can then still collide across daemons on the same machine; use capabilities or separate hosts for them).
+Each daemon needs its own `--cache-dir`: a worker locks its local file cache directory, so a second daemon using the same
+(default) directory refuses to start (see <<tools-test-distribution-workers>>). Cancelling a
 partition (lease expiry, lost connection, worker shutdown) kills the forked JVM and every process it started; nothing is
 uploaded from a cancelled or crashed run. The forked JVM's `java.io.tmpdir` is a short `/tmp/cdtmp-*` directory on POSIX
 systems so Unix domain socket paths stay within platform limits.
