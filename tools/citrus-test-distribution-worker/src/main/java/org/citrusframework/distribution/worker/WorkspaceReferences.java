@@ -18,18 +18,30 @@ package org.citrusframework.distribution.worker;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.file.Files;
+import java.nio.file.InvalidPathException;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
+import java.time.Instant;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Supplier;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 /** Checks filesystem references that can outlive both JVMs and no longer appear in their process trees. */
 final class WorkspaceReferences {
 
     private static final int UNIX_FILE_TYPE_MASK = 0170000;
     private static final int UNIX_SOCKET_TYPE = 0140000;
+    private static final int MAX_TARGETED_PIDS = 256;
+    private static final int MAX_LSOF_OUTPUT_BYTES = 8 * 1024 * 1024;
+    private static final int LSOF_TIMEOUT_SECONDS = 5;
 
     private WorkspaceReferences() {
     }
@@ -38,17 +50,70 @@ final class WorkspaceReferences {
         return osName().contains("linux") ? LinuxWorkspaceReferences.currentStart() : null;
     }
 
+    static Map<Long, Instant> captureMacOsBaselineProcesses() {
+        if (!osName().startsWith("mac")) {
+            return Map.of();
+        }
+        Map<Long, Instant> baseline = new HashMap<>();
+        try (var processes = ProcessHandle.allProcesses()) {
+            processes.filter(ProcessHandle::isAlive).forEach(process ->
+                    process.info().startInstant().ifPresent(start -> baseline.put(process.pid(), start)));
+        }
+        return baseline;
+    }
+
     static boolean inUse(List<Path> roots, boolean recovering, LinuxWorkspaceReferences.StartTicks linuxWorkerStart)
             throws IOException {
+        return inUse(roots, recovering, linuxWorkerStart, null);
+    }
+
+    static boolean inUse(List<Path> roots, boolean recovering, LinuxWorkspaceReferences.StartTicks linuxWorkerStart,
+                         Map<Long, Instant> macOsBaselineProcesses) throws IOException {
+        return inUse(roots, recovering, linuxWorkerStart, macOsBaselineProcesses, ProcessHandle::allProcesses,
+                WorkspaceReferences::runLsof);
+    }
+
+    static boolean inUse(List<Path> roots, boolean recovering, LinuxWorkspaceReferences.StartTicks linuxWorkerStart,
+                         Map<Long, Instant> macOsBaselineProcesses, Supplier<Stream<ProcessHandle>> allProcesses,
+                         CommandRunner commandRunner) throws IOException {
         String os = osName();
         if (os.contains("linux")) {
             return LinuxWorkspaceReferences.inUse(roots, linuxWorkerStart) || containsUnixSocket(roots);
         }
         if (os.startsWith("mac")) {
-            return macOsReferences(roots) || containsUnixSocket(roots);
+            if (recovering || macOsBaselineProcesses == null || Thread.currentThread().isInterrupted()) {
+                return macOsReferences(roots, commandRunner) || containsUnixSocket(roots);
+            }
+            if (containsUnixSocket(roots)) {
+                return true;
+            }
+            List<Long> postLaunchPids;
+            try {
+                postLaunchPids = postLaunchPids(macOsBaselineProcesses, allProcesses);
+            } catch (SecurityException | UnsupportedOperationException e) {
+                return macOsReferences(roots, commandRunner);
+            }
+            return macOsProcessReferences(roots, postLaunchPids, commandRunner);
         }
         // An orphan on a platform without an inspection backend has no owner left to vouch for it.
         return recovering;
+    }
+
+    private static List<Long> postLaunchPids(Map<Long, Instant> baseline, Supplier<Stream<ProcessHandle>> allProcesses) {
+        ProcessHandle current = ProcessHandle.current();
+        String currentUser = current.info().user().orElse(null);
+        try (var processes = allProcesses.get()) {
+            return processes.filter(process -> process.pid() != current.pid() && process.isAlive())
+                    .filter(process -> {
+                        ProcessHandle.Info info = process.info();
+                        Instant startedAt = info.startInstant().orElse(null);
+                        return (currentUser == null || currentUser.equals(info.user().orElse(currentUser)))
+                                && (startedAt == null || !Objects.equals(baseline.get(process.pid()), startedAt));
+                    })
+                    .map(ProcessHandle::pid)
+                    .limit(MAX_TARGETED_PIDS + 1L)
+                    .toList();
+        }
     }
 
     private static String osName() {
@@ -75,32 +140,154 @@ final class WorkspaceReferences {
         return false;
     }
 
-    private static boolean macOsReferences(List<Path> roots) throws IOException {
+    static boolean macOsProcessReferences(List<Path> roots, List<Long> postLaunchPids, CommandRunner commandRunner)
+            throws IOException {
+        checkInterrupted();
+        if (postLaunchPids.isEmpty()) {
+            return false;
+        }
+        if (postLaunchPids.size() > MAX_TARGETED_PIDS) {
+            return macOsReferences(roots, commandRunner);
+        }
+        List<Path> normalizedRoots = normalizedRoots(roots);
+        // Depending on its locale, lsof can escape backslashes and non-ASCII or non-printable path characters.
+        if (normalizedRoots.stream().anyMatch(WorkspaceReferences::mayBeEscaped)) {
+            checkInterrupted();
+            return macOsReferences(roots, commandRunner);
+        }
+        String pids = postLaunchPids.stream().map(String::valueOf).collect(Collectors.joining(","));
+        List<String> command = List.of("/usr/sbin/lsof", "-n", "-P", "-Fn", "+w", "-p", pids);
+        try {
+            LsofResult result = commandRunner.run(command);
+            Optional<Boolean> references =
+                    parseMacOsProcessLsofOutput(result.output(), result.exitCode(), normalizedRoots);
+            checkInterrupted();
+            if (references.isPresent()) {
+                return references.get();
+            }
+        } catch (IOException e) {
+            if (Thread.currentThread().isInterrupted()) {
+                throw e;
+            }
+            // A failed targeted inspection still permits the full directory scan.
+        }
+        checkInterrupted();
+        return macOsReferences(roots, commandRunner);
+    }
+
+    private static boolean mayBeEscaped(Path path) {
+        return path.toString().replace(path.getFileSystem().getSeparator(), "/")
+                .chars().anyMatch(ch -> ch < ' ' || ch > '~' || ch == '\\');
+    }
+
+    private static List<Path> normalizedRoots(List<Path> roots) {
+        List<Path> normalizedRoots = new ArrayList<>();
+        for (Path root : roots) {
+            Path absolute = root.toAbsolutePath().normalize();
+            normalizedRoots.add(absolute);
+            try {
+                Path real = root.toRealPath();
+                if (!real.equals(absolute)) {
+                    normalizedRoots.add(real);
+                }
+            } catch (IOException ignored) {
+                // The absolute path remains useful when the directory cannot be resolved.
+            }
+        }
+        return normalizedRoots;
+    }
+
+    static boolean matchesAnyRoot(String lsofNameField, List<Path> normalizedRoots) {
+        if (!lsofNameField.startsWith("n") || lsofNameField.length() == 1) {
+            return false;
+        }
+        try {
+            Path name = Path.of(lsofNameField.substring(1));
+            return normalizedRoots.stream().anyMatch(name::startsWith);
+        } catch (InvalidPathException e) {
+            // The name field can also contain values such as socket identifiers.
+            return false;
+        }
+    }
+
+    static Optional<Boolean> parseMacOsProcessLsofOutput(String stdout, int exitCode, List<Path> normalizedRoots) {
+        boolean hasDiagnostics = false;
+        var lines = stdout.lines().iterator();
+        while (lines.hasNext()) {
+            String line = lines.next();
+            if (matchesAnyRoot(line, normalizedRoots)) {
+                return Optional.of(true);
+            }
+            if (!line.isEmpty() && !line.startsWith("p") && !line.startsWith("f") && !line.startsWith("n")) {
+                hasDiagnostics = true;
+            }
+        }
+        return hasDiagnostics || (exitCode != 0 && exitCode != 1) ? Optional.empty() : Optional.of(false);
+    }
+
+    private static boolean macOsReferences(List<Path> roots, CommandRunner commandRunner) throws IOException {
         // Terse mode disables warnings by default. Re-enable them to detect partial directory scans.
         List<String> command = new ArrayList<>(List.of("/usr/sbin/lsof", "-n", "-P", "-t", "+w", "-x", "f"));
         for (Path root : roots) {
             command.add("+D");
             command.add(root.toString());
         }
-        Process inspection = new ProcessBuilder(command).redirectErrorStream(true).start();
+        // Cancellation cleanup still needs the full scan when the caller already has its interrupt flag set.
         boolean wasInterrupted = Thread.interrupted();
-        try (var output = inspection.getInputStream()) {
-            if (!inspection.waitFor(5, TimeUnit.SECONDS)) {
-                throw new IOException("Timed out checking workspace process references");
-            }
+        try {
+            LsofResult result = commandRunner.run(command);
             // macOS lsof can return 1 with matching PIDs. Only 1 with no output confirms no matches.
             // Diagnostics also keep the workspace, since they may indicate a partial scan.
-            return output.read() != -1 || inspection.exitValue() != 1;
-        } catch (InterruptedException e) {
-            wasInterrupted = true;
-            throw new IOException("Interrupted checking workspace process references", e);
+            return !result.output().isEmpty() || result.exitCode() != 1;
         } finally {
-            if (inspection.isAlive()) {
-                inspection.destroyForcibly();
-            }
             if (wasInterrupted) {
                 Thread.currentThread().interrupt();
             }
         }
+    }
+
+    private static LsofResult runLsof(List<String> command) throws IOException {
+        checkInterrupted();
+        // Field output can exceed the pipe buffer while we wait for lsof to exit.
+        Path output = Files.createTempFile("citrus-lsof-", ".log");
+        Process inspection = null;
+        try {
+            inspection = new ProcessBuilder(command).redirectErrorStream(true).redirectOutput(output.toFile()).start();
+            if (!inspection.waitFor(LSOF_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+                throw new IOException("Timed out checking workspace process references");
+            }
+            checkInterrupted();
+            long outputBytes = Files.size(output);
+            if (command.contains("-t")) {
+                // Terse mode needs only the presence of a PID or diagnostic.
+                return new LsofResult(outputBytes == 0 ? "" : "lsof output", inspection.exitValue());
+            }
+            if (outputBytes > MAX_LSOF_OUTPUT_BYTES) {
+                throw new IOException("Too much output while checking workspace process references");
+            }
+            return new LsofResult(Files.readString(output), inspection.exitValue());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("Interrupted checking workspace process references", e);
+        } finally {
+            if (inspection != null && inspection.isAlive()) {
+                inspection.destroyForcibly();
+            }
+            Files.deleteIfExists(output);
+        }
+    }
+
+    private static void checkInterrupted() throws IOException {
+        if (Thread.currentThread().isInterrupted()) {
+            throw new IOException("Interrupted checking workspace process references");
+        }
+    }
+
+    @FunctionalInterface
+    interface CommandRunner {
+        LsofResult run(List<String> command) throws IOException;
+    }
+
+    record LsofResult(String output, int exitCode) {
     }
 }

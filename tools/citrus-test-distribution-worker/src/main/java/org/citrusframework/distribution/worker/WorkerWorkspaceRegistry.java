@@ -41,6 +41,7 @@ import java.util.ArrayList;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Properties;
 import java.util.regex.Pattern;
@@ -107,7 +108,7 @@ final class WorkerWorkspaceRegistry {
                             && (record.shortTempKey().isEmpty() || shortTempKey.equals(record.shortTempKey()))
                             && !processScope.isEmpty() && processScope.equals(record.processScope())
                             && record.worker().isGone() && record.canRecover()) {
-                        removeOwnedDirectories(id, record, null, null, true);
+                        removeOwnedDirectories(id, record, null, null, true, null);
                     }
                 } catch (IOException | RuntimeException e) {
                     LOG.debug("Could not recover partition workspace {}", id, e);
@@ -117,7 +118,15 @@ final class WorkerWorkspaceRegistry {
     }
 
     Workspace create(boolean forked, boolean leased) throws IOException {
-        Workspace workspace = reserve(forked);
+        Map<Long, Instant> baselineProcesses = null;
+        if (forked && !leased) {
+            try {
+                baselineProcesses = WorkspaceReferences.captureMacOsBaselineProcesses();
+            } catch (SecurityException | UnsupportedOperationException e) {
+                LOG.debug("Could not capture baseline processes for a forked partition workspace", e);
+            }
+        }
+        Workspace workspace = reserve(forked, baselineProcesses);
         try {
             Path root = workspace.root();
             Files.createDirectory(root, privatePermissions("rwx------"));
@@ -155,7 +164,7 @@ final class WorkerWorkspaceRegistry {
         }
     }
 
-    private Workspace reserve(boolean forked) throws IOException {
+    private Workspace reserve(boolean forked, Map<Long, Instant> baselineProcesses) throws IOException {
         for (;;) {
             String id = randomHex(7).substring(0, 13);
             Path entry = journal.resolve(id);
@@ -176,12 +185,13 @@ final class WorkerWorkspaceRegistry {
                 }
                 throw e;
             }
-            return new Workspace(id, record, forked);
+            return new Workspace(id, record, forked, baselineProcesses);
         }
     }
 
     private void removeOwnedDirectories(String id, Record record, DirectoryIdentity rootIdentity,
-                                        DirectoryIdentity shortTempIdentity, boolean recovering) throws IOException {
+                                        DirectoryIdentity shortTempIdentity, boolean recovering,
+                                        Map<Long, Instant> baselineProcesses) throws IOException {
         Path entry = journal.resolve(id);
         Path root = tempBase.resolve("cdist-" + id);
         Path shortTemp = record.shortTempKey().isEmpty() ? null : shortTempBase.resolve("cdtmp-" + id);
@@ -207,7 +217,8 @@ final class WorkerWorkspaceRegistry {
         }
         // A process using either directory may also need the other. Check both before removing anything.
         try {
-            if (!ownedRoots.isEmpty() && WorkspaceReferences.inUse(ownedRoots, recovering, record.linuxWorkerStart())) {
+            if (!ownedRoots.isEmpty() && WorkspaceReferences.inUse(ownedRoots, recovering, record.linuxWorkerStart(),
+                    record.leased() ? null : baselineProcesses)) {
                 LOG.debug("Deferring cleanup of referenced partition workspace {}", id);
                 return;
             }
@@ -457,15 +468,17 @@ final class WorkerWorkspaceRegistry {
     final class Workspace implements AutoCloseable {
         private final String id;
         private final boolean forked;
+        private final Map<Long, Instant> baselineProcesses;
         private Record record;
         private ProcessHandle child;
         private DirectoryIdentity rootIdentity;
         private DirectoryIdentity shortTempIdentity;
 
-        private Workspace(String id, Record record, boolean forked) {
+        private Workspace(String id, Record record, boolean forked, Map<Long, Instant> baselineProcesses) {
             this.id = id;
             this.record = record;
             this.forked = forked;
+            this.baselineProcesses = baselineProcesses;
         }
 
         Path root() {
@@ -511,7 +524,7 @@ final class WorkerWorkspaceRegistry {
             int maxAttempts = forked ? 5 : 1;
             for (int attempt = 1; ; attempt++) {
                 try {
-                    removeOwnedDirectories(id, record, rootIdentity, shortTempIdentity, false);
+                    removeOwnedDirectories(id, record, rootIdentity, shortTempIdentity, false, baselineProcesses);
                     return;
                 } catch (IOException e) {
                     if (attempt == maxAttempts) {
