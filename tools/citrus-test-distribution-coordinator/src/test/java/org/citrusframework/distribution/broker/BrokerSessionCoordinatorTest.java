@@ -782,7 +782,24 @@ class BrokerSessionCoordinatorTest {
 
         worker.heartbeat(null);
         assertThat(storedStats("w-cache")).as("heartbeat without stats keeps the previous ones").isEqualTo(refreshed);
-        assertThat(coordinator.listWorkers()).singleElement().satisfies(w -> assertThat(w.cacheStats()).isEqualTo(refreshed));
+        assertThat(coordinator.listWorkers()).singleElement().satisfies(w -> {
+            assertThat(w.state()).isEqualTo(WorkerState.IDLE);
+            assertThat(w.cacheStats()).isEqualTo(refreshed);
+        });
+
+        WorkerCacheStats recovered = new WorkerCacheStats(true, 100L, 3, 350L, 200L, 1L, false);
+        worker.heartbeat(null, recovered);
+        assertThat(coordinator.listWorkers()).singleElement().satisfies(w -> {
+            assertThat(w.state()).isEqualTo(WorkerState.IDLE);
+            assertThat(w.cacheStats()).isEqualTo(recovered);
+        });
+
+        worker.heartbeat(null, refreshed);
+        coordinator.handleWorkerDisconnect("conn-cache");
+        assertThat(coordinator.listWorkers()).singleElement().satisfies(w -> {
+            assertThat(w.state()).isEqualTo(WorkerState.OFFLINE);
+            assertThat(w.cacheStats()).isEqualTo(refreshed);
+        });
 
         register("conn-legacy", "w-legacy", Map.of());
         assertThat(storedStats("w-legacy")).isNull();

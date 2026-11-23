@@ -60,6 +60,8 @@ let lastDetailLoadAt = 0;
 let detailTimer = null;
 // Increases with every session detail request; a response that is no longer the latest is discarded.
 let detailRequestSeq = 0;
+let workerRequestSeq = 0;
+let workerPollInFlight = false;
 let pollTimer = null;
 let suppressHashChange = false;
 
@@ -141,11 +143,14 @@ function apiHeaders() {
 }
 
 async function apiGet(path) {
+  const authToken = state.authToken;
   const res = await fetch(path, { headers: apiHeaders() });
   if (res.status === 401) {
-    state.showAuthModal = true;
-    state.authError = 'Bearer token required to access broker API.';
-    renderApp();
+    if (authToken === state.authToken) {
+      state.showAuthModal = true;
+      state.authError = 'Bearer token required to access broker API.';
+      renderApp();
+    }
     throw new Error('Unauthorized');
   }
   if (!res.ok) {
@@ -206,6 +211,31 @@ async function loadHistory(force = false) {
   }
 }
 
+async function loadWorkers() {
+  const requestSeq = ++workerRequestSeq;
+  const workers = await apiGet('/api/v1/workers');
+  // An event can start a full refresh while a worker poll is already in progress.
+  if (requestSeq !== workerRequestSeq) return false;
+  state.workers = Array.isArray(workers) ? workers : [];
+  return true;
+}
+
+async function pollWorkers() {
+  if (refreshInFlight || workerPollInFlight) return;
+  workerPollInFlight = true;
+  try {
+    if (await loadWorkers() && shouldPollWorkers()) {
+      renderApp();
+    }
+  } catch (err) {
+    if (err.message !== 'Unauthorized') {
+      console.warn('Worker refresh error:', err.message);
+    }
+  } finally {
+    workerPollInFlight = false;
+  }
+}
+
 async function refreshAll() {
   // One refresh at a time: events arriving meanwhile coalesce into a single follow-up refresh.
   if (refreshInFlight) {
@@ -214,12 +244,11 @@ async function refreshAll() {
   }
   refreshInFlight = true;
   try {
-    const [sessions, workers] = await Promise.all([
+    const [sessions] = await Promise.all([
       apiGet('/api/v1/sessions?limit=500'),
-      apiGet('/api/v1/workers')
+      loadWorkers()
     ]);
     state.sessions = Array.isArray(sessions) ? sessions : [];
-    state.workers = Array.isArray(workers) ? workers : [];
     loadHistory(); // independent: a slow history query must not hold back sessions and workers
     state.authError = '';
 
@@ -310,10 +339,17 @@ function ensurePollingLoop() {
         connectSse();
       }
       refreshAll();
+    } else if (shouldPollWorkers()) {
+      // Heartbeats update worker telemetry without publishing a lifecycle event.
+      pollWorkers();
     } else if (state.sessions.some(s => s.status === 'RUNNING')) {
       renderApp();
     }
   }, POLL_INTERVAL_MS);
+}
+
+function shouldPollWorkers() {
+  return state.sseConnected && !state.authError && (state.view === 'overview' || state.view === 'workers');
 }
 
 function connectSse() {
@@ -325,6 +361,9 @@ function connectSse() {
   eventSource.onopen = () => {
     state.sseConnected = true;
     renderApp();
+    if (shouldPollWorkers()) {
+      pollWorkers();
+    }
   };
   eventSource.onerror = () => {
     state.sseConnected = false;
@@ -1384,18 +1423,19 @@ function renderWorkerCacheTelemetry(w) {
   if (!c) {
     return html`<div class="worker-cache-panel worker-cache-empty">Local file cache: no telemetry reported</div>`;
   }
+  const lowDisk = isLowDisk(w);
   const pct = cacheDiskPercent(c);
   const usableLabel = Number(c.usableDiskBytes) < 0 || !Number.isFinite(Number(c.usableDiskBytes))
     ? 'N/A'
     : formatBytes(Number(c.usableDiskBytes));
   const bufferLabel = Number(c.freeSpaceBufferBytes) > 0 ? formatBytes(Number(c.freeSpaceBufferBytes)) : 'none';
   return html`
-    <div class=${`worker-cache-panel ${c.lowDiskSpace ? 'low-disk' : ''}`}>
+    <div class=${`worker-cache-panel ${lowDisk ? 'low-disk' : ''}`}>
       <div class="worker-cache-head">
         <span class="worker-cache-title">Local File Cache</span>
         <span>
           <span class=${`badge ${c.cleanupEnabled ? 'badge-idle' : 'badge-offline'}`}>${c.cleanupEnabled ? 'AUTO LRU' : 'NO CLEANUP'}</span>
-          ${c.lowDiskSpace ? html` <span class="badge badge-failed">LOW DISK</span>` : null}
+          ${lowDisk ? html` <span class="badge badge-failed">LOW DISK</span>` : null}
         </span>
       </div>
       <div class="worker-cache-row">
@@ -1403,7 +1443,7 @@ function renderWorkerCacheTelemetry(w) {
         · evicted <strong>${Number(c.evictedBlobsTotal) || 0}</strong>
       </div>
       <div class="worker-cache-bar" title=${`Usable disk ${usableLabel} vs buffer ${bufferLabel}`}>
-        <div class=${`worker-cache-bar-fill ${c.lowDiskSpace ? 'low-disk' : ''}`} style=${`width:${pct}%`}></div>
+        <div class=${`worker-cache-bar-fill ${lowDisk ? 'low-disk' : ''}`} style=${`width:${pct}%`}></div>
       </div>
       <div class="worker-cache-row worker-cache-muted">Usable disk ${usableLabel} · buffer ${bufferLabel}</div>
     </div>

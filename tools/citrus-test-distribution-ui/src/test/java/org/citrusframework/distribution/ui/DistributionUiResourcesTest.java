@@ -61,6 +61,14 @@ class DistributionUiResourcesTest {
                     .containsPattern("usableLabel = Number\\(c\\.usableDiskBytes\\) < 0 [^\\n]+\\s*\\? 'N/A'")
                     .containsPattern("(?s)<div class=\"overview-worker-badges\">.*?isLowDisk\\(w\\).*?statusBadge\\(w\\.state\\)")
                     .contains("w.state !== 'OFFLINE' && w.cacheStats && w.cacheStats.lowDiskSpace")
+                    .contains("const lowDisk = isLowDisk(w);")
+                    .contains("worker-cache-panel ${lowDisk ? 'low-disk' : ''}",
+                            "worker-cache-bar-fill ${lowDisk ? 'low-disk' : ''}",
+                            "${lowDisk ? html` <span class=\"badge badge-failed\">LOW DISK</span>` : null}")
+                    .containsPattern("(?s)else if \\(shouldPollWorkers\\(\\)\\) \\{[^}]*pollWorkers\\(\\);")
+                    .contains("return state.sseConnected && !state.authError && (state.view === 'overview' || state.view === 'workers');")
+                    .containsPattern("(?s)function loadWorkers\\(\\).*?apiGet\\('/api/v1/workers'\\).*?state\\.workers")
+                    .containsPattern("(?s)function pollWorkers\\(\\).*?if \\(await loadWorkers\\(\\) && shouldPollWorkers\\(\\)\\) \\{\\s+renderApp\\(\\);")
                     .contains("worker.offline")
                     .contains("session.aborted")
                     .contains("/abort")
