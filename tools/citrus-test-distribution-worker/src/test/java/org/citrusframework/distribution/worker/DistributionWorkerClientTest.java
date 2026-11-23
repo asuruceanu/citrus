@@ -30,9 +30,14 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Stream;
 
+import io.vertx.core.Vertx;
+import io.vertx.core.buffer.Buffer;
+import io.vertx.core.http.HttpServer;
 import org.citrusframework.distribution.broker.DistributionBrokerConfig;
 import org.citrusframework.distribution.broker.DistributionBrokerServer;
 import org.citrusframework.distribution.cache.BlobCacheDirectory;
@@ -40,11 +45,12 @@ import org.citrusframework.distribution.cache.ClasspathPackager;
 import org.citrusframework.distribution.cache.WorkspacePackager;
 import org.citrusframework.distribution.config.DistributionJson;
 import org.citrusframework.distribution.config.DistributionSettings;
-import org.citrusframework.distribution.model.BuildSessionResponse;
-import org.citrusframework.distribution.model.CompleteSessionRequest;
 import org.citrusframework.distribution.model.ArtifactKind;
 import org.citrusframework.distribution.model.ArtifactRef;
+import org.citrusframework.distribution.model.BuildSessionResponse;
+import org.citrusframework.distribution.model.CompleteSessionRequest;
 import org.citrusframework.distribution.model.CreateSessionRequest;
+import org.citrusframework.distribution.model.PartitionAssignPayload;
 import org.citrusframework.distribution.model.PartitionPolicy;
 import org.citrusframework.distribution.model.PartitionState;
 import org.citrusframework.distribution.model.SessionDetailResponse;
@@ -52,6 +58,7 @@ import org.citrusframework.distribution.model.SessionStatus;
 import org.citrusframework.distribution.model.SubmitWorkRequest;
 import org.citrusframework.distribution.model.TestOutcomeStatus;
 import org.citrusframework.distribution.model.WorkUnitSpec;
+import org.citrusframework.distribution.model.WorkerWsMessage;
 import org.citrusframework.distribution.model.WorkspaceFileSet;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -312,36 +319,105 @@ class DistributionWorkerClientTest {
         }
     }
 
+    public static class BlockingPartitionFixture {
+        private static final CountDownLatch STARTED = new CountDownLatch(1);
+        private static final CountDownLatch RELEASE = new CountDownLatch(1);
+
+        @Test
+        void shouldWaitOnWorker() throws Exception {
+            // The fixture runs in a child-first loader; use the host copy to share the test's latches.
+            ClassLoader.getSystemClassLoader().loadClass(getClass().getName()).getMethod("awaitRelease").invoke(null);
+        }
+
+        public static void awaitRelease() throws InterruptedException {
+            STARTED.countDown();
+            if (!RELEASE.await(15, TimeUnit.SECONDS)) {
+                throw new AssertionError("test did not release the partition");
+            }
+        }
+    }
+
     @Test
     void shouldFailFastWhenSecondWorkerClientSharesCacheDirAndAllowReuseAfterClose() throws Exception {
-        try (DistributionBrokerServer broker = startBroker("worker_shared_cache_")) {
+        try (DistributionBrokerServer broker = startBroker("worker_shared_cache_");
+             var executor = Executors.newVirtualThreadPerTaskExecutor()) {
             Path sharedCache = tempDir.resolve("shared-worker-cache");
-            ClasspathPackager.PackagedArtifact packaged = upload(broker, packageClassesOf(SampleRemoteTest.class));
-            WorkUnitSpec unit = unit(SampleRemoteTest.class, "shouldPassOnWorker");
+            ClasspathPackager.PackagedArtifact packaged = upload(broker, packageClassesOf(BlockingPartitionFixture.class));
+            WorkUnitSpec blockedUnit = unit(BlockingPartitionFixture.class, "shouldWaitOnWorker");
 
-            DistributionWorkerClient worker2 = new DistributionWorkerClient(workerConfig("worker-two", broker, sharedCache).build());
-            try {
+            try (DistributionWorkerClient worker2 = new DistributionWorkerClient(workerConfig("worker-two", broker, sharedCache).build())) {
                 try (DistributionWorkerClient worker1 = new DistributionWorkerClient(workerConfig("worker-one", broker, sharedCache).build())) {
                     worker1.start();
                     assertThat(worker1.awaitRegistration(5, TimeUnit.SECONDS)).isTrue();
-                    assertCompleted(runPartition(broker, List.of(packaged.ref()), unit, List.of(), List.of()));
-                    assertThat(worker1.blobClient().downloadRequests()).as("cold cache downloads the blob").isEqualTo(1);
-
-                    assertThatThrownBy(worker2::start)
-                            .isInstanceOf(IllegalStateException.class)
-                            .hasMessageContaining("--cache-dir");
-                    assertThat(worker2.isConnected()).isFalse();
-                    assertThat(worker1.isConnected()).as("the running worker keeps its cache").isTrue();
+                    var partition = executor.submit(() -> runPartition(broker, List.of(packaged.ref()), blockedUnit,
+                            List.of(), List.of()));
+                    try {
+                        assertThat(BlockingPartitionFixture.STARTED.await(10, TimeUnit.SECONDS)).isTrue();
+                        assertThat(partition.isDone()).isFalse();
+                        assertThat(worker1.blobClient().downloadRequests()).isEqualTo(1);
+                        assertThatThrownBy(worker2::start)
+                                .isInstanceOf(IllegalStateException.class)
+                                .hasMessageContaining("--cache-dir");
+                        assertThat(worker2.isConnected()).isFalse();
+                        assertThat(worker1.isConnected()).isTrue();
+                    } finally {
+                        BlockingPartitionFixture.RELEASE.countDown();
+                    }
+                    assertCompleted(partition.get(10, TimeUnit.SECONDS));
                 }
 
                 worker2.start();
                 assertThat(worker2.awaitRegistration(5, TimeUnit.SECONDS)).isTrue();
-                assertCompleted(runPartition(broker, List.of(packaged.ref()), unit, List.of(), List.of()));
+                WorkUnitSpec warmUnit = unit(SampleRemoteTest.class, "shouldPassOnWorker");
+                assertCompleted(runPartition(broker, List.of(packaged.ref()), warmUnit, List.of(), List.of()));
                 assertThat(worker2.blobClient().downloadRequests())
                         .as("warm blob reused, no blob GET issued to the coordinator").isZero();
-            } finally {
-                worker2.close();
             }
+        }
+    }
+
+    @Test
+    void shouldClosePromptlyWhileAPartitionDownloadIsStalled() throws Exception {
+        CountDownLatch bodyStarted = new CountDownLatch(1);
+        byte[] expected = new byte[1024];
+        ArtifactRef artifact = new ArtifactRef("stalled.jar", ClasspathPackager.sha256Hex(expected),
+                ArtifactKind.REGULAR_FILE, expected.length);
+        PartitionAssignPayload assignment = new PartitionAssignPayload("stalled-partition", "s1", 1,
+                List.of(artifact), Map.of(), List.of(unit(SampleRemoteTest.class, "shouldPassOnWorker")));
+        @SuppressWarnings("unchecked")
+        Map<String, Object> payload = DistributionJson.convert(assignment, Map.class);
+        String assignmentMessage = DistributionJson.toJson(new WorkerWsMessage(WorkerWsMessage.PARTITION_ASSIGN, payload));
+
+        Vertx vertx = Vertx.vertx();
+        try {
+            HttpServer broker = vertx.createHttpServer()
+                    .requestHandler(request -> request.response().setChunked(true).write(Buffer.buffer(new byte[128]))
+                            .onSuccess(ignored -> bodyStarted.countDown()))
+                    .webSocketHandler(socket -> socket.textMessageHandler(message -> {
+                        if (WorkerWsMessage.WORKER_REGISTER.equals(DistributionJson.fromJson(message, WorkerWsMessage.class).type())) {
+                            socket.writeTextMessage(assignmentMessage);
+                        }
+                    }))
+                    .listen(0, "127.0.0.1").toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
+            Path cacheDir = tempDir.resolve("stalled-worker-cache");
+            DistributionWorkerConfig config = DistributionWorkerConfig.builder()
+                    .brokerUrl("http://127.0.0.1:" + broker.actualPort())
+                    .cacheDir(cacheDir)
+                    .cacheCleanup(false)
+                    .forkMode(DistributionSettings.WorkerForkMode.AUTO)
+                    .build();
+            try (DistributionWorkerClient worker = new DistributionWorkerClient(config)) {
+                worker.start();
+                assertThat(bodyStarted.await(5, TimeUnit.SECONDS)).isTrue();
+                CompletableFuture.runAsync(worker::close).get(4, TimeUnit.SECONDS);
+                try (Stream<Path> tmpFiles = Files.list(cacheDir.resolve("tmp"));
+                     WorkerFileCache reopened = WorkerFileCache.open(cacheDir, false, 0L)) {
+                    assertThat(tmpFiles).isEmpty();
+                    assertThat(reopened.statsSnapshot().blobCount()).isZero();
+                }
+            }
+        } finally {
+            vertx.close().toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
         }
     }
 

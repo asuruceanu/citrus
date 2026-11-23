@@ -17,6 +17,7 @@
 package org.citrusframework.distribution.worker;
 
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -43,6 +44,7 @@ public final class DistributionWorkerConfig {
     private final Map<String, String> capabilities;
     private final long heartbeatIntervalMs;
     private final long reconnectDelayMs;
+    private final Duration blobReadIdleTimeout;
     private final WorkerForkMode forkMode;
     private final List<String> forkJvmArgs;
     private final WorkerCwdCheckMode cwdCheckMode;
@@ -64,6 +66,7 @@ public final class DistributionWorkerConfig {
         this.capabilities = Collections.unmodifiableMap(caps);
         this.heartbeatIntervalMs = builder.heartbeatIntervalMs;
         this.reconnectDelayMs = builder.reconnectDelayMs;
+        this.blobReadIdleTimeout = builder.blobReadIdleTimeout;
         this.forkMode = builder.forkMode;
         this.forkJvmArgs = List.copyOf(builder.forkJvmArgs);
         this.cwdCheckMode = builder.cwdCheckMode;
@@ -119,6 +122,10 @@ public final class DistributionWorkerConfig {
         return heartbeatIntervalMs;
     }
 
+    Duration blobReadIdleTimeout() {
+        return blobReadIdleTimeout;
+    }
+
     public long reconnectDelayMs() {
         return reconnectDelayMs;
     }
@@ -157,6 +164,7 @@ public final class DistributionWorkerConfig {
         private Map<String, String> capabilities = new LinkedHashMap<>(DistributionSettings.detectHostCapabilities(null));
         private long heartbeatIntervalMs = 5_000L;
         private long reconnectDelayMs = 1_000L;
+        private Duration blobReadIdleTimeout = Duration.ofSeconds(60);
         private WorkerForkMode forkMode = DistributionSettings.parseWorkerForkMode(DistributionSettings.getString(
                 DistributionSettings.WORKER_FORK_MODE_PROPERTY, DistributionSettings.WORKER_FORK_MODE_ENV, null));
         private List<String> forkJvmArgs = DistributionSettings.parseForkJvmArgs(DistributionSettings.getString(
@@ -258,6 +266,15 @@ public final class DistributionWorkerConfig {
 
         public Builder heartbeatIntervalMs(long heartbeatIntervalMs) {
             this.heartbeatIntervalMs = heartbeatIntervalMs;
+            return this;
+        }
+
+        Builder blobReadIdleTimeout(Duration timeout) {
+            Objects.requireNonNull(timeout, "blobReadIdleTimeout");
+            if (timeout.isZero() || timeout.isNegative()) {
+                throw new IllegalArgumentException("Blob read idle timeout must be positive");
+            }
+            this.blobReadIdleTimeout = timeout;
             return this;
         }
 

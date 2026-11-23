@@ -66,6 +66,7 @@ public final class DistributionWorkerClient implements AutoCloseable {
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final AtomicBoolean draining = new AtomicBoolean(false);
     private final AtomicBoolean closed = new AtomicBoolean(false);
+    private final AtomicBoolean cacheStatsFailureActive = new AtomicBoolean();
     private final AtomicReference<WebSocket> activeWebSocket = new AtomicReference<>();
     private final ActiveAssignmentTracker assignments = new ActiveAssignmentTracker();
     private volatile CountDownLatch registeredLatch = new CountDownLatch(1);
@@ -187,9 +188,8 @@ public final class DistributionWorkerClient implements AutoCloseable {
     }
 
     /**
-     * Cancels and drains in-flight work, disconnects, waits (bounded) for the partition thread to finish, killing the
-     * forked partition JVMs it left running when it does not stop in time, then closes the blob client, the HTTP client
-     * and finally the worker cache. Idempotent.
+     * Cancels in-flight work and aborts blob transfers before draining. Disconnects, waits for the partition thread
+     * and kills any remaining forked JVMs before closing the cache. Idempotent.
      */
     @Override
     public void close() {
@@ -198,6 +198,10 @@ public final class DistributionWorkerClient implements AutoCloseable {
         }
         try {
             assignments.cancel(null, 0);
+            BrokerBlobClient blobs = blobClient;
+            if (blobs != null) {
+                blobs.close();
+            }
             drain(10, TimeUnit.SECONDS);
             running.set(false);
             WebSocket ws = activeWebSocket.getAndSet(null);
@@ -214,18 +218,21 @@ public final class DistributionWorkerClient implements AutoCloseable {
                 if (!partitionExecutor.awaitTermination(5, TimeUnit.SECONDS)) {
                     LOG.warn("Partition thread of worker {} did not stop within 5 seconds; killing its forked partition "
                             + "JVMs and releasing its cache anyway", config.workerId());
-                    ForkedPartitionRunner forked = forkedRunner;
-                    if (forked != null) {
-                        // No child may keep reading or writing the cache directory once another worker may own it.
-                        forked.killActiveForks();
-                    }
                 }
                 scheduler.awaitTermination(1, TimeUnit.SECONDS);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }
         } finally {
-            closeResources();
+            try {
+                ForkedPartitionRunner forked = forkedRunner;
+                if (!partitionExecutor.isTerminated() && forked != null) {
+                    // No child may keep reading or writing the cache once another worker can own it.
+                    forked.killActiveForks();
+                }
+            } finally {
+                closeResources();
+            }
         }
     }
 
@@ -339,9 +346,15 @@ public final class DistributionWorkerClient implements AutoCloseable {
             return null;
         }
         try {
-            return cache.statsSnapshot();
+            WorkerCacheStats stats = cache.statsSnapshot();
+            cacheStatsFailureActive.set(false);
+            return stats;
         } catch (RuntimeException e) {
-            LOG.debug("Could not read cache statistics of worker {}", config.workerId(), e);
+            if (cacheStatsFailureActive.compareAndSet(false, true)) {
+                LOG.warn("Could not read cache statistics of worker {}: {}", config.workerId(), e.toString());
+            } else {
+                LOG.debug("Could not read cache statistics of worker {}", config.workerId(), e);
+            }
             return null;
         }
     }

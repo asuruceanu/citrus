@@ -29,13 +29,16 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.time.Clock;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -197,27 +200,33 @@ class BrokerBlobClientCacheTest {
         byte[] corrupt = "the fake content".getBytes(StandardCharsets.UTF_8);
 
         try (WorkerFileCache cache = WorkerFileCache.open(cacheDir, true, 0L);
-             BrokerBlobClient blobs = new BrokerBlobClient(config(cacheDir), cache)) {
-            // Declared size above the cap: rejected before any request.
-            ArtifactRef tooLarge = new ArtifactRef("big.bin", sha, ArtifactKind.REGULAR_FILE, ClasspathPackager.MAX_BLOB_BYTES + 1);
-            assertThatThrownBy(() -> blobs.ensureCached(tooLarge)).isInstanceOf(IOException.class);
+             BrokerBlobClient production = new BrokerBlobClient(config(cacheDir), cache);
+             BrokerBlobClient blobs = new BrokerBlobClient(config(cacheDir), cache, 4 * 1024L)) {
+            // The production cap is enforced before sending a request.
+            ArtifactRef tooLarge = new ArtifactRef("big.bin", sha, ArtifactKind.REGULAR_FILE,
+                    ClasspathPackager.MAX_BLOB_BYTES + 1);
+            assertThatThrownBy(() -> production.ensureCached(tooLarge)).isInstanceOf(IOException.class)
+                    .hasMessageEndingWith("more than the maximum of " + ClasspathPackager.MAX_BLOB_BYTES);
+            ArtifactRef overTestCap = new ArtifactRef("big.bin", sha, ArtifactKind.REGULAR_FILE, 4 * 1024L + 1);
+            assertThatThrownBy(() -> blobs.ensureCached(overTestCap)).isInstanceOf(IOException.class)
+                    .hasMessageContaining("maximum of 4096");
             assertThat(blobGets).hasValue(0);
 
             // Chunked body exceeding the cap: aborted mid-stream.
             String oversizedSha = "ab".repeat(32);
+            byte[] oversizedBody = new byte[4 * 1024 + 1];
             blobHandler = exchange -> {
                 exchange.sendResponseHeaders(200, 0);
-                streamZeros(exchange.getResponseBody(), ClasspathPackager.MAX_BLOB_BYTES + 1);
+                exchange.getResponseBody().write(oversizedBody);
             };
-            assertThatThrownBy(() -> blobs.ensureCached(oversizedSha)).isInstanceOf(IOException.class);
+            assertThatThrownBy(() -> blobs.ensureCached(oversizedSha)).isInstanceOf(IOException.class)
+                    .hasMessageContaining("exceeds the maximum of 4096");
             assertNothingStored(cache);
 
             // Declared Content-Length above the cap: aborted before streaming.
-            blobHandler = exchange -> {
-                exchange.sendResponseHeaders(200, ClasspathPackager.MAX_BLOB_BYTES + 1);
-                streamZeros(exchange.getResponseBody(), ClasspathPackager.MAX_BLOB_BYTES + 1);
-            };
-            assertThatThrownBy(() -> blobs.ensureCached(oversizedSha)).isInstanceOf(IOException.class);
+            blobHandler = exchange -> respond(exchange, 200, oversizedBody);
+            assertThatThrownBy(() -> blobs.ensureCached(oversizedSha)).isInstanceOf(IOException.class)
+                    .hasMessageContaining("Content-Length of 4097");
             assertNothingStored(cache);
 
             for (int status : List.of(404, 500)) {
@@ -309,6 +318,82 @@ class BrokerBlobClientCacheTest {
             assertThat(new BlobCacheDirectory(cache.rootDir()).resolveBlobPath(packaged.ref().sha256())).exists();
             assertThat(tmpFiles(cache)).isEmpty();
             assertThat(cache.isPinned(packaged.ref().sha256())).as("pins released after the partition").isFalse();
+        }
+    }
+
+    @Test
+    void shouldFailAStalledPartitionAndDownloadSuccessfullyOnTheNextPartition() throws Exception {
+        ClasspathPackager.PackagedArtifact classes = ClasspathPackager.packagePath(
+                Paths.get(TrivialFixture.class.getProtectionDomain().getCodeSource().getLocation().toURI()));
+        CountDownLatch releaseBody = new CountDownLatch(1);
+        blobHandler = exchange -> {
+            exchange.sendResponseHeaders(200, classes.bytes().length);
+            try (OutputStream body = exchange.getResponseBody()) {
+                body.write(classes.bytes(), 0, 128);
+                body.flush();
+                try {
+                    releaseBody.await(10, TimeUnit.SECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        };
+
+        Path cacheDir = tempDir.resolve("cache-stall");
+        DistributionWorkerConfig config = configBuilder(cacheDir).blobReadIdleTimeout(Duration.ofMillis(400)).build();
+        try (WorkerFileCache cache = WorkerFileCache.open(cacheDir, true, 0L);
+             BrokerBlobClient blobs = new BrokerBlobClient(config, cache);
+             ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
+            IsolatedPartitionRunner runner = new IsolatedPartitionRunner(config, cache, blobs);
+            PartitionAssignPayload assignment = new PartitionAssignPayload("p-stall", "s1", 1,
+                    List.of(classes.ref()), Map.of(), List.of(unit(TrivialFixture.class, "passes")));
+            var execution = executor.submit(() -> runner.execute(assignment, CancellationToken.create(), e -> { }));
+            try {
+                var failed = execution.get(5, TimeUnit.SECONDS);
+                assertThat(failed.success()).isFalse();
+                assertThat(failed.errorMessage()).contains("Blob download stalled", classes.ref().sha256());
+                assertNothingStored(cache);
+            } finally {
+                releaseBody.countDown();
+                execution.cancel(true);
+            }
+
+            serve(classes);
+            var recovered = runner.execute(assignment, CancellationToken.create(), e -> { });
+            assertThat(recovered.success()).as(recovered.errorMessage()).isTrue();
+            assertThat(tmpFiles(cache)).isEmpty();
+        }
+    }
+
+    @Test
+    void shouldRecoverAfterFailureOpeningTheDownloadTempFile() throws Exception {
+        ClasspathPackager.PackagedArtifact classes = ClasspathPackager.packagePath(
+                Paths.get(TrivialFixture.class.getProtectionDomain().getCodeSource().getLocation().toURI()));
+        serve(classes);
+        Path cacheDir = tempDir.resolve("cache-open-enospc");
+        DistributionWorkerConfig config = config(cacheDir);
+        try (WorkerFileCache cache = WorkerFileCache.open(cacheDir, true, 0L);
+             BrokerBlobClient blobs = new BrokerBlobClient(config, cache)) {
+            blobs.tempFileOpener(tmp -> {
+                assertThat(tmp).exists();
+                throw new IOException("No space left on device");
+            });
+            assertThatThrownBy(() -> blobs.ensureCached(classes.ref())).isInstanceOf(IOException.class)
+                    .hasMessageContaining("No space left on device");
+            assertNothingStored(cache);
+
+            IsolatedPartitionRunner runner = new IsolatedPartitionRunner(config, cache, blobs);
+            PartitionAssignPayload assignment = new PartitionAssignPayload("p-enospc", "s1", 1,
+                    List.of(classes.ref()), Map.of(), List.of(unit(TrivialFixture.class, "passes")));
+            var failed = runner.execute(assignment, CancellationToken.create(), e -> { });
+            assertThat(failed.success()).isFalse();
+            assertThat(failed.errorMessage()).contains("No space left on device");
+            assertNothingStored(cache);
+
+            blobs.tempFileOpener(Files::newOutputStream);
+            var recovered = runner.execute(assignment, CancellationToken.create(), e -> { });
+            assertThat(recovered.success()).as(recovered.errorMessage()).isTrue();
+            assertThat(tmpFiles(cache)).isEmpty();
         }
     }
 
@@ -421,14 +506,17 @@ class BrokerBlobClientCacheTest {
     }
 
     private DistributionWorkerConfig config(Path cacheDir) {
+        return configBuilder(cacheDir).build();
+    }
+
+    private DistributionWorkerConfig.Builder configBuilder(Path cacheDir) {
         return DistributionWorkerConfig.builder()
                 .workerId("blob-" + UUID.randomUUID().toString().substring(0, 6))
                 .brokerUrl("http://127.0.0.1:" + server.getAddress().getPort())
                 .cacheDir(cacheDir)
                 .cacheCleanup(true)
                 .cacheFreeSpaceBufferBytes(0L)
-                .cwdCheckMode(WorkerCwdCheckMode.OFF)
-                .build();
+                .cwdCheckMode(WorkerCwdCheckMode.OFF);
     }
 
     private static ArtifactRef ref(byte[] content) {
@@ -443,16 +531,6 @@ class BrokerBlobClientCacheTest {
         exchange.sendResponseHeaders(status, body.length == 0 ? -1 : body.length);
         if (body.length > 0) {
             exchange.getResponseBody().write(body);
-        }
-    }
-
-    private static void streamZeros(OutputStream out, long total) throws IOException {
-        byte[] chunk = new byte[64 * 1024];
-        long sent = 0;
-        while (sent < total) {
-            int len = (int) Math.min(chunk.length, total - sent);
-            out.write(chunk, 0, len);
-            sent += len;
         }
     }
 
