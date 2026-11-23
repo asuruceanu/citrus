@@ -570,8 +570,15 @@ When a worker starts with the same cache directory and temporary directory setti
 private partition workspaces left by a worker JVM that was forcibly killed or called `Runtime.halt()`.
 Recovery checks a matching ownership record and the identities of the worker and partition JVMs on the same host.
 Workspaces are left in place if either JVM is still alive, a fork launch could not be confirmed, or ownership cannot be
-verified. On Linux, recovery also requires the same boot and process namespace. Background processes that outlive the
-recorded JVMs are outside the liveness check.
+verified. On Linux, recovery also requires the same boot and process namespace.
+
+On Linux and macOS, the worker checks both directories for current filesystem references before removing a partition
+workspace. An open file or working directory can keep both directories in place even after the worker and partition JVMs
+exit. Linux uses `/proc` to check visible processes running under the worker's user identity and macOS uses the
+system `lsof` command. Cleanup is deferred if the check cannot complete, for example when a same-user process restricts
+inspection. Unix socket paths are retained when the worker cannot establish whether a listener still owns them.
+On other platforms, the worker defers startup recovery and uses the platform's filesystem behavior during normal cleanup.
+A process that only retains a path for future use has no current filesystem reference for the worker to check.
 
 [[tools-test-distribution-external-resources-compat]]
 === Requirements and caveats

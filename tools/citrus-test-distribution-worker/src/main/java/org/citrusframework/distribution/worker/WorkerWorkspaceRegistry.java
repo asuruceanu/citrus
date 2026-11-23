@@ -37,7 +37,9 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.security.SecureRandom;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.HexFormat;
+import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
 import java.util.Properties;
@@ -102,7 +104,7 @@ final class WorkerWorkspaceRegistry {
                             && (record.shortTempKey().isEmpty() || shortTempKey.equals(record.shortTempKey()))
                             && !processScope.isEmpty() && processScope.equals(record.processScope())
                             && record.worker().isGone() && record.canRecover()) {
-                        removeOwnedDirectories(id, record, null, null);
+                        removeOwnedDirectories(id, record, null, null, true);
                     }
                 } catch (IOException | RuntimeException e) {
                     LOG.debug("Could not recover partition workspace {}", id, e);
@@ -171,48 +173,79 @@ final class WorkerWorkspaceRegistry {
     }
 
     private void removeOwnedDirectories(String id, Record record, DirectoryIdentity rootIdentity,
-                                        DirectoryIdentity shortTempIdentity) throws IOException {
+                                        DirectoryIdentity shortTempIdentity, boolean recovering) throws IOException {
         Path entry = journal.resolve(id);
-        boolean tempRemoved = true;
-        if (!record.shortTempKey().isEmpty()) {
-            tempRemoved = deleteOwnedDirectory(shortTempBase.resolve("cdtmp-" + id), entry, record.token(), shortTempIdentity);
+        Path root = tempBase.resolve("cdist-" + id);
+        Path shortTemp = record.shortTempKey().isEmpty() ? null : shortTempBase.resolve("cdtmp-" + id);
+        List<Path> ownedRoots = new ArrayList<>(2);
+        if (ownedDirectory(root, entry, record.token(), rootIdentity) != null) {
+            ownedRoots.add(root);
+        } else if (!Files.notExists(root, LinkOption.NOFOLLOW_LINKS)) {
+            return;
         }
-        boolean rootRemoved = deleteOwnedDirectory(tempBase.resolve("cdist-" + id), entry, record.token(), rootIdentity);
+        if (shortTemp != null) {
+            if (ownedDirectory(shortTemp, entry, record.token(), shortTempIdentity) != null) {
+                ownedRoots.add(shortTemp);
+            } else if (!Files.notExists(shortTemp, LinkOption.NOFOLLOW_LINKS)) {
+                return;
+            }
+        }
+        // A process using either directory may also need the other. Check both before removing anything.
+        try {
+            if (!ownedRoots.isEmpty() && WorkspaceReferences.inUse(ownedRoots, recovering)) {
+                LOG.debug("Deferring cleanup of referenced partition workspace {}", id);
+                return;
+            }
+        } catch (IOException | SecurityException | UnsupportedOperationException e) {
+            LOG.debug("Could not check process references to partition workspace {}", id, e);
+            return;
+        }
+        boolean tempRemoved = shortTemp == null || deleteOwnedDirectory(shortTemp, entry, record.token(), shortTempIdentity);
+        boolean rootRemoved = deleteOwnedDirectory(root, entry, record.token(), rootIdentity);
         if (tempRemoved && rootRemoved) {
             Files.deleteIfExists(entry);
         }
     }
 
-    /**
-     * Keeps the marker until the directory contents are gone, so a partial delete is retryable.
-     * The workspace is private, and callers have already ruled out a live owner.
-     */
-    private static boolean deleteOwnedDirectory(Path root, Path entry, String token, DirectoryIdentity created)
+    private static DirectoryIdentity ownedDirectory(Path root, Path entry, String token, DirectoryIdentity created)
             throws IOException {
-        Path marker = root.resolve(OWNER_FILE);
         try {
             if (!isCanonicalDirectory(root)) {
-                return false;
+                return null;
             }
         } catch (NoSuchFileException e) {
-            return Files.notExists(root, LinkOption.NOFOLLOW_LINKS);
+            return null;
         }
         DirectoryIdentity current = DirectoryIdentity.of(root);
         UserPrincipal owner = current.owner();
         if (!owner.equals(Files.getOwner(entry, LinkOption.NOFOLLOW_LINKS))) {
-            return false;
+            return null;
         }
+        Path marker = root.resolve(OWNER_FILE);
         if (Files.notExists(marker, LinkOption.NOFOLLOW_LINKS)) {
-            // A test can clear its scratch directory. Only its allocator can verify the original directory's identity.
+            // Restore a cleared marker only for the original directory so deferred cleanup can recover it later.
             if (created == null || created.fileKey() == null || !created.equals(current)) {
-                return false;
+                return null;
             }
             writeOwnerFile(root, token);
-        } else if (!Files.isRegularFile(marker, LinkOption.NOFOLLOW_LINKS)
-                || !owner.equals(Files.getOwner(marker, LinkOption.NOFOLLOW_LINKS))
-                || !token.equals(readSmallFile(marker, 32))) {
-            return false;
+            return current;
         }
+        return Files.isRegularFile(marker, LinkOption.NOFOLLOW_LINKS)
+                && owner.equals(Files.getOwner(marker, LinkOption.NOFOLLOW_LINKS))
+                && token.equals(readSmallFile(marker, 32)) ? current : null;
+    }
+
+    /**
+     * Keeps the marker until the directory contents are gone, so a partial delete is retryable.
+     */
+    private static boolean deleteOwnedDirectory(Path root, Path entry, String token, DirectoryIdentity created)
+            throws IOException {
+        DirectoryIdentity current = ownedDirectory(root, entry, token, created);
+        if (current == null) {
+            return Files.notExists(root, LinkOption.NOFOLLOW_LINKS);
+        }
+        UserPrincipal owner = current.owner();
+        Path marker = root.resolve(OWNER_FILE);
         Files.walkFileTree(root, new SimpleFileVisitor<>() {
             @Override
             public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs) throws IOException {
@@ -443,7 +476,7 @@ final class WorkerWorkspaceRegistry {
             int maxAttempts = forked ? 5 : 1;
             for (int attempt = 1; ; attempt++) {
                 try {
-                    removeOwnedDirectories(id, record, rootIdentity, shortTempIdentity);
+                    removeOwnedDirectories(id, record, rootIdentity, shortTempIdentity, false);
                     return;
                 } catch (IOException e) {
                     if (attempt == maxAttempts) {

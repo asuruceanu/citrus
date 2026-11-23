@@ -16,6 +16,9 @@
 package org.citrusframework.distribution.worker;
 
 import java.io.IOException;
+import java.net.StandardProtocolFamily;
+import java.net.UnixDomainSocketAddress;
+import java.nio.channels.ServerSocketChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -26,6 +29,9 @@ import java.util.concurrent.TimeUnit;
 import java.util.stream.Stream;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.condition.DisabledOnOs;
+import org.junit.jupiter.api.condition.EnabledOnOs;
+import org.junit.jupiter.api.condition.OS;
 import org.junit.jupiter.api.io.TempDir;
 
 import static java.nio.file.LinkOption.NOFOLLOW_LINKS;
@@ -44,6 +50,7 @@ class WorkerWorkspaceRecoveryTest {
     Path tempDir;
 
     @Test
+    @EnabledOnOs({OS.LINUX, OS.MAC})
     void shouldReclaimOnlyWorkspacesRegisteredToTheReopenedCacheAfterHalt() throws Exception {
         Path cacheDir = tempDir.resolve("worker");
         Path otherCacheDir = tempDir.resolve("other-worker");
@@ -78,6 +85,7 @@ class WorkerWorkspaceRecoveryTest {
     }
 
     @Test
+    @EnabledOnOs({OS.LINUX, OS.MAC})
     void shouldPreserveASymlinkThatReplacedARecordedWorkspaceAndItsTarget() throws Exception {
         Path cacheDir = tempDir.resolve("worker");
         Path target = Files.createDirectory(tempDir.resolve("unrelated"));
@@ -102,6 +110,7 @@ class WorkerWorkspaceRecoveryTest {
     }
 
     @Test
+    @EnabledOnOs({OS.LINUX, OS.MAC})
     void shouldPreserveLiveWorkspacesAndRecoverOnlyTheOrphanAfterForcibleExit() throws Exception {
         Path cacheDir = tempDir.resolve("worker");
         Path ready = tempDir.resolve("ready");
@@ -140,6 +149,64 @@ class WorkerWorkspaceRecoveryTest {
     }
 
     @Test
+    @EnabledOnOs({OS.LINUX, OS.MAC})
+    void shouldReclaimWorkspacesOnlyAfterUnrecordedProcessesReleaseThem() throws Exception {
+        Path cacheDir = tempDir.resolve("worker");
+        Path ready = tempDir.resolve("worker.ready");
+        try (WorkerProcess worker = startWorker("waitForKill", cacheDir, ready.toString())) {
+            worker.awaitReady(ready);
+            try (WorkspacePaths paths = WorkspacePaths.read(ready)) {
+                Path processDirectory = Files.createDirectory(paths.inProcessRoot().resolve("work"));
+                try (WorkerProcess directoryUser = startBackgroundUser("cwd", processDirectory, null);
+                     WorkerProcess fileUser = startBackgroundUser("fd", tempDir, paths.childTmpDir().resolve(SENTINEL))) {
+                    stop(worker.process());
+                    openCache(cacheDir);
+
+                    assertThat(processDirectory).isDirectory();
+                    assertPresent(paths.inProcessRoot(), paths.forkedRoot(), paths.childTmpDir());
+                    directoryUser.assertCanReadWorkspaceFile();
+                    fileUser.assertCanReadWorkspaceFile();
+
+                    stop(directoryUser.process());
+                    openCache(cacheDir);
+
+                    assertThat(paths.inProcessRoot()).doesNotExist();
+                    assertPresent(paths.forkedRoot(), paths.childTmpDir());
+
+                    stop(fileUser.process());
+                    openCache(cacheDir);
+
+                    assertThat(paths.forkedRoot()).doesNotExist();
+                    assertThat(paths.childTmpDir()).doesNotExist();
+                }
+            }
+        }
+    }
+
+    @Test
+    @EnabledOnOs({OS.LINUX, OS.MAC})
+    void shouldPreserveBothForkedDirectoriesWhenABackgroundProcessStillUsesOne() throws Exception {
+        try (WorkerFileCache cache = WorkerFileCache.open(tempDir.resolve("worker"), false, 0L);
+             WorkerWorkspaceRegistry.Workspace workspace = cache.createWorkspace(true)) {
+            Path childTmpDir = workspace.childTmpDir();
+            try {
+                writeSentinel(workspace.root());
+                writeSentinel(childTmpDir);
+                try (WorkerProcess fileUser = startBackgroundUser("fd", tempDir, childTmpDir.resolve(SENTINEL))) {
+                    workspace.close();
+
+                    assertPresent(workspace.root(), childTmpDir);
+                    fileUser.assertCanReadWorkspaceFile();
+                }
+            } finally {
+                deleteTestTree(childTmpDir);
+                deleteTestTree(workspace.root());
+            }
+        }
+    }
+
+    @Test
+    @EnabledOnOs({OS.LINUX, OS.MAC})
     void shouldPreserveForkedWorkspaceWhenWorkerHaltedWithAnUnresolvedLaunch() throws Exception {
         Path cacheDir = tempDir.resolve("worker");
         try (WorkspacePaths paths = haltWorker(cacheDir, "launching")) {
@@ -147,6 +214,39 @@ class WorkerWorkspaceRecoveryTest {
 
             assertThat(paths.inProcessRoot()).doesNotExist();
             assertPresent(paths.forkedRoot(), paths.childTmpDir());
+        }
+    }
+
+    @Test
+    @EnabledOnOs({OS.LINUX, OS.MAC})
+    void shouldPreserveWorkspaceWithAnUnattributedUnixSocketPath() throws Exception {
+        try (WorkerFileCache cache = WorkerFileCache.open(tempDir.resolve("worker"), false, 0L);
+             WorkerWorkspaceRegistry.Workspace workspace = cache.createWorkspace(true)) {
+            Path socket = workspace.childTmpDir().resolve("socket");
+            try {
+                try (ServerSocketChannel server = ServerSocketChannel.open(StandardProtocolFamily.UNIX)) {
+                    server.bind(UnixDomainSocketAddress.of(socket));
+                }
+                // A pathname alone cannot establish whether a listener opened it under a different name.
+                workspace.close();
+
+                assertThat(socket).exists();
+                assertThat(workspace.root()).exists();
+            } finally {
+                deleteTestTree(workspace.childTmpDir());
+                deleteTestTree(workspace.root());
+            }
+        }
+    }
+
+    @Test
+    @DisabledOnOs({OS.LINUX, OS.MAC})
+    void shouldDeferStartupCleanupWhenProcessReferencesCannotBeChecked() throws Exception {
+        Path cacheDir = tempDir.resolve("worker");
+        try (WorkspacePaths paths = haltWorker(cacheDir, "halt")) {
+            openCache(cacheDir);
+
+            assertPresent(paths.inProcessRoot(), paths.forkedRoot(), paths.childTmpDir());
         }
     }
 
@@ -199,6 +299,29 @@ class WorkerWorkspaceRecoveryTest {
                 .redirectOutput(log.toFile())
                 .start();
         return new WorkerProcess(process, log);
+    }
+
+    private WorkerProcess startBackgroundUser(String id, Path workingDirectory, Path heldFile) throws Exception {
+        Path ready = tempDir.resolve(id + ".ready");
+        Path log = tempDir.resolve(id + ".log");
+        String[] args = heldFile == null ? new String[] { ready.toString() }
+                : new String[] { ready.toString(), heldFile.toString() };
+        Process process = javaProcess(ForkedChildMain.class, args)
+                .directory(workingDirectory.toFile())
+                .redirectErrorStream(true)
+                .redirectOutput(log.toFile()).start();
+        WorkerProcess background = new WorkerProcess(process, log);
+        try {
+            background.awaitReady(ready);
+            return background;
+        } catch (Exception | AssertionError e) {
+            try {
+                background.close();
+            } catch (Exception cleanup) {
+                e.addSuppressed(cleanup);
+            }
+            throw e;
+        }
     }
 
     private ProcessBuilder javaProcess(Class<?> main, String... args) {
@@ -269,6 +392,17 @@ class WorkerWorkspaceRecoveryTest {
                     .as("worker exited (log at %s)", log).isTrue();
         }
 
+        void assertCanReadWorkspaceFile() throws IOException, InterruptedException {
+            process.getOutputStream().write(1);
+            process.getOutputStream().flush();
+            long deadline = System.nanoTime() + START_TIMEOUT.toNanos();
+            while (!Files.readAllLines(log).contains(SENTINEL) && process.isAlive() && System.nanoTime() < deadline) {
+                Thread.sleep(20);
+            }
+            assertThat(Files.readAllLines(log)).contains(SENTINEL);
+            assertThat(process.isAlive()).isTrue();
+        }
+
         void assertExitCode(int expected) throws IOException, InterruptedException {
             awaitExit();
             assertThat(process.exitValue()).as("worker output: %s", Files.readString(log)).isEqualTo(expected);
@@ -301,7 +435,7 @@ class WorkerWorkspaceRecoveryTest {
                     }
                     writeReady(Path.of(args[2]), List.of(inProcess.root().toString(), forked.root().toString(),
                             forked.childTmpDir().toString()));
-                    if ("hold".equals(mode)) {
+                    if ("hold".equals(mode) || "waitForKill".equals(mode)) {
                         Thread.sleep(HELPER_LIFETIME.toMillis());
                     } else {
                         Runtime.getRuntime().halt(HALTED);
@@ -318,8 +452,18 @@ class WorkerWorkspaceRecoveryTest {
 
     public static final class ForkedChildMain {
 
-        public static void main(String[] args) throws InterruptedException {
-            Thread.sleep(HELPER_LIFETIME.toMillis());
+        public static void main(String[] args) throws IOException, InterruptedException {
+            try (var heldFile = args.length == 2 ? Files.newInputStream(Path.of(args[1])) : null) {
+                if (args.length > 0) {
+                    Files.createFile(Path.of(args[0]));
+                    if (System.in.read() == -1) {
+                        return;
+                    }
+                    Path sentinel = args.length == 2 ? Path.of(args[1]) : Path.of("..", SENTINEL);
+                    System.out.println(Files.readString(sentinel));
+                }
+                Thread.sleep(HELPER_LIFETIME.toMillis());
+            }
         }
     }
 }
