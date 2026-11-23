@@ -24,6 +24,7 @@
 - Legacy global `citrus.test.distribution.cacheDir` / `CITRUS_DIST_CACHE_DIR` continues to govern coordinator/launcher defaults only and must not affect the worker cache default.
 - Blank (`null` or whitespace-only) system properties and environment variables are treated as unset and fall through; non-blank invalid values fail immediately with `IllegalArgumentException` (never silently falling back); blank CLI `=` values fail immediately with `IllegalArgumentException`.
 - Maximum single blob size remains `ClasspathPackager.MAX_BLOB_BYTES` (`256 MiB`); downloads stream in `64 KiB` chunks with explicit `try-with-resources` file handle closure prior to atomic promotion.
+- **Base is `1b4cb519ef` (PR #4).** It adds `<cacheDir>/classpath/<sha256>/<name>.jar` named JARs (hard link or copy of the blob, staged via `.staging-*.jar`), makes `forkMode=ALWAYS` the worker default (so `ForkedPartitionRunner` is the main path to verify), and centralizes JDBC column migrations in `JdbcDistributionStore.ensureColumns`. `WorkingDirectorySnapshot` is a nested record in `IsolatedPartitionRunner` with `take(Path root, Path excluded)`.
 
 ## Review Focus
 
@@ -32,6 +33,7 @@
 3. **Symlinked or relative `cacheDir` inside worker `user.dir` (including macOS `/var` -> `/private/var`):** `IsolatedPartitionRunner` must pass both `config.cacheDir()` and `cache.rootDir()` (or exclude canonicalized paths) when taking `WorkingDirectorySnapshot` so worker cache writes inside `user.dir` never trigger false-positive CWD mutation errors (pinned in Task 3).
 4. **Suffix case-sensitivity, whitespace, and non-binary/decimal units in `--cache-free-space-buffer-size`:** Outer/inner whitespace around valid suffixes (`" 512 MiB "`) is accepted, while lowercase (`"2gib"`), SI (`"2GB"`), fractional (`"1.5GiB"`), and negative (`"-1MiB"`) values throw `IllegalArgumentException` naming `KiB`, `MiB`, `GiB`, or integer bytes (pinned in Task 1).
 5. **Zero-buffer (`freeSpaceBufferBytes == 0`) or failed disk probe (`usableDiskBytes == -1`) in telemetry & stray files in `blobs/`:** `WorkerFileCache.statsSnapshot()` and `app.js` must never divide by `0` or report `lowDiskSpace = true` when `usableDiskBytes < 0` or `freeSpaceBufferBytes == 0`, and `BlobCacheDirectory.listBlobs()` must ignore `.DS_Store`, symlinks, and non-digest filenames instead of failing startup/eviction (pinned in Tasks 1, 2, and 4).
+6. **Named-JAR hard links defeating eviction (PR #4):** Evicting or invalidating a digest must delete both `blobs/<2-hex>/<sha256>` and `classpath/<sha256>/`. Otherwise the hard-linked `<name>.jar` keeps the inode alive, `usableSpace` never rises, and the loop wipes every unpinned blob while freeing nothing. Pinned digests must keep their named JAR, because `PartitionClassLoader` URLs and forked-child argfiles reference the named path, not the blob (pinned in Tasks 1 and 2).
 
 ---
 
@@ -40,12 +42,12 @@
 **Files:**
 - Modify: `tools/citrus-test-distribution-protocol/src/main/java/org/citrusframework/distribution/config/DistributionSettings.java`
 - Modify: `tools/citrus-test-distribution-protocol/src/main/java/org/citrusframework/distribution/cache/BlobCacheDirectory.java`
-- Create: `tools/citrus-test-distribution-protocol/src/main/java/org/citrusframework/distribution/protocol/WorkerCacheStats.java`
-- Modify: `tools/citrus-test-distribution-protocol/src/main/java/org/citrusframework/distribution/protocol/WorkerRegisterPayload.java`
-- Modify: `tools/citrus-test-distribution-protocol/src/main/java/org/citrusframework/distribution/protocol/WorkerHeartbeatPayload.java`
-- Modify: `tools/citrus-test-distribution-protocol/src/main/java/org/citrusframework/distribution/protocol/WorkerRecord.java`
+- Create: `tools/citrus-test-distribution-protocol/src/main/java/org/citrusframework/distribution/model/WorkerCacheStats.java`
+- Modify: `tools/citrus-test-distribution-protocol/src/main/java/org/citrusframework/distribution/model/WorkerRegisterPayload.java`
+- Modify: `tools/citrus-test-distribution-protocol/src/main/java/org/citrusframework/distribution/model/WorkerHeartbeatPayload.java`
+- Modify: `tools/citrus-test-distribution-protocol/src/main/java/org/citrusframework/distribution/model/WorkerRecord.java`
 - Modify: `tools/citrus-test-distribution-protocol/src/test/java/org/citrusframework/distribution/config/DistributionSettingsAndPathRewriterTest.java`
-- Create: `tools/citrus-test-distribution-protocol/src/test/java/org/citrusframework/distribution/cache/BlobCacheDirectoryTest.java`
+- Modify: `tools/citrus-test-distribution-protocol/src/test/java/org/citrusframework/distribution/cache/BlobCacheDirectoryTest.java` (exists since PR #4; add tests alongside the named-JAR tests)
 
 **Interfaces:**
 - Consumes: `ClasspathPackager.MAX_BLOB_BYTES`, `ClasspathPackager.sha256Hex(Path)`, `WorkerState`
@@ -79,7 +81,8 @@
   - `BlobCacheDirectory` types and methods:
     - `public record BlobEntry(String sha256, Path path, long sizeBytes, long lastModifiedMillis)`
     - `public List<BlobEntry> listBlobs() throws IOException`
-    - `public boolean delete(String sha256) throws IOException`
+    - `public boolean delete(String sha256) throws IOException` (also removes `classpath/<sha256>/`)
+    - `public int sweepClasspathStaging() throws IOException` (removes orphan `classpath/*/.staging-*.jar`)
 
 - [ ] **Step 1: Write failing unit tests for `DistributionSettings` worker cache precedence and parsers**
 
@@ -98,9 +101,10 @@ Add tests to `DistributionSettingsAndPathRewriterTest.java` covering:
 
 - [ ] **Step 2: Write failing unit tests for `BlobCacheDirectory.listBlobs`, `delete`, `moveIntoPlace` cleanup, and `WorkerCacheStats` JSON round-trip**
 
-Create `BlobCacheDirectoryTest.java` testing:
+Extend `BlobCacheDirectoryTest.java` (keep the PR #4 named-JAR tests) with:
 - `shouldListStoredBlobsIgnoringStrayFilesAndSymlinks`: stores two valid SHA-256 blobs, writes `<root>/blobs/.DS_Store`, `<root>/blobs/aa/not-a-digest.txt`, and (on POSIX) a symlink inside `<root>/blobs/aa/`; asserts `listBlobs()` returns only the two valid `BlobEntry` records with exact `sha256`, `path`, `sizeBytes`, and `lastModifiedMillis`.
 - `shouldDeleteExistingBlobAndReturnFalseWhenMissing`: asserts `delete(sha)` returns `true` then `false`, removing `<root>/blobs/<prefix>/<sha>` while rejecting malformed digest strings with `IllegalArgumentException`.
+- `shouldDeleteNamedJarDirectoryWithBlobAndSweepOrphanStaging`: materializes a JAR via `materializeForClasspath` (creating `classpath/<sha>/<name>.jar`), asserts `delete(sha)` removes both the blob and `classpath/<sha>/`, and on POSIX asserts the blob inode's link count drops to `0` (no surviving hard link). Leaves `classpath/<other>/.staging-x.jar` and asserts `sweepClasspathStaging()` deletes it while keeping published named JARs.
 - `shouldRoundTripWorkerCacheStatsAndLegacyPayloadsWithoutCacheStats`: verifies `DistributionJson.toJson` / `fromJson` round-trips `WorkerRegisterPayload`, `WorkerHeartbeatPayload`, and `WorkerRecord` both with populated `WorkerCacheStats` and when legacy JSON omits `"cacheStats"` (deserializing `cacheStats() == null`).
 
 - [ ] **Step 3: Run protocol tests to verify failure**
@@ -116,7 +120,7 @@ In `DistributionSettings.java`:
 - Implement `resolveFirstNonBlank(String propKey, String primaryEnvKey, String aliasEnvKey, UnaryOperator<String> prop, UnaryOperator<String> env)` returning the first trimmed non-empty string or `null`.
 
 In `BlobCacheDirectory.java`:
-- Add `BlobEntry` record, `delete(String sha256)` (`validateDigest(sha256)` + `Files.deleteIfExists(resolveBlobPath(sha256))`), and `listBlobs()` using `Files.walkFileTree(blobsDir, Set.of(), 2, visitor)` (no `FOLLOW_LINKS`) collecting regular files at depth 2 whose filename matches `SHA256_HEX` and matches parent 2-char prefix.
+- Add `BlobEntry` record, `delete(String sha256)` (`validateDigest(sha256)` + `Files.deleteIfExists(resolveBlobPath(sha256))` + recursive `NOFOLLOW_LINKS` delete of `rootDir.resolve("classpath").resolve(sha256)`, confined under `rootDir`), `sweepClasspathStaging()`, a reworded `namedJar` comment (workers no longer share a cache directory), and `listBlobs()` using `Files.walkFileTree(blobsDir, Set.of(), 2, visitor)` (no `FOLLOW_LINKS`) collecting regular files at depth 2 whose filename matches `SHA256_HEX` and matches parent 2-char prefix.
 - In `moveIntoPlace(Path tmp, Path target)`, record `boolean targetExisted = Files.exists(target, LinkOption.NOFOLLOW_LINKS)` before the `AtomicMoveNotSupportedException` fallback; if fallback `Files.move(tmp, target, StandardCopyOption.REPLACE_EXISTING)` throws `IOException` and `!targetExisted`, call `Files.deleteIfExists(target)` in catch before rethrowing.
 
 - [ ] **Step 5: Run protocol tests to verify pass**
@@ -176,6 +180,7 @@ Cover every P0/P1 invariant in `WorkerFileCacheTest.java`:
 - `shouldRollBackJvmLockSetWhenFileLockThrowsIoException`: tests package-private lock factory / simulated `IOException` during `open()` and verifies `ACTIVE_JVM_LOCKS` does not retain `canonicalDir`.
 - `shouldAlwaysSweepOrphanTmpFilesEvenWhenCacheCleanupDisabled`: creates `<dir>/tmp/dl-stale.tmp` and valid blob in `<dir>/blobs/..`, opens with `cacheCleanup = false` and `spaceProbe = p -> 0L`, asserts `dl-stale.tmp` is deleted while `<dir>/tmp` directory and valid blob survive.
 - `shouldDetectStampMismatchOnExternalSizeMtimeOrInodeMutation`: promotes a blob, verifies warm `verifyOrInvalidate` hit, then (a) overwrites bytes changing size, (b) overwrites same-length corrupt bytes with bumped `mtime`, and (c) replaces file via move-over (new inode / `fileKey` with restored `mtime`); asserts `verifyOrInvalidate` returns `null` and deletes the corrupt file in all three cases.
+- `shouldFreeNamedJarFootprintOnEvictionAndSweepStagingOnOpen`: materializes a JAR (named hard link under `classpath/<sha>/`), makes it the LRU candidate, triggers eviction with a fake `DiskSpaceProbe` that reports space freed only once the inode is gone (link count `0`), and asserts eviction stops after that one digest instead of draining every blob. Also asserts that a pinned digest keeps its `classpath/<sha>/<name>.jar`, and that `open()` sweeps orphan `.staging-*.jar` even with `cacheCleanup = false`.
 - `shouldEvictInExactSessionAccessOrderAndDeterministicRestartOrderWhilePreservingPinnedBlobs`:
   - Stores 4 blobs at fixed `Clock` instant, accesses blob 1 then blob 2 via `verifyOrInvalidate`, pins blob 3 (including duplicate digest in `pinAll(List.of(sha3, sha3))`), triggers `ensureFreeSpaceForDownload` -> blob 4 (untouched) evicts first, then blob 1, while pinned blob 3 is never evicted; closing `PinLease` unpins blob 3 cleanly on first `close()` (idempotent second `close()`).
   - Opens a fresh `WorkerFileCache` (simulating restart with tied `mtime`s) and verifies deterministic `sha256` ascending eviction order.
@@ -302,27 +307,27 @@ git commit -m "feat(distribution): stream worker blob downloads and wire shared 
 ### Task 4: Coordinator Persistence, Demo Seeder & Web UI Worker Cache Telemetry
 
 **Files:**
-- Modify: `tools/citrus-test-distribution-coordinator/src/main/java/org/citrusframework/distribution/broker/store/JdbcDistributionStore.java`
+- Modify: `tools/citrus-test-distribution-coordinator/src/main/java/org/citrusframework/distribution/store/JdbcDistributionStore.java`
 - Modify: `tools/citrus-test-distribution-coordinator/src/main/java/org/citrusframework/distribution/broker/BrokerSessionCoordinator.java`
-- Modify: `tools/citrus-test-distribution-coordinator/src/main/java/org/citrusframework/distribution/broker/demo/DemoDataSeeder.java`
-- Modify: `tools/citrus-test-distribution-coordinator/src/test/java/org/citrusframework/distribution/broker/store/JdbcDistributionStoreTest.java`
+- Modify: `tools/citrus-test-distribution-coordinator/src/main/java/org/citrusframework/distribution/broker/DemoDataSeeder.java`
+- Modify: `tools/citrus-test-distribution-coordinator/src/test/java/org/citrusframework/distribution/store/JdbcDistributionStoreTest.java`
 - Modify: `tools/citrus-test-distribution-coordinator/src/test/java/org/citrusframework/distribution/broker/BrokerSessionCoordinatorTest.java`
 - Modify: `tools/citrus-test-distribution-coordinator/src/test/java/org/citrusframework/distribution/broker/DistributionBrokerUiTest.java`
-- Modify: `tools/citrus-test-distribution-ui/src/main/resources/org/citrusframework/distribution/ui/dist-ui/app.js`
-- Modify: `tools/citrus-test-distribution-ui/src/main/resources/org/citrusframework/distribution/ui/dist-ui/styles.css`
+- Modify: `tools/citrus-test-distribution-ui/src/main/resources/META-INF/resources/dist-ui/app.js`
+- Modify: `tools/citrus-test-distribution-ui/src/main/resources/META-INF/resources/dist-ui/styles.css`
 - Modify: `tools/citrus-test-distribution-ui/src/test/java/org/citrusframework/distribution/ui/DistributionUiResourcesTest.java`
 
 **Interfaces:**
 - Consumes: `WorkerCacheStats`, `WorkerRegisterPayload.cacheStats()`, `WorkerHeartbeatPayload.cacheStats()`, `WorkerRecord.cacheStats()`
 - Produces:
-  - `JdbcDistributionStore`: `cache_stats_json VARCHAR(2048)` column in `dist_workers` DDL + additive `ensureWorkerColumns` `ALTER TABLE` migration + `upsertWorker` / `listWorkers` JSON serialization (`null`-safe).
+  - `JdbcDistributionStore`: `cache_stats_json VARCHAR(2048)` column in `dist_workers` DDL + additive migration via `additions.put("dist_workers", Map.of("cache_stats_json", "VARCHAR(2048)"))` in the existing generic `ensureColumns` + `upsertWorker` / `listWorkers` JSON serialization (`null`-safe).
   - `BrokerSessionCoordinator`: stores `volatile WorkerCacheStats cacheStats` on `WorkerConnection`, populates on `WORKER_REGISTER`, updates when non-null on `WORKER_HEARTBEAT`, and preserves across `persistWorker` / `abortSession`.
   - `DemoDataSeeder`: populates realistic `WorkerCacheStats` across all seeded demo workers (healthy warm caches, `--no-cache-cleanup`, and low-disk pressure with evictions).
   - `app.js` & `styles.css`: `renderWorkerCacheTelemetry(w)` inside `Workers Pool` cards (`AUTO LRU` / `NO CLEANUP` badge, `LOW DISK` badge, cached bytes + blob count, usable disk vs buffer progress bar with safe `0`-buffer / `-1`-unknown guards, `evictedBlobsTotal`, and muted fallback when `cacheStats == null`), `LOW_DISK` filter pill in `Workers Pool`, and compact `LOW DISK` badge in `Overview` (`Worker Pool Health`).
 
 - [ ] **Step 1: Write failing tests in `JdbcDistributionStoreTest`, `BrokerSessionCoordinatorTest`, `DistributionBrokerUiTest`, and `DistributionUiResourcesTest`**
 
-- In `JdbcDistributionStoreTest.java`: verify `upsertWorker` + `listWorkers` round-trips both `null` and non-null `WorkerCacheStats`, and verify opening a `JdbcDistributionStore` over a pre-existing `dist_workers` table lacking `cache_stats_json` migrates cleanly via `ensureWorkerColumns`.
+- In `JdbcDistributionStoreTest.java`: verify `upsertWorker` + `listWorkers` round-trips both `null` and non-null `WorkerCacheStats`, and verify opening a `JdbcDistributionStore` over a pre-existing `dist_workers` table lacking `cache_stats_json` migrates cleanly via `ensureColumns`.
 - In `BrokerSessionCoordinatorTest.java`: verify `WORKER_REGISTER` stores initial `WorkerCacheStats`, `WORKER_HEARTBEAT` updates `cacheStats` when present and retains prior `cacheStats` when `hb.cacheStats() == null`, and `abortSession` preserves `cacheStats`.
 - In `DistributionBrokerUiTest.java`: verify `/api/v1/demo/seed` followed by `GET /api/v1/workers` returns workers containing `cacheStats` including both `"lowDiskSpace":true` and `"cleanupEnabled":false` examples.
 - In `DistributionUiResourcesTest.java`: assert `app.js` and `styles.css` include `renderWorkerCacheTelemetry`, `lowDiskSpace`, `freeSpaceBufferBytes`, `evictedBlobsTotal`, and `.worker-cache-panel` styling.
@@ -462,11 +467,11 @@ Expected: PASS (`0` failures).
 - [ ] **Step 3: Update `src/manual/tools-test-distribution.adoc` and commit feature docs + E2E tests**
 
 Update `src/manual/tools-test-distribution.adoc`:
-- In `== Worker Pool and Citrus Agent Mode` (around lines 306–329), show `--cache-dir`, `--[no-]cache-cleanup`, and `--cache-free-space-buffer-size` on both `citrus dist worker start` and `citrus-agent.jar --mode worker`, and add an admonition warning that sharing a local file cache directory across multiple workers on the same host is not supported (workers enforce an exclusive `.lock` and require distinct `--cache-dir` paths or container isolation when running >1 worker per host).
-- In `== Configuration Reference` (around lines 468–499):
+- In `== Worker Pool and Citrus Agent Mode` (starts line 309), show `--cache-dir`, `--[no-]cache-cleanup`, and `--cache-free-space-buffer-size` on both `citrus dist worker start` and `citrus-agent.jar --mode worker`, and add an admonition warning that sharing a local file cache directory across multiple workers on the same host is not supported (workers enforce an exclusive `.lock` and require distinct `--cache-dir` paths or container isolation when running >1 worker per host).
+- In `== Configuration Reference` (around lines 475–500):
   - Replace the stale sentence `Workers keep their own cache in <cacheDir>/worker...` with the dedicated worker cache default `${user.home}/.citrus-test-distribution-agent/file-cache` and note that `citrus.test.distribution.cacheDir` governs only coordinator/launcher caches.
   - Add rows to `=== Worker settings` for `citrus.test.distribution.worker.cacheDir` (`CITRUS_DIST_WORKER_CACHE_DIR` / `TEST_DISTRIBUTION_AGENT_CACHE_DIR`, default `${user.home}/.citrus-test-distribution-agent/file-cache`), `citrus.test.distribution.worker.cacheCleanup` (`CITRUS_DIST_WORKER_CACHE_CLEANUP` / `TEST_DISTRIBUTION_AGENT_CACHE_CLEANUP`, default `true`), and `citrus.test.distribution.worker.cacheFreeSpaceBufferSize` (`CITRUS_DIST_WORKER_CACHE_FREE_SPACE_BUFFER_SIZE` / `TEST_DISTRIBUTION_AGENT_CACHE_FREE_SPACE_BUFFER_SIZE`, default `2GiB`, supporting `KiB`, `MiB`, `GiB`, or bytes, with shared-drive sizing guidance).
-- In `== Known Limitations` (around line 515), remove `* Worker caches are not evicted automatically.` and note cross-restart tie-breaking is deterministic approximate LRU when filesystem `mtime`s tie.
+- In `== Known Limitations` (around line 531), remove `* Worker caches are not evicted automatically.` and note cross-restart tie-breaking is deterministic approximate LRU when filesystem `mtime`s tie.
 
 Commit E2E tests and manual updates:
 ```bash

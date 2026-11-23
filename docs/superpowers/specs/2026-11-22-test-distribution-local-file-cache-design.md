@@ -1,7 +1,9 @@
 # Test Distribution Worker Local File Cache — Design Specification
 
 **Date:** 2026-11-22
-**Target Branch Base:** `origin/incubator/test-distribution` (`f325b94e5d`)
+**Target Branch Base:** `origin/incubator/test-distribution` (`1b4cb519ef`, after PR #4 "run the full repo distributed with parity to local")
+
+> **Rebase note (2026-11-23):** PR #4 changed three things this design depends on. (a) `BlobCacheDirectory.materializeForClasspath` now publishes each JAR under its original file name as `<cacheDir>/classpath/<sha256>/<name>.jar`: a hard link to the blob, or a copy where links are unsupported. It stages through `.staging-*.jar` temp files. (b) The default worker fork mode is now `ALWAYS`, so `ForkedPartitionRunner` is the main execution path. (c) `JdbcDistributionStore` migrates columns through one generic `ensureColumns` `additions` map. Sections 5.3, 5.4, 5.6, and 5.7 below are updated for these changes.
 **Status:** Approved
 
 ---
@@ -125,7 +127,14 @@ This feature implements a **Worker Local File Cache**: a deterministic user-home
   blobs/
     <2-hex-prefix>/
       <64-hex-sha256>         # Immutable content-addressed artifact files
+  classpath/
+    <64-hex-sha256>/
+      <name>.jar              # Named JAR (PR #4): hard link to blobs/../<sha256>, or a copy if links are unsupported
+      .staging-*.jar          # Transient publish staging; orphans swept on open()
+  extracted/ ...              # Per-partition workspace extraction (unchanged, outside cache accounting)
 ```
+
+- **Named JARs are part of a digest's footprint:** Deleting only `blobs/<2-hex>/<sha256>` frees **no** disk space while the `classpath/<sha256>/<name>.jar` hard link still exists, and a copy fallback doubles the footprint. Every digest removal (eviction or corrupt-blob invalidation) therefore deletes `blobs/<2-hex>/<sha256>` **and** the whole `classpath/<sha256>/` directory, and pinning a digest also protects its named JAR.
 
 - **Lock Acquisition & Partial-Open Rollback (`WorkerFileCache.open()`):**
   - Resolves `canonicalDir = Files.createDirectories(cacheDir).toRealPath()`.
@@ -148,7 +157,9 @@ This feature implements a **Worker Local File Cache**: a deterministic user-home
 - `record BlobEntry(String sha256, Path path, long sizeBytes, long lastModifiedMillis)`
 - `List<BlobEntry> listBlobs()` — walks `blobs/` (`Files.walkFileTree`, `maxDepth = 2`, `Set.of()` no symlink following), reusing `visitFile(Path, BasicFileAttributes)` directly (1 stat per file), ignoring non-digest filenames and benign `NoSuchFileException`.
 - `Optional<BasicFileAttributes> touchAndStat(String sha256, Instant timestamp)` / `touch(String sha256, Instant timestamp)` — updates `Files.setLastModifiedTime` on `blobs/<2-hex>/<sha256>` (`NOFOLLOW_LINKS`) if regular file exists.
-- `boolean delete(String sha256)` — deletes `blobs/<2-hex>/<sha256>` if present and best-effort prunes empty `<2-hex>` directory (`DirectoryNotEmptyException` ignored).
+- `boolean delete(String sha256)` — deletes `blobs/<2-hex>/<sha256>` if present, then recursively deletes `classpath/<sha256>/` (named JAR links/copies and staging files, `NOFOLLOW_LINKS`, confined under `rootDir`), and best-effort prunes empty `<2-hex>` directory (`DirectoryNotEmptyException` ignored). Returns `true` if the blob file existed.
+- `int sweepClasspathStaging()` — deletes orphan `classpath/*/.staging-*.jar` files left by a crash during named-JAR publishing; runs on `WorkerFileCache.open()` alongside the `tmp/` sweep.
+- The existing comment in `namedJar` ("Several worker JVMs may share the cache directory") is reworded: worker JVMs no longer share a cache directory once `.lock` ownership is enforced. Only the owning worker and its forked children (which read named-JAR paths but never write the cache) touch it.
 - `int sweepTempFiles()` — strictly confined to `rootDir.resolve("tmp")` with `LinkOption.NOFOLLOW_LINKS` (never touching `blobs/` or `.lock`); deletes leftover children inside `tmp/` while keeping `tmp/` itself, logging `WARN` and continuing on any per-entry `IOException`. Runs unconditionally on `WorkerFileCache.open()`, even when `--no-cache-cleanup` is set.
 - **Non-Atomic Move Fallback Hardening:** In `BlobCacheDirectory.moveIntoPlace(tmp, target)`, if `ATOMIC_MOVE` throws `AtomicMoveNotSupportedException` and the fallback `Files.move(tmp, target, REPLACE_EXISTING)` fails with `IOException`, delete any partial `target` (`Files.deleteIfExists(target)`) before rethrowing (unless `target` already existed with valid content).
 
@@ -183,6 +194,7 @@ This feature implements a **Worker Local File Cache**: a deterministic user-home
 - **Byte-Batched LRU Eviction (`evictIfNeeded(long additionalBytesRequired)`):**
   - Default `DiskSpaceProbe` caches the resolved `FileStore` for `canonicalDir` (falling back to `Files.getFileStore(canonicalDir)` if needed) so probing calls `FileStore.getUsableSpace()` (`statvfs`) directly without re-parsing `/proc/mounts` on Linux.
   - Deficit check (overflow-safe): `deficit = freeSpaceBufferBytes - usableSpace + additionalBytesRequired` (using saturating `Math` arithmetic). If `deficit <= 0`, returns immediately without walking `blobs/`.
+  - Eviction removes a digest via `blobCache.delete(sha256)`, which also drops `classpath/<sha256>/`. Without that, hard-linked named JARs would keep the inode alive and the loop would delete every candidate while freeing nothing.
   - Walks `blobCache.listBlobs()`, excludes digests in `pinnedCounts`, and sorts candidates by `(lastModifiedMillis ASC, accessSequence ASC, sha256 ASC)`.
   - Deletes candidates while accumulating `freedBytes += entry.sizeBytes()`, re-probing `diskSpaceProbe.usableSpace(canonicalDir)` only once `freedBytes >= deficit` or every `64` deletions (plus a final verification probe before exiting), keeping syscalls bounded even at `100k+` small blobs.
   - **Soft Buffer Shortfall vs Hard `ENOSPC`:** If unpinned candidates are exhausted while `usableSpace` remains below `freeSpaceBufferBytes + additionalBytesRequired`, logs a single rate-limited `WARN` per shortage episode (resetting once `usableSpace >= freeSpaceBufferBytes`) and returns so the partition may still succeed if actual free space suffices; actual `ENOSPC` fails at write time with `IOException`, cleans up `tmp/` and `partitionRoot` in `finally`, and fails the partition cleanly without crashing the worker daemon.
@@ -193,11 +205,11 @@ This feature implements a **Worker Local File Cache**: a deterministic user-home
   - `public record WorkerCacheStats(boolean cleanupEnabled, long freeSpaceBufferBytes, int blobCount, long cachedBytes, long usableDiskBytes, long evictedBlobsTotal, boolean lowDiskSpace)` — intentionally omits host `cacheDir` paths so filesystem layout is never exposed via `/api/v1/workers`.
   - `WorkerRegisterPayload`, `WorkerHeartbeatPayload`, and `WorkerRecord` gain nullable trailing `WorkerCacheStats cacheStats` fields while preserving backward-compatible convenience constructors (`null` `cacheStats`) for older workers and existing callers.
 - **`O(1)` Worker Snapshot (`WorkerFileCache.statsSnapshot()`):**
-  - `WorkerFileCache` seeds `blobCount` and `cachedBytes` once during `open()` and maintains `blobCount`, `cachedBytes`, and `evictedBlobsTotal` incrementally under `evictionLock` across download promotion, forked output staging, corrupt-blob removal, and eviction — performing **zero** `listBlobs()` directory walks on heartbeats.
+  - `WorkerFileCache` seeds `blobCount` and `cachedBytes` once during `open()` and maintains `blobCount`, `cachedBytes`, and `evictedBlobsTotal` incrementally under `evictionLock` across download promotion, forked output staging, corrupt-blob removal, and eviction — performing **zero** `listBlobs()` directory walks on heartbeats. `cachedBytes` counts blob bytes only. Hard-linked named JARs share the blob inode. Copy-fallback named JARs (filesystems without hard links) are not counted, which is an accepted under-count.
   - `statsSnapshot()` queries `spaceProbe.usableBytes(canonicalDir)` (returning `-1L` if `IOException` occurs so heartbeats never fail) and sets `lowDiskSpace = usableDiskBytes >= 0 && freeSpaceBufferBytes > 0 && usableDiskBytes < freeSpaceBufferBytes`.
   - `DistributionWorkerClient` attaches `workerCache.statsSnapshot()` to `WorkerRegisterPayload` and `WorkerHeartbeatPayload`.
 - **Coordinator Persistence & Demo Seeding (`citrus-test-distribution-coordinator`):**
-  - `JdbcDistributionStore` adds `cache_stats_json VARCHAR(2048)` to `dist_workers` (including additive `ALTER TABLE` migration in `ensureWorkerColumns`) and round-trips `WorkerRecord.cacheStats()`.
+  - `JdbcDistributionStore` adds `cache_stats_json VARCHAR(2048)` to the `dist_workers` DDL, plus an additive migration registered as `additions.put("dist_workers", Map.of("cache_stats_json", "VARCHAR(2048)"))` in the existing generic `ensureColumns`, and round-trips `WorkerRecord.cacheStats()`.
   - `BrokerSessionCoordinator` records `cacheStats` on registration, updates it on heartbeats when non-null, and preserves it across state transitions.
   - `DemoDataSeeder` populates realistic `WorkerCacheStats` across demo workers (healthy warm caches, `--no-cache-cleanup`, and low-disk pressure with evictions).
 - **Web UI (`citrus-test-distribution-ui`):**
