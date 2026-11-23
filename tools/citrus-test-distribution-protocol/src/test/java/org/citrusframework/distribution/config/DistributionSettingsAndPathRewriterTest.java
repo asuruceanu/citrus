@@ -44,6 +44,41 @@ class DistributionSettingsAndPathRewriterTest {
     private static final String TOKEN = DistributionSettings.WORKSPACE_TOKEN;
 
     @Test
+    void shouldResolveAdaptiveBrokerSettingsFromSystemProperties() {
+        String duration = DistributionSettings.BROKER_MIN_PARTITION_DURATION_MS_PROPERTY;
+        String waves = DistributionSettings.BROKER_MAX_WAVES_PER_WORKER_PROPERTY;
+        String previousDuration = System.getProperty(duration);
+        String previousWaves = System.getProperty(waves);
+        try {
+            System.setProperty(duration, "4500");
+            System.setProperty(waves, "3");
+            assertThat(DistributionSettings.getBrokerMinPartitionDurationMs()).isEqualTo(4_500L);
+            assertThat(DistributionSettings.getBrokerMaxWavesPerWorker()).isEqualTo(3);
+
+            System.setProperty(duration, "-1");
+            System.setProperty(waves, "-1");
+            assertThat(DistributionSettings.getBrokerMinPartitionDurationMs()).isZero();
+            assertThat(DistributionSettings.getBrokerMaxWavesPerWorker()).isZero();
+
+            System.setProperty(duration, "invalid");
+            System.setProperty(waves, "invalid");
+            assertThat(DistributionSettings.getBrokerMinPartitionDurationMs()).isEqualTo(5_000L);
+            assertThat(DistributionSettings.getBrokerMaxWavesPerWorker()).isEqualTo(2);
+        } finally {
+            restoreProperty(duration, previousDuration);
+            restoreProperty(waves, previousWaves);
+        }
+    }
+
+    private static void restoreProperty(String key, String previous) {
+        if (previous == null) {
+            System.clearProperty(key);
+        } else {
+            System.setProperty(key, previous);
+        }
+    }
+
+    @Test
     void shouldReturnOnlyExplicitPositiveMaxPartitionSizes() {
         UnaryOperator<String> unset = key -> null;
         assertThat(DistributionSettings.findConfiguredMaxPartitionSize(unset, unset)).isEmpty();

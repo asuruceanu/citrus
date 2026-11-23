@@ -66,6 +66,15 @@ public final class DistributionSettings {
     public static final String MAX_PARTITION_SIZE_ENV = "CITRUS_DIST_MAX_PARTITION_SIZE";
     public static final int DEFAULT_MAX_PARTITION_SIZE = 5;
 
+    public static final String BROKER_MIN_PARTITION_DURATION_MS_PROPERTY =
+            "citrus.test.distribution.broker.minPartitionDurationMs";
+    public static final String BROKER_MIN_PARTITION_DURATION_MS_ENV = "CITRUS_DIST_BROKER_MIN_PARTITION_DURATION_MS";
+    public static final long DEFAULT_BROKER_MIN_PARTITION_DURATION_MS = 5_000L;
+
+    public static final String BROKER_MAX_WAVES_PER_WORKER_PROPERTY = "citrus.test.distribution.broker.maxWavesPerWorker";
+    public static final String BROKER_MAX_WAVES_PER_WORKER_ENV = "CITRUS_DIST_BROKER_MAX_WAVES_PER_WORKER";
+    public static final int DEFAULT_BROKER_MAX_WAVES_PER_WORKER = 2;
+
     public static final String MIN_REMOTE_DURATION_MS_PROPERTY = "citrus.test.distribution.minRemoteDurationMs";
     public static final String MIN_REMOTE_DURATION_MS_ENV = "CITRUS_DIST_MIN_REMOTE_DURATION_MS";
     public static final long DEFAULT_MIN_REMOTE_DURATION_MS = 2_000L;
@@ -396,6 +405,16 @@ public final class DistributionSettings {
     public static int getMinRemoteColdUnits(UnaryOperator<String> prop, UnaryOperator<String> env) {
         String raw = getString(prop, env, MIN_REMOTE_COLD_UNITS_PROPERTY, MIN_REMOTE_COLD_UNITS_ENV, null);
         return Math.max(0, parseInt(raw, DEFAULT_MIN_REMOTE_COLD_UNITS));
+    }
+
+    public static long getBrokerMinPartitionDurationMs() {
+        return Math.max(0L, getLong(BROKER_MIN_PARTITION_DURATION_MS_PROPERTY, BROKER_MIN_PARTITION_DURATION_MS_ENV,
+                DEFAULT_BROKER_MIN_PARTITION_DURATION_MS));
+    }
+
+    public static int getBrokerMaxWavesPerWorker() {
+        return Math.max(0, getInt(BROKER_MAX_WAVES_PER_WORKER_PROPERTY, BROKER_MAX_WAVES_PER_WORKER_ENV,
+                DEFAULT_BROKER_MAX_WAVES_PER_WORKER));
     }
 
     public static int getMaxRetries() {

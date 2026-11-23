@@ -16,6 +16,8 @@
 
 package org.citrusframework.distribution.store;
 
+import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
@@ -23,11 +25,13 @@ import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 
 import org.apache.commons.dbcp2.BasicDataSource;
 import org.citrusframework.distribution.config.DistributionJson;
@@ -816,24 +820,40 @@ public class JdbcDistributionStore implements DistributionStore {
         if (workUnitKeys == null || workUnitKeys.isEmpty()) {
             return Map.of();
         }
+        int runLimit = Math.max(1, recentLimit);
         Map<String, Long> durations = new LinkedHashMap<>();
-        String sql = "SELECT duration_ms FROM dist_test_executions WHERE work_unit_key=? AND status IN ('PASSED','FAILED') " +
-                "ORDER BY recorded_at DESC";
+        // Older records can lack a session ID. Treat each of those records as an independent run.
+        String sql = """
+                SELECT session_id, COALESCE(attempt, 1) AS run_attempt,
+                       CASE WHEN TRIM(COALESCE(session_id, '')) = '' THEN id ELSE NULL END AS legacy_id,
+                       SUM(CASE WHEN duration_ms > 0 THEN CAST(duration_ms AS DECIMAL(38, 0)) ELSE 0 END) AS total_ms,
+                       MAX(recorded_at) AS last_recorded_at
+                FROM dist_test_executions
+                WHERE work_unit_key = ? AND status IN ('PASSED', 'FAILED')
+                GROUP BY session_id, COALESCE(attempt, 1),
+                         CASE WHEN TRIM(COALESCE(session_id, '')) = '' THEN id ELSE NULL END
+                ORDER BY last_recorded_at DESC NULLS LAST, run_attempt DESC, session_id, legacy_id
+                """;
         try (Connection conn = dataSource.getConnection();
              PreparedStatement ps = conn.prepareStatement(sql)) {
-            ps.setMaxRows(Math.max(1, recentLimit));
             for (String key : workUnitKeys) {
                 ps.setString(1, key);
-                long sum = 0L;
+                Set<String> seenSessions = new HashSet<>();
+                BigDecimal sum = BigDecimal.ZERO;
                 int count = 0;
                 try (ResultSet rs = ps.executeQuery()) {
-                    while (rs.next()) {
-                        sum += Math.max(1L, rs.getLong(1));
+                    while (count < runLimit && rs.next()) {
+                        String sessionId = rs.getString("session_id");
+                        if (sessionId != null && !sessionId.isBlank() && !seenSessions.add(sessionId)) {
+                            continue;
+                        }
+                        sum = sum.add(rs.getBigDecimal("total_ms").max(BigDecimal.ONE));
                         count++;
                     }
                 }
                 if (count > 0) {
-                    durations.put(key, sum / count);
+                    BigDecimal average = sum.divide(BigDecimal.valueOf(count), 0, RoundingMode.HALF_UP);
+                    durations.put(key, average.min(BigDecimal.valueOf(Long.MAX_VALUE)).longValueExact());
                 }
             }
             return durations;

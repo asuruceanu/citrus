@@ -20,6 +20,7 @@ import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.stream.IntStream;
 
 import org.citrusframework.distribution.config.DistributionJson;
 import org.citrusframework.distribution.config.DistributionSettings;
@@ -79,6 +80,91 @@ class BrokerSessionCoordinatorTest {
         store.initialize();
         hub = new BrokerEventStreamHub();
         coordinator = new BrokerSessionCoordinator(config, store, hub);
+    }
+
+    @Test
+    void shouldPackFastUnitsAdaptivelyWhenSessionMaxPartitionSizeIsDefaultZero() {
+        assertFastUnitsScheduled(0, List.of(), 12, 1);
+    }
+
+    @Test
+    void shouldHonorExplicitPositiveSessionMaxPartitionSizeWithoutAdaptivePacking() {
+        assertFastUnitsScheduled(2, List.of(), 6, 3);
+    }
+
+    @Test
+    void shouldPreservePartitionSizeCapForDeclaredOutputs() {
+        assertFastUnitsScheduled(0, List.of("target/docs"), 12, 2);
+    }
+
+    @Test
+    void shouldCapWavesByDistinctEligibleOnlineWorkersIncludingBusyWorkers() {
+        coordinator = new BrokerSessionCoordinator(DistributionBrokerConfig.builder()
+                .defaultMaxPartitionSize(2)
+                .minPartitionDurationMs(0L)
+                .maxWavesPerWorker(2)
+                .build(), store, hub);
+        Map<String, String> docker = Map.of("docker", "true");
+        Worker busy = register("docker-one", "worker-one", docker);
+        String busySession = newSession(0);
+        submit(busySession, "sub-busy", List.of(), List.of(), false,
+                new WorkUnitSpec("pkg.BusyTest", "pkg.BusyTest", null, null, docker, 1_000L));
+        assertThat(busy.assignments()).hasSize(1);
+
+        register("docker-two", "worker-two", docker);
+        register("docker-duplicate", "worker-two", docker);
+        register("docker-draining", "worker-three", docker).send(WorkerWsMessage.WORKER_DRAINING, Map.of());
+        register("no-docker", "worker-four", Map.of());
+
+        String sessionId = coordinator.createSession(
+                new CreateSessionRequest("citrus", "main", "abc", List.of(), 0, 0)).sessionId();
+        WorkUnitSpec[] units = IntStream.range(0, 12).mapToObj(i -> {
+            String key = "pkg.DockerTest" + i;
+            return new WorkUnitSpec(key, key, null, null, docker, 1_000L);
+        }).toArray(WorkUnitSpec[]::new);
+        submit(sessionId, "sub-docker", List.of(), List.of(), false, units);
+
+        assertThat(store.listPartitions(sessionId)).hasSize(4)
+                .allSatisfy(partition -> assertThat(partition.workUnits()).hasSize(3));
+    }
+
+    @Test
+    void shouldResolveAdaptiveSettingsThroughBrokerConfigBuilder() {
+        String property = DistributionBrokerConfig.MIN_PARTITION_DURATION_MS_PROPERTY;
+        String previous = System.getProperty(property);
+        try {
+            System.setProperty(property, "4500");
+            assertThat(DistributionBrokerConfig.builder().build().minPartitionDurationMs()).isEqualTo(4_500L);
+            assertThat(DistributionBrokerConfig.fromSettings().minPartitionDurationMs()).isEqualTo(4_500L);
+            DistributionBrokerConfig disabled = DistributionBrokerConfig.builder()
+                    .minPartitionDurationMs(-1L).maxWavesPerWorker(-1).build();
+            assertThat(disabled.minPartitionDurationMs()).isZero();
+            assertThat(disabled.maxWavesPerWorker()).isZero();
+        } finally {
+            if (previous == null) {
+                System.clearProperty(property);
+            } else {
+                System.setProperty(property, previous);
+            }
+        }
+    }
+
+    private void assertFastUnitsScheduled(int requestedSize, List<String> outputs, int unitCount, int expectedPartitions) {
+        String sessionId = coordinator.createSession(
+                new CreateSessionRequest("citrus", "main", "abc", List.of(), requestedSize, 1)).sessionId();
+        register("one", "worker-one", WORKSPACE_CAPS);
+        register("two", "worker-two", WORKSPACE_CAPS);
+
+        WorkUnitSpec[] units = IntStream.range(0, unitCount).mapToObj(i -> {
+            WorkUnitSpec unit = unit("pkg.FastTest" + i);
+            store.saveTestExecution(new TestExecutionRecord("historical-" + i, "history", "part", "worker",
+                    unit.key(), unit.className(), "test", TestOutcomeStatus.PASSED, 200L, 1,
+                    false, null, null, List.of(), 1L));
+            return unit;
+        }).toArray(WorkUnitSpec[]::new);
+        submit(sessionId, "sub-fast", List.of(), outputs, false, units);
+
+        assertThat(store.listPartitions(sessionId)).hasSize(expectedPartitions);
     }
 
     @Test

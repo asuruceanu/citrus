@@ -21,6 +21,7 @@ import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
@@ -107,7 +108,7 @@ public final class BrokerSessionCoordinator {
             store.saveChangedFiles(sessionId, request.changedFiles());
         }
 
-        sessions.put(sessionId, new SessionRuntime(record, maxPartSize, maxRetries));
+        sessions.put(sessionId, new SessionRuntime(record, maxPartSize, maxRetries, request.maxPartitionSize()));
         eventHub.publish("session.created", sessionId, null, null, Map.of(
                 "projectName", record.projectName(),
                 "status", record.status().name()));
@@ -144,6 +145,8 @@ public final class BrokerSessionCoordinator {
         List<String> keys = units.stream().map(WorkUnitSpec::key).toList();
         Map<String, Long> historicalDurations = store.findHistoricalDurationsMs(keys, 10);
 
+        boolean adaptive = session.requestedMaxPartitionSize <= 0 && request.outputPaths().isEmpty();
+
         // Schedule before touching any state: an invalid SINGLE submission must leave no trace.
         List<PartitionRecord> scheduled = scheduler.schedule(
                 sessionId,
@@ -151,7 +154,10 @@ public final class BrokerSessionCoordinator {
                 historicalDurations,
                 config.defaultDurationMs(),
                 session.maxPartitionSize,
-                request.partitionPolicy());
+                request.partitionPolicy(),
+                adaptive ? config.minPartitionDurationMs() : 0L,
+                adaptive ? config.maxWavesPerWorker() : 0,
+                this::countEligibleOnlineWorkers);
 
         session.cachedBlobs += Math.max(0, request.cachedBlobs());
         session.uploadedBlobs += Math.max(0, request.uploadedBlobs());
@@ -491,6 +497,19 @@ public final class BrokerSessionCoordinator {
 
     public List<TestHistorySummary> listTestHistory(int limit) {
         return store.listTestHistory(limit);
+    }
+
+    public Map<String, Long> findHistoricalDurations(List<String> testKeys, int limit) {
+        if (testKeys == null || testKeys.isEmpty()) {
+            return Map.of();
+        }
+        List<String> keys = testKeys.stream()
+                .filter(Objects::nonNull)
+                .filter(key -> !key.isBlank())
+                .distinct()
+                .toList();
+        int recentLimit = limit <= 0 ? 10 : Math.min(limit, 100);
+        return store.findHistoricalDurationsMs(keys, recentLimit);
     }
 
     public int seedDemoData() {
@@ -935,6 +954,17 @@ public final class BrokerSessionCoordinator {
                 capabilities, unit.estimatedDurationMs(), unit.enclosingClassNames());
     }
 
+    private int countEligibleOnlineWorkers(Map<String, String> requiredCapabilities) {
+        long aliveSince = System.currentTimeMillis() - config.leaseTimeoutMs();
+        return (int) workers.values().stream()
+                .filter(conn -> conn.state == WorkerState.IDLE || conn.state == WorkerState.BUSY)
+                .filter(conn -> conn.cancelledPartitionId == null && conn.lastHeartbeatAt >= aliveSince)
+                .filter(conn -> CapabilityMatcher.matches(requiredCapabilities, conn.capabilities))
+                .map(conn -> conn.workerId)
+                .distinct()
+                .count();
+    }
+
     /**
      * An idle worker that is not finishing a cancelled attempt, has been heard from within the lease timeout, and
      * satisfies {@code requiredCapabilities}. Workers outside {@code preferAvoiding} (those that ran earlier attempts
@@ -1105,10 +1135,10 @@ public final class BrokerSessionCoordinator {
             return null;
         }
         BuildSessionRecord record = stored.get();
+        // The original requested size is unavailable after restart. Retain the previous fixed-size default.
+        int defaultPartitionSize = config.defaultMaxPartitionSize();
         SessionRuntime rehydrated = new SessionRuntime(
-                record,
-                config.defaultMaxPartitionSize(),
-                config.defaultMaxRetries());
+                record, defaultPartitionSize, config.defaultMaxRetries(), Math.max(1, defaultPartitionSize));
         rehydrated.cachedBlobs = Math.max(0, record.cachedBlobs());
         rehydrated.uploadedBlobs = Math.max(0, record.totalBlobs() - record.cachedBlobs());
         Set<String> seenPartitionIds = new HashSet<>();
@@ -1155,6 +1185,7 @@ public final class BrokerSessionCoordinator {
         private BuildSessionRecord record;
         private final int maxPartitionSize;
         private final int maxRetries;
+        private final int requestedMaxPartitionSize;
         private final List<String> partitionIds = new ArrayList<>();
         private final Set<String> failedOrInterruptedTests = new HashSet<>();
         private final Map<String, TestExecutionRecord> latestExecutionsByTest = new LinkedHashMap<>();
@@ -1166,10 +1197,11 @@ public final class BrokerSessionCoordinator {
         private int submittedUnitCount;
         private int reportedLocalTestCount;
 
-        private SessionRuntime(BuildSessionRecord record, int maxPartitionSize, int maxRetries) {
+        private SessionRuntime(BuildSessionRecord record, int maxPartitionSize, int maxRetries, int requestedMaxPartitionSize) {
             this.record = record;
             this.maxPartitionSize = maxPartitionSize;
             this.maxRetries = maxRetries;
+            this.requestedMaxPartitionSize = requestedMaxPartitionSize;
         }
 
         /**

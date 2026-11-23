@@ -24,6 +24,8 @@ import java.net.http.WebSocket;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.BlockingQueue;
@@ -39,6 +41,8 @@ import org.citrusframework.distribution.model.ArtifactRef;
 import org.citrusframework.distribution.model.BuildSessionResponse;
 import org.citrusframework.distribution.model.CompleteSessionRequest;
 import org.citrusframework.distribution.model.CreateSessionRequest;
+import org.citrusframework.distribution.model.HistoricalDurationsRequest;
+import org.citrusframework.distribution.model.HistoricalDurationsResponse;
 import org.citrusframework.distribution.model.MissingDigestsRequest;
 import org.citrusframework.distribution.model.MissingDigestsResponse;
 import org.citrusframework.distribution.model.PartitionAssignPayload;
@@ -50,6 +54,7 @@ import org.citrusframework.distribution.model.SessionDetailResponse;
 import org.citrusframework.distribution.model.SessionStatus;
 import org.citrusframework.distribution.model.SubmitWorkRequest;
 import org.citrusframework.distribution.model.SubmitWorkResponse;
+import org.citrusframework.distribution.model.TestExecutionRecord;
 import org.citrusframework.distribution.model.TestHistorySummary;
 import org.citrusframework.distribution.model.TestOutcomeStatus;
 import org.citrusframework.distribution.model.WorkUnitSpec;
@@ -70,6 +75,50 @@ class DistributionBrokerServerTest {
     private final HttpClient httpClient = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(5))
             .build();
+
+    @Test
+    void shouldServeHistoricalDurationsEndpointAndValidateBounds() throws Exception {
+        DistributionBrokerConfig config = DistributionBrokerConfig.builder()
+                .port(0)
+                .authToken("top-secret-token")
+                .cacheDir(tempDir.resolve("cache"))
+                .jdbcUrl("jdbc:hsqldb:mem:broker_duration_" + System.nanoTime())
+                .build();
+
+        try (DistributionBrokerServer server = new DistributionBrokerServer(config)) {
+            server.start();
+            String key = "pkg.SampleTest";
+            server.store().saveTestExecution(new TestExecutionRecord("test-duration", "history", "part", "worker",
+                    key, key, "test", TestOutcomeStatus.PASSED, 250L, 1, false, null, null, List.of(), 1L));
+            String url = server.baseUrl() + "/api/v1/history/durations";
+
+            assertThat(postJson(url, new HistoricalDurationsRequest(List.of(key), 10)).statusCode()).isEqualTo(401);
+            HttpResponse<String> known = postHistoricalDurations(url,
+                    DistributionJson.toJson(new HistoricalDurationsRequest(Arrays.asList(key, "pkg.Unknown", "", null, key), 10)));
+            assertThat(known.statusCode()).isEqualTo(200);
+            assertThat(DistributionJson.fromJson(known.body(), HistoricalDurationsResponse.class).durationsMs())
+                    .isEqualTo(Map.of(key, 250L));
+
+            HttpResponse<String> empty = postHistoricalDurations(url, "{\"testKeys\":[],\"limit\":10}");
+            assertThat(empty.statusCode()).isEqualTo(200);
+            assertThat(DistributionJson.fromJson(empty.body(), HistoricalDurationsResponse.class).durationsMs()).isEmpty();
+            assertThat(postHistoricalDurations(url, DistributionJson.toJson(
+                    new HistoricalDurationsRequest(Collections.nCopies(10_001, key), 10))).statusCode()).isEqualTo(400);
+            for (String invalid : List.of("", "{", "null", "{} {}", "{\"testKeys\":{}}")) {
+                assertThat(postHistoricalDurations(url, invalid).statusCode()).isEqualTo(400);
+            }
+        }
+    }
+
+    private HttpResponse<String> postHistoricalDurations(String url, String body) throws Exception {
+        return httpClient.send(
+                HttpRequest.newBuilder(URI.create(url))
+                        .header("Authorization", "Bearer top-secret-token")
+                        .header("Content-Type", "application/json")
+                        .POST(HttpRequest.BodyPublishers.ofString(body))
+                        .build(),
+                HttpResponse.BodyHandlers.ofString());
+    }
 
     @Test
     void shouldEnforceBearerAuthExceptHealthEndpoint() throws Exception {
