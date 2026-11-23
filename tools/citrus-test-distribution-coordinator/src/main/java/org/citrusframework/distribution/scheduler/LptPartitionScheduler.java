@@ -32,8 +32,9 @@ import org.citrusframework.distribution.model.WorkUnitSpec;
 /**
  * Splits submitted work units into partitions.
  * <ul>
- *     <li>{@link PartitionPolicy#LPT} (default): Longest-Processing-Time ordering by historical duration, grouped by
- *     capability constraints and chunked into partitions of at most {@code maxPartitionSize} units.</li>
+ *     <li>{@link PartitionPolicy#LPT} (default): grouped by capability constraints; within a group, units are taken
+ *     longest historical duration first and each is placed in the least loaded of {@code ceil(n / maxPartitionSize)}
+ *     partitions that still has room, which balances the partitions instead of grouping the slowest units.</li>
  *     <li>{@link PartitionPolicy#SINGLE}: all units in exactly one partition, in submission order, requiring the
  *     union of their capabilities. Values for one key must be equal ignoring case; different thresholds such as
  *     {@code >=2048} and {@code >=4096} count as a conflict rather than being merged.</li>
@@ -94,7 +95,8 @@ public class LptPartitionScheduler {
                 raw.methodName(),
                 raw.dynamicSourceName(),
                 normalizedCaps,
-                resolvedDuration
+                resolvedDuration,
+                raw.enclosingClassNames()
         );
     }
 
@@ -126,10 +128,26 @@ public class LptPartitionScheduler {
             groupUnits.sort(Comparator.comparingLong(WorkUnitSpec::estimatedDurationMs).reversed()
                     .thenComparing(WorkUnitSpec::key));
 
-            for (int i = 0; i < groupUnits.size(); i += capSize) {
-                List<WorkUnitSpec> chunk = List.copyOf(groupUnits.subList(i, Math.min(i + capSize, groupUnits.size())));
-                long sumDuration = chunk.stream().mapToLong(WorkUnitSpec::estimatedDurationMs).sum();
-                partitions.add(newPartition(sessionId, group.getKey(), chunk, sumDuration));
+            // Longest-processing-time first: as few partitions as the size cap allows, each unit going to the
+            // partition with the least estimated work that still has room, so the slowest units run side by side.
+            int binCount = (groupUnits.size() + capSize - 1) / capSize;
+            List<List<WorkUnitSpec>> bins = new ArrayList<>();
+            long[] binDurations = new long[binCount];
+            for (int i = 0; i < binCount; i++) {
+                bins.add(new ArrayList<>());
+            }
+            for (WorkUnitSpec unit : groupUnits) {
+                int target = -1;
+                for (int i = 0; i < binCount; i++) {
+                    if (bins.get(i).size() < capSize && (target < 0 || binDurations[i] < binDurations[target])) {
+                        target = i;
+                    }
+                }
+                bins.get(target).add(unit);
+                binDurations[target] += unit.estimatedDurationMs();
+            }
+            for (int i = 0; i < binCount; i++) {
+                partitions.add(newPartition(sessionId, group.getKey(), List.copyOf(bins.get(i)), binDurations[i]));
             }
         }
 

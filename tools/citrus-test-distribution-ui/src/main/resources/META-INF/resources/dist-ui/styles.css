@@ -671,6 +671,25 @@ pre,
   color: var(--rose-text);
 }
 
+.session-failure-banner {
+  font-weight: 500;
+}
+
+.session-failure-title {
+  font-weight: 700;
+  margin-bottom: 6px;
+}
+
+.session-failure-reason {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 12px;
+  max-height: 220px;
+  overflow: auto;
+}
+
 .alert-banner-amber {
   background: var(--amber-bg);
   border-color: rgba(245, 158, 11, 0.35);
@@ -960,4 +979,66 @@ tbody tr.clickable-row:hover {
   .search-input {
     min-width: 100%;
   }
+}
+
+.session-modules {
+  display: inline-block;
+  font-size: 11.5px;
+  color: var(--text-muted);
+  border-bottom: 1px dotted currentColor;
+  cursor: help;
+}
+
+.legend-swatch-outline {
+  background: transparent !important;
+  border: 2px solid;
+  box-sizing: border-box;
+}
+
+.partition-timing {
+  margin-bottom: 16px;
+}
+
+.partition-timing-bar {
+  display: flex;
+  height: 12px;
+  border-radius: 6px;
+  overflow: hidden;
+  background: var(--border-color);
+}
+
+.partition-timing-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  margin-top: 6px;
+  font-size: 12px;
+}
+
+.timing-swatch {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 3px;
+  vertical-align: middle;
+}
+
+.timing-setup { background: #f59e0b; }
+.timing-tests { background: #10b981; }
+.timing-wrapup { background: #94a3b8; }
+
+.pager {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 10px 14px;
+  font-size: 12px;
+  color: var(--text-muted);
+  flex-wrap: wrap;
+}
+
+.pager .btn[disabled] {
+  opacity: 0.45;
+  cursor: default;
 }

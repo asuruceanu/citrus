@@ -43,7 +43,9 @@ class DistributionUiResourcesTest {
             String stylesText = new String(styles.readAllBytes(), StandardCharsets.UTF_8);
             assertThat(stylesText)
                     .contains("--citrus-orange: #f5921d")
-                    .contains(".btn-danger");
+                    .contains(".btn-danger")
+                    .contains(".session-failure-banner")
+                    .contains(".pager {");
 
             String appText = new String(app.readAllBytes(), StandardCharsets.UTF_8);
             assertThat(appText)
@@ -57,7 +59,28 @@ class DistributionUiResourcesTest {
                     .contains("producedOutputs")
                     .contains("errorMessage")
                     .contains("safeDecodeSegment")
-                    .contains("collectLatestTestFailures");
+                    .contains("collectLatestTestFailures")
+                    .contains("session.failureReason")
+                    .contains("session-failure-banner")
+                    .contains("refreshInFlight")
+                    .contains("DETAIL_MIN_INTERVAL_MS")
+                    .contains("detailRequestSeq")
+                    .contains("detailTimer")
+                    .contains("moduleColor")
+                    .contains("session-modules")
+                    .contains("<title>")
+                    .contains("fitBarLabel")
+                    .contains("partitionTiming")
+                    .contains("function paginate(")
+                    .contains("function loadHistory(")
+                    .contains("HISTORY_MIN_INTERVAL_MS")
+                    // A table returns to its first page when the session or a filter it shows changes.
+                    .contains("function paginate(key, items, pageSize = 25, context = '')")
+                    .contains("paginate('sessions', filtered, 25, `${state.sessionStatusFilter}|${q}`)")
+                    .contains("paginate('partitions', partitions, 25, state.selectedSessionId)")
+                    .contains("paginate('tests', filteredTests, 50, `${state.selectedSessionId}|${state.testStatusFilter}|${tq}`)")
+                    .contains("paginate('history', filtered, 25, `${state.historyFlakyOnly}|${q}`)")
+                    .contains("class=\"pager\"");
 
             String htmText = new String(htm.readAllBytes(), StandardCharsets.UTF_8);
             assertThat(htmText)

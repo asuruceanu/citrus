@@ -117,7 +117,8 @@ public class JdbcDistributionStore implements DistributionStore {
                         "total_blobs INT, " +
                         "cached_blobs INT, " +
                         "serial_duration_ms BIGINT, " +
-                        "wall_duration_ms BIGINT)",
+                        "wall_duration_ms BIGINT, " +
+                        "failure_reason VARCHAR(4096))",
                 "CREATE TABLE IF NOT EXISTS dist_session_changes (" +
                         "session_id VARCHAR(64), " +
                         "file_path VARCHAR(1024), " +
@@ -170,7 +171,8 @@ public class JdbcDistributionStore implements DistributionStore {
                         "error_message VARCHAR(4096), " +
                         "stack_trace " + longText + ", " +
                         "endpoints_json VARCHAR(4096), " +
-                        "recorded_at BIGINT)"
+                        "recorded_at BIGINT, " +
+                        "unique_id VARCHAR(1024))"
         );
 
         try (Connection conn = dataSource.getConnection();
@@ -178,38 +180,82 @@ public class JdbcDistributionStore implements DistributionStore {
             for (String sql : ddl) {
                 stmt.execute(sql);
             }
-            ensurePartitionColumns(conn, stmt, longText);
+            ensureColumns(conn, stmt, longText);
+            // Lookups by session (session detail) and by work unit (historical durations for scheduling).
+            stmt.execute("CREATE INDEX IF NOT EXISTS idx_dist_tests_session ON dist_test_executions (session_id)");
+            stmt.execute("CREATE INDEX IF NOT EXISTS idx_dist_tests_unit ON dist_test_executions (work_unit_key)");
+            stmt.execute("CREATE INDEX IF NOT EXISTS idx_dist_parts_session ON dist_partitions (session_id)");
         } catch (SQLException e) {
             throw new IllegalStateException("Failed to initialize distribution schema on " + jdbcUrl, e);
         }
     }
 
-    private static void ensurePartitionColumns(Connection conn, Statement stmt, String longText) throws SQLException {
-        java.util.Set<String> existing = new java.util.HashSet<>();
-        String actualTableName = null;
+    /** Adds columns introduced after a table's first release, scanning the schema once. */
+    private static void ensureColumns(Connection conn, Statement stmt, String longText) throws SQLException {
+        Map<String, java.util.Set<String>> existing = new java.util.HashMap<>();
+        String partitionsTable = null;
         try (ResultSet rs = conn.getMetaData().getColumns(conn.getCatalog(), conn.getSchema(), null, null)) {
             while (rs.next()) {
                 String table = rs.getString("TABLE_NAME");
                 String col = rs.getString("COLUMN_NAME");
-                if (table != null && col != null && "dist_partitions".equalsIgnoreCase(table)) {
-                    actualTableName = table;
-                    existing.add(col.toLowerCase(Locale.ROOT));
+                if (table != null && col != null) {
+                    existing.computeIfAbsent(table.toLowerCase(Locale.ROOT), k -> new java.util.HashSet<>())
+                            .add(col.toLowerCase(Locale.ROOT));
+                    if ("dist_partitions".equalsIgnoreCase(table)) {
+                        partitionsTable = table;
+                    }
                 }
             }
         }
-        Map<String, String> additions = new LinkedHashMap<>();
-        additions.put("module_name", "VARCHAR(255)");
-        additions.put("fork_workspace", "BOOLEAN");
-        additions.put("working_directory", "VARCHAR(1024)");
-        additions.put("inputs_json", longText);
-        additions.put("outputs_json", longText);
-        additions.put("produced_outputs_json", longText);
-        additions.put("error_message", "VARCHAR(4096)");
-        for (Map.Entry<String, String> entry : additions.entrySet()) {
-            if (!existing.contains(entry.getKey())) {
-                stmt.execute("ALTER TABLE dist_partitions ADD COLUMN " + entry.getKey() + " " + entry.getValue());
+        Map<String, Map<String, String>> additions = new LinkedHashMap<>();
+        Map<String, String> partitionColumns = new LinkedHashMap<>();
+        partitionColumns.put("module_name", "VARCHAR(255)");
+        partitionColumns.put("fork_workspace", "BOOLEAN");
+        partitionColumns.put("working_directory", "VARCHAR(1024)");
+        partitionColumns.put("inputs_json", longText);
+        partitionColumns.put("outputs_json", longText);
+        partitionColumns.put("produced_outputs_json", longText);
+        partitionColumns.put("error_message", "VARCHAR(4096)");
+        additions.put("dist_partitions", partitionColumns);
+        additions.put("dist_sessions", Map.of("failure_reason", "VARCHAR(4096)"));
+        additions.put("dist_test_executions", Map.of("unique_id", "VARCHAR(1024)"));
+        for (Map.Entry<String, Map<String, String>> table : additions.entrySet()) {
+            java.util.Set<String> columns = existing.getOrDefault(table.getKey(), java.util.Set.of());
+            for (Map.Entry<String, String> column : table.getValue().entrySet()) {
+                if (!columns.contains(column.getKey())) {
+                    addColumn(conn, stmt, table.getKey(), column.getKey(), column.getValue());
+                }
             }
         }
+        ensurePartitionPrimaryKey(conn, stmt, partitionsTable);
+    }
+
+    /**
+     * Adds {@code column} to {@code table}. A failure is ignored when the column exists by now: another coordinator
+     * sharing the database added it between this one's schema scan and its {@code ALTER TABLE}.
+     */
+    static void addColumn(Connection conn, Statement stmt, String table, String column, String type) throws SQLException {
+        try {
+            stmt.execute("ALTER TABLE " + table + " ADD COLUMN " + column + " " + type);
+        } catch (SQLException e) {
+            if (!columnExists(conn, table, column)) {
+                throw e;
+            }
+        }
+    }
+
+    private static boolean columnExists(Connection conn, String table, String column) throws SQLException {
+        try (ResultSet rs = conn.getMetaData().getColumns(conn.getCatalog(), conn.getSchema(), null, null)) {
+            while (rs.next()) {
+                if (table.equalsIgnoreCase(rs.getString("TABLE_NAME")) && column.equalsIgnoreCase(rs.getString("COLUMN_NAME"))) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private static void ensurePartitionPrimaryKey(Connection conn, Statement stmt, String actualTableName) throws SQLException {
         if (actualTableName != null) {
             java.util.Set<String> pkCols = new java.util.HashSet<>();
             String pkName = null;
@@ -241,11 +287,11 @@ public class JdbcDistributionStore implements DistributionStore {
     public synchronized void saveSession(BuildSessionRecord s) {
         String updateSql = "UPDATE dist_sessions SET project_name=?, git_branch=?, git_commit=?, status=?, " +
                 "started_at=?, finished_at=?, total_tests=?, passed_tests=?, failed_tests=?, skipped_tests=?, " +
-                "total_blobs=?, cached_blobs=?, serial_duration_ms=?, wall_duration_ms=? WHERE session_id=?";
+                "total_blobs=?, cached_blobs=?, serial_duration_ms=?, wall_duration_ms=?, failure_reason=? WHERE session_id=?";
         String insertSql = "INSERT INTO dist_sessions (session_id, project_name, git_branch, git_commit, status, " +
                 "started_at, finished_at, total_tests, passed_tests, failed_tests, skipped_tests, " +
-                "total_blobs, cached_blobs, serial_duration_ms, wall_duration_ms) " +
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+                "total_blobs, cached_blobs, serial_duration_ms, wall_duration_ms, failure_reason) " +
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
         try (Connection conn = dataSource.getConnection()) {
             try (PreparedStatement ps = conn.prepareStatement(updateSql)) {
                 ps.setString(1, s.projectName());
@@ -262,7 +308,8 @@ public class JdbcDistributionStore implements DistributionStore {
                 ps.setInt(12, s.cachedBlobs());
                 ps.setLong(13, s.serialDurationMs());
                 ps.setLong(14, s.wallDurationMs());
-                ps.setString(15, s.sessionId());
+                ps.setString(15, truncate(s.failureReason(), 4096));
+                ps.setString(16, s.sessionId());
                 if (ps.executeUpdate() > 0) {
                     return;
                 }
@@ -283,6 +330,7 @@ public class JdbcDistributionStore implements DistributionStore {
                 ps.setInt(13, s.cachedBlobs());
                 ps.setLong(14, s.serialDurationMs());
                 ps.setLong(15, s.wallDurationMs());
+                ps.setString(16, truncate(s.failureReason(), 4096));
                 ps.executeUpdate();
             }
         } catch (SQLException e) {
@@ -291,10 +339,11 @@ public class JdbcDistributionStore implements DistributionStore {
     }
 
     @Override
-    public synchronized void updateSessionStatus(String sessionId, SessionStatus status, long finishedAt, SessionSummary summary) {
+    public synchronized void updateSessionStatus(String sessionId, SessionStatus status, long finishedAt,
+                                                 SessionSummary summary, String failureReason) {
         String sql = "UPDATE dist_sessions SET status=?, finished_at=?, total_tests=?, passed_tests=?, " +
-                "failed_tests=?, skipped_tests=?, total_blobs=?, cached_blobs=?, serial_duration_ms=?, wall_duration_ms=? " +
-                "WHERE session_id=?";
+                "failed_tests=?, skipped_tests=?, total_blobs=?, cached_blobs=?, serial_duration_ms=?, wall_duration_ms=?, " +
+                "failure_reason=? WHERE session_id=?";
         try (Connection conn = dataSource.getConnection();
              PreparedStatement ps = conn.prepareStatement(sql)) {
             ps.setString(1, status.name());
@@ -307,7 +356,8 @@ public class JdbcDistributionStore implements DistributionStore {
             ps.setInt(8, summary.cachedBlobs());
             ps.setLong(9, summary.serialDurationMs());
             ps.setLong(10, summary.wallDurationMs());
-            ps.setString(11, sessionId);
+            ps.setString(11, truncate(failureReason, 4096));
+            ps.setString(12, sessionId);
             ps.executeUpdate();
         } catch (SQLException e) {
             throw new IllegalStateException("Failed to update session status for " + sessionId, e);
@@ -318,13 +368,15 @@ public class JdbcDistributionStore implements DistributionStore {
     public Optional<BuildSessionRecord> findSession(String sessionId) {
         String sql = "SELECT session_id, project_name, git_branch, git_commit, status, started_at, finished_at, " +
                 "total_tests, passed_tests, failed_tests, skipped_tests, total_blobs, cached_blobs, " +
-                "serial_duration_ms, wall_duration_ms FROM dist_sessions WHERE session_id=?";
+                "serial_duration_ms, wall_duration_ms, failure_reason FROM dist_sessions WHERE session_id=?";
         try (Connection conn = dataSource.getConnection();
              PreparedStatement ps = conn.prepareStatement(sql)) {
             ps.setString(1, sessionId);
             try (ResultSet rs = ps.executeQuery()) {
                 if (rs.next()) {
-                    return Optional.of(mapSession(rs));
+                    BuildSessionRecord session = mapSession(rs);
+                    return Optional.of(session.withModules(
+                            findModules(conn, List.of(session.sessionId())).getOrDefault(session.sessionId(), List.of())));
                 }
                 return Optional.empty();
             }
@@ -337,7 +389,7 @@ public class JdbcDistributionStore implements DistributionStore {
     public List<BuildSessionRecord> listSessions(int limit) {
         String sql = "SELECT session_id, project_name, git_branch, git_commit, status, started_at, finished_at, " +
                 "total_tests, passed_tests, failed_tests, skipped_tests, total_blobs, cached_blobs, " +
-                "serial_duration_ms, wall_duration_ms FROM dist_sessions ORDER BY started_at DESC";
+                "serial_duration_ms, wall_duration_ms, failure_reason FROM dist_sessions ORDER BY started_at DESC";
         List<BuildSessionRecord> result = new ArrayList<>();
         try (Connection conn = dataSource.getConnection();
              PreparedStatement ps = conn.prepareStatement(sql)) {
@@ -347,7 +399,12 @@ public class JdbcDistributionStore implements DistributionStore {
                     result.add(mapSession(rs));
                 }
             }
-            return result;
+            Map<String, List<String>> modules = findModules(conn, result.stream().map(BuildSessionRecord::sessionId).toList());
+            List<BuildSessionRecord> withModules = new ArrayList<>(result.size());
+            for (BuildSessionRecord session : result) {
+                withModules.add(session.withModules(modules.getOrDefault(session.sessionId(), List.of())));
+            }
+            return withModules;
         } catch (SQLException e) {
             throw new IllegalStateException("Failed to list sessions", e);
         }
@@ -634,10 +691,10 @@ public class JdbcDistributionStore implements DistributionStore {
         String endpointsJson = truncate(DistributionJson.toJson(t.endpoints() != null ? t.endpoints() : List.of()), 4096);
         String updateSql = "UPDATE dist_test_executions SET session_id=?, partition_id=?, worker_id=?, " +
                 "work_unit_key=?, class_name=?, test_name=?, status=?, duration_ms=?, attempt=?, flaky=?, " +
-                "error_message=?, stack_trace=?, endpoints_json=?, recorded_at=? WHERE id=?";
+                "error_message=?, stack_trace=?, endpoints_json=?, recorded_at=?, unique_id=? WHERE id=?";
         String insertSql = "INSERT INTO dist_test_executions (id, session_id, partition_id, worker_id, " +
                 "work_unit_key, class_name, test_name, status, duration_ms, attempt, flaky, error_message, " +
-                "stack_trace, endpoints_json, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+                "stack_trace, endpoints_json, recorded_at, unique_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
         try (Connection conn = dataSource.getConnection()) {
             try (PreparedStatement ps = conn.prepareStatement(updateSql)) {
                 ps.setString(1, t.sessionId());
@@ -654,7 +711,8 @@ public class JdbcDistributionStore implements DistributionStore {
                 ps.setString(12, t.stackTrace());
                 ps.setString(13, endpointsJson);
                 ps.setLong(14, t.recordedAt());
-                ps.setString(15, t.id());
+                ps.setString(15, truncate(t.uniqueId(), 1024));
+                ps.setString(16, t.id());
                 if (ps.executeUpdate() > 0) {
                     return;
                 }
@@ -675,6 +733,7 @@ public class JdbcDistributionStore implements DistributionStore {
                 ps.setString(13, t.stackTrace());
                 ps.setString(14, endpointsJson);
                 ps.setLong(15, t.recordedAt());
+                ps.setString(16, truncate(t.uniqueId(), 1024));
                 ps.executeUpdate();
             }
         } catch (SQLException e) {
@@ -685,7 +744,7 @@ public class JdbcDistributionStore implements DistributionStore {
     @Override
     public List<TestExecutionRecord> listTestExecutions(String sessionId) {
         String sql = "SELECT id, session_id, partition_id, worker_id, work_unit_key, class_name, test_name, " +
-                "status, duration_ms, attempt, flaky, error_message, stack_trace, endpoints_json, recorded_at " +
+                "status, duration_ms, attempt, flaky, error_message, stack_trace, endpoints_json, recorded_at, unique_id " +
                 "FROM dist_test_executions WHERE session_id=? ORDER BY recorded_at ASC";
         List<TestExecutionRecord> records = new ArrayList<>();
         try (Connection conn = dataSource.getConnection();
@@ -709,7 +768,8 @@ public class JdbcDistributionStore implements DistributionStore {
                             rs.getString("error_message"),
                             rs.getString("stack_trace"),
                             endpointsRaw == null || endpointsRaw.isBlank() ? List.of() : DistributionJson.fromJson(endpointsRaw, STRING_LIST_TYPE),
-                            rs.getLong("recorded_at")
+                            rs.getLong("recorded_at"),
+                            rs.getString("unique_id")
                     ));
                 }
             }
@@ -758,32 +818,27 @@ public class JdbcDistributionStore implements DistributionStore {
                 "SUM(CASE WHEN status='FAILED' THEN 1 ELSE 0 END) AS failed_runs, " +
                 "SUM(CASE WHEN flaky=TRUE THEN 1 ELSE 0 END) AS flaky_runs " +
                 "FROM dist_test_executions GROUP BY work_unit_key, class_name, test_name ORDER BY avg_ms DESC";
-        String latestStatusSql = "SELECT status FROM dist_test_executions " +
-                "WHERE COALESCE(work_unit_key, '')=? AND COALESCE(class_name, '')=? AND COALESCE(test_name, '')=? " +
-                "ORDER BY recorded_at DESC, attempt DESC, id DESC";
+        // Latest outcome of every test in one ordered pass (a per-test lookup scanned the whole table per row).
+        // Latest outcome per test: the rows at each test's newest recorded_at (one or a few per test), not the table.
+        String latestStatusSql = "SELECT e.work_unit_key, e.class_name, e.test_name, e.status, e.attempt, e.id " +
+                "FROM dist_test_executions e JOIN (SELECT work_unit_key, class_name, test_name, MAX(recorded_at) AS last_at " +
+                "FROM dist_test_executions GROUP BY work_unit_key, class_name, test_name) m " +
+                "ON COALESCE(e.work_unit_key, '') = COALESCE(m.work_unit_key, '') " +
+                "AND COALESCE(e.class_name, '') = COALESCE(m.class_name, '') " +
+                "AND COALESCE(e.test_name, '') = COALESCE(m.test_name, '') AND e.recorded_at = m.last_at " +
+                "ORDER BY e.attempt, e.id";
         List<TestHistorySummary> history = new ArrayList<>();
         try (Connection conn = dataSource.getConnection();
              PreparedStatement ps = conn.prepareStatement(sql);
              PreparedStatement latestPs = conn.prepareStatement(latestStatusSql)) {
             ps.setMaxRows(Math.max(1, limit));
-            latestPs.setMaxRows(1);
+            List<String[]> keys = new ArrayList<>();
             try (ResultSet rs = ps.executeQuery()) {
                 while (rs.next()) {
                     String key = rs.getString("work_unit_key");
                     String className = rs.getString("class_name");
                     String testName = rs.getString("test_name");
-                    TestOutcomeStatus lastStatus = TestOutcomeStatus.PASSED;
-                    latestPs.setString(1, key != null ? key : "");
-                    latestPs.setString(2, className != null ? className : "");
-                    latestPs.setString(3, testName != null ? testName : "");
-                    try (ResultSet lrs = latestPs.executeQuery()) {
-                        if (lrs.next()) {
-                            String rawStatus = lrs.getString(1);
-                            if (rawStatus != null && !rawStatus.isBlank()) {
-                                lastStatus = TestOutcomeStatus.valueOf(rawStatus);
-                            }
-                        }
-                    }
+                    keys.add(new String[] {key, className, testName});
                     history.add(new TestHistorySummary(
                             key,
                             className,
@@ -794,8 +849,32 @@ public class JdbcDistributionStore implements DistributionStore {
                             rs.getInt("passed_runs"),
                             rs.getInt("failed_runs"),
                             rs.getInt("flaky_runs"),
-                            lastStatus
+                            TestOutcomeStatus.PASSED
                     ));
+                }
+            }
+            Map<String, TestOutcomeStatus> latest = new java.util.HashMap<>();
+            java.util.Set<String> wanted = new java.util.HashSet<>();
+            for (String[] k : keys) {
+                wanted.add(historyKey(k[0], k[1], k[2]));
+            }
+            latestPs.setFetchSize(2_000);
+            try (ResultSet lrs = latestPs.executeQuery()) {
+                while (lrs.next()) {
+                    String k = historyKey(lrs.getString(1), lrs.getString(2), lrs.getString(3));
+                    String rawStatus = lrs.getString(4);
+                    if (wanted.contains(k) && rawStatus != null && !rawStatus.isBlank()) {
+                        latest.put(k, TestOutcomeStatus.valueOf(rawStatus));
+                    }
+                }
+            }
+            for (int i = 0; i < history.size(); i++) {
+                TestHistorySummary h = history.get(i);
+                TestOutcomeStatus status = latest.get(historyKey(h.workUnitKey(), h.className(), h.testName()));
+                if (status != null && status != h.lastStatus()) {
+                    history.set(i, new TestHistorySummary(h.workUnitKey(), h.className(), h.testName(),
+                            h.avgDurationMs(), h.maxDurationMs(), h.totalRuns(), h.passedRuns(), h.failedRuns(),
+                            h.flakyRuns(), status));
                 }
             }
             return history;
@@ -821,6 +900,45 @@ public class JdbcDistributionStore implements DistributionStore {
         }
     }
 
+    private static String historyKey(String workUnitKey, String className, String testName) {
+        return (workUnitKey != null ? workUnitKey : "") + '\u0000' + (className != null ? className : "") + '\u0000'
+                + (testName != null ? testName : "");
+    }
+
+    /**
+     * Modules that submitted partitions to each session, in the order they first started (Maven reactor order;
+     * modules none of whose partitions started yet come last). One query per chunk of sessions.
+     */
+    private static Map<String, List<String>> findModules(Connection conn, List<String> sessionIds) throws SQLException {
+        Map<String, List<String>> modules = new java.util.HashMap<>();
+        int chunk = 200;
+        for (int from = 0; from < sessionIds.size(); from += chunk) {
+            List<String> ids = sessionIds.subList(from, Math.min(sessionIds.size(), from + chunk));
+            String sql = "SELECT session_id, module_name, MIN(CASE WHEN started_at > 0 THEN started_at END) AS first_start "
+                    + "FROM dist_partitions WHERE module_name IS NOT NULL AND session_id IN ("
+                    + String.join(",", java.util.Collections.nCopies(ids.size(), "?")) + ") "
+                    + "GROUP BY session_id, module_name";
+            Map<String, List<Object[]>> rows = new java.util.HashMap<>();
+            try (PreparedStatement ps = conn.prepareStatement(sql)) {
+                for (int i = 0; i < ids.size(); i++) {
+                    ps.setString(i + 1, ids.get(i));
+                }
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        long firstStart = rs.getLong("first_start");
+                        rows.computeIfAbsent(rs.getString("session_id"), k -> new ArrayList<>()).add(new Object[] {
+                                rs.getString("module_name"), rs.wasNull() ? Long.MAX_VALUE : firstStart});
+                    }
+                }
+            }
+            rows.forEach((session, list) -> modules.put(session, list.stream()
+                    .sorted(java.util.Comparator.<Object[]>comparingLong(r -> (Long) r[1]).thenComparing(r -> (String) r[0]))
+                    .map(r -> (String) r[0])
+                    .toList()));
+        }
+        return modules;
+    }
+
     private static BuildSessionRecord mapSession(ResultSet rs) throws SQLException {
         return new BuildSessionRecord(
                 rs.getString("session_id"),
@@ -837,7 +955,8 @@ public class JdbcDistributionStore implements DistributionStore {
                 rs.getInt("total_blobs"),
                 rs.getInt("cached_blobs"),
                 rs.getLong("serial_duration_ms"),
-                rs.getLong("wall_duration_ms")
+                rs.getLong("wall_duration_ms"),
+                rs.getString("failure_reason")
         );
     }
 

@@ -34,7 +34,6 @@ import org.citrusframework.distribution.config.CitrusEndpointCollector;
 import org.citrusframework.distribution.model.TestOutcomeStatus;
 import org.citrusframework.distribution.model.WorkUnitSpec;
 import org.citrusframework.distribution.model.WorkerTestEventPayload;
-import org.citrusframework.junit.jupiter.CitrusDynamicSourceFilter;
 import org.junit.platform.engine.DiscoverySelector;
 import org.junit.platform.engine.TestExecutionResult;
 import org.junit.platform.engine.TestSource;
@@ -129,7 +128,7 @@ public final class LocalFallbackExecutor {
                                 0L,
                                 reason,
                                 null,
-                                List.of()));
+                                List.of(), testIdentifier.getUniqueId()));
                     }
                 }
 
@@ -152,7 +151,7 @@ public final class LocalFallbackExecutor {
                                     0L,
                                     result.getThrowable().map(Throwable::getMessage).orElse("Container failed"),
                                     result.getThrowable().map(LocalFallbackExecutor::formatStackTrace).orElse(null),
-                                    endpointCollector.drainEndpoints()));
+                                    endpointCollector.drainEndpoints(), testIdentifier.getUniqueId()));
                         }
                         return;
                     }
@@ -186,7 +185,7 @@ public final class LocalFallbackExecutor {
                             elapsed,
                             result.getThrowable().map(Throwable::getMessage).orElse(null),
                             result.getThrowable().map(LocalFallbackExecutor::formatStackTrace).orElse(null),
-                            endpointCollector.drainEndpoints()));
+                            endpointCollector.drainEndpoints(), testIdentifier.getUniqueId()));
                 }
             };
 
@@ -212,14 +211,14 @@ public final class LocalFallbackExecutor {
 
             for (WorkUnitSpec dynamicUnit : dynamicUnits) {
                 activeDynamicUnitKey.set(dynamicUnit.key());
-                CitrusDynamicSourceFilter.setAllowedSources(new LinkedHashSet<>(Set.of(dynamicUnit.dynamicSourceName())));
+                CitrusJupiterSupport.allowSources(new LinkedHashSet<>(Set.of(dynamicUnit.dynamicSourceName())));
                 try {
                     LauncherDiscoveryRequest req = LauncherDiscoveryRequestBuilder.request()
                             .selectors(DiscoverySelectors.selectClass(dynamicUnit.className()))
                             .build();
                     delegate.execute(req, merged);
                 } finally {
-                    CitrusDynamicSourceFilter.clear();
+                    CitrusJupiterSupport.clearAllowedSources();
                     activeDynamicUnitKey.set(null);
                 }
             }
@@ -278,10 +277,22 @@ public final class LocalFallbackExecutor {
     }
 
     private static DiscoverySelector toSelector(WorkUnitSpec unit) {
+        List<String> enclosing = unit.enclosingClassNames();
         if (unit.methodName() != null && !unit.methodName().isBlank()) {
-            return DiscoverySelectors.selectMethod(unit.className() + "#" + unit.methodName());
+            if (enclosing.isEmpty()) {
+                return DiscoverySelectors.selectMethod(unit.className() + "#" + unit.methodName());
+            }
+            String method = unit.methodName();
+            int open = method.indexOf('(');
+            return open > 0 && method.endsWith(")")
+                    ? DiscoverySelectors.selectNestedMethod(enclosing, unit.className(), method.substring(0, open),
+                            method.substring(open + 1, method.length() - 1))
+                    : DiscoverySelectors.selectNestedMethod(enclosing, unit.className(), method);
         }
-        return DiscoverySelectors.selectClass(unit.className());
+        // A @Nested class goes through the classes enclosing it in the plan (e.g. the subclass inheriting it).
+        return enclosing.isEmpty()
+                ? DiscoverySelectors.selectClass(unit.className())
+                : DiscoverySelectors.selectNestedClass(enclosing, unit.className());
     }
 
     private static TestExecutionListener[] mergeListeners(TestExecutionListener[] existing,

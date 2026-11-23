@@ -21,6 +21,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Stream;
@@ -45,6 +46,7 @@ import org.junit.platform.launcher.Launcher;
 import org.junit.platform.launcher.LauncherDiscoveryRequest;
 import org.junit.platform.launcher.TestExecutionListener;
 import org.junit.platform.launcher.TestIdentifier;
+import org.junit.platform.launcher.TestPlan;
 import org.junit.platform.launcher.core.LauncherDiscoveryRequestBuilder;
 import org.junit.platform.launcher.core.LauncherFactory;
 
@@ -128,6 +130,173 @@ class DistributedLauncherTest {
     }
 
     @Test
+    void shouldReplayRemoteResultsAgainstTheTestPlanInsideStartedClassContainers() throws Exception {
+        try (Cluster cluster = Cluster.start(tempDir)) {
+            System.setProperty(DistributionSettings.ENABLED_PROPERTY, "true");
+            System.setProperty(DistributionSettings.BROKER_URL_PROPERTY, cluster.broker.baseUrl());
+
+            SurefireLikeListener listener = new SurefireLikeListener();
+            new DistributedLauncher(LauncherFactory.create()).execute(LauncherDiscoveryRequestBuilder.request()
+                    .selectors(DiscoverySelectors.selectClass(RemoteMixedFixture.class))
+                    .build(), listener);
+
+            assertThat(listener.problems).as("events Surefire could not attribute to a test set").isEmpty();
+            assertThat(listener.finishedTests).containsOnlyKeys(
+                    planMethodId(listener.plan, RemoteMixedFixture.class, "passes"),
+                    planMethodId(listener.plan, RemoteMixedFixture.class, "fails"));
+            assertThat(listener.finishedTests.get(planMethodId(listener.plan, RemoteMixedFixture.class, "fails")))
+                    .isEqualTo(TestExecutionResult.Status.FAILED);
+            assertThat(listener.finishedContainers).as("class test set completed")
+                    .contains(RemoteMixedFixture.class.getName());
+        }
+    }
+
+    @Test
+    void shouldReportAClassSplitBetweenLocalAndRemoteUnitsAsOneTestSet() throws Exception {
+        try (Cluster cluster = Cluster.start(tempDir)) {
+            System.setProperty(DistributionSettings.ENABLED_PROPERTY, "true");
+            System.setProperty(DistributionSettings.BROKER_URL_PROPERTY, cluster.broker.baseUrl());
+
+            SurefireLikeListener listener = new SurefireLikeListener();
+            new DistributedLauncher(LauncherFactory.create()).execute(LauncherDiscoveryRequestBuilder.request()
+                    .selectors(DiscoverySelectors.selectClass(SplitFixture.class))
+                    .build(), listener);
+
+            assertThat(listener.classStarts).containsEntry(SplitFixture.class.getName(), 1);
+            assertThat(listener.problems).isEmpty();
+            assertThat(listener.finishedTests).containsOnlyKeys(
+                    planMethodId(listener.plan, SplitFixture.class, "onHost"),
+                    planMethodId(listener.plan, SplitFixture.class, "onWorker"));
+        }
+    }
+
+    @Test
+    void shouldReportEachTestOnceToListenersRegisteredOnTheLauncher() throws Exception {
+        try (Cluster cluster = Cluster.start(tempDir)) {
+            System.setProperty(DistributionSettings.ENABLED_PROPERTY, "true");
+            System.setProperty(DistributionSettings.BROKER_URL_PROPERTY, cluster.broker.baseUrl());
+
+            List<String> finished = new java.util.concurrent.CopyOnWriteArrayList<>();
+            DistributedLauncher launcher = new DistributedLauncher(LauncherFactory.create());
+            launcher.registerTestExecutionListeners(new TestExecutionListener() {
+                @Override
+                public void executionFinished(TestIdentifier id, TestExecutionResult result) {
+                    if (id.isTest()) {
+                        finished.add(id.getDisplayName());
+                    }
+                }
+            });
+            launcher.execute(LauncherDiscoveryRequestBuilder.request()
+                    .selectors(DiscoverySelectors.selectClass(SplitFixture.class))
+                    .build());
+
+            assertThat(finished).containsExactlyInAnyOrder("onHost()", "onWorker()");
+        }
+    }
+
+    @Test
+    void shouldReportLocallyRunTestsLiveWithTheirRealDurationAndOutcome() throws Exception {
+        try (Cluster cluster = Cluster.start(tempDir)) {
+            System.setProperty(DistributionSettings.ENABLED_PROPERTY, "true");
+            System.setProperty(DistributionSettings.BROKER_URL_PROPERTY, cluster.broker.baseUrl());
+
+            Map<String, Long> startedAt = new java.util.concurrent.ConcurrentHashMap<>();
+            Map<String, Long> durations = new java.util.concurrent.ConcurrentHashMap<>();
+            Map<String, TestExecutionResult.Status> outcomes = new java.util.concurrent.ConcurrentHashMap<>();
+            new DistributedLauncher(LauncherFactory.create()).execute(LauncherDiscoveryRequestBuilder.request()
+                    .selectors(DiscoverySelectors.selectClass(LocalTimingFixture.class))
+                    .build(), new TestExecutionListener() {
+                @Override
+                public void executionStarted(TestIdentifier id) {
+                    startedAt.put(id.getDisplayName(), System.nanoTime());
+                }
+
+                @Override
+                public void executionFinished(TestIdentifier id, TestExecutionResult result) {
+                    if (id.isTest()) {
+                        durations.put(id.getDisplayName(), (System.nanoTime() - startedAt.get(id.getDisplayName())) / 1_000_000);
+                        outcomes.put(id.getDisplayName(), result.getStatus());
+                    }
+                }
+            });
+
+            assertThat(durations.get("slow()")).as("listeners see the test while it runs").isGreaterThanOrEqualTo(250L);
+            assertThat(outcomes).containsEntry("assumed()", TestExecutionResult.Status.ABORTED)
+                    .containsEntry("remote()", TestExecutionResult.Status.SUCCESSFUL);
+        }
+    }
+
+    private static String planMethodId(TestPlan plan, Class<?> type, String method) {
+        java.util.List<TestIdentifier> found = new java.util.ArrayList<>();
+        java.util.ArrayDeque<TestIdentifier> queue = new java.util.ArrayDeque<>(plan.getRoots());
+        while (!queue.isEmpty()) {
+            TestIdentifier id = queue.poll();
+            queue.addAll(plan.getChildren(id));
+            if (id.getSource().orElse(null) instanceof org.junit.platform.engine.support.descriptor.MethodSource ms
+                    && ms.getClassName().equals(type.getName()) && ms.getMethodName().equals(method)) {
+                found.add(id);
+            }
+        }
+        assertThat(found).hasSize(1);
+        return found.getFirst().getUniqueId();
+    }
+
+    /** Mirrors what Surefire's RunListenerAdapter needs: tests from the plan, nested in a started class container. */
+    private static final class SurefireLikeListener implements TestExecutionListener {
+        private TestPlan plan;
+        private final Set<String> startedContainers = new java.util.HashSet<>();
+        private final Map<String, Integer> classStarts = new java.util.concurrent.ConcurrentHashMap<>();
+        private final Map<String, TestExecutionResult.Status> finishedTests = new java.util.concurrent.ConcurrentHashMap<>();
+        private final Set<String> finishedContainers = java.util.concurrent.ConcurrentHashMap.newKeySet();
+        private final List<String> problems = new java.util.concurrent.CopyOnWriteArrayList<>();
+
+        @Override
+        public void testPlanExecutionStarted(TestPlan testPlan) {
+            plan = testPlan;
+        }
+
+        @Override
+        public void executionStarted(TestIdentifier id) {
+            if (id.isContainer()) {
+                startedContainers.add(id.getUniqueId());
+                if (id.getSource().orElse(null) instanceof org.junit.platform.engine.support.descriptor.ClassSource cs) {
+                    classStarts.merge(cs.getClassName(), 1, Integer::sum);
+                }
+            } else {
+                checkAttributable(id);
+            }
+        }
+
+        @Override
+        public void executionFinished(TestIdentifier id, TestExecutionResult result) {
+            if (id.isContainer()) {
+                if (id.getSource().orElse(null) instanceof org.junit.platform.engine.support.descriptor.ClassSource cs) {
+                    finishedContainers.add(cs.getClassName());
+                }
+                return;
+            }
+            checkAttributable(id);
+            finishedTests.put(id.getUniqueId(), result.getStatus());
+        }
+
+        private void checkAttributable(TestIdentifier id) {
+            String parent = id.getParentId().orElse(null);
+            if (parent == null) {
+                problems.add(id.getUniqueId() + " has no parent");
+                return;
+            }
+            try {
+                plan.getTestIdentifier(org.junit.platform.engine.UniqueId.parse(parent));
+            } catch (RuntimeException e) {
+                problems.add(id.getUniqueId() + " has a parent outside the test plan");
+            }
+            if (!startedContainers.contains(parent)) {
+                problems.add(id.getUniqueId() + " reported before its container was started");
+            }
+        }
+    }
+
+    @Test
     void shouldFailRunAndWriteNothingWhenPartitionsProduceConflictingOutputs() throws Exception {
         try (Cluster cluster = Cluster.start(tempDir)) {
             Path module = Files.createDirectories(tempDir.resolve("module-conflict"));
@@ -143,6 +312,9 @@ class DistributedLauncherTest {
             assertThat(module.resolve("target/citrus-docs/conflict.txt")).doesNotExist();
             assertThat(cluster.broker.store().listSessions(1).getFirst().status())
                     .isEqualTo(org.citrusframework.distribution.model.SessionStatus.FAILED);
+            assertThat(cluster.broker.store().listSessions(1).getFirst().failureReason())
+                    .as("the launcher reports why its own session failed")
+                    .contains("target/citrus-docs/conflict.txt");
         }
     }
 
@@ -525,6 +697,46 @@ class DistributedLauncherTest {
         void write() throws Exception {
             Files.createDirectories(Path.of("target/citrus-docs"));
             Files.writeString(Path.of("target/citrus-docs/conflict.txt"), "B");
+        }
+    }
+
+    public static class LocalTimingFixture {
+        @Test
+        @LocalOnly
+        void slow() throws InterruptedException {
+            Thread.sleep(300);
+        }
+
+        @Test
+        @LocalOnly
+        void assumed() {
+            org.junit.jupiter.api.Assumptions.assumeTrue(false, "not on this host");
+        }
+
+        @Test
+        void remote() {
+        }
+    }
+
+    public static class SplitFixture {
+        @Test
+        @LocalOnly
+        void onHost() {
+        }
+
+        @Test
+        void onWorker() {
+        }
+    }
+
+    public static class RemoteMixedFixture {
+        @Test
+        void passes() {
+        }
+
+        @Test
+        void fails() {
+            throw new AssertionError("expected remote failure");
         }
     }
 

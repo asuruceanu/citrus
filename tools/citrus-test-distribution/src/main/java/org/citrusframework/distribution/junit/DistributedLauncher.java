@@ -44,21 +44,14 @@ import org.citrusframework.distribution.model.PartitionPolicy;
 import org.citrusframework.distribution.model.ReportLocalTestsRequest;
 import org.citrusframework.distribution.model.SubmitWorkRequest;
 import org.citrusframework.distribution.model.SubmitWorkResponse;
-import org.citrusframework.distribution.model.TestOutcomeStatus;
 import org.citrusframework.distribution.model.WorkUnitSpec;
 import org.citrusframework.distribution.model.WorkerTestEventPayload;
 import org.citrusframework.distribution.model.WorkspaceFileSet;
-import org.junit.platform.engine.TestDescriptor;
-import org.junit.platform.engine.TestExecutionResult;
-import org.junit.platform.engine.UniqueId;
-import org.junit.platform.engine.support.descriptor.AbstractTestDescriptor;
-import org.junit.platform.engine.support.descriptor.ClassSource;
 import org.junit.platform.launcher.Launcher;
 import org.junit.platform.launcher.LauncherDiscoveryListener;
 import org.junit.platform.launcher.LauncherDiscoveryRequest;
 import org.junit.platform.launcher.LauncherExecutionRequest;
 import org.junit.platform.launcher.TestExecutionListener;
-import org.junit.platform.launcher.TestIdentifier;
 import org.junit.platform.launcher.TestPlan;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -85,7 +78,8 @@ public class DistributedLauncher implements Launcher {
 
     @Override
     public void registerTestExecutionListeners(TestExecutionListener... listeners) {
-        delegate.registerTestExecutionListeners(listeners);
+        // Kept here, not on the delegate: results reach them through this launcher exactly once, whether a test ran
+        // locally through the delegate (passed per call) or remotely (replayed).
         if (listeners != null) {
             registeredListeners.addAll(List.of(listeners));
         }
@@ -118,17 +112,21 @@ public class DistributedLauncher implements Launcher {
     }
 
     private void executeDistributed(TestPlan testPlan, TestExecutionListener[] callListeners) {
+        JacksonClasspathCheck.conflicts(Thread.currentThread().getContextClassLoader())
+                .forEach(conflict -> LOG.warn("Citrus Test Distribution: {}", conflict));
         DiscoveredWorkExtractor.ExtractedWork extracted = DiscoveredWorkExtractor.extract(
-                testPlan, DistributionSettings.getDefaultTestDurationMs());
+                testPlan, DistributionSettings.getDefaultTestDurationMs(),
+                DiscoveredWorkExtractor.partiallySelectedClasses(delegate, testPlan));
 
         if (extracted.remoteUnits().isEmpty() && extracted.localUnits().isEmpty()) {
-            delegate.execute(testPlan, callListeners);
+            delegate.execute(testPlan, combineListeners(callListeners).toArray(TestExecutionListener[]::new));
             return;
         }
 
         if (extracted.remoteUnits().isEmpty()) {
             LocalFallbackExecutor.LocalExecutionStats onlyLocal =
-                    LocalFallbackExecutor.executeLocally(delegate, extracted.localUnits(), callListeners);
+                    LocalFallbackExecutor.executeLocally(delegate, extracted.localUnits(),
+                            combineListeners(callListeners).toArray(TestExecutionListener[]::new));
             String sharedSessionId = System.getProperty(DistributionSettings.SESSION_ID_PROPERTY);
             if (sharedSessionId != null && !sharedSessionId.isBlank() && !onlyLocal.executions().isEmpty()) {
                 try {
@@ -181,22 +179,17 @@ public class DistributedLauncher implements Launcher {
             LOG.warn("Broker {} unreachable ({}); falling back to local execution", brokerUrl, e.getMessage());
             List<WorkUnitSpec> all = new ArrayList<>(extracted.localUnits());
             all.addAll(extracted.remoteUnits());
-            LocalFallbackExecutor.executeLocally(delegate, all, callListeners);
+            LocalFallbackExecutor.executeLocally(delegate, all,
+                    combineListeners(callListeners).toArray(TestExecutionListener[]::new));
             return;
         }
 
         List<TestExecutionListener> allListeners = combineListeners(callListeners);
         SurefireReportWriter reportWriter = new SurefireReportWriter();
 
-        LocalFallbackExecutor.LocalExecutionStats localStats =
-                LocalFallbackExecutor.executeLocally(delegate, extracted.localUnits(), callListeners);
-        if (!localStats.executions().isEmpty()) {
-            try {
-                client.reportLocalTests(sessionId, new ReportLocalTestsRequest("local-host", localStats.executions()));
-            } catch (Exception e) {
-                LOG.warn("Failed to report @LocalOnly test executions to session {}: {}", sessionId, e.getMessage());
-            }
-        }
+        // Pinned units run below, once the remote partitions are submitted: they execute while the workers do, and
+        // their events reach the listeners live through the replayer, sharing class test sets with remote results.
+        LocalFallbackExecutor.LocalExecutionStats localStats = new LocalFallbackExecutor.LocalExecutionStats(0, 0, 0, 0L);
 
         boolean sessionCompleted = false;
         LocalFallbackExecutor.LocalExecutionStats lostStats =
@@ -245,37 +238,52 @@ public class DistributedLauncher implements Launcher {
                     workspace.outputPaths(), workspace.cacheExclusion()), workspace.cache());
             Map<String, WorkUnitSpec> unitsByKey = new LinkedHashMap<>();
             extracted.remoteUnits().forEach(unit -> unitsByKey.putIfAbsent(unit.key(), unit));
+            List<WorkUnitSpec> expectedUnits = new ArrayList<>(extracted.localUnits());
+            expectedUnits.addAll(extracted.remoteUnits());
+            RemoteResultReplayer replayer = new RemoteResultReplayer(testPlan, allListeners, expectedUnits);
             try {
                 notifyTestPlanExecutionStarted(allListeners, testPlan);
                 try {
+                    localStats = LocalFallbackExecutor.executeLocally(delegate, extracted.localUnits(),
+                            new TestExecutionListener[] {replayer.liveListener()});
+                    replayer.localUnitsDone(keysOf(extracted.localUnits()));
+                    if (!localStats.executions().isEmpty()) {
+                        try {
+                            client.reportLocalTests(sessionId, new ReportLocalTestsRequest("local-host", localStats.executions()));
+                        } catch (Exception e) {
+                            LOG.warn("Failed to report @LocalOnly test executions to session {}: {}", sessionId, e.getMessage());
+                        }
+                    }
                     if (!pendingPartitions.isEmpty()) {
                         client.streamSessionEvents(
                                 sessionId,
                                 0L,
                                 DistributionSettings.getSessionTimeoutMs(),
-                                event -> handleBrokerEvent(event, testPlan, allListeners, reportWriter, submittedPartitions,
+                                event -> handleBrokerEvent(event, replayer, reportWriter, submittedPartitions,
                                         pendingPartitions, lostUnits, unitsByKey, outcomes, client));
                     }
-                } finally {
-                    notifyTestPlanExecutionFinished(allListeners, testPlan);
-                }
-
-                if (!lostUnits.isEmpty()) {
-                    if (!fallbackLocal || extracted.hasRemoteOnlyUnits()) {
-                        throw new IllegalStateException("Remote partitions were lost: " + lostUnits.size());
-                    }
-                    LOG.warn("Executing {} lost remote work unit(s) locally", lostUnits.size());
-                    lostStats = LocalFallbackExecutor.executeLocally(delegate, lostUnits, callListeners);
-                    if (!lostStats.executions().isEmpty()) {
-                        try {
-                            client.reportLocalTests(
-                                    sessionId,
-                                    new ReportLocalTestsRequest("local-fallback", lostStats.executions()));
-                        } catch (Exception e) {
-                            LOG.warn("Failed to report fallback test executions to session {}: {}",
-                                    sessionId, e.getMessage());
+                    if (!lostUnits.isEmpty()) {
+                        if (!fallbackLocal || extracted.hasRemoteOnlyUnits()) {
+                            throw new IllegalStateException("Remote partitions were lost: " + lostUnits.size());
+                        }
+                        LOG.warn("Executing {} lost remote work unit(s) locally", lostUnits.size());
+                        lostStats = LocalFallbackExecutor.executeLocally(delegate, lostUnits,
+                                new TestExecutionListener[] {replayer.liveListener()});
+                        replayer.localUnitsDone(keysOf(lostUnits));
+                        if (!lostStats.executions().isEmpty()) {
+                            try {
+                                client.reportLocalTests(
+                                        sessionId,
+                                        new ReportLocalTestsRequest("local-fallback", lostStats.executions()));
+                            } catch (Exception e) {
+                                LOG.warn("Failed to report fallback test executions to session {}: {}",
+                                        sessionId, e.getMessage());
+                            }
                         }
                     }
+                } finally {
+                    replayer.finishStartedContainers();
+                    notifyTestPlanExecutionFinished(allListeners, testPlan);
                 }
 
                 String reportDirProp = System.getProperty(DistributionSettings.REPORT_DIR_PROPERTY);
@@ -291,7 +299,8 @@ public class DistributedLauncher implements Launcher {
                             localStats.failed() + lostStats.failed(),
                             localStats.skipped() + lostStats.skipped(),
                             localStats.serialDurationMs() + lostStats.serialDurationMs(),
-                            outputFailure != null));
+                            outputFailure != null,
+                            outputFailure != null ? describe(outputFailure) : null));
                     sessionCompleted = true;
                 }
                 if (outputFailure != null) {
@@ -301,14 +310,14 @@ public class DistributedLauncher implements Launcher {
                 // Every abort path (lost partitions, stream errors, failures in the event handler) drops staged outputs.
                 outcomes.committer().discardStaging();
             }
-        } catch (RuntimeException re) {
+        } catch (RuntimeException | Error re) {
             if (ownsSession && !sessionCompleted) {
-                completeOwnedSessionOnFailure(client, sessionId, localStats, lostStats);
+                completeOwnedSessionOnFailure(client, sessionId, localStats, lostStats, re);
             }
             throw re;
         } catch (Exception e) {
             if (ownsSession && !sessionCompleted) {
-                completeOwnedSessionOnFailure(client, sessionId, localStats, lostStats);
+                completeOwnedSessionOnFailure(client, sessionId, localStats, lostStats, e);
             }
             throw new IllegalStateException("Distributed test execution failed for session " + sessionId, e);
         }
@@ -318,17 +327,30 @@ public class DistributedLauncher implements Launcher {
             BrokerHttpClient client,
             String sessionId,
             LocalFallbackExecutor.LocalExecutionStats localStats,
-            LocalFallbackExecutor.LocalExecutionStats lostStats) {
+            LocalFallbackExecutor.LocalExecutionStats lostStats,
+            Throwable cause) {
         try {
             client.completeSession(sessionId, new CompleteSessionRequest(
                     localStats.passed() + lostStats.passed(),
                     localStats.failed() + lostStats.failed(),
                     localStats.skipped() + lostStats.skipped(),
                     localStats.serialDurationMs() + lostStats.serialDurationMs(),
-                    true));
+                    true,
+                    describe(cause)));
         } catch (Exception e) {
             LOG.warn("Failed to mark failed session {} as completed on broker: {}", sessionId, e.getMessage());
         }
+    }
+
+    /** {@code <exception class>: <message>} of {@code cause}, falling back to the first cause that has a message. */
+    static String describe(Throwable cause) {
+        java.util.Set<Throwable> seen = java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
+        for (Throwable cur = cause; cur != null && seen.add(cur); cur = cur.getCause()) {
+            if (cur.getMessage() != null && !cur.getMessage().isBlank()) {
+                return cur.getClass().getName() + ": " + cur.getMessage();
+            }
+        }
+        return cause != null ? cause.getClass().getName() : null;
     }
 
     /**
@@ -336,8 +358,7 @@ public class DistributedLauncher implements Launcher {
      * session) are ignored, and each partition's completion is processed once even if replayed.
      */
     private boolean handleBrokerEvent(BrokerEvent event,
-                                      TestPlan testPlan,
-                                      List<TestExecutionListener> listeners,
+                                      RemoteResultReplayer replayer,
                                       SurefireReportWriter reportWriter,
                                       Set<String> submittedPartitions,
                                       Set<String> pendingPartitions,
@@ -349,20 +370,27 @@ public class DistributedLauncher implements Launcher {
         switch (event.type()) {
             case "test.event" -> {
                 if (ownEvent) {
-                    WorkerTestEventPayload payload = DistributionJson.convert(event.data(), WorkerTestEventPayload.class);
-                    reportWriter.record(payload);
-                    replayToJUnitListeners(testPlan, listeners, payload);
+                    replayer.buffer(DistributionJson.convert(event.data(), WorkerTestEventPayload.class));
                 }
             }
             case "partition.completed" -> {
                 if (ownEvent && pendingPartitions.remove(event.partitionId())) {
+                    // Only the attempt that completed the partition is reported, once, with its final outcomes.
+                    replayer.complete(event.partitionId(), attemptOf(event), unitKeysOf(event)).forEach(reportWriter::record);
                     outcomes.completed(event, client);
+                }
+            }
+            case "partition.requeued" -> {
+                if (ownEvent) {
+                    replayer.abandon(event.partitionId());
                 }
             }
             case "partition.lost" -> {
                 if (!ownEvent || !pendingPartitions.remove(event.partitionId())) {
                     return pendingPartitions.isEmpty();
                 }
+                // Lost units re-run locally and report themselves; the remote attempt's partial results are dropped.
+                replayer.abandon(event.partitionId());
                 List<?> rawUnits = event.data() != null && event.data().get("workUnits") instanceof List<?> list ? list : List.of();
                 int mapped = 0;
                 for (Object item : rawUnits) {
@@ -387,40 +415,22 @@ public class DistributedLauncher implements Launcher {
         return pendingPartitions.isEmpty();
     }
 
-    private void replayToJUnitListeners(TestPlan testPlan,
-                                        List<TestExecutionListener> listeners,
-                                        WorkerTestEventPayload payload) {
-        TestIdentifier id = synthesizeIdentifier(payload);
-        if (payload.status() == TestOutcomeStatus.STARTED) {
-            for (TestExecutionListener l : listeners) {
-                l.executionStarted(id);
-            }
-            return;
-        }
-        if (payload.status() == TestOutcomeStatus.SKIPPED) {
-            for (TestExecutionListener l : listeners) {
-                l.executionSkipped(id, payload.errorMessage() != null ? payload.errorMessage() : "skipped");
-            }
-            return;
-        }
-        TestExecutionResult result = payload.status() == TestOutcomeStatus.PASSED
-                ? TestExecutionResult.successful()
-                : TestExecutionResult.failed(new AssertionError(
-                        payload.errorMessage() != null ? payload.errorMessage() : "Remote test failed"));
-        for (TestExecutionListener l : listeners) {
-            l.executionStarted(id);
-            l.executionFinished(id, result);
-        }
+    private static List<String> keysOf(List<WorkUnitSpec> units) {
+        return units.stream().map(WorkUnitSpec::key).toList();
     }
 
-    private static TestIdentifier synthesizeIdentifier(WorkerTestEventPayload payload) {
-        String className = payload.className() != null ? payload.className() : "DistributedTest";
-        String testName = payload.testName() != null ? payload.testName() : payload.workUnitKey();
-        UniqueId uid = UniqueId.forEngine("junit-jupiter")
-                .append("class", className)
-                .append("method", testName);
-        SyntheticRemoteDescriptor descriptor = new SyntheticRemoteDescriptor(uid, testName, className);
-        return TestIdentifier.from(descriptor);
+    /** Work unit keys a {@code partition.completed} event lists, or {@code null} for coordinators that do not send them. */
+    private static List<String> unitKeysOf(BrokerEvent event) {
+        Object units = event.data() != null ? event.data().get("workUnits") : null;
+        if (!(units instanceof List<?> list)) {
+            return null;
+        }
+        return list.stream().map(String::valueOf).toList();
+    }
+
+    private static int attemptOf(BrokerEvent event) {
+        Object attempt = event.data() != null ? event.data().get("attempt") : null;
+        return attempt instanceof Number n ? n.intValue() : 1;
     }
 
     private void notifyTestPlanExecutionStarted(List<TestExecutionListener> listeners, TestPlan plan) {
@@ -709,17 +719,6 @@ public class DistributedLauncher implements Launcher {
             } catch (IOException | RuntimeException e) {
                 return new IllegalStateException("Failed to write remote outputs into the module: " + e.getMessage(), e);
             }
-        }
-    }
-
-    private static final class SyntheticRemoteDescriptor extends AbstractTestDescriptor {
-        SyntheticRemoteDescriptor(UniqueId uniqueId, String displayName, String className) {
-            super(uniqueId, displayName, ClassSource.from(className));
-        }
-
-        @Override
-        public Type getType() {
-            return Type.TEST;
         }
     }
 }

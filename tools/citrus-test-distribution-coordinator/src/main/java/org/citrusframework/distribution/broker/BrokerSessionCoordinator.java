@@ -77,6 +77,7 @@ public final class BrokerSessionCoordinator {
     private final Map<String, SubmitWorkResponse> submissionResponses = new ConcurrentHashMap<>();
     private final Map<String, PartitionRuntime> partitions = new ConcurrentHashMap<>();
     private final Map<String, WorkerConnection> workers = new ConcurrentHashMap<>();
+    private long assignmentSequence;
 
     public BrokerSessionCoordinator(DistributionBrokerConfig config, DistributionStore store, BrokerEventStreamHub eventHub) {
         this.config = config;
@@ -236,7 +237,7 @@ public final class BrokerSessionCoordinator {
             if (evt == null || evt.status() == null || evt.status() == TestOutcomeStatus.STARTED) {
                 continue;
             }
-            String testKey = testIdentityKey(evt.workUnitKey(), evt.className(), evt.testName());
+            String testKey = session.testKey(evt.workUnitKey(), evt.className(), evt.testName(), evt.uniqueId());
             int localAttempt = session.nextAttemptFor(testKey);
             boolean flaky = localAttempt > 1
                     && evt.status() == TestOutcomeStatus.PASSED
@@ -256,7 +257,8 @@ public final class BrokerSessionCoordinator {
                     evt.errorMessage(),
                     evt.stackTrace(),
                     evt.endpoints() != null ? evt.endpoints() : List.of(),
-                    System.currentTimeMillis()
+                    System.currentTimeMillis(),
+                    evt.uniqueId()
             );
             store.saveTestExecution(execRecord);
             session.recordExecution(execRecord);
@@ -376,7 +378,7 @@ public final class BrokerSessionCoordinator {
         }
 
         SessionSummary summary = computeSessionSummary(session, null, now);
-        store.updateSessionStatus(sessionId, SessionStatus.ABORTED, now, summary);
+        store.updateSessionStatus(sessionId, SessionStatus.ABORTED, now, summary, abortReason);
         BuildSessionRecord updated = store.findSession(sessionId).orElse(session.record);
         session.record = updated;
 
@@ -433,7 +435,10 @@ public final class BrokerSessionCoordinator {
         SessionStatus finalStatus = (summary.failedTests() > 0 || unrecoveredPartitionFailure || buildFailed)
                 ? SessionStatus.FAILED
                 : SessionStatus.PASSED;
-        store.updateSessionStatus(sessionId, finalStatus, finishedAt, summary);
+        String failureReason = finalStatus == SessionStatus.FAILED
+                ? describeFailure(request, summary, unrecoveredPartitionFailure)
+                : null;
+        store.updateSessionStatus(sessionId, finalStatus, finishedAt, summary, failureReason);
 
         BuildSessionRecord updated = store.findSession(sessionId).orElse(session.record);
         session.record = updated;
@@ -447,6 +452,22 @@ public final class BrokerSessionCoordinator {
                 "wallDurationMs", summary.wallDurationMs()
         ));
         return updated;
+    }
+
+    private static String describeFailure(CompleteSessionRequest request, SessionSummary summary,
+                                          boolean unrecoveredPartitionFailure) {
+        if (request != null && request.failureReason() != null && !request.failureReason().isBlank()) {
+            return summary.failedTests() > 0
+                    ? request.failureReason() + " (" + summary.failedTests() + " test(s) failed)"
+                    : request.failureReason();
+        }
+        if (unrecoveredPartitionFailure) {
+            return "A partition did not complete and was not recovered locally";
+        }
+        if (summary.failedTests() > 0) {
+            return summary.failedTests() + " test(s) failed";
+        }
+        return "Build failed outside distributed test execution (no reason reported by the launcher)";
     }
 
     public synchronized Optional<SessionDetailResponse> getSessionDetail(String sessionId) {
@@ -575,7 +596,9 @@ public final class BrokerSessionCoordinator {
                     }
                     pr.lastProgressAt = System.currentTimeMillis();
                     SessionRuntime session = getOrRehydrateSession(pr.record.sessionId());
-                    String testKey = testIdentityKey(evt.workUnitKey(), evt.className(), evt.testName());
+                    String testKey = session != null
+                            ? session.testKey(evt.workUnitKey(), evt.className(), evt.testName(), evt.uniqueId())
+                            : testIdentityKey(evt.workUnitKey(), evt.className(), evt.testName(), evt.uniqueId());
                     if (evt.status() == TestOutcomeStatus.STARTED) {
                         pr.inFlightTestKey = testKey;
                     } else {
@@ -601,7 +624,8 @@ public final class BrokerSessionCoordinator {
                                 evt.errorMessage(),
                                 evt.stackTrace(),
                                 evt.endpoints() != null ? evt.endpoints() : List.of(),
-                                System.currentTimeMillis()
+                                System.currentTimeMillis(),
+                                evt.uniqueId()
                         );
                         store.saveTestExecution(execRecord);
                         if (session != null) {
@@ -695,6 +719,7 @@ public final class BrokerSessionCoordinator {
             Map<String, Object> data = new LinkedHashMap<>();
             data.put("state", endState.name());
             data.put("attempt", pr.record.attempt());
+            data.put("workUnits", pr.record.workUnits().stream().map(WorkUnitSpec::key).toList());
             if (done.errorMessage() != null) {
                 data.put("errorMessage", done.errorMessage());
             }
@@ -804,6 +829,7 @@ public final class BrokerSessionCoordinator {
             store.savePartition(pr.record);
 
             matchingWorker.state = WorkerState.BUSY;
+            matchingWorker.lastAssignedAt = ++assignmentSequence;
             matchingWorker.activePartitionId = pr.record.partitionId();
             pr.activeConnectionId = matchingWorker.connectionId;
             persistWorker(matchingWorker);
@@ -900,7 +926,7 @@ public final class BrokerSessionCoordinator {
         }
         capabilities.put(DistributionSettings.WORKSPACE_CAPABILITY_KEY, "true");
         return new WorkUnitSpec(unit.key(), unit.className(), unit.methodName(), unit.dynamicSourceName(),
-                capabilities, unit.estimatedDurationMs());
+                capabilities, unit.estimatedDurationMs(), unit.enclosingClassNames());
     }
 
     /**
@@ -910,20 +936,31 @@ public final class BrokerSessionCoordinator {
      */
     private WorkerConnection findIdleMatchingWorker(Map<String, String> requiredCapabilities, Set<String> preferAvoiding) {
         long aliveSince = System.currentTimeMillis() - config.leaseTimeoutMs();
+        // Least recently assigned first, so partitions spread over the pool instead of always hitting the worker that
+        // happens to come first; a worker an earlier attempt ran on is only a fallback.
+        WorkerConnection best = null;
         WorkerConnection fallback = null;
         for (WorkerConnection conn : workers.values()) {
             if (conn.state == WorkerState.IDLE && conn.activePartitionId == null && conn.cancelledPartitionId == null
                     && conn.lastHeartbeatAt >= aliveSince
                     && CapabilityMatcher.matches(requiredCapabilities, conn.capabilities)) {
                 if (!preferAvoiding.contains(conn.workerId)) {
-                    return conn;
-                }
-                if (fallback == null) {
+                    if (best == null || assignedEarlier(conn, best)) {
+                        best = conn;
+                    }
+                } else if (fallback == null || assignedEarlier(conn, fallback)) {
                     fallback = conn;
                 }
             }
         }
-        return fallback;
+        return best != null ? best : fallback;
+    }
+
+    private static boolean assignedEarlier(WorkerConnection a, WorkerConnection b) {
+        if (a.lastAssignedAt != b.lastAssignedAt) {
+            return a.lastAssignedAt < b.lastAssignedAt;
+        }
+        return a.workerId.compareTo(b.workerId) < 0;
     }
 
     private void persistWorker(WorkerConnection conn) {
@@ -1031,7 +1068,20 @@ public final class BrokerSessionCoordinator {
         );
     }
 
-    private static String testIdentityKey(String workUnitKey, String className, String testName) {
+    /** Length the store keeps of a unique id; keys use the same prefix so live and rehydrated keys agree. */
+    private static final int UNIQUE_ID_KEY_LENGTH = 1024;
+
+    /**
+     * Identity of one test across attempts: work unit plus JUnit unique id when reported, otherwise work unit, class,
+     * and display name. The unique id keeps parameterized and dynamic invocations with equal display names apart; the
+     * work unit keeps Citrus factory sources apart, since each source runs in its own filtered JUnit run and so always
+     * reports the same {@code [dynamic-test:#1]} id.
+     */
+    private static String testIdentityKey(String workUnitKey, String className, String testName, String uniqueId) {
+        if (uniqueId != null && !uniqueId.isBlank()) {
+            String uid = uniqueId.length() > UNIQUE_ID_KEY_LENGTH ? uniqueId.substring(0, UNIQUE_ID_KEY_LENGTH) : uniqueId;
+            return "uid:" + (workUnitKey != null ? workUnitKey : "") + "|" + uid;
+        }
         String keyPart = (workUnitKey != null && !workUnitKey.isBlank()) ? workUnitKey : "";
         String cls = (className != null && !className.isBlank()) ? className : "";
         String tst = (testName != null && !testName.isBlank()) ? testName : "";
@@ -1101,6 +1151,8 @@ public final class BrokerSessionCoordinator {
         private final List<String> partitionIds = new ArrayList<>();
         private final Set<String> failedOrInterruptedTests = new HashSet<>();
         private final Map<String, TestExecutionRecord> latestExecutionsByTest = new LinkedHashMap<>();
+        /** Legacy test key (no unique id) to the unique-id key that took it over. */
+        private final Map<String, String> legacyKeyOwners = new java.util.HashMap<>();
         private final Set<String> locallyExecutedWorkUnitKeys = new HashSet<>();
         private int cachedBlobs;
         private int uploadedBlobs;
@@ -1113,13 +1165,33 @@ public final class BrokerSessionCoordinator {
             this.maxRetries = maxRetries;
         }
 
+        /**
+         * Identity key of a test in this session. A test first recorded without a unique id (older worker or launcher,
+         * or a row stored before the column existed) keeps that legacy key, so its retries with a unique id still
+         * count as the same test. Only the first unique id seen for a legacy key takes it over: invocations sharing a
+         * display name (parameterized, dynamic) stay separate tests.
+         */
+        private String testKey(String workUnitKey, String className, String testName, String uniqueId) {
+            String key = testIdentityKey(workUnitKey, className, testName, uniqueId);
+            if (!latestExecutionsByTest.containsKey(key)) {
+                String legacy = testIdentityKey(workUnitKey, className, testName, null);
+                if (!legacy.equals(key) && latestExecutionsByTest.containsKey(legacy)) {
+                    String owner = legacyKeyOwners.putIfAbsent(legacy, key);
+                    if (owner == null || owner.equals(key)) {
+                        return legacy;
+                    }
+                }
+            }
+            return key;
+        }
+
         private int nextAttemptFor(String key) {
             TestExecutionRecord previous = latestExecutionsByTest.get(key);
             return previous == null ? 1 : previous.attempt() + 1;
         }
 
         private void recordExecution(TestExecutionRecord exec) {
-            String key = testIdentityKey(exec.workUnitKey(), exec.className(), exec.testName());
+            String key = testKey(exec.workUnitKey(), exec.className(), exec.testName(), exec.uniqueId());
             if ("|#".equals(key)) {
                 key = exec.id();
             }
@@ -1217,6 +1289,8 @@ public final class BrokerSessionCoordinator {
         private final long connectedAt = System.currentTimeMillis();
         private long lastHeartbeatAt = System.currentTimeMillis();
         private WorkerState state = WorkerState.IDLE;
+        /** Sequence number of this worker's latest assignment (0 = never), for least-recently-used dispatch. */
+        private long lastAssignedAt;
         private String activePartitionId;
         /** Partition whose expired attempt this worker was told to cancel and has not yet confirmed ending. */
         private String cancelledPartitionId;

@@ -20,6 +20,7 @@ import java.io.PrintWriter;
 import java.io.StringWriter;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
+import java.util.Optional;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -67,9 +68,13 @@ public final class PartitionJUnitLauncher {
     }
 
     /**
-     * Executes {@code workUnits} one after another with {@code testClassLoader} as context class loader, streaming a
-     * {@link WorkerTestEventPayload} for every test start, skip and finish. Stops before the next work unit once
-     * {@code cancellationToken} is cancelled.
+     * Executes {@code workUnits} with {@code testClassLoader} as context class loader, streaming a
+     * {@link WorkerTestEventPayload} for every test start, skip and finish.
+     * <p>
+     * All class and method units run in one JUnit execution, so the module's own configuration (for example
+     * {@code junit.jupiter.execution.parallel.*} in its {@code junit-platform.properties}) applies across the whole
+     * partition, as it does in a local Surefire run. Citrus factory source units run afterwards, one at a time, because
+     * each needs its own source filter. Execution stops once {@code cancellationToken} is cancelled.
      */
     public static ExecutionSummary executeWorkUnits(String partitionId,
                                                     String sessionId,
@@ -83,19 +88,47 @@ public final class PartitionJUnitLauncher {
         thread.setContextClassLoader(testClassLoader);
         try (CitrusEndpointCollector endpointCollector = CitrusEndpointCollector.install(testClassLoader)) {
             resetCitrusExtensionIfPresent(testClassLoader);
-            List<String> unmatched = new ArrayList<>();
+            List<WorkUnitSpec> regular = new ArrayList<>();
+            List<WorkUnitSpec> dynamic = new ArrayList<>();
             for (WorkUnitSpec unit : workUnits) {
-                if (cancellationToken != null && cancellationToken.isCancellationRequested()) {
+                (unit.dynamicSourceName() != null && !unit.dynamicSourceName().isBlank() ? dynamic : regular).add(unit);
+            }
+            Set<String> reported = java.util.concurrent.ConcurrentHashMap.newKeySet();
+            // A test class missing from the partition fails the partition, but only after every other unit has run.
+            Set<String> missingClasses = new LinkedHashSet<>();
+            List<WorkUnitSpec> loadable = new ArrayList<>();
+            for (WorkUnitSpec unit : workUnits) {
+                try {
+                    Class.forName(unit.className(), false, testClassLoader);
+                    loadable.add(unit);
+                } catch (ClassNotFoundException e) {
+                    missingClasses.add(unit.className());
+                }
+            }
+            regular.retainAll(loadable);
+            dynamic.retainAll(loadable);
+            if (!regular.isEmpty() && !isCancelled(cancellationToken)) {
+                executeTogether(partitionId, sessionId, attempt, regular, testClassLoader, endpointCollector,
+                        cancellationToken, eventSink, reported);
+            }
+            for (WorkUnitSpec unit : dynamic) {
+                if (isCancelled(cancellationToken)) {
                     break;
                 }
-                boolean reported = executeWorkUnit(
-                        new EventFactory(partitionId, sessionId, attempt, unit),
-                        testClassLoader,
-                        endpointCollector,
-                        cancellationToken,
-                        eventSink);
-                if (!reported && (cancellationToken == null || !cancellationToken.isCancellationRequested())) {
-                    unmatched.add(unit.key() + " (" + (unit.methodName() != null ? unit.methodName() : unit.className()) + ")");
+                if (executeWorkUnit(new EventFactory(partitionId, sessionId, attempt, identifier -> unit),
+                        testClassLoader, endpointCollector, cancellationToken, eventSink)) {
+                    reported.add(unit.key());
+                }
+            }
+            if (!missingClasses.isEmpty()) {
+                return new ExecutionSummary(false, "Test class not found: " + String.join(", ", missingClasses));
+            }
+            List<String> unmatched = new ArrayList<>();
+            if (!isCancelled(cancellationToken)) {
+                for (WorkUnitSpec unit : loadable) {
+                    if (!reported.contains(unit.key())) {
+                        unmatched.add(unit.key() + " (" + (unit.methodName() != null ? unit.methodName() : unit.className()) + ")");
+                    }
                 }
             }
             if (!unmatched.isEmpty()) {
@@ -115,6 +148,60 @@ public final class PartitionJUnitLauncher {
         } finally {
             thread.setContextClassLoader(previous);
         }
+    }
+
+    /** Selector for {@code unit} by class name; see {@link #selectorFor(WorkUnitSpec, ClassLoader)}. */
+    static DiscoverySelector selectorFor(WorkUnitSpec unit) {
+        try {
+            return selectorFor(unit, Thread.currentThread().getContextClassLoader());
+        } catch (ClassNotFoundException e) {
+            throw new IllegalArgumentException("Test class not found: " + unit.className(), e);
+        }
+    }
+
+    /**
+     * Selector for {@code unit} by class name, so JUnit loads the test class itself through the context class loader,
+     * as in a local Surefire run. Frameworks rely on that: Quarkus' launcher interceptor installs a class loader that
+     * {@code @QuarkusTest} classes must be loaded with. {@code classLoader} only resolves bare method names to an
+     * exact overload and checks that the class exists.
+     *
+     * @throws ClassNotFoundException when the partition does not contain the test class
+     */
+    static DiscoverySelector selectorFor(WorkUnitSpec unit, ClassLoader classLoader) throws ClassNotFoundException {
+        String methodName = unit.methodName();
+        List<String> enclosing = unit.enclosingClassNames();
+        if (methodName == null || methodName.isBlank()) {
+            Class.forName(unit.className(), false, classLoader);
+            // A @Nested class goes through the classes enclosing it on the host, e.g. the subclass that inherits it.
+            return enclosing.isEmpty()
+                    ? DiscoverySelectors.selectClass(unit.className())
+                    : DiscoverySelectors.selectNestedClass(enclosing, unit.className());
+        }
+        String name;
+        String parameterTypes;
+        int open = methodName.indexOf('(');
+        if (open > 0 && methodName.endsWith(")")) {
+            name = methodName.substring(0, open);
+            parameterTypes = methodName.substring(open + 1, methodName.length() - 1);
+        } else {
+            Class<?> testClass = Class.forName(unit.className(), false, classLoader);
+            DiscoverySelector resolved = methodSelector(testClass, methodName);
+            if (resolved instanceof org.junit.platform.engine.discovery.MethodSelector ms && ms.getJavaMethod() != null) {
+                name = ms.getJavaMethod().getName();
+                parameterTypes = org.junit.platform.commons.util.ClassUtils.nullSafeToString(
+                        ms.getJavaMethod().getParameterTypes());
+            } else {
+                name = methodName;
+                parameterTypes = null;
+            }
+        }
+        if (!enclosing.isEmpty()) {
+            return DiscoverySelectors.selectNestedMethod(enclosing, unit.className(), name,
+                    parameterTypes != null ? parameterTypes : "");
+        }
+        return parameterTypes != null
+                ? DiscoverySelectors.selectMethod(unit.className(), name, parameterTypes)
+                : DiscoverySelectors.selectMethod(unit.className(), name);
     }
 
     /**
@@ -143,6 +230,147 @@ public final class PartitionJUnitLauncher {
         return DiscoverySelectors.selectMethod(testClass, methodName);
     }
 
+    private static boolean isCancelled(CancellationToken cancellationToken) {
+        return cancellationToken != null && cancellationToken.isCancellationRequested();
+    }
+
+    /** Runs all {@code units} in one JUnit execution; adds the key of every unit that reported something. */
+    private static void executeTogether(String partitionId, String sessionId, int attempt, List<WorkUnitSpec> units,
+                                        ClassLoader classLoader, CitrusEndpointCollector endpointCollector,
+                                        CancellationToken cancellationToken, Consumer<WorkerTestEventPayload> eventSink,
+                                        Set<String> reported) throws ClassNotFoundException {
+        List<DiscoverySelector> selectors = new ArrayList<>();
+        for (WorkUnitSpec unit : units) {
+            selectors.add(selectorFor(unit, classLoader));
+        }
+        UnitIndex index = new UnitIndex(units);
+        setDynamicSourceFilterIfPresent(classLoader, null);
+        try (LauncherSession session = LauncherFactory.openSession()) {
+            LauncherDiscoveryRequest discoveryRequest = LauncherDiscoveryRequestBuilder.request()
+                    .selectors(selectors)
+                    .build();
+            EventListener listener = new EventListener(
+                    new EventFactory(partitionId, sessionId, attempt, null), endpointCollector, eventSink);
+            listener.events = new EventFactory(partitionId, sessionId, attempt, listener::unitOf);
+            listener.index = index;
+            listener.reportedUnits = reported;
+            LauncherExecutionRequestBuilder execution = LauncherExecutionRequestBuilder.request(discoveryRequest)
+                    .listeners(listener);
+            if (cancellationToken != null) {
+                execution.cancellationToken(cancellationToken);
+            }
+            session.getLauncher().execute(execution.build());
+        }
+    }
+
+    /**
+     * Work unit of a test or container: the most specific method unit, else the closest enclosing class unit. Units
+     * are keyed by the chain of classes enclosing them in the plan, so the same inherited {@code @Nested} class under
+     * two subclasses maps to two units.
+     */
+    private static final class UnitIndex {
+        private final List<WorkUnitSpec> units;
+        private final Map<String, WorkUnitSpec> byMethod = new java.util.HashMap<>();
+        private final Map<String, WorkUnitSpec> byClass = new java.util.HashMap<>();
+
+        UnitIndex(List<WorkUnitSpec> units) {
+            this.units = units;
+            Map<String, List<WorkUnitSpec>> byBareName = new java.util.LinkedHashMap<>();
+            for (WorkUnitSpec unit : units) {
+                String classKey = classKey(unit.enclosingClassNames(), unit.className());
+                if (unit.methodName() != null && !unit.methodName().isBlank()) {
+                    int open = unit.methodName().indexOf('(');
+                    String bare = open > 0 ? unit.methodName().substring(0, open) : unit.methodName();
+                    // The host names a method without parameters by its bare name, so that name is also its exact key.
+                    String exact = open > 0 ? unit.methodName() : bare + "()";
+                    byMethod.putIfAbsent(classKey + "#" + exact, unit);
+                    byBareName.computeIfAbsent(classKey + "#" + bare, k -> new ArrayList<>()).add(unit);
+                } else {
+                    byClass.putIfAbsent(classKey, unit);
+                }
+            }
+            // A bare name only identifies a unit when no other overload in the partition shares it.
+            byBareName.forEach((key, owners) -> {
+                if (owners.size() == 1) {
+                    byMethod.putIfAbsent(key, owners.get(0));
+                }
+            });
+        }
+
+        static String classKey(List<String> enclosing, String className) {
+            return enclosing == null || enclosing.isEmpty() ? className : String.join("/", enclosing) + "/" + className;
+        }
+
+        WorkUnitSpec lookup(TestIdentifier identifier, org.junit.platform.launcher.TestPlan plan) {
+            for (TestIdentifier cur = identifier; cur != null;
+                 cur = plan != null ? plan.getParent(cur).orElse(null) : null) {
+                TestSource source = cur.getSource().orElse(null);
+                if (source instanceof MethodSource ms) {
+                    String classKey = classKeyOf(classContainer(cur, plan), plan, ms.getClassName());
+                    String params = ms.getMethodParameterTypes();
+                    WorkUnitSpec unit = byMethod.get(classKey + "#" + ms.getMethodName() + "(" + (params != null ? params : "") + ")");
+                    if (unit == null) {
+                        unit = byMethod.get(classKey + "#" + ms.getMethodName());
+                    }
+                    if (unit == null) {
+                        unit = byClass.get(classKey);
+                    }
+                    if (unit != null) {
+                        return unit;
+                    }
+                } else if (source instanceof ClassSource cs) {
+                    WorkUnitSpec unit = byClass.get(classKeyOf(cur, plan, cs.getClassName()));
+                    if (unit != null) {
+                        return unit;
+                    }
+                }
+                if (plan == null) {
+                    break;
+                }
+            }
+            return null;
+        }
+
+        /** Every unit of the class container {@code identifier} and the classes nested in it. */
+        List<WorkUnitSpec> unitsWithin(TestIdentifier identifier, org.junit.platform.launcher.TestPlan plan) {
+            if (!(identifier.getSource().orElse(null) instanceof ClassSource cs)) {
+                return List.of();
+            }
+            String classKey = classKeyOf(identifier, plan, cs.getClassName());
+            return units.stream()
+                    .filter(u -> {
+                        String key = classKey(u.enclosingClassNames(), u.className());
+                        return key.equals(classKey) || key.startsWith(classKey + "/");
+                    })
+                    .toList();
+        }
+
+        private static TestIdentifier classContainer(TestIdentifier node, org.junit.platform.launcher.TestPlan plan) {
+            for (TestIdentifier cur = node; cur != null && plan != null; cur = plan.getParent(cur).orElse(null)) {
+                if (cur.getSource().orElse(null) instanceof ClassSource) {
+                    return cur;
+                }
+            }
+            return null;
+        }
+
+        private static String classKeyOf(TestIdentifier classNode, org.junit.platform.launcher.TestPlan plan,
+                                         String fallbackClassName) {
+            if (classNode == null || plan == null || !(classNode.getSource().orElse(null) instanceof ClassSource cs)) {
+                return fallbackClassName;
+            }
+            List<String> enclosing = new ArrayList<>();
+            Optional<TestIdentifier> parent = plan.getParent(classNode);
+            while (parent.isPresent()) {
+                if (parent.get().getSource().orElse(null) instanceof ClassSource outer) {
+                    enclosing.add(0, outer.getClassName());
+                }
+                parent = plan.getParent(parent.get());
+            }
+            return classKey(enclosing, cs.getClassName());
+        }
+    }
+
     /**
      * Runs one work unit and returns whether anything was reported for it (a test, a skipped or failed container).
      */
@@ -151,18 +379,17 @@ public final class PartitionJUnitLauncher {
                                            CitrusEndpointCollector endpointCollector,
                                            CancellationToken cancellationToken,
                                            Consumer<WorkerTestEventPayload> eventSink) throws ClassNotFoundException {
-        WorkUnitSpec unit = events.unit();
-        Class<?> testClass = Class.forName(unit.className(), false, classLoader);
-        DiscoverySelector selector = unit.methodName() != null && !unit.methodName().isBlank() && unit.dynamicSourceName() == null
-                ? methodSelector(testClass, unit.methodName())
-                : DiscoverySelectors.selectClass(testClass);
+        WorkUnitSpec unit = events.unit(null);
+        DiscoverySelector selector = unit.dynamicSourceName() == null
+                ? selectorFor(unit, classLoader)
+                : selectorFor(new WorkUnitSpec(unit.key(), unit.className(), null, null, Map.of(), 0L,
+                        unit.enclosingClassNames()), classLoader);
 
         boolean dynamicFilter = unit.dynamicSourceName() != null && !unit.dynamicSourceName().isBlank();
         setDynamicSourceFilterIfPresent(classLoader, dynamicFilter ? Set.of(unit.dynamicSourceName()) : null);
         try (LauncherSession session = LauncherFactory.openSession()) {
             LauncherDiscoveryRequest discoveryRequest = LauncherDiscoveryRequestBuilder.request()
                     .selectors(selector)
-                    .configurationParameter("junit.platform.launcher.interceptors.enabled", "false")
                     .build();
             EventListener listener = new EventListener(events, endpointCollector, eventSink);
             LauncherExecutionRequestBuilder execution = LauncherExecutionRequestBuilder.request(discoveryRequest)
@@ -202,13 +429,19 @@ public final class PartitionJUnitLauncher {
         }
     }
 
-    private record EventFactory(String partitionId, String sessionId, int attempt, WorkUnitSpec unit) {
+    private record EventFactory(String partitionId, String sessionId, int attempt,
+                                java.util.function.Function<TestIdentifier, WorkUnitSpec> unitOf) {
+
+        WorkUnitSpec unit(TestIdentifier identifier) {
+            return unitOf != null ? unitOf.apply(identifier) : null;
+        }
 
         WorkerTestEventPayload event(TestIdentifier identifier, TestOutcomeStatus status, long durationMs,
                                      String errorMessage, String stackTrace, List<String> endpoints) {
-            return new WorkerTestEventPayload(partitionId, sessionId, attempt, unit.key(),
-                    resolveClassName(identifier, unit.className()), identifier.getDisplayName(), status, durationMs,
-                    errorMessage, stackTrace, endpoints != null ? endpoints : List.of());
+            WorkUnitSpec unit = unit(identifier);
+            return new WorkerTestEventPayload(partitionId, sessionId, attempt, unit != null ? unit.key() : null,
+                    resolveClassName(identifier, unit != null ? unit.className() : null), identifier.getDisplayName(), status, durationMs,
+                    errorMessage, stackTrace, endpoints != null ? endpoints : List.of(), identifier.getUniqueId());
         }
 
         private static String resolveClassName(TestIdentifier identifier, String fallback) {
@@ -229,11 +462,47 @@ public final class PartitionJUnitLauncher {
      */
     private static final class EventListener implements TestExecutionListener {
 
-        private final EventFactory events;
+        private EventFactory events;
         private final CitrusEndpointCollector endpointCollector;
         private final Consumer<WorkerTestEventPayload> eventSink;
         private final Map<String, Long> startTimes = new ConcurrentHashMap<>();
         private volatile boolean reported;
+        /** Set for a multi-unit execution: resolves each event's unit and collects the units that reported. */
+        private UnitIndex index;
+        private Set<String> reportedUnits;
+        private volatile org.junit.platform.launcher.TestPlan plan;
+
+        @Override
+        public void testPlanExecutionStarted(org.junit.platform.launcher.TestPlan testPlan) {
+            this.plan = testPlan;
+        }
+
+        WorkUnitSpec unitOf(TestIdentifier identifier) {
+            return unitForEvent(identifier);
+        }
+
+        private void markReported(TestIdentifier identifier) {
+            reported = true;
+            if (reportedUnits != null) {
+                WorkUnitSpec unit = index != null ? index.lookup(identifier, plan) : events.unit(identifier);
+                if (unit != null) {
+                    reportedUnits.add(unit.key());
+                } else if (index != null && identifier.isContainer()) {
+                    // A skipped or failed class (e.g. @Disabled, failing @BeforeAll) that was split into method and
+                    // nested-class units: none of its tests run, and that outcome covers all of them.
+                    index.unitsWithin(identifier, plan).forEach(u -> reportedUnits.add(u.key()));
+                }
+            }
+        }
+
+        WorkUnitSpec unitForEvent(TestIdentifier identifier) {
+            WorkUnitSpec unit = index != null ? index.lookup(identifier, plan) : null;
+            if (unit == null && index != null && identifier.isContainer()) {
+                List<WorkUnitSpec> within = index.unitsWithin(identifier, plan);
+                return within.isEmpty() ? null : within.get(0);
+            }
+            return unit;
+        }
 
         private EventListener(
                 EventFactory events,
@@ -247,7 +516,7 @@ public final class PartitionJUnitLauncher {
         @Override
         public void executionStarted(TestIdentifier testIdentifier) {
             if (testIdentifier.isTest()) {
-                reported = true;
+                markReported(testIdentifier);
                 endpointCollector.startTest();
                 startTimes.put(testIdentifier.getUniqueId(), System.currentTimeMillis());
                 eventSink.accept(events.event(testIdentifier, TestOutcomeStatus.STARTED, 0L, null, null, List.of()));
@@ -257,7 +526,7 @@ public final class PartitionJUnitLauncher {
         @Override
         public void executionSkipped(TestIdentifier testIdentifier, String reason) {
             if (testIdentifier.isTest() || testIdentifier.getSource().isPresent()) {
-                reported = true;
+                markReported(testIdentifier);
                 eventSink.accept(events.event(testIdentifier, TestOutcomeStatus.SKIPPED, 0L, reason, null, List.of()));
             }
         }
@@ -266,7 +535,7 @@ public final class PartitionJUnitLauncher {
         public void executionFinished(TestIdentifier testIdentifier, TestExecutionResult result) {
             if (!testIdentifier.isTest()) {
                 if (result.getStatus() == TestExecutionResult.Status.FAILED) {
-                    reported = true;
+                    markReported(testIdentifier);
                     eventSink.accept(events.event(testIdentifier, TestOutcomeStatus.FAILED, 0L,
                             result.getThrowable().map(Throwable::getMessage).orElse("Container failed"),
                             result.getThrowable().map(EventListener::formatStackTrace).orElse(null),

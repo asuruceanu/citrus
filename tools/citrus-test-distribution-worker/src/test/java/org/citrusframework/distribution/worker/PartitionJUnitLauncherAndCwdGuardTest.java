@@ -148,7 +148,28 @@ class PartitionJUnitLauncherAndCwdGuardTest {
         events.clear();
         PartitionJUnitLauncher.executeWorkUnits("p1", "s1", 1, List.of(unit(OverloadedFixture.class, "named()")),
                 getClass().getClassLoader(), CancellationToken.create(), events::add);
-        assertThat(finished(events)).singleElement().satisfies(e -> assertThat(e.testName()).isEqualTo("named()"));
+        assertThat(finished(events)).singleElement().satisfies(e -> {
+            assertThat(e.testName()).isEqualTo("named()");
+            assertThat(e.uniqueId()).as("JUnit unique id lets the host replay into its own test plan")
+                    .startsWith("[engine:junit-jupiter]/[class:" + OverloadedFixture.class.getName() + "]")
+                    .endsWith("[method:named()]");
+        });
+    }
+
+    @Test
+    void shouldAttributeOverloadsInOnePartitionToTheirOwnUnits() {
+        // The host keys a no-argument method by its bare name, so the bare key must not fall to another overload.
+        WorkUnitSpec withInfo = unit(OverloadedFixture.class, "named(org.junit.jupiter.api.TestInfo)");
+        WorkUnitSpec noArgs = unit(OverloadedFixture.class, "named");
+        List<WorkerTestEventPayload> events = new CopyOnWriteArrayList<>();
+        PartitionJUnitLauncher.ExecutionSummary summary = PartitionJUnitLauncher.executeWorkUnits("p1", "s1", 1,
+                List.of(withInfo, noArgs), getClass().getClassLoader(), CancellationToken.create(), events::add);
+
+        assertThat(summary.success()).as(summary.errorMessage()).isTrue();
+        assertThat(finished(events)).extracting(WorkerTestEventPayload::testName, WorkerTestEventPayload::workUnitKey)
+                .containsExactlyInAnyOrder(
+                        org.assertj.core.groups.Tuple.tuple("named(TestInfo)", withInfo.key()),
+                        org.assertj.core.groups.Tuple.tuple("named()", noArgs.key()));
     }
 
     @Test
@@ -258,6 +279,22 @@ class PartitionJUnitLauncherAndCwdGuardTest {
     }
 
     @Test
+    void shouldStillRunThePartitionsOtherUnitsWhenOneTestClassIsMissing() {
+        List<WorkerTestEventPayload> events = new CopyOnWriteArrayList<>();
+        PartitionJUnitLauncher.ExecutionSummary summary = PartitionJUnitLauncher.executeWorkUnits("p1", "s1", 1,
+                List.of(new WorkUnitSpec("missing", "org.example.DoesNotExist", null, null, Map.of(), 0L),
+                        unit(OverloadedFixture.class, "named()")),
+                getClass().getClassLoader(), CancellationToken.create(), events::add);
+
+        assertThat(finished(events)).singleElement().satisfies(e -> {
+            assertThat(e.testName()).isEqualTo("named()");
+            assertThat(e.status()).isEqualTo(TestOutcomeStatus.PASSED);
+        });
+        assertThat(summary.success()).isFalse();
+        assertThat(summary.errorMessage()).isEqualTo("Test class not found: org.example.DoesNotExist");
+    }
+
+    @Test
     void shouldRedirectBasedirReportsAndExpandWorkspaceTokenPerPartition() {
         List<WorkerTestEventPayload> events = new CopyOnWriteArrayList<>();
         IsolatedPartitionRunner.PartitionExecutionResult result = runner(WorkerCwdCheckMode.FAIL).execute(
@@ -352,19 +389,19 @@ class PartitionJUnitLauncherAndCwdGuardTest {
     @Test
     void shouldExposeForkAndCwdSettingsAndAdvertiseWorkspaceCapability() {
         DistributionWorkerConfig defaults = DistributionWorkerConfig.builder().cacheDir(tempDir).build();
-        assertThat(defaults.forkMode()).isEqualTo(WorkerForkMode.AUTO);
+        assertThat(defaults.forkMode()).isEqualTo(WorkerForkMode.ALWAYS);
         assertThat(defaults.cwdCheckMode()).isEqualTo(WorkerCwdCheckMode.FAIL);
         assertThat(defaults.forkJvmArgs()).containsExactly("-Xmx768m", "-XX:ActiveProcessorCount=2");
         assertThat(defaults.capabilities()).containsEntry(DistributionSettings.WORKSPACE_CAPABILITY_KEY, "true");
 
         DistributionWorkerConfig custom = DistributionWorkerConfig.builder()
                 .cacheDir(tempDir)
-                .forkMode(WorkerForkMode.ALWAYS)
+                .forkMode(WorkerForkMode.AUTO)
                 .cwdCheckMode(WorkerCwdCheckMode.WARN)
                 .forkJvmArgs(List.of("-Xmx1g"))
                 .addCapabilitiesCsv(DistributionSettings.WORKSPACE_CAPABILITY_KEY + "=false")
                 .build();
-        assertThat(custom.forkMode()).isEqualTo(WorkerForkMode.ALWAYS);
+        assertThat(custom.forkMode()).isEqualTo(WorkerForkMode.AUTO);
         assertThat(custom.cwdCheckMode()).isEqualTo(WorkerCwdCheckMode.WARN);
         assertThat(custom.forkJvmArgs()).containsExactly("-Xmx1g");
         assertThat(custom.capabilities()).as("explicit opt-out is kept").containsEntry(DistributionSettings.WORKSPACE_CAPABILITY_KEY, "false");
@@ -473,6 +510,159 @@ class PartitionJUnitLauncherAndCwdGuardTest {
 
     private static PartitionAssignPayload assignment(Map<String, String> systemProperties, WorkUnitSpec unit) {
         return new PartitionAssignPayload("p-" + UUID.randomUUID(), "s1", 1, List.of(), systemProperties, List.of(unit));
+    }
+
+    @Test
+    void shouldRunThePartitionsClassesInOneJUnitRunSoTheirParallelConfigurationApplies() {
+        BarrierFixtureA.BARRIER.reset();
+        Map<String, String> parallel = Map.of(
+                "junit.jupiter.execution.parallel.enabled", "true",
+                "junit.jupiter.execution.parallel.mode.default", "same_thread",
+                "junit.jupiter.execution.parallel.mode.classes.default", "concurrent");
+        parallel.forEach(System::setProperty);
+        try {
+            List<WorkerTestEventPayload> events = new CopyOnWriteArrayList<>();
+            PartitionJUnitLauncher.ExecutionSummary summary = PartitionJUnitLauncher.executeWorkUnits("p1", "s1", 1,
+                    List.of(classUnit(BarrierFixtureA.class), classUnit(BarrierFixtureB.class)),
+                    getClass().getClassLoader(), CancellationToken.create(), events::add);
+
+            assertThat(summary.success()).isTrue();
+            assertThat(finished(events)).as("both classes waited for each other at the barrier")
+                    .extracting(WorkerTestEventPayload::workUnitKey, WorkerTestEventPayload::status)
+                    .containsExactlyInAnyOrder(
+                            org.assertj.core.groups.Tuple.tuple(BarrierFixtureA.class.getName(), TestOutcomeStatus.PASSED),
+                            org.assertj.core.groups.Tuple.tuple(BarrierFixtureB.class.getName(), TestOutcomeStatus.PASSED));
+        } finally {
+            parallel.keySet().forEach(System::clearProperty);
+        }
+    }
+
+    @Test
+    void shouldHonourTheModulesLauncherInterceptorsLikeSurefireDoes() {
+        // e.g. quarkus-junit5-config enables interceptors in its junit-platform.properties to load @QuarkusTest classes
+        System.setProperty("junit.platform.launcher.interceptors.enabled", "true");
+        CountingLauncherInterceptor.INVOCATIONS.set(0);
+        try {
+            List<WorkerTestEventPayload> events = new CopyOnWriteArrayList<>();
+            PartitionJUnitLauncher.executeWorkUnits("p1", "s1", 1, List.of(classUnit(BarrierFixtureB.class)),
+                    getClass().getClassLoader(), CancellationToken.create(), events::add);
+
+            assertThat(CountingLauncherInterceptor.INVOCATIONS.get()).as("module's launcher interceptor ran").isPositive();
+        } finally {
+            System.clearProperty("junit.platform.launcher.interceptors.enabled");
+        }
+    }
+
+    @Test
+    void shouldSelectTestsByNameSoFrameworkInterceptorsCanLoadTheClasses() {
+        // Quarkus' launcher interceptor loads @QuarkusTest classes through its own class loader; a selector that
+        // already holds a Class loaded by the partition loader bypasses it.
+        org.junit.platform.engine.DiscoverySelector classSelector =
+                PartitionJUnitLauncher.selectorFor(classUnit(BarrierFixtureB.class));
+        org.junit.platform.engine.DiscoverySelector methodSelector =
+                PartitionJUnitLauncher.selectorFor(unit(OverloadedFixture.class, "named()"));
+
+        assertThat(classSelector).isInstanceOfSatisfying(org.junit.platform.engine.discovery.ClassSelector.class,
+                selector -> {
+                    assertThat(selector.getClassName()).isEqualTo(BarrierFixtureB.class.getName());
+                    assertThat(selector.getClassLoader()).as("resolved lazily, through the context loader").isNull();
+                });
+        assertThat(methodSelector).isInstanceOfSatisfying(org.junit.platform.engine.discovery.MethodSelector.class,
+                selector -> {
+                    assertThat(selector.getClassName()).isEqualTo(OverloadedFixture.class.getName());
+                    assertThat(selector.getMethodName()).isEqualTo("named");
+                    assertThat(selector.getClassLoader()).isNull();
+                });
+    }
+
+    @Test
+    void shouldNotSwitchOffTheModulesLauncherInterceptorsInForkedPartitions() {
+        assertThat(ForkedPartitionRunner.CHILD_SYSTEM_PROPERTIES)
+                .noneMatch(property -> property.startsWith("-Djunit.platform.launcher.interceptors.enabled"));
+    }
+
+    @Test
+    void shouldRunAnInheritedNestedClassThroughTheSubclassItBelongsTo() {
+        List<WorkerTestEventPayload> events = new CopyOnWriteArrayList<>();
+        WorkUnitSpec viaFirst = new WorkUnitSpec(FirstSub.class.getName() + "/" + Base.Inner.class.getName(),
+                Base.Inner.class.getName(), null, null, Map.of(), 0L, List.of(FirstSub.class.getName()));
+        WorkUnitSpec viaSecond = new WorkUnitSpec(SecondSub.class.getName() + "/" + Base.Inner.class.getName(),
+                Base.Inner.class.getName(), null, null, Map.of(), 0L, List.of(SecondSub.class.getName()));
+
+        PartitionJUnitLauncher.ExecutionSummary summary = PartitionJUnitLauncher.executeWorkUnits("p1", "s1", 1,
+                List.of(viaFirst, viaSecond), getClass().getClassLoader(), CancellationToken.create(), events::add);
+
+        assertThat(summary.success()).as(summary.errorMessage()).isTrue();
+        assertThat(finished(events)).extracting(WorkerTestEventPayload::workUnitKey, WorkerTestEventPayload::uniqueId)
+                .containsExactlyInAnyOrder(
+                        org.assertj.core.groups.Tuple.tuple(viaFirst.key(), "[engine:junit-jupiter]/[class:"
+                                + FirstSub.class.getName() + "]/[nested-class:Inner]/[method:inherited()]"),
+                        org.assertj.core.groups.Tuple.tuple(viaSecond.key(), "[engine:junit-jupiter]/[class:"
+                                + SecondSub.class.getName() + "]/[nested-class:Inner]/[method:inherited()]"));
+    }
+
+    @Test
+    void shouldAccountForUnitsOfADisabledClassThatWasSplit() {
+        List<WorkerTestEventPayload> events = new CopyOnWriteArrayList<>();
+        WorkUnitSpec method = unit(DisabledOuter.class, "outer");
+        WorkUnitSpec nested = new WorkUnitSpec(DisabledOuter.class.getName() + "/" + DisabledOuter.Inner.class.getName(),
+                DisabledOuter.Inner.class.getName(), null, null, Map.of(), 0L, List.of(DisabledOuter.class.getName()));
+
+        PartitionJUnitLauncher.ExecutionSummary summary = PartitionJUnitLauncher.executeWorkUnits("p1", "s1", 1,
+                List.of(method, nested), getClass().getClassLoader(), CancellationToken.create(), events::add);
+
+        assertThat(summary.success()).as("a disabled class is reported as skipped, not as missing tests: %s",
+                summary.errorMessage()).isTrue();
+        assertThat(events).anyMatch(e -> e.status() == TestOutcomeStatus.SKIPPED);
+    }
+
+    public abstract static class Base {
+        @org.junit.jupiter.api.Nested
+        class Inner {
+            @Test
+            void inherited() {
+            }
+        }
+    }
+
+    public static class FirstSub extends Base {
+    }
+
+    public static class SecondSub extends Base {
+    }
+
+    @org.junit.jupiter.api.Disabled("not today")
+    public static class DisabledOuter {
+        @Test
+        void outer() {
+        }
+
+        @org.junit.jupiter.api.Nested
+        class Inner {
+            @Test
+            void inner() {
+            }
+        }
+    }
+
+    private static WorkUnitSpec classUnit(Class<?> fixture) {
+        return new WorkUnitSpec(fixture.getName(), fixture.getName(), null, null, Map.of(), 0L);
+    }
+
+    public static class BarrierFixtureA {
+        static final java.util.concurrent.CyclicBarrier BARRIER = new java.util.concurrent.CyclicBarrier(2);
+
+        @Test
+        void meet() throws Exception {
+            BARRIER.await(5, java.util.concurrent.TimeUnit.SECONDS);
+        }
+    }
+
+    public static class BarrierFixtureB {
+        @Test
+        void meet() throws Exception {
+            BarrierFixtureA.BARRIER.await(5, java.util.concurrent.TimeUnit.SECONDS);
+        }
     }
 
     private static WorkUnitSpec unit(Class<?> fixture, String methodName) {

@@ -33,6 +33,7 @@ import org.citrusframework.distribution.broker.DistributionBrokerConfig;
 import org.citrusframework.distribution.broker.DistributionBrokerServer;
 import org.citrusframework.distribution.cache.ClasspathPackager;
 import org.citrusframework.distribution.config.DistributionJson;
+import org.citrusframework.distribution.config.DistributionSettings;
 import org.citrusframework.distribution.model.BuildSessionResponse;
 import org.citrusframework.distribution.model.CompleteSessionRequest;
 import org.citrusframework.distribution.model.CreateSessionRequest;
@@ -107,6 +108,7 @@ class DistributionWorkerClientTest {
                     .brokerUrl(broker.baseUrl())
                     .authToken("worker-secret")
                     .cacheDir(tempDir.resolve("worker-cache"))
+                    .forkMode(DistributionSettings.WorkerForkMode.AUTO) // exercises the shared worker JVM
                     .addCapabilitiesCsv("zone=eu-central")
                     .build();
 
@@ -195,12 +197,14 @@ class DistributionWorkerClientTest {
                     .brokerUrl(broker.baseUrl())
                     .authToken("worker-secret")
                     .cacheDir(tempDir.resolve("worker-alpha-cache"))
+                    .forkMode(DistributionSettings.WorkerForkMode.AUTO) // exercises the shared worker JVM
                     .build();
             DistributionWorkerConfig betaConfig = DistributionWorkerConfig.builder()
                     .workerId("worker-beta")
                     .brokerUrl(broker.baseUrl())
                     .authToken("worker-secret")
                     .cacheDir(tempDir.resolve("worker-beta-cache"))
+                    .forkMode(DistributionSettings.WorkerForkMode.AUTO) // exercises the shared worker JVM
                     .build();
 
             try (DistributionWorkerClient workerAlpha = new DistributionWorkerClient(alphaConfig);

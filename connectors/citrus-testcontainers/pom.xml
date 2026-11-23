@@ -16,6 +16,9 @@
   <properties>
     <!-- Container tests typically do not run behind a company proxy. Set this property if required, when building locally-->
     <skipContainerTests>false</skipContainerTests>
+    <!-- Citrus Test Distribution: these tests start real containers, bound by the Docker host rather than test CPU.
+         One partition keeps the container start-up load the same as a local run. -->
+    <citrus.test.distribution.partitionPolicy>SINGLE</citrus.test.distribution.partitionPolicy>
   </properties>
 
   <dependencies>

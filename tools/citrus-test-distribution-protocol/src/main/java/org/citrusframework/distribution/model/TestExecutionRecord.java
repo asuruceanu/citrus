@@ -33,6 +33,16 @@ public record TestExecutionRecord(
         String errorMessage,
         String stackTrace,
         List<String> endpoints,
-        long recordedAt
+        long recordedAt,
+        String uniqueId
 ) {
+
+    /** Execution without a JUnit unique id (reported by older workers and launchers). */
+    public TestExecutionRecord(String id, String sessionId, String partitionId, String workerId, String workUnitKey,
+                               String className, String testName, TestOutcomeStatus status, long durationMs,
+                               int attempt, boolean flaky, String errorMessage, String stackTrace,
+                               List<String> endpoints, long recordedAt) {
+        this(id, sessionId, partitionId, workerId, workUnitKey, className, testName, status, durationMs, attempt, flaky,
+                errorMessage, stackTrace, endpoints, recordedAt, null);
+    }
 }

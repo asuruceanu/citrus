@@ -105,6 +105,12 @@ public final class DistributionSettings {
     public static final String OUTPUTS_PROPERTY = "citrus.test.distribution.outputs";
     public static final String OUTPUTS_ENV = "CITRUS_DIST_OUTPUTS";
 
+    /**
+     * Module property: {@code true} keeps the module's tests local, for suites that cannot run on a worker (for
+     * example {@code @QuarkusTest}, which bootstraps from the Maven project layout). Wins over an enabled build.
+     */
+    public static final String SKIP_PROPERTY = "citrus.test.distribution.skip";
+    public static final String SKIP_ENV = "CITRUS_DIST_SKIP";
     public static final String FORK_PROPERTY = "citrus.test.distribution.fork";
     public static final String FORK_ENV = "CITRUS_DIST_FORK";
 
@@ -260,12 +266,13 @@ public final class DistributionSettings {
     }
 
     /**
-     * Parses the worker fork mode; {@code null}/blank yields {@link WorkerForkMode#AUTO}.
+     * Parses the worker fork mode; {@code null}/blank yields {@link WorkerForkMode#ALWAYS}: every partition runs in a fresh
+     * JVM so state left behind by one partition (containers, system properties, statics, threads) cannot leak into the next.
      *
      * @throws IllegalArgumentException for an unknown mode
      */
     public static WorkerForkMode parseWorkerForkMode(String rawValue) {
-        return parseEnum(rawValue, WorkerForkMode.class, WorkerForkMode.AUTO, WORKER_FORK_MODE_PROPERTY);
+        return parseEnum(rawValue, WorkerForkMode.class, WorkerForkMode.ALWAYS, WORKER_FORK_MODE_PROPERTY);
     }
 
     /**

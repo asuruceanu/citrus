@@ -19,8 +19,8 @@ Citrus Test Distribution partitions and executes JUnit Platform and Citrus integ
 A distributed test run involves three components:
 
 . *Build Host (Maven Extension + JUnit `LauncherInterceptor`):* Opens a single build session on the coordinator (recording project name, Git branch, commit SHA, and changed workspace files), discovers JUnit Platform test descriptors per module, executes `@LocalOnly` tests locally, packages the test classpath and any declared external input paths into SHA-256 content-addressed blobs, uploads only missing digests, submits remote work units, streams live test and partition events over Server-Sent Events (SSE), writes standard `TEST-*.xml` Surefire/Failsafe reports, and atomically commits any declared output files back into the module.
-. *Coordinator (`DistributionBrokerServer`):* Persists sessions, partitions, worker leases, and historical test durations in JDBC (`HSQLDB` or `PostgreSQL`), schedules work units onto capability-matching workers using Longest-Processing-Time (LPT) bin packing seeded from historical execution times, deduplicates classpath/workspace blobs on disk, monitors worker heartbeats, automatically requeues evicted or stalled partitions up to `maxRetries`, and serves the real-time Web UI and REST/SSE APIs.
-. *Workers (`DistributionWorkerClient`):* Maintain outbound WebSocket connections (`/ws/v1/worker`) to the coordinator, advertise auto-detected host capabilities (`os`, `arch`, `jdk`, `cpuCores`, `memoryMb`, `citrus.workspace.v1`) plus user tags, pull missing blobs into a local content-addressed cache, execute assigned partitions in either an isolated child-first `ClassLoader` or a forked workspace JVM, stream per-test outcomes and captured Citrus endpoint names, and drain cleanly on `SIGTERM`.
+. *Coordinator (`DistributionBrokerServer`):* Persists sessions, partitions, worker leases, and historical test durations in JDBC (`HSQLDB` or `PostgreSQL`), schedules work units onto capability-matching workers using Longest-Processing-Time (LPT) bin packing seeded from historical execution times (handing each partition to the idle worker that has waited longest, so the whole pool is used), deduplicates classpath/workspace blobs on disk, monitors worker heartbeats, automatically requeues evicted or stalled partitions up to `maxRetries`, and serves the real-time Web UI and REST/SSE APIs.
+. *Workers (`DistributionWorkerClient`):* Maintain outbound WebSocket connections (`/ws/v1/worker`) to the coordinator, advertise auto-detected host capabilities (`os`, `arch`, `jdk`, `cpuCores`, `memoryMb`, `citrus.workspace.v1`) plus user tags, pull missing blobs into a local content-addressed cache, execute assigned partitions in a forked JVM (default) or, with `forkMode=AUTO`, an isolated child-first `ClassLoader` inside the worker JVM, stream per-test outcomes and captured Citrus endpoint names, and drain cleanly on `SIGTERM`.
 
 [[tools-test-distribution-maven]]
 == Maven Quickstart and Build Host Settings
@@ -104,7 +104,7 @@ TIP: Projects that do not use the Maven extension can add `org.citrusframework:c
 |`.citrus-dist/cache`
 |===
 
-For module-level workspace and isolation settings (`inputs`, `outputs`, `fork`, `partitionPolicy`), see <<tools-test-distribution-external-resources>>.
+For module-level workspace and isolation settings (`inputs`, `outputs`, `fork`, `partitionPolicy`, `skip`), see <<tools-test-distribution-external-resources>>.
 
 [[tools-test-distribution-coordinator]]
 == Coordinator, CLI, and REST API
@@ -284,16 +284,18 @@ Provides fleet-wide KPIs across recent sessions and workers:
 
 ==== Build Sessions Explorer (`#sessions`)
 
-Lists build sessions with instant text filtering by session ID, Git branch, commit SHA, or project name, and status filter pills (`ALL`, `RUNNING`, `PASSED`, `FAILED`, `ABORTED`). `RUNNING` sessions display live-updated test progress bars, blob cache hit percentages, and elapsed wall time as partitions and `@LocalOnly` tests report in.
+Lists build sessions, named after the root Maven project (hover the name for the modules the session ran), with instant text filtering by session ID, Git branch, commit SHA, or project name, and status filter pills (`ALL`, `RUNNING`, `PASSED`, `FAILED`, `ABORTED`). `RUNNING` sessions display live-updated test progress bars, blob cache hit percentages, and elapsed wall time as partitions and `@LocalOnly` tests report in.
 
 ==== Session Waterfall and Inspector (`#session/<sessionId>/<tab>`)
 
-Inspects a single build session across five session KPIs (`Passed Tests`, `Failed Tests`, `Flaky Recovered`, `Wall vs Serial Time`, `Blob Cache Hit`), an `✕ Abort Session` control while `RUNNING`, and four sub-tabs:
+Inspects a single build session across five session KPIs (`Passed Tests`, `Failed Tests`, `Flaky Recovered`, `Wall vs Serial Time`, `Blob Cache Hit`), an `✕ Abort Session` control while `RUNNING`, a banner with the failure reason of a `FAILED` session (for example the failing module and its failed test count), and four sub-tabs:
 
-* *Execution Waterfall (`waterfall`):* Renders an interactive worker-swimlane SVG Gantt chart of all partition attempts alongside the *Partition Breakdown* table. When a worker disconnects or stalls mid-partition, attempt `#1` remains visible as `LOST` on the original worker swimlane while attempt `#2` renders on the recovery worker swimlane. Clicking any waterfall bar or partition row opens the *Partition Detail Modal* showing state, attempt number, worker assignment, required capabilities, Failure / Eviction Reason (`errorMessage`), *Workspace & External Test Resources* (`moduleName`, `forkWorkspace` isolation mode, `workingDirectory`, materialized `inputPaths`, declared `outputPaths`, and collected `producedOutputs`), work units, and executed tests.
+* *Execution Waterfall (`waterfall`):* Renders an interactive worker-swimlane SVG Gantt chart of all partition attempts, colored by Maven module with a legend, alongside the *Partition Breakdown* table. When a worker disconnects or stalls mid-partition, attempt `#1` remains visible as `LOST` on the original worker swimlane while attempt `#2` renders on the recovery worker swimlane. Clicking any waterfall bar or partition row opens the *Partition Detail Modal* showing state, attempt number, worker assignment, required capabilities, Failure / Eviction Reason (`errorMessage`), *Workspace & External Test Resources* (`moduleName`, `forkWorkspace` isolation mode, `workingDirectory`, materialized `inputPaths`, declared `outputPaths`, and collected `producedOutputs`), work units, and executed tests.
 * *Test Executions (`tests`):* Lists every remote and `@LocalOnly` test execution with status pills (`ALL`, `FAILED`, `FLAKY`, `PASSED`, `SKIPPED`) and search across test class, method, worker ID, or *Citrus Endpoints*. During execution on both remote workers and local fallback runs, Citrus automatically hooks `CitrusInstanceManager` / `TestActionListener` to record the deduplicated Citrus endpoint names (or endpoint URIs) exercised by each test, displaying them as inline badges and in the *Test Execution Detail Modal*.
 * *Failing Tests (`failures`):* Surfaces full stack traces with one-click `Copy Trace` buttons for every `FAILED` test execution, *and* renders partition-level crash or eviction diagnostic cards whenever a partition fails or is lost (`FAILED` or `LOST` with `errorMessage`) — ensuring forked JVM crashes, `ClassNotFoundException`, undeclared working-directory writes (`cwdCheck=FAIL`), or aborted partitions are immediately visible even when zero individual JUnit tests completed.
 * *Changed Files (`files`):* Displays the workspace Git delta (`Δ <path>`) captured when the session started.
+
+Long lists (build sessions, partitions, test executions and test history) are paginated; a table returns to its first page when the selected session or one of its filters changes.
 
 ==== Workers Pool (`#workers`)
 
@@ -333,6 +335,8 @@ Every worker automatically advertises host capabilities (`os`, `arch`, `jdk`, `c
 * `@LocalOnly` — Pins a test class or method to the local build host JVM (executed locally and reported to the coordinator under `partitionId="local"`).
 * `@RemoteOnly` — Requires execution on a remote worker and fails fast when the coordinator is unreachable regardless of `fallbackLocal`.
 * `@AgentRequirement(key = "docker", value = "true")` — Repeatable capability filter matched against registered worker capabilities. Supports exact string matching (`os=linux`, `docker=true`) and numeric threshold expressions (`memoryMb>=4096`, `cpuCores>=4`, `jdk>=21`).
+
+`@Nested` test classes are distributed as work units of their own and inherit these annotations from the classes enclosing them.
 
 [source,java]
 ----
@@ -391,6 +395,11 @@ inputs or outputs implies a forked JVM.
 partition and workspace (for tests that depend on files written by other test classes). Under `SINGLE`, tests requiring
 different values for the same capability are rejected.
 |`LPT`
+|`citrus.test.distribution.skip`
+|`true` keeps the module's tests local, exactly as without Test Distribution, for suites that cannot run on a worker
+(for example `@QuarkusTest`, which bootstraps from the Maven project layout). Taken from the command line, then the
+module's `<properties>`, then the environment variable `CITRUS_DIST_SKIP`.
+|`false`
 |===
 
 [source,xml]
@@ -427,7 +436,8 @@ On a worker, classpath directories are unpacked to a different location than loc
 from a class or resource location (for example `getResource(...).getFile()` followed by string replacements). Use
 `System.getProperty("basedir")` to locate module files instead.
 * *Files written relative to the working directory, temporary files with fixed names, JVM-wide changes* (Log4j levels,
-default locale or time zone, static caches) *or servers on fixed ports:* set `fork=true`. In the shared worker JVM a
+default locale or time zone, static caches) *or servers on fixed ports:* set `fork=true` so the partition is forked even
+on workers running with `forkMode=AUTO`. In the shared worker JVM a
 read-only check of the worker's working directory fails the partition when a test wrote there (see `cwdCheck` below);
 nothing is ever deleted.
 * *Generated files needed on the developer machine after the tests:* declare them as `outputs`.
@@ -475,8 +485,10 @@ the module's `target/`) and are not evicted automatically. Workers keep their ow
 |===
 |Property / environment variable |Meaning |Default
 |`citrus.test.distribution.worker.forkMode` / `CITRUS_DIST_WORKER_FORK_MODE`
-|`AUTO` forks only partitions that need it; `ALWAYS` forks every partition.
-|`AUTO`
+|`ALWAYS` runs every partition in a fresh JVM, so containers, system properties, static state and threads left behind
+by one partition cannot affect the next. `AUTO` runs partitions in the shared worker JVM (faster, less isolated) and forks
+only those with inputs, outputs or `fork=true`.
+|`ALWAYS`
 |`citrus.test.distribution.worker.forkJvmArgs` / `CITRUS_DIST_WORKER_FORK_JVM_ARGS`
 |Whitespace-separated JVM arguments for forked partitions (quoting is not interpreted).
 |`-Xmx768m -XX:ActiveProcessorCount=2`
@@ -512,6 +524,10 @@ rather than at build start.
 * The forked JVM uses the worker's copy of the distribution protocol classes; keep hosts and workers on the same Citrus
 version.
 * Tests of a partition that crashed are missing from the Surefire reports; the build fails with the crash diagnostic.
+* A test class the worker cannot find in the partition's classpath fails the partition (`Test class not found`) after
+the partition's other tests have run.
+* In the shared worker JVM (`forkMode=AUTO`) the JUnit Platform, SLF4J and the Log4j API come from the worker; the tests
+see no other worker classes except those of the worker's own `-javaagent` jars (for example a JaCoCo runtime).
 * Worker caches are not evicted automatically.
 
 [[tools-test-distribution-external-resources-limits]]
@@ -523,4 +539,5 @@ no symbolic links or special files, valid names, at most 50,000 entries.
 entries, 256 MiB per entry and 2 GiB uncompressed in total.
 * Symbolic links and Windows junctions in inputs or outputs are rejected, as are absolute paths, `..`, `:` and Windows
 reserved names such as `CON` or `aux.json` (on every operating system, so workspaces stay portable).
-* Forked partitions require JUnit Platform 6 on the module's test classpath.
+* Forked partitions require JUnit Platform 6 on the module's test classpath. Because workers fork every partition by
+default, modules on an older JUnit Platform need workers started with `forkMode=AUTO`.

@@ -21,13 +21,23 @@ public record CompleteSessionRequest(
         int localFailedTests,
         int localSkippedTests,
         long localSerialDurationMs,
-        boolean buildFailed
+        boolean buildFailed,
+        String failureReason
 ) {
     public CompleteSessionRequest(
             int localPassedTests,
             int localFailedTests,
             int localSkippedTests,
             long localSerialDurationMs) {
-        this(localPassedTests, localFailedTests, localSkippedTests, localSerialDurationMs, false);
+        this(localPassedTests, localFailedTests, localSkippedTests, localSerialDurationMs, false, null);
+    }
+
+    public CompleteSessionRequest(
+            int localPassedTests,
+            int localFailedTests,
+            int localSkippedTests,
+            long localSerialDurationMs,
+            boolean buildFailed) {
+        this(localPassedTests, localFailedTests, localSkippedTests, localSerialDurationMs, buildFailed, null);
     }
 }

@@ -53,6 +53,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.tuple;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class BrokerSessionCoordinatorTest {
@@ -123,7 +124,9 @@ class BrokerSessionCoordinatorTest {
 
         assertThat(partition(sessionId).state()).isEqualTo(PartitionState.COMPLETED);
         BrokerEvent completed = lastEvent(sessionId, "partition.completed");
-        assertThat(completed.data()).containsEntry("attempt", 1).containsKey("outputArtifacts");
+        assertThat(completed.data()).containsEntry("attempt", 1).containsKey("outputArtifacts")
+                .as("lets the launcher close each class test set once all its units reported")
+                .containsEntry("workUnits", List.of("a.A"));
         assertThat(DistributionJson.toJson(completed.data().get("outputArtifacts"))).contains("target/docs", "e".repeat(64));
     }
 
@@ -344,6 +347,30 @@ class BrokerSessionCoordinatorTest {
     }
 
     @Test
+    void shouldSpreadConsecutiveSinglePartitionsAcrossIdleWorkers() {
+        String sessionId = newSession(1);
+        List<Worker> pool = List.of(
+                register("conn-a", "worker-a", WORKSPACE_CAPS),
+                register("conn-b", "worker-b", WORKSPACE_CAPS),
+                register("conn-c", "worker-c", WORKSPACE_CAPS));
+
+        java.util.Set<String> used = new java.util.LinkedHashSet<>();
+        for (int i = 0; i < 3; i++) {
+            // Like a reactor of small modules: each submits one partition and waits for it.
+            String key = "m" + i + ".T";
+            submit(sessionId, "sub-" + i, List.of(), List.of(), false, unit(key));
+            Worker assigned = pool.stream().filter(w -> !w.assignments().isEmpty()
+                            && w.lastAssignment().workUnits().getFirst().key().equals(key))
+                    .findFirst().orElseThrow();
+            used.add(assigned.connectionId);
+            PartitionAssignPayload assign = assigned.lastAssignment();
+            assigned.complete(assign, assign.attempt(), List.of());
+        }
+
+        assertThat(used).as("least recently used idle worker gets the next partition").hasSize(3);
+    }
+
+    @Test
     void shouldPreferAnotherWorkerForRetry() {
         String sessionId = newSession(2);
         Worker original = register("conn-a1", "worker-a", Map.of());
@@ -424,6 +451,147 @@ class BrokerSessionCoordinatorTest {
                 .hasMessageContaining("os");
         assertThat(store.listPartitions(sessionId)).hasSize(1);
         assertThat(store.findWorkSubmission(sessionId, "sub-conflict")).isEmpty();
+    }
+
+    @Test
+    void shouldKeepFailureReasonReportedWithFailedBuildCompletion() {
+        String sessionId = coordinator.createSession(
+                new CreateSessionRequest("citrus", "main", "abc", List.of(), 5, 1)).sessionId();
+
+        BuildSessionRecord completed = coordinator.completeSession(sessionId, new CompleteSessionRequest(
+                0, 0, 0, 0L, true, "citrus-api: NoClassDefFoundError: org/citrusframework/junit/jupiter/CitrusTestFactory"));
+
+        assertThat(completed.status()).isEqualTo(SessionStatus.FAILED);
+        assertThat(completed.failureReason())
+                .isEqualTo("citrus-api: NoClassDefFoundError: org/citrusframework/junit/jupiter/CitrusTestFactory");
+        assertThat(coordinator.getSessionDetail(sessionId).orElseThrow().session().failureReason())
+                .isEqualTo(completed.failureReason());
+    }
+
+    @Test
+    void shouldCountParameterizedInvocationsSharingADisplayNameSeparately() {
+        String sessionId = coordinator.createSession(
+                new CreateSessionRequest("citrus", "main", "abc", List.of(), 5, 1)).sessionId();
+        String template = "[engine:junit-jupiter]/[class:a.A]/[test-template:p(int)]";
+        coordinator.reportLocalTests(sessionId, new org.citrusframework.distribution.model.ReportLocalTestsRequest(
+                "local-host", List.of(
+                        new WorkerTestEventPayload("local", sessionId, 1, "a.A", "a.A", "value", TestOutcomeStatus.PASSED,
+                                1L, null, null, List.of(), template + "/[test-template-invocation:#1]"),
+                        new WorkerTestEventPayload("local", sessionId, 1, "a.A", "a.A", "value", TestOutcomeStatus.PASSED,
+                                1L, null, null, List.of(), template + "/[test-template-invocation:#2]"))));
+
+        BuildSessionRecord completed = coordinator.completeSession(sessionId, new CompleteSessionRequest(0, 0, 0, 0L));
+
+        assertThat(completed.totalTests()).isEqualTo(2);
+    }
+
+    @Test
+    void shouldKeepCitrusFactorySourcesApartEvenThoughEachReportsTheSameUniqueId() {
+        String sessionId = coordinator.createSession(
+                new CreateSessionRequest("citrus", "main", "abc", List.of(), 5, 1)).sessionId();
+        // Each source runs in its own filtered JUnit run, so every source is dynamic-test #1.
+        String sameId = "[engine:junit-jupiter]/[class:a.A]/[test-factory:f()]/[dynamic-test:#1]";
+        coordinator.reportLocalTests(sessionId, new org.citrusframework.distribution.model.ReportLocalTestsRequest(
+                "local-host", List.of(
+                        new WorkerTestEventPayload("local", sessionId, 1, "a.A#f[s1]", "a.A", "s1", TestOutcomeStatus.FAILED,
+                                1L, "boom", null, List.of(), sameId),
+                        new WorkerTestEventPayload("local", sessionId, 1, "a.A#f[s2]", "a.A", "s2", TestOutcomeStatus.PASSED,
+                                1L, null, null, List.of(), sameId))));
+
+        BuildSessionRecord completed = coordinator.completeSession(sessionId, new CompleteSessionRequest(0, 0, 0, 0L));
+
+        assertThat(completed.totalTests()).isEqualTo(2);
+        assertThat(completed.failedTests()).isEqualTo(1);
+        assertThat(completed.status()).isEqualTo(SessionStatus.FAILED);
+        assertThat(coordinator.getSessionDetail(sessionId).orElseThrow().tests())
+                .extracting(TestExecutionRecord::attempt, TestExecutionRecord::flaky).containsOnly(tuple(1, false));
+    }
+
+    @Test
+    void shouldTreatAnOldRecordWithoutUniqueIdAndItsRetryWithOneAsTheSameTest() {
+        String sessionId = coordinator.createSession(
+                new CreateSessionRequest("citrus", "main", "abc", List.of(), 5, 1)).sessionId();
+        coordinator.reportLocalTests(sessionId, new org.citrusframework.distribution.model.ReportLocalTestsRequest(
+                "local-host", List.of(new WorkerTestEventPayload("local", sessionId, 1, "a.A", "a.A", "t()",
+                        TestOutcomeStatus.FAILED, 1L, "boom", null, List.of()))));
+        coordinator.reportLocalTests(sessionId, new org.citrusframework.distribution.model.ReportLocalTestsRequest(
+                "local-host", List.of(new WorkerTestEventPayload("local", sessionId, 1, "a.A", "a.A", "t()",
+                        TestOutcomeStatus.FAILED, 1L, "boom", null, List.of(), "[engine:junit-jupiter]/[class:a.A]/[method:t()]"))));
+        coordinator.reportLocalTests(sessionId, new org.citrusframework.distribution.model.ReportLocalTestsRequest(
+                "local-host", List.of(new WorkerTestEventPayload("local", sessionId, 1, "a.A", "a.A", "t()",
+                        TestOutcomeStatus.PASSED, 1L, null, null, List.of(), "[engine:junit-jupiter]/[class:a.A]/[method:t()]"))));
+
+        BuildSessionRecord completed = coordinator.completeSession(sessionId, new CompleteSessionRequest(0, 0, 0, 0L));
+
+        assertThat(completed.totalTests()).isEqualTo(1);
+        assertThat(completed.passedTests()).isEqualTo(1);
+        assertThat(coordinator.getSessionDetail(sessionId).orElseThrow().tests())
+                .filteredOn(TestExecutionRecord::flaky).hasSize(1);
+    }
+
+    @Test
+    void shouldLetOnlyOneInvocationTakeOverAnOldRecordWithoutUniqueId() {
+        String sessionId = coordinator.createSession(
+                new CreateSessionRequest("citrus", "main", "abc", List.of(), 5, 1)).sessionId();
+        String template = "[engine:junit-jupiter]/[class:a.A]/[test-template:p(int)]";
+        coordinator.reportLocalTests(sessionId, new org.citrusframework.distribution.model.ReportLocalTestsRequest(
+                "local-host", List.of(new WorkerTestEventPayload("local", sessionId, 1, "a.A", "a.A", "value",
+                        TestOutcomeStatus.PASSED, 1L, null, null, List.of()))));
+        coordinator.reportLocalTests(sessionId, new org.citrusframework.distribution.model.ReportLocalTestsRequest(
+                "local-host", List.of(
+                        new WorkerTestEventPayload("local", sessionId, 1, "a.A", "a.A", "value", TestOutcomeStatus.PASSED,
+                                1L, null, null, List.of(), template + "/[test-template-invocation:#1]"),
+                        new WorkerTestEventPayload("local", sessionId, 1, "a.A", "a.A", "value", TestOutcomeStatus.PASSED,
+                                1L, null, null, List.of(), template + "/[test-template-invocation:#2]"))));
+
+        BuildSessionRecord completed = coordinator.completeSession(sessionId, new CompleteSessionRequest(0, 0, 0, 0L));
+
+        assertThat(completed.totalTests()).as("#1 continues the old record, #2 is a test of its own").isEqualTo(2);
+    }
+
+    @Test
+    void shouldKeepTheFailedTestCountNextToAReportedReason() {
+        String sessionId = coordinator.createSession(
+                new CreateSessionRequest("citrus", "main", "abc", List.of(), 5, 1)).sessionId();
+
+        BuildSessionRecord completed = coordinator.completeSession(sessionId, new CompleteSessionRequest(
+                0, 2, 0, 0L, true, "Conflicting outputs for target/docs/a.txt"));
+
+        assertThat(completed.failureReason()).isEqualTo("Conflicting outputs for target/docs/a.txt (2 test(s) failed)");
+    }
+
+    @Test
+    void shouldExplainFailedBuildCompletionWithoutReportedReason() {
+        String sessionId = coordinator.createSession(
+                new CreateSessionRequest("citrus", "main", "abc", List.of(), 5, 1)).sessionId();
+
+        BuildSessionRecord completed = coordinator.completeSession(sessionId, new CompleteSessionRequest(0, 0, 0, 0L, true));
+
+        assertThat(completed.status()).isEqualTo(SessionStatus.FAILED);
+        assertThat(completed.failureReason()).isNotBlank();
+    }
+
+    @Test
+    void shouldNotRecordFailureReasonForPassedSession() {
+        String sessionId = coordinator.createSession(
+                new CreateSessionRequest("citrus", "main", "abc", List.of(), 5, 1)).sessionId();
+
+        BuildSessionRecord completed = coordinator.completeSession(sessionId, new CompleteSessionRequest(
+                0, 0, 0, 0L, false, "ignored"));
+
+        assertThat(completed.status()).isEqualTo(SessionStatus.PASSED);
+        assertThat(completed.failureReason()).isNull();
+    }
+
+    @Test
+    void shouldRecordAbortReasonOnSession() {
+        String sessionId = coordinator.createSession(
+                new CreateSessionRequest("citrus", "main", "abc", List.of(), 5, 1)).sessionId();
+
+        BuildSessionRecord aborted = coordinator.abortSession(sessionId, "Maven build interrupted");
+
+        assertThat(aborted.status()).isEqualTo(SessionStatus.ABORTED);
+        assertThat(aborted.failureReason()).isEqualTo("Maven build interrupted");
     }
 
     @Test

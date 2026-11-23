@@ -35,6 +35,7 @@ import java.nio.file.SimpleFileVisitor;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.Enumeration;
 import java.util.List;
 import java.util.Map;
@@ -662,13 +663,145 @@ public final class IsolatedPartitionRunner implements PartitionRunner {
     }
 
     /**
-     * Child-first classloader that delegates JDK, JUnit Platform/Jupiter, OpenTest4J, and SLF4J
-     * SPI types to the worker's parent classloader while isolating test and application classes.
+     * Child-first classloader that isolates a partition from the worker's own classpath.
+     * <p>
+     * JDK classes (every package of a boot-layer module, including {@code org.w3c.dom} and {@code org.xml.sax}) and the
+     * JUnit Platform, OpenTest4J, and SLF4J SPI types shared with the worker launcher come from the parent. Everything
+     * else is loaded from the partition, falling back only to the JVM's own platform and bootstrap loaders: a class or
+     * resource the partition does not ship must not leak in from the worker's application classpath (for example the
+     * worker's own Citrus jars), or it would link against a second copy of the same classes.
      */
-    private static final class PartitionClassLoader extends URLClassLoader {
+    static final class PartitionClassLoader extends URLClassLoader {
+
+        private static final Set<String> JDK_PACKAGES = ModuleLayer.boot().modules().stream()
+                .flatMap(module -> module.getPackages().stream())
+                .collect(java.util.stream.Collectors.toUnmodifiableSet());
+
+        /** JUnit SPIs the worker's own jars may register providers for (ServiceLoader runs from the shared JUnit). */
+        private static final List<String> JUNIT_SERVICE_FILES = List.of(
+                "META-INF/services/org.junit.platform.engine.TestEngine",
+                "META-INF/services/org.junit.platform.launcher.LauncherSessionListener",
+                "META-INF/services/org.junit.platform.launcher.LauncherDiscoveryListener",
+                "META-INF/services/org.junit.platform.launcher.TestExecutionListener",
+                "META-INF/services/org.junit.platform.launcher.PostDiscoveryFilter",
+                "META-INF/services/org.junit.platform.launcher.LauncherInterceptor",
+                "META-INF/services/org.junit.jupiter.api.extension.Extension");
+
+        /** Resource prefixes of the libraries shared with the worker: they must see their own resources. */
+        private static final List<String> SHARED_RESOURCE_PREFIXES = List.of(
+                "META-INF/services/org.junit.",
+                "META-INF/services/org.slf4j.",
+                "META-INF/services/org.apache.logging.log4j.",
+                "META-INF/org/apache/logging/log4j/",
+                "org/junit/",
+                "org/opentest4j/",
+                "org/apiguardian/",
+                "org/slf4j/",
+                "org/apache/logging/log4j/");
+
+        /** Jars of the worker JVM's own {@code -javaagent} arguments. */
+        private static final List<Path> WORKER_JAVA_AGENTS = javaAgentPaths(
+                java.lang.management.ManagementFactory.getRuntimeMXBean().getInputArguments());
+
+        private final ClassLoader jdkLoader;
+        private final ClassLoader agentHost;
+        private final List<Path> agentLocations;
+        private final Set<String> workerServiceProviders;
 
         PartitionClassLoader(URL[] urls, ClassLoader parent) {
-            super(urls, parent);
+            this(urls, parent, ClassLoader.getPlatformClassLoader());
+        }
+
+        /** {@code jdkLoader} resolves JDK resources and classes the JVM itself defines (platform and bootstrap). */
+        PartitionClassLoader(URL[] urls, ClassLoader parent, ClassLoader jdkLoader) {
+            this(urls, parent, jdkLoader, ClassLoader.getSystemClassLoader(), WORKER_JAVA_AGENTS);
+        }
+
+        /**
+         * {@code agentHost} is the loader the JVM appends {@code -javaagent} jars to; only classes it loads from one of
+         * {@code javaAgents} are visible to the partition, never the rest of the worker's classpath.
+         */
+        PartitionClassLoader(URL[] urls, ClassLoader parent, ClassLoader jdkLoader, ClassLoader agentHost,
+                             List<Path> javaAgents) {
+            // Named like Surefire's JDK "app" loader is: frameworks such as Quarkus read the test class loader's name.
+            super("citrus-distribution-partition", urls, parent);
+            this.jdkLoader = jdkLoader;
+            this.agentHost = agentHost;
+            this.agentLocations = javaAgents.stream().map(PartitionClassLoader::realPath).toList();
+            this.workerServiceProviders = readServiceProviders(parent);
+        }
+
+        /** Jar paths of the {@code -javaagent:<jar>[=options]} entries in {@code jvmArguments}. */
+        static List<Path> javaAgentPaths(List<String> jvmArguments) {
+            List<Path> agents = new ArrayList<>();
+            for (String argument : jvmArguments) {
+                if (argument.startsWith("-javaagent:")) {
+                    String jar = argument.substring("-javaagent:".length());
+                    int options = jar.indexOf('=');
+                    agents.add(Path.of(options >= 0 ? jar.substring(0, options) : jar).toAbsolutePath());
+                }
+            }
+            return List.copyOf(agents);
+        }
+
+        private static Path realPath(Path path) {
+            try {
+                return path.toRealPath();
+            } catch (IOException | RuntimeException e) {
+                return path.toAbsolutePath().normalize();
+            }
+        }
+
+        /** File or directory a class resource was read from: the jar of a {@code jar:} URL, else the file itself. */
+        private static Path sourceOf(URL resource) {
+            try {
+                String url = resource.toString();
+                if (url.startsWith("jar:")) {
+                    int separator = url.indexOf("!/");
+                    return realPath(Path.of(java.net.URI.create(url.substring(4, separator > 0 ? separator : url.length()))));
+                }
+                return "file".equals(resource.getProtocol()) ? realPath(Path.of(resource.toURI())) : null;
+            } catch (RuntimeException | java.net.URISyntaxException e) {
+                return null;
+            }
+        }
+
+        private Class<?> loadFromJavaAgent(String name) throws ClassNotFoundException {
+            if (agentHost != null && !agentLocations.isEmpty()) {
+                URL resource = agentHost.getResource(name.replace('.', '/') + ".class");
+                Path source = resource != null ? sourceOf(resource) : null;
+                if (source != null) {
+                    for (Path location : agentLocations) {
+                        if (source.equals(location) || source.startsWith(location)) {
+                            return agentHost.loadClass(name);
+                        }
+                    }
+                }
+            }
+            throw new ClassNotFoundException(name);
+        }
+
+        private static Set<String> readServiceProviders(ClassLoader parent) {
+            Set<String> providers = new java.util.HashSet<>();
+            if (parent == null) {
+                return providers;
+            }
+            for (String serviceFile : JUNIT_SERVICE_FILES) {
+                try {
+                    for (URL url : Collections.list(parent.getResources(serviceFile))) {
+                        try (java.io.BufferedReader reader = new java.io.BufferedReader(new java.io.InputStreamReader(
+                                url.openStream(), java.nio.charset.StandardCharsets.UTF_8))) {
+                            reader.lines()
+                                    .map(line -> line.replaceAll("#.*", "").strip())
+                                    .filter(line -> !line.isEmpty())
+                                    .forEach(providers::add);
+                        }
+                    }
+                } catch (IOException ignored) {
+                    // unreadable service file: its providers are simply not shared
+                }
+            }
+            return providers;
         }
 
         @Override
@@ -676,13 +809,20 @@ public final class IsolatedPartitionRunner implements PartitionRunner {
             synchronized (getClassLoadingLock(name)) {
                 Class<?> loaded = findLoadedClass(name);
                 if (loaded == null) {
-                    if (shouldDelegateToParent(name)) {
+                    if (shouldDelegateToParent(name) || workerServiceProviders.contains(name)) {
                         loaded = super.loadClass(name, false);
                     } else {
                         try {
                             loaded = findClass(name);
-                        } catch (ClassNotFoundException ignored) {
-                            loaded = super.loadClass(name, false);
+                        } catch (ClassNotFoundException notInPartition) {
+                            // Only the JVM's own loaders, never the worker's application classpath: covers classes a
+                            // test agent injects at runtime (Mockito's MockMethodDispatcher lives in the bootstrap loader).
+                            try {
+                                loaded = jdkLoader.loadClass(name);
+                            } catch (ClassNotFoundException notInJvm) {
+                                // Then classes of the worker's -javaagent jars (JaCoCo runtime, APM agents).
+                                loaded = loadFromJavaAgent(name);
+                            }
                         }
                     }
                 }
@@ -695,32 +835,47 @@ public final class IsolatedPartitionRunner implements PartitionRunner {
 
         @Override
         public URL getResource(String name) {
-            if (name.startsWith("META-INF/services/org.junit.")) {
+            if (isSharedResource(name)) {
                 return super.getResource(name);
             }
             URL url = findResource(name);
-            return url != null ? url : super.getResource(name);
+            return url != null ? url : jdkLoader.getResource(name);
         }
 
         @Override
         public Enumeration<URL> getResources(String name) throws IOException {
-            if (name.startsWith("META-INF/services/org.junit.")) {
+            if (isSharedResource(name)) {
                 return super.getResources(name);
             }
-            return super.getResources(name);
+            List<URL> urls = new ArrayList<>(Collections.list(findResources(name)));
+            urls.addAll(Collections.list(jdkLoader.getResources(name)));
+            return Collections.enumeration(urls);
         }
 
-        private static boolean shouldDelegateToParent(String name) {
+        private static boolean isSharedResource(String name) {
+            for (String prefix : SHARED_RESOURCE_PREFIXES) {
+                if (name.startsWith(prefix)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        static boolean shouldDelegateToParent(String name) {
+            // JDK packages are matched exactly (isJdkPackage), not by javax./jdk./sun. prefixes: third-party javax.*
+            // libraries such as wsdl4j's javax.wsdl must load from the partition with their implementation.
             return name.startsWith("java.")
-                    || name.startsWith("jdk.")
-                    || name.startsWith("javax.")
-                    || name.startsWith("sun.")
                     || name.startsWith("org.junit.")
                     || name.startsWith("org.opentest4j.")
                     || name.startsWith("org.apiguardian.")
                     || name.startsWith("org.slf4j.")
                     || name.startsWith("org.apache.logging.log4j.")
-                    || name.startsWith("org.citrusframework.junit.jupiter.CitrusDynamicSourceFilter");
+                    || isJdkPackage(name);
+        }
+
+        private static boolean isJdkPackage(String className) {
+            int lastDot = className.lastIndexOf('.');
+            return lastDot > 0 && JDK_PACKAGES.contains(className.substring(0, lastDot));
         }
     }
 }

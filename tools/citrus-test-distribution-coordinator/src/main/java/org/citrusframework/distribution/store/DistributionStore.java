@@ -40,7 +40,14 @@ public interface DistributionStore extends AutoCloseable {
 
     void saveSession(BuildSessionRecord session);
 
-    void updateSessionStatus(String sessionId, SessionStatus status, long finishedAt, SessionSummary summary);
+    /** Updates status and totals and clears any failure reason. */
+    default void updateSessionStatus(String sessionId, SessionStatus status, long finishedAt, SessionSummary summary) {
+        updateSessionStatus(sessionId, status, finishedAt, summary, null);
+    }
+
+    /** Updates status and totals; {@code failureReason} explains a failed or aborted session ({@code null} for none). */
+    void updateSessionStatus(String sessionId, SessionStatus status, long finishedAt, SessionSummary summary,
+                             String failureReason);
 
     Optional<BuildSessionRecord> findSession(String sessionId);
 

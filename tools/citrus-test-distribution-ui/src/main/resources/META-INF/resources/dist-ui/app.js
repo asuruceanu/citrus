@@ -10,6 +10,8 @@ import { html } from './vendor/htm-mini.js';
 const STORAGE_TOKEN_KEY = 'citrus.dist.authToken';
 const STORAGE_THEME_KEY = 'citrus.dist.theme';
 const POLL_INTERVAL_MS = 4000;
+// Full session detail can be several MB for large suites: reload it at most this often during live updates.
+const DETAIL_MIN_INTERVAL_MS = 2000;
 const VALID_DETAIL_TABS = new Set(['waterfall', 'tests', 'failures', 'files']);
 
 const state = {
@@ -42,6 +44,8 @@ const state = {
 
   // Modals
   selectedPartition: null,
+  pages: {}, // current page per paginated table
+  pageContexts: {}, // session and filters each table's current page belongs to
   selectedTestExecution: null
 };
 
@@ -50,6 +54,12 @@ document.documentElement.setAttribute('data-theme', state.theme);
 let eventSource = null;
 let toastTimer = null;
 let refreshTimer = null;
+let refreshInFlight = false;
+let refreshPending = false;
+let lastDetailLoadAt = 0;
+let detailTimer = null;
+// Increases with every session detail request; a response that is no longer the latest is discarded.
+let detailRequestSeq = 0;
 let pollTimer = null;
 let suppressHashChange = false;
 
@@ -117,6 +127,9 @@ function setView(view, detailTab = null) {
   state.mobileMenuOpen = false;
   syncHash();
   renderApp();
+  if (HISTORY_VIEWS.has(view)) {
+    loadHistory(true);
+  }
 }
 
 function apiHeaders() {
@@ -167,20 +180,73 @@ function scheduleRefresh(delayMs = 140) {
   }, delayMs);
 }
 
-async function refreshAll() {
+let historyInFlight = false;
+let lastHistoryLoadAt = 0;
+// Test history aggregates every recorded execution: refresh it at most this often, and only where it is shown.
+const HISTORY_MIN_INTERVAL_MS = 10000;
+const HISTORY_VIEWS = new Set(['overview', 'history']);
+
+async function loadHistory(force = false) {
+  if (historyInFlight) return;
+  if (!force && (!HISTORY_VIEWS.has(state.view) || Date.now() - lastHistoryLoadAt < HISTORY_MIN_INTERVAL_MS)) {
+    if (state.history.length > 0) return;
+  }
+  historyInFlight = true;
+  lastHistoryLoadAt = Date.now();
   try {
-    const [sessions, workers, history] = await Promise.all([
-      apiGet('/api/v1/sessions?limit=50'),
-      apiGet('/api/v1/workers'),
-      apiGet('/api/v1/tests/history?limit=150')
+    const history = await apiGet('/api/v1/tests/history?limit=2000');
+    state.history = Array.isArray(history) ? history : [];
+    renderApp();
+  } catch (err) {
+    if (err.message !== 'Unauthorized') {
+      console.warn('History refresh error:', err.message);
+    }
+  } finally {
+    historyInFlight = false;
+  }
+}
+
+async function refreshAll() {
+  // One refresh at a time: events arriving meanwhile coalesce into a single follow-up refresh.
+  if (refreshInFlight) {
+    refreshPending = true;
+    return;
+  }
+  refreshInFlight = true;
+  try {
+    const [sessions, workers] = await Promise.all([
+      apiGet('/api/v1/sessions?limit=500'),
+      apiGet('/api/v1/workers')
     ]);
     state.sessions = Array.isArray(sessions) ? sessions : [];
     state.workers = Array.isArray(workers) ? workers : [];
-    state.history = Array.isArray(history) ? history : [];
+    loadHistory(); // independent: a slow history query must not hold back sessions and workers
     state.authError = '';
 
-    if (state.selectedSessionId) {
-      await loadSessionDetail(state.selectedSessionId, false);
+    // The heavy session detail is only needed on the session page.
+    if (state.selectedSessionId && state.view === 'session-detail') {
+      const current = state.sessionDetail && state.sessionDetail.session
+        && state.sessionDetail.session.sessionId === state.selectedSessionId;
+      const sinceDetail = Date.now() - lastDetailLoadAt;
+      if (!current || sinceDetail >= DETAIL_MIN_INTERVAL_MS) {
+        await loadSessionDetail(state.selectedSessionId, false);
+      } else {
+        // Keep the KPI counters live from the light session list; reload the heavy detail on the trailing edge.
+        const summary = state.sessions.find(s => s.sessionId === state.selectedSessionId);
+        if (summary) {
+          state.sessionDetail = { ...state.sessionDetail, session: summary };
+        }
+        if (!detailTimer) {
+          detailTimer = setTimeout(() => {
+            detailTimer = null;
+            if (state.view === 'session-detail' && state.selectedSessionId) {
+              loadSessionDetail(state.selectedSessionId, false);
+            }
+          }, DETAIL_MIN_INTERVAL_MS - sinceDetail);
+        }
+      }
+    } else if (state.selectedSessionId) {
+      // keep the selection; its detail is loaded when the session page is shown
     } else if (state.sessions.length > 0) {
       state.selectedSessionId = state.sessions[0].sessionId;
       if (state.view === 'session-detail') {
@@ -193,12 +259,23 @@ async function refreshAll() {
     if (err.message !== 'Unauthorized') {
       console.warn('Refresh error:', err.message);
     }
+  } finally {
+    refreshInFlight = false;
+    if (refreshPending) {
+      refreshPending = false;
+      scheduleRefresh();
+    }
   }
 }
 
 async function loadSessionDetail(sessionId, switchView = true) {
   try {
+    const requestSeq = ++detailRequestSeq;
     const detail = await apiGet(`/api/v1/sessions/${encodeURIComponent(sessionId)}`);
+    if (requestSeq !== detailRequestSeq) {
+      return; // a newer request (e.g. the user switched sessions) superseded this one
+    }
+    lastDetailLoadAt = Date.now();
     state.selectedSessionId = sessionId;
     state.sessionDetail = detail;
 
@@ -587,12 +664,15 @@ function renderSessionsTable(rows) {
                 <td>
                   <div class="mono" style="font-weight:700;color:var(--citrus-orange-deep)">${s.sessionId}</div>
                   <div style="font-size:11.5px;color:var(--text-muted)">${s.projectName || 'citrus'}</div>
+                  ${Array.isArray(s.modules) && s.modules.length > 0 ? html`
+                    <div class="session-modules" title=${s.modules.join('\n')}>${modulesLabel(s)}</div>
+                  ` : null}
                 </td>
                 <td>
                   <div style="font-weight:600">${s.gitBranch || 'local'}</div>
                   <div class="mono" style="font-size:11.5px;color:var(--text-muted)">${(s.gitCommit || '').slice(0, 10) || 'working-tree'}</div>
                 </td>
-                <td>${statusBadge(s.status)}</td>
+                <td title=${s.failureReason || ''}>${statusBadge(s.status)}</td>
                 <td>
                   <div style="font-size:12.5px;font-weight:600;margin-bottom:4px">
                     <span style="color:var(--emerald-text)">${s.passedTests}✓</span> ·
@@ -662,10 +742,102 @@ function renderSessionsExplorer() {
       </div>
 
       <div class="card">
-        ${renderSessionsTable(filtered)}
+        ${(() => {
+          const page = paginate('sessions', filtered, 25, `${state.sessionStatusFilter}|${q}`);
+          return html`${renderSessionsTable(page.items)}${page.controls}`;
+        })()}
       </div>
     </div>
   `;
+}
+
+// One color per module, stable for a session: modules in the order they started (reactor order).
+const MODULE_PALETTE = ['#10b981', '#6366f1', '#f97316', '#0ea5e9', '#d946ef', '#84cc16', '#eab308', '#14b8a6', '#f43f5e', '#8b5cf6'];
+
+function moduleOrder(session, partitions) {
+  const ordered = Array.isArray(session.modules) ? [...session.modules] : [];
+  const byStart = [...partitions].sort((a, b) => (a.startedAt || 0) - (b.startedAt || 0));
+  for (const p of byStart) {
+    const m = p.moduleName || 'default';
+    if (!ordered.includes(m)) ordered.push(m);
+  }
+  return ordered;
+}
+
+function moduleColor(modules, moduleName) {
+  const idx = modules.indexOf(moduleName || 'default');
+  return MODULE_PALETTE[(idx < 0 ? 0 : idx) % MODULE_PALETTE.length];
+}
+
+function modulesLabel(session) {
+  const modules = Array.isArray(session.modules) ? session.modules : [];
+  return modules.length === 1 ? modules[0] : `${modules.length} modules`;
+}
+
+// Client-side pagination: one page of items plus pager controls; the page is remembered per table and clamped when
+// filters shrink the list. `context` names the session and filters the list depends on: when it changes, the table
+// returns to its first page.
+function paginate(key, items, pageSize = 25, context = '') {
+  if (state.pageContexts[key] !== context) {
+    state.pageContexts[key] = context;
+    state.pages[key] = 0;
+  }
+  const total = items.length;
+  const pageCount = Math.max(1, Math.ceil(total / pageSize));
+  const page = Math.min(Math.max(0, state.pages[key] || 0), pageCount - 1);
+  const go = target => { state.pages[key] = target; renderApp(); };
+  const from = total === 0 ? 0 : page * pageSize + 1;
+  const to = Math.min(total, (page + 1) * pageSize);
+  return {
+    items: items.slice(page * pageSize, (page + 1) * pageSize),
+    controls: total <= pageSize ? null : html`
+      <div class="pager">
+        <span>Showing ${from}–${to} of ${total}</span>
+        <button class="btn btn-sm" disabled=${page === 0} onClick=${() => go(0)}>« First</button>
+        <button class="btn btn-sm" disabled=${page === 0} onClick=${() => go(page - 1)}>‹ Prev</button>
+        <span class="mono">Page ${page + 1} / ${pageCount}</span>
+        <button class="btn btn-sm" disabled=${page >= pageCount - 1} onClick=${() => go(page + 1)}>Next ›</button>
+        <button class="btn btn-sm" disabled=${page >= pageCount - 1} onClick=${() => go(pageCount - 1)}>Last »</button>
+      </div>
+    `
+  };
+}
+
+// Where a partition's time went: before its first test (worker setup: classpath, JVM or class loader, JUnit and
+// framework bootstrap), running tests, and after its last test (reporting, workspace cleanup). Derived from the
+// recorded test timestamps; null when no test of the partition has finished yet.
+function partitionTiming(p, tests) {
+  if (!(p.startedAt > 0)) return null;
+  const end = p.finishedAt > 0 ? p.finishedAt : Date.now();
+  const own = (tests || []).filter(t => t.partitionId === p.partitionId && (!t.attempt || t.attempt === p.attempt)
+    && t.status !== 'STARTED' && t.recordedAt > 0);
+  if (own.length === 0) return null;
+  const firstStart = Math.max(p.startedAt, Math.min(...own.map(t => t.recordedAt - (t.durationMs || 0))));
+  const lastEnd = Math.min(end, Math.max(...own.map(t => t.recordedAt)));
+  return {
+    total: end - p.startedAt,
+    setup: Math.max(0, firstStart - p.startedAt),
+    tests: Math.max(0, lastEnd - firstStart),
+    wrapUp: Math.max(0, end - lastEnd),
+    testTime: own.reduce((sum, t) => sum + (t.durationMs || 0), 0)
+  };
+}
+
+// Bar labels always stay inside their bar: shortened with an ellipsis to fit, or omitted when nothing readable fits.
+// The full partition id is always in the bar's tooltip.
+const BAR_LABEL_CHAR_PX = 6.8;
+const BAR_LABEL_PADDING_PX = 16;
+
+function fitBarLabel(label, barWidth) {
+  const maxChars = Math.floor((barWidth - BAR_LABEL_PADDING_PX) / BAR_LABEL_CHAR_PX);
+  if (label.length <= maxChars) {
+    return label;
+  }
+  const distinctive = label.replace(/^part-/, '');  // every partition id shares this prefix
+  if (distinctive.length <= maxChars) {
+    return distinctive;
+  }
+  return maxChars >= 5 ? `${distinctive.slice(0, maxChars - 1)}…` : '';
 }
 
 function renderWaterfallSvg(session, partitions) {
@@ -703,14 +875,15 @@ function renderWaterfallSvg(session, partitions) {
   const headerHeight = 34;
   const svgHeight = headerHeight + laneEntries.length * rowHeight + 16;
 
-  const colorFor = st => {
+  const modules = moduleOrder(session, partitions);
+  // Fill shows the module; the outline shows the state.
+  const outlineFor = st => {
     switch (st) {
-      case 'COMPLETED': return '#10b981';
-      case 'FAILED': return '#ef4444';
+      case 'FAILED': return { stroke: '#ef4444', width: 3, dash: '' };
+      case 'LOST': return { stroke: '#f59e0b', width: 3, dash: '5,3' };
       case 'RUNNING':
-      case 'ASSIGNED': return '#3b82f6';
-      case 'LOST': return '#f59e0b';
-      default: return '#64748b';
+      case 'ASSIGNED': return { stroke: '#3b82f6', width: 2, dash: '4,3' };
+      default: return { stroke: 'none', width: 0, dash: '' };
     }
   };
 
@@ -719,11 +892,13 @@ function renderWaterfallSvg(session, partitions) {
   return html`
     <div>
       <div class="waterfall-legend">
-        <span class="legend-item"><span class="legend-swatch" style="background:#10b981"></span> Completed</span>
-        <span class="legend-item"><span class="legend-swatch" style="background:#ef4444"></span> Failed</span>
-        <span class="legend-item"><span class="legend-swatch" style="background:#3b82f6"></span> Running</span>
-        <span class="legend-item"><span class="legend-swatch" style="background:#f59e0b"></span> Lost / Evicted (Requeued)</span>
-        <span style="margin-left:auto;font-size:12px;color:var(--text-muted)">Click any partition bar to inspect work units, workspace & capabilities</span>
+        ${modules.map(m => html`
+          <span class="legend-item"><span class="legend-swatch" style=${`background:${moduleColor(modules, m)}`}></span> ${m}</span>
+        `)}
+        <span class="legend-item legend-outline"><span class="legend-swatch legend-swatch-outline" style="border-color:#ef4444"></span> Failed</span>
+        <span class="legend-item legend-outline"><span class="legend-swatch legend-swatch-outline" style="border-color:#3b82f6;border-style:dashed"></span> Running</span>
+        <span class="legend-item legend-outline"><span class="legend-swatch legend-swatch-outline" style="border-color:#f59e0b;border-style:dashed"></span> Lost / Requeued</span>
+        <span style="margin-left:auto;font-size:12px;color:var(--text-muted)">Hover a bar for details · click to inspect</span>
       </div>
 
       <div class="waterfall-scroll">
@@ -754,17 +929,32 @@ function renderWaterfallSvg(session, partitions) {
                   const w = Math.max(44, Math.round(((Math.max(300, pEnd - pStart)) / totalSpan) * chartWidth));
                   const clampedW = Math.max(24, Math.min(w, chartWidth - relX));
                   const barLabel = `${p.partitionId} ${p.attempt > 1 ? `(#${p.attempt})` : p.state === 'LOST' ? `(LOST #${p.attempt || 1})` : ''}`.trim();
-                  const labelInside = clampedW >= barLabel.length * 6.8 + 16;
+                  const shownLabel = fitBarLabel(barLabel, clampedW);
+                  const outline = outlineFor(p.state);
+                  const timing = partitionTiming(p, state.sessionDetail?.tests);
+                  const tooltip = [
+                    `${p.moduleName || 'default'} · ${p.partitionId}${p.attempt > 1 ? ` (attempt ${p.attempt})` : ''}`,
+                    `Worker ${p.workerId || '—'} · ${p.state}`,
+                    `${(p.workUnits || []).length} work unit(s) · ${formatDuration(Math.max(0, pEnd - pStart))}`,
+                    timing ? `Setup ${formatDuration(timing.setup)} · tests ${formatDuration(timing.tests)} · wrap-up ${formatDuration(timing.wrapUp)}` : null,
+                    p.forkWorkspace ? 'Forked JVM workspace' : 'In worker JVM',
+                    p.errorMessage ? `Error: ${p.errorMessage}` : null
+                  ].filter(Boolean).join('\n');
                   return html`
                     <g class="waterfall-bar" onClick=${() => { state.selectedPartition = p; renderApp(); }}>
-                      <rect x=${x} y=${y + 8} width=${clampedW} height=${rowHeight - 16} rx="6" fill=${colorFor(p.state)} />
-                      <text
-                        x=${labelInside ? x + 8 : x + clampedW + 8}
+                      <title>${tooltip}</title>
+                      <rect x=${x} y=${y + 8} width=${clampedW} height=${rowHeight - 16} rx="6"
+                        fill=${moduleColor(modules, p.moduleName)}
+                        fill-opacity=${p.state === 'RUNNING' || p.state === 'ASSIGNED' ? 0.55 : 1}
+                        stroke=${outline.stroke} stroke-width=${outline.width} stroke-dasharray=${outline.dash} />
+                      ${shownLabel ? html`<text
+                        x=${x + 8}
                         y=${y + 26}
                         font-size="11"
                         font-weight="700"
-                        fill=${labelInside ? '#ffffff' : 'currentColor'}
-                      >${barLabel}</text>
+                        fill="#ffffff"
+                        pointer-events="none"
+                      >${shownLabel}</text>` : null}
                     </g>
                   `;
                 })}
@@ -862,7 +1052,8 @@ function renderSessionDetail() {
             ${speedup !== '—' ? html`<span class="speedup-badge">${speedup} speedup</span>` : null}
           </h1>
           <p class="page-subtitle">
-            Project <strong>${session.projectName || 'citrus'}</strong> · Branch <strong class="mono">${session.gitBranch || 'local'}</strong> · Commit <code class="mono">${session.gitCommit || 'HEAD'}</code> · Started ${formatAgo(session.startedAt)}
+            Project <strong>${session.projectName || 'citrus'}</strong>
+            ${Array.isArray(session.modules) && session.modules.length > 0 ? html` · <span class="session-modules" title=${session.modules.join('\n')}>${modulesLabel(session)}</span>` : null}${' '}· Branch <strong class="mono">${session.gitBranch || 'local'}</strong> · Commit <code class="mono">${session.gitCommit || 'HEAD'}</code> · Started ${formatAgo(session.startedAt)}
           </p>
         </div>
 
@@ -887,6 +1078,16 @@ function renderSessionDetail() {
           </select>
         </div>
       </div>
+
+      ${session.failureReason && (session.status === 'FAILED' || session.status === 'ABORTED') ? html`
+        <div
+          class=${`alert-banner session-failure-banner ${session.status === 'FAILED' ? 'alert-banner-rose' : 'alert-banner-amber'}`}
+          role="alert"
+        >
+          <div class="session-failure-title">${session.status === 'FAILED' ? 'Why this session failed' : 'Why this session was aborted'}</div>
+          <pre class="session-failure-reason">${session.failureReason}</pre>
+        </div>
+      ` : null}
 
       <div class="kpi-grid">
         <div class="kpi-card accent-emerald">
@@ -960,7 +1161,7 @@ function renderSessionDetail() {
                   </tr>
                 </thead>
                 <tbody>
-                  ${partitions.map(p => {
+                  ${paginate('partitions', partitions, 25, state.selectedSessionId).items.map(p => {
                     const dur = (p.startedAt > 0 && p.finishedAt > 0)
                       ? formatDuration(p.finishedAt - p.startedAt)
                       : (p.state === 'RUNNING' ? 'running…' : formatDuration(p.estimatedDurationMs));
@@ -997,6 +1198,7 @@ function renderSessionDetail() {
                 </tbody>
               </table>
             </div>
+            ${paginate('partitions', partitions, 25, state.selectedSessionId).controls}
           </div>
         </div>
       ` : null}
@@ -1039,7 +1241,7 @@ function renderSessionDetail() {
                       </tr>
                     </thead>
                     <tbody>
-                      ${filteredTests.map(t => html`
+                      ${paginate('tests', filteredTests, 50, `${state.selectedSessionId}|${state.testStatusFilter}|${tq}`).items.map(t => html`
                         <tr class="clickable-row" onClick=${() => { state.selectedTestExecution = t; renderApp(); }}>
                           <td>
                             ${statusBadge(t.status)}
@@ -1065,6 +1267,7 @@ function renderSessionDetail() {
                     </tbody>
                   </table>
                 </div>
+                ${paginate('tests', filteredTests, 50, `${state.selectedSessionId}|${state.testStatusFilter}|${tq}`).controls}
               `}
           </div>
         </div>
@@ -1273,7 +1476,7 @@ function renderTestHistory() {
                   </tr>
                 </thead>
                 <tbody>
-                  ${filtered.map(h => {
+                  ${paginate('history', filtered, 25, `${state.historyFlakyOnly}|${q}`).items.map(h => {
                     const passedRuns = typeof h.passedRuns === 'number'
                       ? h.passedRuns
                       : Math.max(0, (h.totalRuns || 0) - (h.failedRuns || 0));
@@ -1309,6 +1512,7 @@ function renderTestHistory() {
                 </tbody>
               </table>
             </div>
+            ${paginate('history', filtered, 25, `${state.historyFlakyOnly}|${q}`).controls}
           `}
       </div>
     </div>
@@ -1351,6 +1555,30 @@ function renderModals() {
             <button class="btn btn-sm" onClick=${() => { state.selectedPartition = null; renderApp(); }}>✕ Close</button>
           </div>
           <div class="modal-body">
+            ${(() => {
+              const timing = partitionTiming(p, partTests);
+              if (!timing) return null;
+              const pct = v => `${Math.max(0, Math.min(100, (v / Math.max(1, timing.total)) * 100)).toFixed(1)}%`;
+              return html`
+                <h3 style="margin:0 0 8px;font-size:13px;text-transform:uppercase;color:var(--text-muted)">Where the time went</h3>
+                <div class="partition-timing">
+                  <div class="partition-timing-bar">
+                    <span class="timing-setup" style=${`width:${pct(timing.setup)}`}></span>
+                    <span class="timing-tests" style=${`width:${pct(timing.tests)}`}></span>
+                    <span class="timing-wrapup" style=${`width:${pct(timing.wrapUp)}`}></span>
+                  </div>
+                  <div class="partition-timing-legend">
+                    <span><span class="timing-swatch timing-setup"></span> Setup ${formatDuration(timing.setup)}</span>
+                    <span><span class="timing-swatch timing-tests"></span> Tests ${formatDuration(timing.tests)} (sum of test times ${formatDuration(timing.testTime)})</span>
+                    <span><span class="timing-swatch timing-wrapup"></span> Wrap-up ${formatDuration(timing.wrapUp)}</span>
+                  </div>
+                  <div style="font-size:12px;color:var(--text-muted);margin-top:6px">
+                    Setup is the worker preparing the partition before its first test: fetching and unpacking the
+                    classpath, starting a JVM or class loader, and bootstrapping JUnit and the test framework.
+                  </div>
+                </div>
+              `;
+            })()}
             ${p.errorMessage ? html`
               <div class=${`alert-banner ${p.state === 'FAILED' ? 'alert-banner-rose' : 'alert-banner-amber'}`}>
                 ${p.errorMessage}

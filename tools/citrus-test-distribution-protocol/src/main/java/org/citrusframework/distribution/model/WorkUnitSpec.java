@@ -24,6 +24,21 @@ public record WorkUnitSpec(
         String methodName,
         String dynamicSourceName,
         Map<String, String> requiredCapabilities,
-        long estimatedDurationMs
+        long estimatedDurationMs,
+        java.util.List<String> enclosingClassNames
 ) {
+
+    /**
+     * {@code enclosingClassNames}: for a {@code @Nested} class (or a method of one), the classes enclosing it in the
+     * host's test plan, outermost first. For a nested class inherited from a superclass this is the subclass, so the
+     * worker selects it the same way (JUnit {@code selectNestedClass}) and reports the same unique ids.
+     */
+    public WorkUnitSpec {
+        enclosingClassNames = enclosingClassNames != null ? java.util.List.copyOf(enclosingClassNames) : java.util.List.of();
+    }
+
+    public WorkUnitSpec(String key, String className, String methodName, String dynamicSourceName,
+                        Map<String, String> requiredCapabilities, long estimatedDurationMs) {
+        this(key, className, methodName, dynamicSourceName, requiredCapabilities, estimatedDurationMs, null);
+    }
 }
