@@ -20,8 +20,8 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.net.JarURLConnection;
 import java.net.URL;
-import java.net.URLConnection;
 import java.net.URLClassLoader;
+import java.net.URLConnection;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -30,6 +30,7 @@ import java.util.List;
 import java.util.jar.JarEntry;
 import java.util.jar.JarFile;
 import java.util.jar.JarOutputStream;
+
 import javax.tools.ToolProvider;
 
 import org.citrusframework.distribution.model.TestOutcomeStatus;
@@ -150,6 +151,9 @@ class PartitionClassLoaderTest {
         Path partitionClass = partitionPath.resolve(className.replace('.', '/') + ".class");
         Files.createDirectories(partitionClass.getParent());
         Files.copy(parentPath.resolve(className.replace('.', '/') + ".class"), partitionClass);
+        Path provider = parentPath.resolve("META-INF/services/org.junit.platform.engine.TestEngine");
+        Files.createDirectories(provider.getParent());
+        Files.writeString(provider, className);
         Files.writeString(parentPath.resolve(resource), "parent");
         Files.writeString(partitionPath.resolve(resource), "partition");
 

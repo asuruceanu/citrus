@@ -1206,7 +1206,7 @@ public final class IsolatedPartitionRunner implements PartitionRunner {
             synchronized (getClassLoadingLock(name)) {
                 Class<?> loaded = findLoadedClass(name);
                 if (loaded == null) {
-                    if (shouldDelegateToParent(name) || workerServiceProviders.contains(name)) {
+                    if (shouldDelegateToParent(name) || isSharedWorkerServiceProvider(name)) {
                         loaded = super.loadClass(name, false);
                     } else {
                         try {
@@ -1228,6 +1228,12 @@ public final class IsolatedPartitionRunner implements PartitionRunner {
                 }
                 return loaded;
             }
+        }
+
+        private boolean isSharedWorkerServiceProvider(String name) {
+            // A partition-provided JUnit Support engine must link against the partition's framework classes.
+            return workerServiceProviders.contains(name) && (!name.startsWith("org.junit.support.")
+                    || super.findResource(name.replace('.', '/') + ".class") == null);
         }
 
         @Override
