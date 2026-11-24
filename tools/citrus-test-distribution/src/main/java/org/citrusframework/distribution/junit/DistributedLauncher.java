@@ -254,16 +254,32 @@ public class DistributedLauncher implements Launcher {
 
         try {
             Map<Path, String> mavenOutputs = mavenOutputDirectories();
-            PackagedClasspath packaged = packageCurrentClasspath(workspace.additionalClasspath(), mavenOutputs);
+            TestJvmClasspath launchClasspath = TestJvmClasspath.capture(workspace.additionalClasspath());
+            PackagedClasspath packaged = packageCurrentClasspath(launchClasspath.artifacts(), mavenOutputs);
+            TestJvmClasspath.JavaRelease javaRelease = launchClasspath.javaRelease(testJvmOptions.contains("--enable-preview"));
+            ForkedJvmOptions.Layout jvmLayout = workspace.jvmLayout(launchClasspath);
             Map<String, ClasspathPackager.PackagedArtifact> uploadable = new LinkedHashMap<>(packaged.byDigest());
             List<WorkspaceFileSet> inputs = new ArrayList<>(workspace.inputArtifacts());
             List<WorkUnitSpec> remoteUnits = extracted.remoteUnits();
             Map<String, String> properties = PathRewriter.rewriteHostProperties(
-                    collectPropagatedProperties(), workspace.hostBaseDir());
+                    collectPropagatedProperties(), workspace.hostBaseDir(), workspace.hostBuildDir(),
+                    workspace.externalBuildDirectory());
             if (!testJvmOptions.isEmpty()) {
                 properties.put(ForkedJvmOptions.PROPERTY, DistributionJson.toJson(testJvmOptions));
-                remoteUnits = remoteUnits.stream().map(unit -> requireCapability(unit, ForkedJvmOptions.CAPABILITY)).toList();
             }
+            if (jvmLayout != null) {
+                properties.put(ForkedJvmOptions.LAYOUT_PROPERTY, DistributionJson.toJson(jvmLayout));
+            }
+            String defaultAssertions = System.getProperty(ForkedJvmOptions.ASSERTIONS_PROPERTY);
+            if (defaultAssertions == null && System.getProperty("surefire.test.class.path") != null) {
+                defaultAssertions = "true";
+            }
+            if (defaultAssertions != null) {
+                properties.put(ForkedJvmOptions.ASSERTIONS_PROPERTY, defaultAssertions);
+            }
+            boolean requireFork = jvmLayout != null || !testJvmOptions.isEmpty();
+            boolean requireJvmLayout = requireFork || defaultAssertions != null;
+            remoteUnits = remoteUnits.stream().map(unit -> requireJava(unit, javaRelease, requireJvmLayout)).toList();
             if (workspace.quarkusModel() != null) {
                 QuarkusBootstrapInputs quarkus = QuarkusBootstrapInputs.prepare(workspace.quarkusModel(),
                         workspace.hostBaseDir(), workspace.hostBuildDir(), packaged.paths(), mavenOutputs.keySet(),
@@ -301,7 +317,7 @@ public class DistributedLauncher implements Launcher {
                     uploadedCount,
                     inputs,
                     workspace.outputPaths(),
-                    workspace.forkWorkspace() || !testJvmOptions.isEmpty(),
+                    workspace.forkWorkspace() || requireFork,
                     workspace.partitionPolicy(),
                     workspace.workingDirectory()));
 
@@ -619,20 +635,19 @@ public class DistributedLauncher implements Launcher {
                 unit.estimatedDurationMs(), unit.enclosingClassNames());
     }
 
-    private static PackagedClasspath packageCurrentClasspath(List<Path> additionalWorkerClasspath,
-                                                             Map<Path, String> mavenOutputs) throws IOException {
-        String cp = System.getProperty("surefire.test.class.path", System.getProperty("java.class.path", ""));
-        Set<Path> classpath = new LinkedHashSet<>();
-        for (String entry : cp.split(File.pathSeparator)) {
-            if (!entry.isBlank()) {
-                Path path = Path.of(entry).toAbsolutePath().normalize();
-                if (Files.exists(path)) {
-                    classpath.add(path);
-                }
-            }
+    private static WorkUnitSpec requireJava(WorkUnitSpec unit, TestJvmClasspath.JavaRelease release,
+                                            boolean requireJvmLayout) {
+        Map<String, String> capabilities = new LinkedHashMap<>(unit.requiredCapabilities());
+        release.requireWorker(capabilities);
+        if (requireJvmLayout) {
+            capabilities.put(ForkedJvmOptions.LAYOUT_CAPABILITY, "true");
         }
-        classpath.addAll(additionalWorkerClasspath);
+        return new WorkUnitSpec(unit.key(), unit.className(), unit.methodName(), unit.dynamicSourceName(), capabilities,
+                unit.estimatedDurationMs(), unit.enclosingClassNames());
+    }
 
+    private static PackagedClasspath packageCurrentClasspath(List<Path> classpath,
+                                                             Map<Path, String> mavenOutputs) throws IOException {
         List<ArtifactRef> artifacts = new ArrayList<>();
         Map<String, ClasspathPackager.PackagedArtifact> byDigest = new LinkedHashMap<>();
         for (Path path : classpath) {
@@ -727,6 +742,31 @@ public class DistributedLauncher implements Launcher {
             return base.relativize(cwd).toString().replace('\\', '/');
         }
 
+        private String externalBuildDirectory() {
+            return externalBuildDirectory(hostBaseDir, hostBuildDir);
+        }
+
+        static String externalBuildDirectory(Path moduleDir, Path buildDir) {
+            return buildDir.startsWith(moduleDir) || buildDir.getFileName() == null ? ""
+                    : ForkedJvmOptions.EXTERNAL_BUILD_ROOT + buildDir.getFileName();
+        }
+
+        ForkedJvmOptions.Layout jvmLayout(TestJvmClasspath launchClasspath) {
+            Map<Integer, String> workspaceDirectories = new LinkedHashMap<>();
+            String external = externalBuildDirectory();
+            if (!external.isEmpty()) {
+                for (int i = 0; i < launchClasspath.artifacts().size(); i++) {
+                    Path path = launchClasspath.artifacts().get(i);
+                    if (Files.isDirectory(path) && path.startsWith(hostBuildDir)) {
+                        String suffix = hostBuildDir.relativize(path).toString().replace(File.separatorChar, '/');
+                        workspaceDirectories.put(i, suffix.isEmpty() ? external : external + "/" + suffix);
+                    }
+                }
+            }
+            return launchClasspath.pathOptions().isEmpty() && workspaceDirectories.isEmpty() && external.isEmpty() ? null
+                    : new ForkedJvmOptions.Layout(launchClasspath.classpath(), launchClasspath.pathOptions(), workspaceDirectories);
+        }
+
         /**
          * The host cache directory relative to the module, when it lies inside it, so remote outputs cannot target it.
          */
@@ -796,10 +836,31 @@ public class DistributedLauncher implements Launcher {
                     setting(DistributionSettings.PARTITION_POLICY_PROPERTY, DistributionSettings.PARTITION_POLICY_ENV));
             Path quarkusModel = QuarkusBootstrapInputs.findModel(hostBaseDir);
             // Inputs and the Quarkus model need a private workspace. Extra classpath entries need a JVM classpath.
+            Path cwd = Path.of(System.getProperty("user.dir", "")).toAbsolutePath().normalize();
+            String workingDirectory = relativeWorkingDirectory(hostBaseDir, cwd);
+            String external = externalBuildDirectory(hostBaseDir, hostBuildDir);
+            if (workingDirectory.isEmpty() && !external.isEmpty()) {
+                workingDirectory = externalWorkingDirectory(hostBuildDir, cwd, external);
+            }
             return new WorkspaceSettings(hostBaseDir, hostBuildDir, cache, List.copyOf(inputs), outputs,
                     fork || quarkusModel != null || !additionalClasspath.isEmpty() || !declaredInputs.isEmpty()
-                            || !outputs.isEmpty(), policy, additionalClasspath, quarkusModel,
-                    relativeWorkingDirectory(hostBaseDir, Path.of(System.getProperty("user.dir", ""))));
+                            || !outputs.isEmpty() || !external.isEmpty(), policy, additionalClasspath, quarkusModel, workingDirectory);
+        }
+
+        private static String externalWorkingDirectory(Path buildDir, Path cwd, String workspaceBuildDir) {
+            if (!cwd.startsWith(buildDir)) {
+                try {
+                    buildDir = buildDir.toRealPath();
+                    cwd = cwd.toRealPath();
+                } catch (IOException | SecurityException e) {
+                    return "";
+                }
+            }
+            if (!cwd.startsWith(buildDir)) {
+                return "";
+            }
+            String relative = buildDir.relativize(cwd).toString().replace(File.separatorChar, '/');
+            return relative.isEmpty() ? workspaceBuildDir : workspaceBuildDir + "/" + relative;
         }
 
         /**

@@ -568,10 +568,15 @@ untouched), including inside `file:` URIs, JDBC URLs, path lists and `@argument`
 matched paths are normalized for transfer. URL-encoded paths and embedded path-list delimiters retain their original
 form.
 
-Citrus Test Distribution forwards portable module-access JVM options such as `--add-opens` and `--add-exports` and
-the `--enable-preview` switch from the build test JVM to a compatible forked worker. Configure worker-specific JVM
-options such as heap limits and agent paths with `citrus.test.distribution.worker.forkJvmArgs`. Maven reactor directory
-entries use their effective output directories and artifact IDs when available.
+Citrus Test Distribution forwards assertion settings, portable module-access options and `--enable-preview` from
+the build test JVM to a compatible forked worker. Module paths and patched modules are rebuilt from transferred
+artifacts. Workers must meet the minimum Java release of the transferred bytecode, and tests using preview features
+require the same Java release. Configure worker-specific JVM options such as heap limits and agent paths with
+`citrus.test.distribution.worker.forkJvmArgs`. Maven reactor directory entries use their effective output directories
+and artifact IDs when available.
+
+When the effective Maven build directory is outside the module, its class outputs, forwarded system properties
+and the test JVM's working directory are mapped into a private area of the worker workspace.
 
 [[tools-test-distribution-external-resources-outputs]]
 === Outputs
@@ -703,9 +708,10 @@ cleared. Startup recovery on other platforms retains orphaned workspaces.
 * Partitions with inputs, outputs or `fork=true`, and partitions whose forwarded system properties contain the module
 path, are only assigned to workers of this version (capability `citrus.workspace.v1`). With only older workers they wait
 until the session times out.
-* Forked JVMs get `forkJvmArgs`, not Surefire's `argLine` or `environmentVariables`; set what the tests need through
+* For host-specific Surefire JVM options and environment variables, configure the worker through
 `forkJvmArgs` or system properties.
-* A local working directory outside the module (unusual) maps to the workspace root.
+* A working directory under the configured Maven build directory retains its location in the worker workspace.
+  Other working directories outside the module map to the workspace root.
 * Without the Maven extension, invalid `fork` or `partitionPolicy` values are reported when the module runs distributed
 rather than at build start.
 * The forked JVM uses the worker's copy of the distribution protocol classes; keep hosts and workers on the same Citrus

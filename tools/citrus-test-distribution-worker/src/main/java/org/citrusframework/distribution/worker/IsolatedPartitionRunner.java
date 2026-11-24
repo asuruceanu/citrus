@@ -62,6 +62,7 @@ import java.util.jar.JarFile;
 import java.util.stream.Stream;
 
 import org.citrusframework.distribution.config.DistributionSettings;
+import org.citrusframework.distribution.config.ForkedJvmOptions;
 import org.citrusframework.distribution.config.DistributionSettings.WorkerCwdCheckMode;
 import org.citrusframework.distribution.config.PathRewriter;
 import org.citrusframework.distribution.model.ArtifactRef;
@@ -188,6 +189,7 @@ public final class IsolatedPartitionRunner implements PartitionRunner {
             }
 
             Map<String, String> overrides = partitionOverrides(assignment.systemProperties(), workspaceDir);
+            String assertions = overrides.remove(ForkedJvmOptions.ASSERTIONS_PROPERTY);
             addWorkspaceLeaseTicket(overrides, workspace);
             WorkingDirectorySnapshot before = null;
             synchronized (WORKER_JVM_LOCK) {
@@ -206,6 +208,9 @@ public final class IsolatedPartitionRunner implements PartitionRunner {
             try (URLClassLoader partitionCl = urls.isEmpty()
                     ? new URLClassLoader(new URL[0], parentCl)
                     : new PartitionClassLoader(urls.toArray(new URL[0]), parentCl)) {
+                if (assertions != null) {
+                    partitionCl.setDefaultAssertionStatus(Boolean.parseBoolean(assertions));
+                }
                 summary = PartitionJUnitLauncher.executeWorkUnits(assignment.partitionId(), assignment.sessionId(),
                         assignment.attempt(), assignment.workUnits(), partitionCl, cancellationToken, eventSink);
             }

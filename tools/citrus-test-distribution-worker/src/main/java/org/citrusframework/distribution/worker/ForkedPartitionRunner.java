@@ -249,6 +249,10 @@ final class ForkedPartitionRunner implements PartitionRunner {
             String layout = assignment.systemProperties() == null ? null
                     : assignment.systemProperties().get(QuarkusWorkspace.PROPERTY);
             QuarkusWorkspace quarkus = layout == null ? null : DistributionJson.fromJson(layout, QuarkusWorkspace.class);
+            String jvmLayoutJson = assignment.systemProperties() == null ? null
+                    : assignment.systemProperties().get(ForkedJvmOptions.LAYOUT_PROPERTY);
+            ForkedJvmOptions.Layout jvmLayout = jvmLayoutJson == null ? null
+                    : DistributionJson.fromJson(jvmLayoutJson, ForkedJvmOptions.Layout.class);
             List<Path> classpath = new ArrayList<>();
             for (ArtifactRef artifact : classpathArtifacts) {
                 Path verified = blobs.ensureCached(artifact);
@@ -256,7 +260,11 @@ final class ForkedPartitionRunner implements PartitionRunner {
                     if (jvmStopping) {
                         return cancelledResult();
                     }
-                    String directory = quarkus == null ? null : quarkus.classpathDirectories().get(classpath.size());
+                    int index = classpath.size();
+                    String directory = quarkus == null ? null : quarkus.classpathDirectories().get(index);
+                    if (directory == null && jvmLayout != null) {
+                        directory = jvmLayout.workspaceDirectories().get(index);
+                    }
                     if (directory == null) {
                         classpath.add(cache.materializeForClasspath(artifact, verified, fork.partitionRoot));
                     } else {
@@ -288,7 +296,8 @@ final class ForkedPartitionRunner implements PartitionRunner {
             }
             Map<String, String> baseline = WorkspacePackager.snapshotBaselineHashes(workspace, assignment.outputPaths());
             verifyJUnitPlatform(classpath);
-            String classpathLine = argfileClasspathLine(childClasspath(classpath)) + System.lineSeparator();
+            List<Path> runtimeClasspath = jvmLayout == null ? classpath : selectArtifacts(classpath, jvmLayout.classpath());
+            String classpathLine = argfileClasspathLine(childClasspath(runtimeClasspath)) + System.lineSeparator();
 
             byte[] secret = new byte[32];
             new SecureRandom().nextBytes(secret);
@@ -296,12 +305,18 @@ final class ForkedPartitionRunner implements PartitionRunner {
             Map<String, String> properties = new LinkedHashMap<>(
                     IsolatedPartitionRunner.workspaceOverrides(assignment.systemProperties(), workspace));
             properties.remove(QuarkusWorkspace.PROPERTY);
+            properties.remove(ForkedJvmOptions.LAYOUT_PROPERTY);
             String optionsJson = properties.remove(ForkedJvmOptions.PROPERTY);
-            List<String> testJvmOptions = optionsJson == null ? List.of()
+            List<String> testJvmOptions = new ArrayList<>();
+            if (jvmLayout != null) {
+                addModuleOptions(testJvmOptions, jvmLayout, classpath);
+            }
+            List<String> options = optionsJson == null ? List.of()
                     : DistributionJson.mapper().readValue(optionsJson, new TypeReference<List<String>>() {});
-            if (testJvmOptions.stream().anyMatch(option -> option == null || !ForkedJvmOptions.supported(option))) {
+            if (options.stream().anyMatch(option -> option == null || !ForkedJvmOptions.supported(option))) {
                 throw new IOException("Unsupported build JVM option in partition assignment");
             }
+            testJvmOptions.addAll(options);
             if (quarkusModel != null) {
                 properties.put(QuarkusWorkspace.MODEL_PROPERTY, quarkusModel.toString());
                 properties.put(QuarkusWorkspace.MODEL_FORMAT_PROPERTY, "json");
@@ -620,6 +635,37 @@ final class ForkedPartitionRunner implements PartitionRunner {
      */
     static final List<String> CHILD_SYSTEM_PROPERTIES = List.of(
             "-D" + DistributionSettings.ROLE_PROPERTY + "=" + DistributionSettings.ROLE_WORKER);
+
+    private static List<Path> selectArtifacts(List<Path> artifacts, List<Integer> indices) throws IOException {
+        List<Path> selected = new ArrayList<>(indices.size());
+        for (Integer index : indices) {
+            if (index == null || index < 0 || index >= artifacts.size()) {
+                throw new IOException("Invalid JVM layout artifact index: " + index);
+            }
+            selected.add(artifacts.get(index));
+        }
+        return selected;
+    }
+
+    private static void addModuleOptions(List<String> command, ForkedJvmOptions.Layout layout,
+                                         List<Path> artifacts) throws IOException {
+        for (ForkedJvmOptions.PathOption option : layout.pathOptions()) {
+            String prefix = switch (option.name()) {
+                case "--module-path", "--upgrade-module-path" -> option.name() + "=";
+                case "--patch-module" -> {
+                    if (option.module() == null || !option.module().matches("[a-zA-Z0-9_.$]+")) {
+                        throw new IOException("Invalid module name in JVM layout");
+                    }
+                    yield "--patch-module=" + option.module() + "=";
+                }
+                default -> throw new IOException("Unsupported path option in JVM layout: " + option.name());
+            };
+            List<Path> paths = selectArtifacts(artifacts, option.artifacts());
+            if (!paths.isEmpty()) {
+                command.add(prefix + String.join(File.pathSeparator, paths.stream().map(Path::toString).toList()));
+            }
+        }
+    }
 
     private Process launch(Path argfile, Path request, int port, Path workspace, Path workingDirectory, Path tmpDir,
                            List<String> testJvmOptions) throws IOException {

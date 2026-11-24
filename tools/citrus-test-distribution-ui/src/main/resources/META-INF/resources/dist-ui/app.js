@@ -12,7 +12,7 @@ const POLL_INTERVAL_MS = 4000;
 // Full session detail can be several MB for large suites: reload it at most this often during live updates.
 const DETAIL_MIN_INTERVAL_MS = 2000;
 const VALID_DETAIL_TABS = new Set(['waterfall', 'tests', 'failures', 'files']);
-const INTERNAL_WORKSPACE_CAPABILITIES = new Set(['citrus.workspace.v1', 'citrus.workspace.quarkus.v1', 'citrus.workspace.jvm-options.v1']);
+const INTERNAL_WORKSPACE_CAPABILITIES = new Set(['citrus.workspace.v1', 'citrus.workspace.quarkus.v1', 'citrus.workspace.jvm-options.v1', 'citrus.workspace.jvm-layout.v1']);
 
 function visibleCapabilities(capabilities) {
   return Object.entries(capabilities || {}).filter(([key]) => !INTERNAL_WORKSPACE_CAPABILITIES.has(key));

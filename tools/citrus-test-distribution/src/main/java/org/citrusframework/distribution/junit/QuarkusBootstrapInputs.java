@@ -79,7 +79,7 @@ record QuarkusBootstrapInputs(QuarkusWorkspace layout, List<WorkspaceFileSet> in
         Map<Path, String> moduleRoots = new LinkedHashMap<>();
         moduleRoots.put(moduleDir, "");
         if (!buildDir.startsWith(moduleDir)) {
-            moduleRoots.put(buildDir, WorkspacePackager.DEPENDENCY_STAGING_DIR + "build");
+            moduleRoots.put(buildDir, DistributedLauncher.WorkspaceSettings.externalBuildDirectory(moduleDir, buildDir));
         }
         for (JsonNode artifact : artifacts) {
             JsonNode module = artifact.path("module");

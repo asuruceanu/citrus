@@ -56,13 +56,25 @@ public final class PathRewriter {
      * Nothing is rewritten when {@code hostBaseDir} is {@code null} or the filesystem root.
      */
     public static Map<String, String> rewriteHostProperties(Map<String, String> props, Path hostBaseDir) {
+        return rewriteHostProperties(props, hostBaseDir, null, "");
+    }
+
+    /** Also maps a build directory that is staged separately from the module root. */
+    public static Map<String, String> rewriteHostProperties(Map<String, String> props, Path hostBaseDir,
+                                                            Path hostBuildDir, String workspaceBuildDir) {
         Map<String, String> result = new LinkedHashMap<>();
         if (props == null) {
             return result;
         }
-        List<String> candidates = hostPrefixCandidates(hostBaseDir);
+        Map<String, String> replacements = new LinkedHashMap<>();
+        if (!workspaceBuildDir.isEmpty()) {
+            hostPrefixCandidates(hostBuildDir).forEach(root -> replacements.put(root,
+                    DistributionSettings.WORKSPACE_TOKEN + "/" + workspaceBuildDir));
+        }
+        hostPrefixCandidates(hostBaseDir).forEach(root -> replacements.put(root, DistributionSettings.WORKSPACE_TOKEN));
+        List<String> candidates = replacements.keySet().stream().sorted(Comparator.comparingInt(String::length).reversed()).toList();
         props.forEach((key, value) ->
-                result.put(key, candidates.isEmpty() ? value : rewriteValue(value, candidates, WINDOWS, WINDOWS)));
+                result.put(key, rewriteValue(value, candidates, WINDOWS, WINDOWS, replacements)));
         return result;
     }
 
@@ -127,7 +139,12 @@ public final class PathRewriter {
     }
 
     static String rewriteValue(String value, List<String> candidates, boolean ignoreCase, boolean canonicalize) {
-        if (value == null || value.isEmpty()) {
+        return rewriteValue(value, candidates, ignoreCase, canonicalize, Map.of());
+    }
+
+    private static String rewriteValue(String value, List<String> candidates, boolean ignoreCase, boolean canonicalize,
+                                       Map<String, String> replacements) {
+        if (value == null || value.isEmpty() || candidates.isEmpty()) {
             return value;
         }
         StringBuilder out = null;
@@ -139,7 +156,7 @@ public final class PathRewriter {
                 for (String candidate : candidates) {
                     int end = i + candidate.length();
                     if (end <= value.length()
-                            && value.regionMatches(ignoreCase, i, candidate, 0, candidate.length())
+                            && matchesPrefix(value, i, candidate, ignoreCase, canonicalize)
                             && isFollowingBoundary(value, end)) {
                         match = candidate;
                         break;
@@ -153,12 +170,14 @@ public final class PathRewriter {
             if (out == null) {
                 out = new StringBuilder(value.length());
             }
-            out.append(value, copiedUpTo, i).append(DistributionSettings.WORKSPACE_TOKEN);
+            out.append(value, copiedUpTo, i).append(replacements.getOrDefault(match, DistributionSettings.WORKSPACE_TOKEN));
+            boolean singleQuoted = i > 0 && value.charAt(i - 1) == '\'';
+            boolean embedded = i > (singleQuoted ? 1 : 0);
             i += match.length();
             if (canonicalize && i < value.length() && (value.charAt(i) == '/' || value.charAt(i) == '\\')) {
                 // Normalize only the matched Windows path. Leave later list entries and other values untouched.
                 boolean escaped = match.contains("\\\\");
-                while (i < value.length() && ":;,\"'<>|?*".indexOf(value.charAt(i)) < 0) {
+                while (i < value.length() && !endsWindowsPath(value, i, singleQuoted, embedded)) {
                     char c = value.charAt(i++);
                     if (c == '\\') {
                         if (escaped && i < value.length() && value.charAt(i) == '\\') {
@@ -175,6 +194,64 @@ public final class PathRewriter {
             return value;
         }
         return out.append(value, copiedUpTo, value.length()).toString();
+    }
+
+    private static boolean matchesPrefix(String value, int offset, String root, boolean ignoreCase, boolean canonicalize) {
+        if (value.regionMatches(ignoreCase, offset, root, 0, root.length())) {
+            return true;
+        }
+        if (!canonicalize) {
+            return false;
+        }
+        for (int i = 0; i < root.length(); i++) {
+            char candidate = root.charAt(i);
+            char current = value.charAt(offset + i);
+            if (!(isSeparator(candidate) && isSeparator(current))
+                    && !value.regionMatches(ignoreCase, offset + i, root, i, 1)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static boolean isSeparator(char c) {
+        return c == '/' || c == '\\';
+    }
+
+    private static boolean endsWindowsPath(String value, int offset, boolean singleQuoted, boolean embedded) {
+        char c = value.charAt(offset);
+        if (":\"<>|?*".indexOf(c) >= 0) {
+            return true;
+        }
+        if (c != ',' && c != ';' && c != '\'') {
+            return false;
+        }
+        // These characters are legal inside a filename. Treat them as separators only at another value or a closing quote.
+        if (c == '\'' && singleQuoted && (offset + 1 == value.length() || ";,) ]".indexOf(value.charAt(offset + 1)) >= 0)) {
+            return true;
+        }
+        int next = offset + 1;
+        while (next < value.length() && Character.isWhitespace(value.charAt(next))) {
+            next++;
+        }
+        if (next + 2 < value.length() && (value.startsWith("file:", next)
+                || (Character.isLetter(value.charAt(next)) && value.charAt(next + 1) == ':' && isSeparator(value.charAt(next + 2)))
+                || (isSeparator(value.charAt(next)) && isSeparator(value.charAt(next + 1))))) {
+            return true;
+        }
+        return c == ';' && embedded && startsPropertyAssignment(value, next);
+    }
+
+    private static boolean startsPropertyAssignment(String value, int next) {
+        int end = next;
+        while (end < value.length()) {
+            char c = value.charAt(end);
+            if (!Character.isLetterOrDigit(c) && c != '_' && c != '-' && c != '.') {
+                break;
+            }
+            end++;
+        }
+        return end > next && end < value.length() && value.charAt(end) == '=';
     }
 
     private static boolean isPrecedingBoundary(String value, int index) {
