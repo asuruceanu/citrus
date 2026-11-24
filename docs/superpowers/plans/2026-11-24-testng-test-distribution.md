@@ -33,7 +33,7 @@
 
 **Files:**
 - Modify: `tools/citrus-test-distribution-worker/src/main/java/org/citrusframework/distribution/worker/IsolatedPartitionRunner.java:1085-1096,1295-1305`
-- Test: `tools/citrus-test-distribution-worker/src/test/java/org/citrusframework/distribution/worker/PartitionClassLoaderTest.java`
+- Test: `tools/citrus-test-distribution-worker/src/test/java/org/citrusframework/distribution/worker/PartitionClassLoaderTest.java` and the worker’s test-scoped Vintage dependency
 
 **Interfaces:**
 - Consumes: package-private `IsolatedPartitionRunner.PartitionClassLoader(URL[] urls, ClassLoader parent)`
@@ -106,12 +106,10 @@ Add `splitsClassesWithExcludedTemplateMethods` in `tools/citrus-test-distributio
           .filters(TagFilter.excludeTags("slow"))
           .build());
   Set<String> partial = DiscoveredWorkExtractor.partiallySelectedClasses(launcher, plan);
-  DiscoveredWorkExtractor.Extraction extraction = DiscoveredWorkExtractor.extract(plan, 1000L, partial);
-  assertThat(partial).isNotEmpty();
-  assertThat(extraction.remote()).singleElement().satisfies(unit -> {
-      assertThat(unit.className()).isEqualTo(MixedTemplateClass.class.getName());
-      assertThat(unit.methodName()).isEqualTo("fastTemplate()");
-  });
+  var work = DiscoveredWorkExtractor.extract(plan, 1000L, partial);
+  assertThat(partial).hasSize(1);
+  assertThat(work.remoteUnits()).extracting(unit -> unit.key())
+          .containsExactly(MixedTemplateClass.class.getName() + "#fastTemplate");
   ```
 
 - [x] **Step 2: Run test to verify it fails**
@@ -145,8 +143,9 @@ git commit -m "fix(test-distribution): count container test methods when detecti
 - Modify: `runtime/citrus-testng/pom.xml:25-65`
 - Modify: `runtime/citrus-testng/src/main/java/org/citrusframework/testng/TestNGCitrusMethodInterceptor.java`
 - Modify: `runtime/citrus-testng/src/main/java/org/citrusframework/testng/spring/TestNGCitrusSpringMethodInterceptor.java`
+- Modify: `TestNGHelper.java` and both Citrus TestNG support classes for timed source scheduling and retry selection
 - Create: `runtime/citrus-testng/src/test/java/org/citrusframework/testng/TestNGCitrusMethodInterceptorTest.java`, `PlainSourceFixture.java`, and `SpringSourceFixture.java`
-- Create: `runtime/citrus-testng/src/test/resources/org/citrusframework/testng/main/second-echo.citrus.it.yaml`
+- Create: `second-echo.citrus.it.yaml` and `fail-source.citrus.it.yaml` under `runtime/citrus-testng/src/test/resources/org/citrusframework/testng/main/`
 
 **Interfaces:**
 - Consumes: `org.junit.support:testng-engine:1.1.0` (`[engine:testng]`), `ITestNGMethod.setInvocationCount(int)`
@@ -169,7 +168,7 @@ Run the real XML integration fixture and the focused regression. The provider-on
 
 - [x] **Step 3: Schedule multi-source methods through TestNG invocation count**
 
-In both interceptors, retain a single `IMethodInstance` per input and use `setInvocationCount` to schedule the source count multiplied by the existing invocation count. Preserve an explicit invocation count per source, matching the previous TestNG scheduling behavior. Verify each source runs once with the default count and repeat counts produce distinct successful launcher results. Keep initially inactive pools serial. For serial total invocation timeouts, preserve the effective timeout per source and assign source ordinals independently of TestNG’s timed callback counter.
+In both interceptors, retain a single `IMethodInstance` per input and use `setInvocationCount` to schedule the source count multiplied by the existing invocation count. Preserve an explicit invocation count per source, matching the previous TestNG scheduling behavior. Verify each source runs once with the default count and repeat counts produce distinct successful launcher results. Keep initially inactive pools serial. For serial total invocation timeouts, preserve the effective timeout per source and assign source ordinals independently of TestNG’s timed callback counter. A retry keeps the prior source for the same parameter index.
 
 - [x] **Step 4: Run `runtime/citrus-testng` full `verify` lifecycle and check runtime dependency scope**
 
@@ -207,8 +206,8 @@ git commit -m "feat(testng): run citrus-testng on JUnit Platform via testng-engi
 - [x] **Step 1: Add `test`-scope `testng` and `testng-engine` to `tools/citrus-test-distribution/pom.xml` and write `TestNgDistributionTest`**
 
 1. In `tools/citrus-test-distribution/pom.xml`, add `<scope>test</scope>` dependencies on `org.testng:testng` and `org.junit.support:testng-engine`.
-2. Create `tools/citrus-test-distribution/src/test/java/org/citrusframework/distribution/junit/TestNgDistributionTest.java` (naming inner TestNG fixture classes `*NgFixture` so Maven Surefire never selects them directly):
-   - `executesTestNgDataProviderAndPrunedGroupsOnWorkerInAutoAndAlwaysForkModes`: parameterized over `WorkerForkMode.AUTO` and `WorkerForkMode.ALWAYS`, starts an embedded `DistributionCoordinatorServer` + `DistributionWorkerClient`, sets `citrus.test.distribution.enabled=true`, `minRemoteDurationMs=0`, `minRemoteColdUnits=1`, `fallbackLocal=false`, and executes `LauncherDiscoveryRequest` selecting `DataProviderNgFixture` (`@DataProvider` returning 3 rows) and `MixedGroupNgFixture` (one default `@org.testng.annotations.Test` method + one `@org.testng.annotations.Test(groups = "should-fail")` method that fails if invoked) with `TagFilter.excludeTags("should-fail")`.
+2. Create `tools/citrus-test-distribution/src/test/java/org/citrusframework/distribution/junit/TestNgDistributionTest.java` (using top-level `*NgFixture` fixture classes outside Maven Surefire’s test naming patterns):
+   - Exercise `WorkerForkMode.AUTO` and `WorkerForkMode.ALWAYS` through the same test helper. The helper starts an embedded `DistributionCoordinatorServer` + `DistributionWorkerClient`, sets `citrus.test.distribution.enabled=true`, `minRemoteDurationMs=0`, `minRemoteColdUnits=1`, `fallbackLocal=false`, and executes `LauncherDiscoveryRequest` selecting `DataProviderNgFixture` (`@DataProvider` returning 3 rows) and `MixedGroupNgFixture` (one default `@org.testng.annotations.Test` method + one `@org.testng.annotations.Test(groups = "should-fail")` method that fails if invoked) with `TagFilter.excludeTags("should-fail")`.
    - Assert: `0` test failures, `4` passed test executions (`3` data-provider invocations + `1` non-excluded method), `MixedGroupNgFixture`'s excluded method was never invoked on the worker, and the coordinator recorded completed remote partitions on the worker. Verify the partition actually executes in the shared worker JVM for AUTO and in a separate JVM for ALWAYS.
 
 - [x] **Step 2: Run `tools/citrus-test-distribution` test suite**
@@ -233,6 +232,7 @@ Update `src/manual/tools-test-distribution.adoc` (under **Quickstart with Maven*
 ```bash
 git add tools/citrus-test-distribution/pom.xml \
         tools/citrus-test-distribution/src/test/java/org/citrusframework/distribution/junit/TestNgDistributionTest.java \
+        runtime/citrus-testng/src/test/java/org/citrusframework/acceptance/CitrusSpringConfigAT.java \
         src/manual/tools-test-distribution.adoc
 git commit -m "test(test-distribution): add TestNG worker distribution coverage and docs"
 ```
@@ -241,14 +241,17 @@ git commit -m "test(test-distribution): add TestNG worker distribution coverage 
 
 | Run | Unit | Integration | Acceptance | Expected failure | Total |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Local | 105 | 101 | 1 | 5 | 212 |
-| Live worker, `AUTO` | 105 | 101 | 1 | 5 | 212 |
-| Live worker, `ALWAYS` | 105 | 101 | 1 | 5 | 212 |
+| Local | 106 | 101 | 1 | 5 | 213 |
+| Live worker, `AUTO` | 106 | 101 | 1 | 5 | 213 |
+| Live worker, `ALWAYS` | 106 | 101 | 1 | 5 | 213 |
 
-Every test passed in all three runs. Both distributed runs recorded every test on the designated worker.
+Every test passed in all three runs. Both distributed runs recorded every test on the designated worker across six completed partitions each.
 `CitrusSpringConfigAT` ran remotely in the acceptance execution. `FailTestNgIT` passed in the expected-failure
 execution and was absent from the default integration execution. The automated regression checked worker process IDs
 to verify that `AUTO` used the shared worker JVM and `ALWAYS` forked.
 
-The worker and distribution test suites also passed with 145 and 68 tests reported, respectively, including two
+The worker and distribution test suites also passed with 146 and 68 tests reported, respectively, including two
 worker skips. The `citrus-testng` runtime dependency listing contained neither the TestNG bridge nor JUnit Platform.
+
+The independent whole-branch review confirmed the fixes for Vintage class identity, inactive TestNG pools,
+serial invocation timeouts, explicit repeats, and retry source selection.
