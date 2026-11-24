@@ -35,8 +35,13 @@ import static org.junit.platform.engine.discovery.DiscoverySelectors.selectMetho
 public class TestNGCitrusMethodInterceptorTest {
 
     @Test
-    public void reportsEachPlainSourceOnce() {
-        assertInvocations(PlainSourceFixture.class, "runSources", PlainSourceFixture.SOURCES, "EchoTest", "SecondEchoTest");
+    public void reportsEachPlainSourceOnceWithoutActivatingTheThreadPool() {
+        PlainSourceFixture.launcherThread = Thread.currentThread();
+        try {
+            assertInvocations(PlainSourceFixture.class, "runSources", PlainSourceFixture.SOURCES, "EchoTest", "SecondEchoTest");
+        } finally {
+            PlainSourceFixture.launcherThread = null;
+        }
     }
 
     @Test
@@ -48,6 +53,12 @@ public class TestNGCitrusMethodInterceptorTest {
     public void retainsExplicitInvocationsPerSource() {
         assertInvocations(PlainSourceFixture.class, "repeatSources", PlainSourceFixture.SOURCES,
                 "EchoTest", "SecondEchoTest", "EchoTest", "SecondEchoTest");
+    }
+
+    @Test
+    public void reportsEachSourceWithAnInvocationTimeout() {
+        assertInvocations(PlainSourceFixture.class, "timedSources", PlainSourceFixture.SOURCES,
+                "EchoTest", "SecondEchoTest");
     }
 
     private static void assertInvocations(Class<?> fixture, String method, List<String> sources, String... expected) {

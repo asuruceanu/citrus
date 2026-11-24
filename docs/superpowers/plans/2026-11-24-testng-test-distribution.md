@@ -37,7 +37,7 @@
 
 **Interfaces:**
 - Consumes: package-private `IsolatedPartitionRunner.PartitionClassLoader(URL[] urls, ClassLoader parent)`
-- Produces: narrowed parent-first JUnit prefixes (`org.junit.platform.`, `org.junit.jupiter.` for classes; `org/junit/platform/`, `org/junit/jupiter/`, `META-INF/services/org.junit.` for resources) so `org.junit.support.*` loads child-first from partition URLs
+- Produces: parent-first delegation for existing JUnit packages and services, with a partition-first exception for `org.junit.support.*`
 
 - [x] **Step 1: Write the failing test in `PartitionClassLoaderTest`**
 
@@ -66,8 +66,8 @@ Expected: FAIL — `partitionLoaded` is the same class as `parentLoaded` (`paren
 - [x] **Step 3: Narrow JUnit parent delegation in `IsolatedPartitionRunner.PartitionClassLoader`**
 
 In `tools/citrus-test-distribution-worker/src/main/java/org/citrusframework/distribution/worker/IsolatedPartitionRunner.java`:
-- Replace `"org/junit/"` in `SHARED_RESOURCE_PREFIXES` with `"org/junit/platform/"` and `"org/junit/jupiter/"` (keeping `"META-INF/services/org.junit."` intact).
-- In `shouldDelegateToParent(String name)`, replace `name.startsWith("org.junit.")` with `name.startsWith("org.junit.platform.") || name.startsWith("org.junit.jupiter.")`.
+- Exclude `org.junit.support.*` classes and resources from parent-first JUnit delegation, including when an engine is registered in the parent.
+- Keep the other shared JUnit namespaces and their service descriptors visible to the partition. Verify Vintage can still discover a partition’s JUnit 4 fixture when both sides ship Vintage and JUnit 4.
 
 - [x] **Step 4: Run worker unit tests to verify they pass**
 
@@ -169,7 +169,7 @@ Run the real XML integration fixture and the focused regression. The provider-on
 
 - [x] **Step 3: Schedule multi-source methods through TestNG invocation count**
 
-In both interceptors, retain a single `IMethodInstance` per input and use `setInvocationCount` to schedule the source count multiplied by the existing invocation count. Preserve an explicit invocation count per source, matching the previous TestNG scheduling behavior. Verify each source runs once with the default count and repeat counts produce distinct successful launcher results.
+In both interceptors, retain a single `IMethodInstance` per input and use `setInvocationCount` to schedule the source count multiplied by the existing invocation count. Preserve an explicit invocation count per source, matching the previous TestNG scheduling behavior. Verify each source runs once with the default count and repeat counts produce distinct successful launcher results. Keep initially inactive pools serial. For serial total invocation timeouts, preserve the effective timeout per source and assign source ordinals independently of TestNG’s timed callback counter.
 
 - [x] **Step 4: Run `runtime/citrus-testng` full `verify` lifecycle and check runtime dependency scope**
 

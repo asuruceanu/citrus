@@ -16,8 +16,7 @@
 
 package org.citrusframework.testng.spring;
 
-import org.citrusframework.annotations.CitrusTestSource;
-import org.citrusframework.common.TestSourceResolver;
+import org.citrusframework.testng.TestNGHelper;
 import org.testng.IMethodInstance;
 import org.testng.IMethodInterceptor;
 import org.testng.ITestContext;
@@ -33,20 +32,6 @@ public class TestNGCitrusSpringMethodInterceptor implements IMethodInterceptor {
 
     @Override
     public List<IMethodInstance> intercept(List<IMethodInstance> methods, ITestContext context) {
-        for (IMethodInstance method : methods) {
-            if (method.getInstance() instanceof TestNGCitrusSpringSupport) {
-                var testngMethod = method.getMethod();
-                var testMethod = testngMethod.getConstructorOrMethod().getMethod();
-                CitrusTestSource annotation = testMethod.getAnnotation(CitrusTestSource.class);
-                if (annotation != null) {
-                    int sources = TestSourceResolver.resolve(annotation, testMethod).size();
-                    if (sources > 1) {
-                        // TestNG repeats each source according to the configured invocation count.
-                        testngMethod.setInvocationCount(Math.multiplyExact(sources, testngMethod.getInvocationCount()));
-                    }
-                }
-            }
-        }
-        return methods;
+        return TestNGHelper.scheduleTestSources(methods, context, TestNGCitrusSpringSupport.class);
     }
 }

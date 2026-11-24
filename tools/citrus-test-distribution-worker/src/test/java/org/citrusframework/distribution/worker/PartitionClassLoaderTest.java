@@ -38,6 +38,12 @@ import org.citrusframework.distribution.model.WorkerTestEventPayload;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.platform.engine.TestEngine;
+import org.junit.platform.engine.discovery.DiscoverySelectors;
+import org.junit.platform.launcher.EngineFilter;
+import org.junit.platform.launcher.core.LauncherDiscoveryRequestBuilder;
+import org.junit.platform.launcher.core.LauncherFactory;
+import org.junit.platform.launcher.listeners.SummaryGeneratingListener;
+import org.junit.vintage.engine.VintageTestEngine;
 import org.w3c.dom.Document;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -167,6 +173,34 @@ class PartitionClassLoaderTest {
             assertThat(new String(in.readAllBytes(), StandardCharsets.UTF_8)).isEqualTo("partition");
             assertThat(loader.loadClass(TestEngine.class.getName())).isSameAs(TestEngine.class);
             assertThat(loader.loadClass(Test.class.getName())).isSameAs(Test.class);
+        }
+    }
+
+    @Test
+    void shouldKeepVintageAndJUnit4SharingTheWorkerTypes() throws Exception {
+        URL junit4 = org.junit.Test.class.getProtectionDomain().getCodeSource().getLocation();
+        URL vintage = VintageTestEngine.class.getProtectionDomain().getCodeSource().getLocation();
+        Path classes = Files.createDirectory(tempDir.resolve("vintage-classes"));
+        Path source = Files.writeString(tempDir.resolve("VintageProbe.java"), """
+                public class VintageProbe {
+                    @org.junit.Test public void runs() {}
+                }
+                """);
+        assertThat(ToolProvider.getSystemJavaCompiler().run(null, null, null, "-classpath",
+                Path.of(junit4.toURI()).toString(), "-d", classes.toString(), source.toString())).isZero();
+
+        try (var loader = new IsolatedPartitionRunner.PartitionClassLoader(
+                new URL[] {classes.toUri().toURL(), junit4, vintage}, WORKER)) {
+            Class<?> fixture = loader.loadClass("VintageProbe");
+            var listener = new SummaryGeneratingListener();
+            LauncherFactory.create().execute(LauncherDiscoveryRequestBuilder.request()
+                    .selectors(DiscoverySelectors.selectClass(fixture))
+                    .filters(EngineFilter.includeEngines("junit-vintage"))
+                    .build(), listener);
+            assertThat(listener.getSummary().getFailures()).isEmpty();
+            assertThat(listener.getSummary().getTestsSucceededCount()).isEqualTo(1);
+            assertThat(loader.loadClass(org.junit.Test.class.getName())).isSameAs(org.junit.Test.class);
+            assertThat(loader.loadClass(VintageTestEngine.class.getName())).isSameAs(VintageTestEngine.class);
         }
     }
 

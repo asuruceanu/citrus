@@ -33,17 +33,27 @@ import org.citrusframework.util.StringUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.testng.IHookCallBack;
+import org.testng.IMethodInstance;
+import org.testng.ITestContext;
+import org.testng.ITestNGMethod;
 import org.testng.ITestResult;
 import org.testng.SkipException;
+import org.testng.internal.BaseTestMethod;
+import org.testng.internal.MethodInstance;
 
 import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.IdentityHashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public final class TestNGHelper {
 
     public static final String BUILDER_ATTRIBUTE = "builder";
+
+    private static final String TIMED_SOURCES_ATTRIBUTE = TestNGHelper.class.getName() + ".timedSources";
 
     /** Logger */
     private static final Logger logger = LoggerFactory.getLogger(TestNGHelper.class);
@@ -127,6 +137,82 @@ public final class TestNGHelper {
         }
 
         return testCaseRunner;
+    }
+
+    /**
+     * Schedules each resolved source on a Citrus TestNG support class.
+     */
+    public static List<IMethodInstance> scheduleTestSources(List<IMethodInstance> methods, ITestContext context,
+                                                             Class<?> supportClass) {
+        Map<ITestNGMethod, AtomicInteger> timedSources = new IdentityHashMap<>();
+        List<IMethodInstance> scheduled = new ArrayList<>(methods.size());
+        for (IMethodInstance method : methods) {
+            scheduled.add(method);
+            if (!supportClass.isInstance(method.getInstance())) {
+                continue;
+            }
+
+            var testngMethod = method.getMethod();
+            Method testMethod = testngMethod.getConstructorOrMethod().getMethod();
+            CitrusTestSource annotation = testMethod.getAnnotation(CitrusTestSource.class);
+            int sources = annotation == null ? 0 : TestSourceResolver.resolve(annotation, testMethod).size();
+            if (sources <= 1) {
+                continue;
+            }
+
+            int invocations = testngMethod.getInvocationCount();
+            int threadPoolSize = testngMethod.getThreadPoolSize();
+            if (testngMethod.getInvocationTimeOut() > 0) {
+                if (!(testngMethod instanceof BaseTestMethod timedMethod)
+                        || (invocations > 1 && threadPoolSize > 1)) {
+                    // Preserve native scheduling for an already-active timed pool or custom method implementation.
+                    for (int source = 1; source < sources; source++) {
+                        scheduled.add(new MethodInstance(testngMethod));
+                    }
+                    continue;
+                }
+                // The Citrus hook handles one source per timed callback. Preserve the effective timeout for
+                // each source and let TestNG report each callback as a separate invocation.
+                if (timedMethod.getTimeOut() <= 0) {
+                    timedMethod.setTimeOut(timedMethod.getInvocationTimeOut());
+                }
+                timedMethod.setInvocationTimeOut(0);
+                invocations = 1;
+            }
+            if (testngMethod.getTimeOut() > 0 && (invocations <= 1 || threadPoolSize <= 1)) {
+                timedSources.put(testngMethod, new AtomicInteger());
+            }
+            // TestNG ignores a configured pool for one invocation. Source expansion must keep it serial.
+            if (invocations == 1 && threadPoolSize > 1) {
+                testngMethod.setThreadPoolSize(1);
+            }
+            testngMethod.setInvocationCount(Math.multiplyExact(sources, invocations));
+        }
+        if (!timedSources.isEmpty()) {
+            if (context.getAttribute(TIMED_SOURCES_ATTRIBUTE) instanceof TimedSources existing) {
+                existing.ordinals().putAll(timedSources);
+            } else {
+                context.setAttribute(TIMED_SOURCES_ATTRIBUTE, new TimedSources(timedSources));
+            }
+        }
+        return scheduled;
+    }
+
+    /**
+     * Resolves the source index for one invocation. TestNG advances its native index inside and outside a timed callback.
+     */
+    public static int sourceIndex(ITestResult result, int invocationCount, int sourceCount) {
+        ITestContext context = result.getTestContext();
+        if (context != null && context.getAttribute(TIMED_SOURCES_ATTRIBUTE) instanceof TimedSources timedSources) {
+            AtomicInteger ordinal = timedSources.ordinals().get(result.getMethod());
+            if (ordinal != null) {
+                return ordinal.getAndIncrement() % sourceCount;
+            }
+        }
+        return invocationCount % sourceCount;
+    }
+
+    private record TimedSources(Map<ITestNGMethod, AtomicInteger> ordinals) {
     }
 
     /**

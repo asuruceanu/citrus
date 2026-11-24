@@ -24,23 +24,32 @@ import org.citrusframework.annotations.CitrusTestSource;
 import org.citrusframework.api.common.TestLoader;
 import org.testng.annotations.Test;
 
+import static org.assertj.core.api.Assertions.assertThat;
+
 public class PlainSourceFixture extends TestNGCitrusSupport {
     private static final String FIRST = "classpath:org/citrusframework/testng/main/echo.citrus.it.yaml";
     private static final String SECOND = "classpath:org/citrusframework/testng/main/second-echo.citrus.it.yaml";
     static final List<String> SOURCES = new ArrayList<>();
+    static volatile Thread launcherThread;
 
     @Override
     protected void before(CitrusContext context) {
         TestNGCitrusMethodInterceptorTest.recordSources(context, SOURCES);
     }
 
-    @Test
+    @Test(threadPoolSize = 2)
     @CitrusTestSource(type = TestLoader.YAML, sources = {FIRST, SECOND})
     public void runSources() {
+        assertThat(Thread.currentThread()).isSameAs(launcherThread);
     }
 
     @Test(invocationCount = 2)
     @CitrusTestSource(type = TestLoader.YAML, sources = {FIRST, SECOND})
     public void repeatSources() {
+    }
+
+    @Test(invocationTimeOut = 10_000)
+    @CitrusTestSource(type = TestLoader.YAML, sources = {FIRST, SECOND})
+    public void timedSources() {
     }
 }
