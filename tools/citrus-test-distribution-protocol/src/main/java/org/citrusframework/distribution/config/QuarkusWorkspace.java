@@ -44,7 +44,7 @@ public record QuarkusWorkspace(String modelPath, Map<Integer, String> classpathD
             for (int i = 0; i < array.size(); i++) {
                 array.set(i, rewriteStrings(array.get(i), rewrite));
             }
-        } else if (node.isTextual()) {
+        } else if (node.isString()) {
             String value = node.asString();
             String replacement = rewrite.apply(value);
             if (!value.equals(replacement)) {
