@@ -20,8 +20,12 @@ import java.util.ArrayList;
 import java.util.List;
 
 import org.citrusframework.CitrusContext;
+import org.citrusframework.TestCase;
+import org.citrusframework.report.AbstractTestListener;
 import org.citrusframework.annotations.CitrusTestSource;
 import org.citrusframework.api.common.TestLoader;
+import org.testng.IRetryAnalyzer;
+import org.testng.ITestResult;
 import org.testng.annotations.Test;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -29,12 +33,21 @@ import static org.assertj.core.api.Assertions.assertThat;
 public class PlainSourceFixture extends TestNGCitrusSupport {
     private static final String FIRST = "classpath:org/citrusframework/testng/main/echo.citrus.it.yaml";
     private static final String SECOND = "classpath:org/citrusframework/testng/main/second-echo.citrus.it.yaml";
+    private static final String FAILING = "classpath:org/citrusframework/testng/main/fail-source.citrus.it.yaml";
+
+    static final List<String> ATTEMPTS = new ArrayList<>();
     static final List<String> SOURCES = new ArrayList<>();
     static volatile Thread launcherThread;
 
     @Override
     protected void before(CitrusContext context) {
         TestNGCitrusMethodInterceptorTest.recordSources(context, SOURCES);
+        context.addTestListener(new AbstractTestListener() {
+            @Override
+            public void onTestStart(TestCase test) {
+                ATTEMPTS.add(test.getName());
+            }
+        });
     }
 
     @Test(threadPoolSize = 2)
@@ -48,8 +61,21 @@ public class PlainSourceFixture extends TestNGCitrusSupport {
     public void repeatTimedSources() {
     }
 
-    @Test(invocationTimeOut = 10_000)
-    @CitrusTestSource(type = TestLoader.YAML, sources = {FIRST, SECOND})
-    public void timedSources() {
+    @Test(invocationTimeOut = 10_000, retryAnalyzer = RetryOnce.class)
+    @CitrusTestSource(type = TestLoader.YAML, sources = {FIRST, FAILING})
+    public void retryTimedSource() {
+    }
+
+    public static class RetryOnce implements IRetryAnalyzer {
+        private boolean retried;
+
+        @Override
+        public boolean retry(ITestResult result) {
+            if (retried) {
+                return false;
+            }
+            retried = true;
+            return true;
+        }
     }
 }

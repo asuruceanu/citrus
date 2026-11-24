@@ -56,9 +56,17 @@ public class TestNGCitrusMethodInterceptorTest {
     }
 
     @Test
-    public void reportsEachSourceWithAnInvocationTimeout() {
-        assertInvocations(PlainSourceFixture.class, "timedSources", PlainSourceFixture.SOURCES,
-                "EchoTest", "SecondEchoTest");
+    public void retriesTheFailingTimedSource() {
+        PlainSourceFixture.ATTEMPTS.clear();
+        var listener = new SummaryGeneratingListener();
+        LauncherFactory.create().execute(LauncherDiscoveryRequestBuilder.request()
+                .selectors(selectMethod(PlainSourceFixture.class, "retryTimedSource"))
+                .build(), listener);
+
+        var summary = listener.getSummary();
+        assertThat(PlainSourceFixture.ATTEMPTS).containsExactly("EchoTest", "FailSource", "FailSource");
+        assertThat(summary.getTestsSucceededCount()).isEqualTo(1);
+        assertThat(summary.getTestsFailedCount()).isEqualTo(1);
     }
 
     private static void assertInvocations(Class<?> fixture, String method, List<String> sources, String... expected) {

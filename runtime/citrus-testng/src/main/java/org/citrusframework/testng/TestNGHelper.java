@@ -44,10 +44,10 @@ import org.testng.internal.MethodInstance;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.atomic.AtomicInteger;
 
 public final class TestNGHelper {
 
@@ -144,7 +144,7 @@ public final class TestNGHelper {
      */
     public static List<IMethodInstance> scheduleTestSources(List<IMethodInstance> methods, ITestContext context,
                                                              Class<?> supportClass) {
-        Map<ITestNGMethod, AtomicInteger> timedSources = new IdentityHashMap<>();
+        Map<ITestNGMethod, SourceInvocations> timedSources = new IdentityHashMap<>();
         List<IMethodInstance> scheduled = new ArrayList<>(methods.size());
         for (IMethodInstance method : methods) {
             scheduled.add(method);
@@ -179,7 +179,7 @@ public final class TestNGHelper {
                 timedMethod.setInvocationTimeOut(0);
             }
             if (testngMethod.getTimeOut() > 0 && (invocations <= 1 || threadPoolSize <= 1)) {
-                timedSources.put(testngMethod, new AtomicInteger());
+                timedSources.put(testngMethod, new SourceInvocations());
             }
             // TestNG ignores a configured pool for one invocation. Source expansion must keep it serial.
             if (invocations == 1 && threadPoolSize > 1) {
@@ -203,15 +203,33 @@ public final class TestNGHelper {
     public static int sourceIndex(ITestResult result, int invocationCount, int sourceCount) {
         ITestContext context = result.getTestContext();
         if (context != null && context.getAttribute(TIMED_SOURCES_ATTRIBUTE) instanceof TimedSources timedSources) {
-            AtomicInteger ordinal = timedSources.ordinals().get(result.getMethod());
-            if (ordinal != null) {
-                return ordinal.getAndIncrement() % sourceCount;
+            SourceInvocations invocations = timedSources.ordinals().get(result.getMethod());
+            if (invocations != null) {
+                return invocations.index(result, sourceCount);
             }
         }
         return invocationCount % sourceCount;
     }
 
-    private record TimedSources(Map<ITestNGMethod, AtomicInteger> ordinals) {
+    private record TimedSources(Map<ITestNGMethod, SourceInvocations> ordinals) {
+    }
+
+    private static final class SourceInvocations {
+        private final Map<Integer, SourceAttempt> attemptsByParameterIndex = new HashMap<>();
+        private int nextIndex;
+
+        synchronized int index(ITestResult result, int sourceCount) {
+            int parameterIndex = result.getParameterIndex();
+            SourceAttempt previous = attemptsByParameterIndex.get(parameterIndex);
+            // TestNG marks the prior result before retrying the same data-provider row.
+            int sourceIndex = previous != null && previous.result().wasRetried()
+                    ? previous.index() : nextIndex++ % sourceCount;
+            attemptsByParameterIndex.put(parameterIndex, new SourceAttempt(result, sourceIndex));
+            return sourceIndex;
+        }
+    }
+
+    private record SourceAttempt(ITestResult result, int index) {
     }
 
     /**
