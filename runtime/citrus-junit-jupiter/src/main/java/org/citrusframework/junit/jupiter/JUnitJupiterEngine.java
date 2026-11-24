@@ -68,6 +68,9 @@ public class JUnitJupiterEngine extends AbstractTestEngine {
     /** Logger */
     private static final Logger logger = LoggerFactory.getLogger(JUnitJupiterEngine.class);
 
+    /** Marks launcher requests created by this engine, including those on a test's executor thread. */
+    public static final String EMBEDDED_LAUNCHER_PARAMETER = "citrus.junit.jupiter.embeddedLauncher";
+
     private final Set<TestExecutionListener> testExecutionListeners = new LinkedHashSet<>();
 
     public JUnitJupiterEngine(TestRunConfiguration configuration) {
@@ -76,7 +79,8 @@ public class JUnitJupiterEngine extends AbstractTestEngine {
 
     @Override
     public void run() {
-        LauncherDiscoveryRequestBuilder requestBuilder = LauncherDiscoveryRequestBuilder.request();
+        LauncherDiscoveryRequestBuilder requestBuilder = LauncherDiscoveryRequestBuilder.request()
+                .configurationParameter(EMBEDDED_LAUNCHER_PARAMETER, "true");
 
         if (getConfiguration().getTestSources().isEmpty()) {
             addTestPackages(requestBuilder, getConfiguration());

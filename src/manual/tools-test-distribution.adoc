@@ -441,6 +441,12 @@ fallback, still apply. For a worker-only verification, disable local fallback an
 (`minRemoteDurationMs` and `minRemoteColdUnits`) to zero. A test with an effective `@RemoteOnly` requirement is
 ineligible for local execution.
 
+A local test's nested launcher stays on the host when it runs on the same thread. For an embedded JUnit launcher
+running on another thread, including an existing executor thread, set the per-request configuration parameter
+`citrus.junit.jupiter.embeddedLauncher=true` on its discovery request. Citrus's Jupiter engine marks its embedded
+requests automatically. Independent launchers use normal placement rules.
+
+
 For the Citrus JBang CLI `RunTest`, resolve the runtime dependencies of `citrus-groovy`, `citrus-cucumber` and
 `citrus-cucumber-core` on the build host and supply their classpath through `additionalWorkerClasspath`.
 

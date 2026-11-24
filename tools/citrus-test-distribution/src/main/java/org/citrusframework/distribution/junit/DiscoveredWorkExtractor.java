@@ -24,6 +24,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.stream.Collectors;
 
 import org.citrusframework.distribution.annotations.RemoteOnly;
 import org.citrusframework.distribution.model.WorkUnitSpec;
@@ -66,8 +67,13 @@ public final class DiscoveredWorkExtractor {
                                  Set<String> remoteLocalOnlyClasses, Set<String> remoteLocalOnlyMethods) {
         Selection selection = new Selection(
                 partiallySelectedClasses != null ? partiallySelectedClasses : Set.of(), remoteLocalOnlyClasses,
-                remoteLocalOnlyMethods);
+                remoteLocalOnlyMethods.stream().map(DiscoveredWorkExtractor::normalizeMethodSelector)
+                        .collect(Collectors.toUnmodifiableSet()));
         return extractWork(testPlan, defaultDurationMs, selection);
+    }
+
+    private static String normalizeMethodSelector(String selector) {
+        return selector.replaceAll("\\s+", "");
     }
 
     private record Selection(Set<String> partialClasses, Set<String> remoteLocalOnlyClasses,
@@ -79,7 +85,8 @@ public final class DiscoveredWorkExtractor {
         }
 
         boolean overridesMethodPin(Class<?> testClass, String methodSelector) {
-            return remoteLocalOnlyMethods.contains(testClass.getName() + "#" + methodSelector);
+            return !remoteLocalOnlyMethods.isEmpty()
+                    && remoteLocalOnlyMethods.contains(testClass.getName() + "#" + normalizeMethodSelector(methodSelector));
         }
 
         boolean isLocalOnly(Class<?> testClass, Method method, String methodSelector) {
@@ -268,7 +275,7 @@ public final class DiscoveredWorkExtractor {
                 Method javaMethod = resolveMethod(testClass, ms);
                 String methodSelector = buildMethodSelectorName(ms);
                 boolean local = enclosingLocal || selection.isLocalOnly(testClass, javaMethod, methodSelector);
-                if (enclosingRemote || selection.declaresRemoteOnly(testClass, javaMethod)) {
+                if (!local && (enclosingRemote || selection.declaresRemoteOnly(testClass, javaMethod))) {
                     hasRemoteOnly[0] = true;
                 }
                 Map<String, String> caps = new LinkedHashMap<>(enclosingCaps);

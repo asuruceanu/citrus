@@ -29,6 +29,7 @@ import org.junit.platform.launcher.LauncherInterceptor;
 public class DistributionLauncherInterceptor implements LauncherInterceptor {
 
     private static final AtomicInteger LOCAL_EXECUTIONS = new AtomicInteger();
+    private static final ThreadLocal<Boolean> LOCAL_SCOPE = new ThreadLocal<>();
 
     @Override
     @SuppressWarnings("unchecked")
@@ -41,20 +42,30 @@ public class DistributionLauncherInterceptor implements LauncherInterceptor {
     }
 
     static boolean isActiveForCurrentProcess() {
-        return DistributionSettings.isEnabled() && !DistributionSettings.isWorkerRole() && !isExecutingLocally();
+        return DistributionSettings.isEnabled() && !DistributionSettings.isWorkerRole() && !isInLocalScope();
     }
 
     static boolean isExecutingLocally() {
         return LOCAL_EXECUTIONS.get() > 0;
     }
 
+    static boolean isInLocalScope() {
+        return Boolean.TRUE.equals(LOCAL_SCOPE.get());
+    }
+
     static void runLocally(Runnable run) {
-        // Nested launchers can be created on existing executor threads in the same test JVM.
+        if (isInLocalScope()) {
+            run.run();
+            return;
+        }
+
+        LOCAL_SCOPE.set(true);
         LOCAL_EXECUTIONS.incrementAndGet();
         try {
             run.run();
         } finally {
             LOCAL_EXECUTIONS.decrementAndGet();
+            LOCAL_SCOPE.remove();
         }
     }
 

@@ -25,6 +25,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Consumer;
 
@@ -87,7 +88,8 @@ public final class PartitionJUnitLauncher {
         Thread thread = Thread.currentThread();
         ClassLoader previous = thread.getContextClassLoader();
         thread.setContextClassLoader(testClassLoader);
-        try (IsolatedTestLock isolation = IsolatedTestLock.acquire(workUnits, testClassLoader);
+        try (IsolatedTestLock isolation = IsolatedTestLock.acquire(workUnits, testClassLoader,
+                     () -> isCancelled(cancellationToken));
              CitrusEndpointCollector endpointCollector = CitrusEndpointCollector.install(testClassLoader)) {
             resetCitrusExtensionIfPresent(testClassLoader);
             List<WorkUnitSpec> regular = new ArrayList<>();
@@ -137,6 +139,8 @@ public final class PartitionJUnitLauncher {
                 return new ExecutionSummary(false, "Work units matched no tests on the worker: " + String.join(", ", unmatched));
             }
             return new ExecutionSummary(true, null);
+        } catch (CancellationException e) {
+            return new ExecutionSummary(false, e.getMessage());
         } catch (Throwable t) {
             if (t instanceof InterruptedException) {
                 thread.interrupt();

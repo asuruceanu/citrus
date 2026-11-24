@@ -25,7 +25,10 @@ import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.BooleanSupplier;
 
 import org.citrusframework.distribution.model.WorkUnitSpec;
 
@@ -34,6 +37,7 @@ public final class IsolatedTestLock implements AutoCloseable {
 
     private static final String ISOLATED = "org.junit.jupiter.api.parallel.Isolated";
     private static final ReentrantLock JVM_LOCK = new ReentrantLock();
+    private static final long LOCK_POLL_MS = 100;
     private final FileChannel channel;
 
     private IsolatedTestLock(FileChannel channel) {
@@ -43,6 +47,13 @@ public final class IsolatedTestLock implements AutoCloseable {
     /** Returns a lock held until closed, or {@code null} when the selection needs no isolation. */
     public static IsolatedTestLock acquire(List<WorkUnitSpec> units, ClassLoader loader)
             throws IOException, InterruptedException {
+        return acquire(units, loader, () -> false);
+    }
+
+    /** Interruptible acquisition for worker assignments that can also be cancelled through a token. */
+    public static IsolatedTestLock acquire(List<WorkUnitSpec> units, ClassLoader loader,
+                                           BooleanSupplier cancelled) throws IOException, InterruptedException {
+        checkCancellation(cancelled);
         if (JVM_LOCK.isHeldByCurrentThread()
                 || units.stream().map(WorkUnitSpec::className).distinct().noneMatch(name -> isIsolated(name, loader))) {
             return null;
@@ -50,14 +61,21 @@ public final class IsolatedTestLock implements AutoCloseable {
 
         Path directory = Path.of(System.getProperty("user.home"), ".citrus-dist");
         Files.createDirectories(directory);
-        JVM_LOCK.lockInterruptibly();
+        while (!JVM_LOCK.tryLock(LOCK_POLL_MS, TimeUnit.MILLISECONDS)) {
+            checkCancellation(cancelled);
+        }
         try {
+            checkCancellation(cancelled);
             FileChannel channel = FileChannel.open(directory.resolve("isolated-tests.lock"),
                     StandardOpenOption.CREATE, StandardOpenOption.WRITE, LinkOption.NOFOLLOW_LINKS);
             try {
-                channel.lock();
+                while (channel.tryLock() == null) {
+                    checkCancellation(cancelled);
+                    Thread.sleep(LOCK_POLL_MS);
+                }
+                checkCancellation(cancelled);
                 return new IsolatedTestLock(channel);
-            } catch (IOException | RuntimeException | Error e) {
+            } catch (IOException | InterruptedException | RuntimeException | Error e) {
                 try {
                     channel.close();
                 } catch (IOException failure) {
@@ -65,9 +83,15 @@ public final class IsolatedTestLock implements AutoCloseable {
                 }
                 throw e;
             }
-        } catch (IOException | RuntimeException | Error e) {
+        } catch (IOException | InterruptedException | RuntimeException | Error e) {
             JVM_LOCK.unlock();
             throw e;
+        }
+    }
+
+    private static void checkCancellation(BooleanSupplier cancelled) {
+        if (cancelled.getAsBoolean()) {
+            throw new CancellationException("Partition cancelled while waiting for isolated tests");
         }
     }
 

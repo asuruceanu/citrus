@@ -53,6 +53,7 @@ import org.citrusframework.distribution.model.WorkUnitSpec;
 import org.citrusframework.distribution.model.WorkerTestEventPayload;
 import org.citrusframework.distribution.model.WorkspaceFileSet;
 import org.citrusframework.distribution.workspace.WorkspaceLease;
+import org.citrusframework.junit.jupiter.JUnitJupiterEngine;
 import org.junit.platform.launcher.Launcher;
 import org.junit.platform.launcher.LauncherDiscoveryListener;
 import org.junit.platform.launcher.LauncherDiscoveryRequest;
@@ -125,7 +126,10 @@ public class DistributedLauncher implements Launcher {
     }
 
     private void executeDistributed(TestPlan testPlan, TestExecutionListener[] callListeners) {
-        if (DistributionLauncherInterceptor.isExecutingLocally()) {
+        // Only requests explicitly marked as embedded can use a local execution on another thread.
+        if (DistributionLauncherInterceptor.isInLocalScope()
+                || (DistributionLauncherInterceptor.isExecutingLocally() && testPlan.getConfigurationParameters()
+                        .getBoolean(JUnitJupiterEngine.EMBEDDED_LAUNCHER_PARAMETER).orElse(false))) {
             executeDelegateLocally(testPlan, callListeners);
             return;
         }
