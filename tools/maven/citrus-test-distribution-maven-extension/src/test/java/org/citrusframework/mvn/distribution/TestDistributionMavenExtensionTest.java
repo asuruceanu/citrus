@@ -31,8 +31,8 @@ import org.apache.maven.execution.MavenSession;
 import org.apache.maven.model.Build;
 import org.apache.maven.model.Plugin;
 import org.apache.maven.project.MavenProject;
-import org.citrusframework.distribution.broker.DistributionBrokerConfig;
-import org.citrusframework.distribution.broker.DistributionBrokerServer;
+import org.citrusframework.distribution.coordinator.DistributionCoordinatorConfig;
+import org.citrusframework.distribution.coordinator.DistributionCoordinatorServer;
 import org.citrusframework.distribution.config.DistributionJson;
 import org.citrusframework.distribution.config.DistributionSettings;
 import org.citrusframework.distribution.model.BuildSessionRecord;
@@ -66,21 +66,21 @@ class TestDistributionMavenExtensionTest {
 
     @Test
     void shouldOpenReactorSessionMutateSurefireAndFailsafeAndCompleteSession() throws Exception {
-        DistributionBrokerConfig brokerConfig = DistributionBrokerConfig.builder()
+        DistributionCoordinatorConfig coordinatorConfig = DistributionCoordinatorConfig.builder()
                 .port(0)
-                .cacheDir(tempDir.resolve("broker-cache"))
+                .cacheDir(tempDir.resolve("coordinator-cache"))
                 .jdbcUrl("jdbc:hsqldb:mem:mvn_ext_" + System.nanoTime())
                 .build();
 
-        try (DistributionBrokerServer broker = new DistributionBrokerServer(brokerConfig)) {
-            broker.start();
+        try (DistributionCoordinatorServer coordinator = new DistributionCoordinatorServer(coordinatorConfig)) {
+            coordinator.start();
 
             MavenProject modA = createSampleProject("citrus-mod-a", tempDir.resolve("mod-a"));
             MavenProject modB = createSampleProject("citrus-mod-b", tempDir.resolve("mod-b"));
 
             Properties userProps = new Properties();
             userProps.setProperty(DistributionSettings.ENABLED_PROPERTY, "true");
-            userProps.setProperty(DistributionSettings.BROKER_URL_PROPERTY, broker.baseUrl());
+            userProps.setProperty(DistributionSettings.COORDINATOR_URL_PROPERTY, coordinator.baseUrl());
             MavenSession session = mockSession(List.of(modA, modB), userProps);
 
             TestDistributionLifecycleParticipant participant = new TestDistributionLifecycleParticipant();
@@ -99,8 +99,8 @@ class TestDistributionMavenExtensionTest {
                         .isEqualTo("true");
                 assertThat(sysProps.getChild(DistributionSettings.SESSION_ID_PROPERTY).getValue())
                         .isEqualTo(sessionId);
-                assertThat(sysProps.getChild(DistributionSettings.BROKER_URL_PROPERTY).getValue())
-                        .isEqualTo(broker.baseUrl());
+                assertThat(sysProps.getChild(DistributionSettings.COORDINATOR_URL_PROPERTY).getValue())
+                        .isEqualTo(coordinator.baseUrl());
                 assertThat(dom.getChild("additionalClasspathElements").getChildCount())
                         .isGreaterThanOrEqualTo(2);
                 assertThat(sysProps.getChild(DistributionSettings.REPORT_DIR_PROPERTY))
@@ -109,7 +109,7 @@ class TestDistributionMavenExtensionTest {
             }
 
             participant.afterSessionEnd(session);
-            BuildSessionRecord record = broker.store().findSession(sessionId).orElseThrow();
+            BuildSessionRecord record = coordinator.store().findSession(sessionId).orElseThrow();
             assertThat(record.status()).isEqualTo(SessionStatus.PASSED);
         }
     }
@@ -117,8 +117,8 @@ class TestDistributionMavenExtensionTest {
     @Test
     void shouldOmitMaxPartitionSizeWhenUnsetAndPropagateMinRemoteThresholds() throws Exception {
         AtomicReference<CreateSessionRequest> created = new AtomicReference<>();
-        HttpServer broker = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
-        broker.createContext("/api/v1/sessions", exchange -> {
+        HttpServer coordinator = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        coordinator.createContext("/api/v1/sessions", exchange -> {
             try (exchange) {
                 if (exchange.getRequestURI().getPath().equals("/api/v1/sessions")) {
                     created.set(DistributionJson.fromJson(
@@ -132,7 +132,7 @@ class TestDistributionMavenExtensionTest {
                 exchange.sendResponseHeaders(204, -1);
             }
         });
-        broker.start();
+        coordinator.start();
         MavenProject project = createSampleProject("module-a", tempDir.resolve("module-a"));
         MavenProject root = createSampleProject("root", tempDir);
         root.setFile(tempDir.resolve("pom.xml").toFile());
@@ -140,7 +140,7 @@ class TestDistributionMavenExtensionTest {
         root.getProperties().setProperty(DistributionSettings.MIN_REMOTE_COLD_UNITS_PROPERTY, "2");
         Properties userProps = new Properties();
         userProps.setProperty(DistributionSettings.ENABLED_PROPERTY, "true");
-        userProps.setProperty(DistributionSettings.BROKER_URL_PROPERTY, "http://127.0.0.1:" + broker.getAddress().getPort());
+        userProps.setProperty(DistributionSettings.COORDINATOR_URL_PROPERTY, "http://127.0.0.1:" + coordinator.getAddress().getPort());
         userProps.setProperty(DistributionSettings.MIN_REMOTE_DURATION_MS_PROPERTY, "2000");
         MavenSession session = mockSession(List.of(project), userProps);
         when(session.getAllProjects()).thenReturn(List.of(root, project));
@@ -160,24 +160,24 @@ class TestDistributionMavenExtensionTest {
             }
         } finally {
             participant.afterSessionEnd(session);
-            broker.stop(0);
+            coordinator.stop(0);
         }
     }
 
     @Test
     void shouldNotDoubleCountRemoteTestFailureAndShouldAbortOnInterruptedBuild() throws Exception {
-        DistributionBrokerConfig brokerConfig = DistributionBrokerConfig.builder()
+        DistributionCoordinatorConfig coordinatorConfig = DistributionCoordinatorConfig.builder()
                 .port(0)
-                .cacheDir(tempDir.resolve("broker-cache-outcomes"))
+                .cacheDir(tempDir.resolve("coordinator-cache-outcomes"))
                 .jdbcUrl("jdbc:hsqldb:mem:mvn_ext_outcomes_" + System.nanoTime())
                 .build();
 
-        try (DistributionBrokerServer broker = new DistributionBrokerServer(brokerConfig)) {
-            broker.start();
+        try (DistributionCoordinatorServer coordinator = new DistributionCoordinatorServer(coordinatorConfig)) {
+            coordinator.start();
 
             Properties userProps = new Properties();
             userProps.setProperty(DistributionSettings.ENABLED_PROPERTY, "true");
-            userProps.setProperty(DistributionSettings.BROKER_URL_PROPERTY, broker.baseUrl());
+            userProps.setProperty(DistributionSettings.COORDINATOR_URL_PROPERTY, coordinator.baseUrl());
 
             // 1. Reactor session with 1 recorded test failure + Surefire build exception -> failedTests stays 1
             MavenProject modFail = createSampleProject("citrus-mod-fail", tempDir.resolve("mod-fail"));
@@ -187,7 +187,7 @@ class TestDistributionMavenExtensionTest {
             p1.afterProjectsRead(failSession);
             String sid1 = p1.getActiveSessionId();
             java.net.http.HttpClient.newHttpClient().send(
-                    java.net.http.HttpRequest.newBuilder(java.net.URI.create(broker.baseUrl() + "/api/v1/sessions/" + sid1 + "/local-tests"))
+                    java.net.http.HttpRequest.newBuilder(java.net.URI.create(coordinator.baseUrl() + "/api/v1/sessions/" + sid1 + "/local-tests"))
                             .header("Content-Type", "application/json")
                             .POST(java.net.http.HttpRequest.BodyPublishers.ofString(
                                     "{\"workerId\":\"local-host\",\"executions\":[{\"sessionId\":\"" + sid1
@@ -197,7 +197,7 @@ class TestDistributionMavenExtensionTest {
                             .build(),
                     java.net.http.HttpResponse.BodyHandlers.discarding());
             p1.afterSessionEnd(failSession);
-            BuildSessionRecord r1 = broker.store().findSession(sid1).orElseThrow();
+            BuildSessionRecord r1 = coordinator.store().findSession(sid1).orElseThrow();
             assertThat(r1.status()).isEqualTo(SessionStatus.FAILED);
             assertThat(r1.failedTests()).isEqualTo(1);
 
@@ -209,7 +209,7 @@ class TestDistributionMavenExtensionTest {
             p2.afterProjectsRead(compileSession);
             String sid2 = p2.getActiveSessionId();
             p2.afterSessionEnd(compileSession);
-            BuildSessionRecord r2 = broker.store().findSession(sid2).orElseThrow();
+            BuildSessionRecord r2 = coordinator.store().findSession(sid2).orElseThrow();
             assertThat(r2.status()).isEqualTo(SessionStatus.FAILED);
             assertThat(r2.failedTests()).isZero();
             assertThat(r2.failureReason()).isEqualTo("Compilation failure");
@@ -222,7 +222,7 @@ class TestDistributionMavenExtensionTest {
             p3.afterProjectsRead(cancelSession);
             String sid3 = p3.getActiveSessionId();
             p3.afterSessionEnd(cancelSession);
-            BuildSessionRecord r3 = broker.store().findSession(sid3).orElseThrow();
+            BuildSessionRecord r3 = coordinator.store().findSession(sid3).orElseThrow();
             assertThat(r3.status()).isEqualTo(SessionStatus.ABORTED);
             assertThat(r3.failureReason()).isEqualTo("Maven build interrupted");
 
@@ -235,12 +235,12 @@ class TestDistributionMavenExtensionTest {
             TestDistributionLifecycleParticipant p4 = new TestDistributionLifecycleParticipant();
             p4.afterProjectsRead(signalSession);
             String sid4 = p4.getActiveSessionId();
-            assertThat(broker.store().findSession(sid4).orElseThrow().projectName()).isEqualTo("custom-citrus-suite");
+            assertThat(coordinator.store().findSession(sid4).orElseThrow().projectName()).isEqualTo("custom-citrus-suite");
             assertThat(p4.getShutdownHook()).isNotNull();
             p4.getShutdownHook().run();
             p4.afterSessionEnd(signalSession);
             assertThat(p4.getShutdownHook()).isNull();
-            BuildSessionRecord r4 = broker.store().findSession(sid4).orElseThrow();
+            BuildSessionRecord r4 = coordinator.store().findSession(sid4).orElseThrow();
             assertThat(r4.status()).isEqualTo(SessionStatus.ABORTED);
         }
     }
@@ -362,7 +362,7 @@ class TestDistributionMavenExtensionTest {
     }
 
     @Test
-    void shouldInjectJacksonJarsTheLauncherNeedsToTalkToTheBroker() {
+    void shouldInjectJacksonJarsTheLauncherNeedsToTalkToTheCoordinator() {
         List<String> jarNames = TestDistributionLifecycleParticipant.resolveInterceptorClasspathJars().stream()
                 .map(path -> path.getFileName().toString())
                 .toList();
@@ -386,11 +386,11 @@ class TestDistributionMavenExtensionTest {
     }
 
     @Test
-    void shouldFallbackLocallyWithoutFailingBuildWhenBrokerUnreachable() throws Exception {
+    void shouldFallbackLocallyWithoutFailingBuildWhenCoordinatorUnreachable() throws Exception {
         MavenProject project = createSampleProject("module-fallback", tempDir.resolve("mod-fb"));
         Properties userProps = new Properties();
         userProps.setProperty(DistributionSettings.ENABLED_PROPERTY, "true");
-        userProps.setProperty(DistributionSettings.BROKER_URL_PROPERTY, "http://127.0.0.1:1");
+        userProps.setProperty(DistributionSettings.COORDINATOR_URL_PROPERTY, "http://127.0.0.1:1");
         userProps.setProperty(DistributionSettings.FALLBACK_LOCAL_PROPERTY, "true");
         MavenSession session = mockSession(List.of(project), userProps);
 
@@ -408,8 +408,9 @@ class TestDistributionMavenExtensionTest {
 
         assertThat(lines).isEmpty();
         assertThat(elapsedMs).isLessThan(2_000L);
+        TestDistributionLifecycleParticipant.runGit(tempDir, "init", "--quiet");
         assertThat(TestDistributionLifecycleParticipant.runGit(
-                Path.of("").toAbsolutePath(), "rev-parse", "--is-inside-work-tree"))
+                tempDir, "rev-parse", "--is-inside-work-tree"))
                 .isEqualTo("true");
     }
 
@@ -509,7 +510,7 @@ class TestDistributionMavenExtensionTest {
         project.getProperties().setProperty(DistributionSettings.FORK_PROPERTY, "maybe");
         Properties userProps = new Properties();
         userProps.setProperty(DistributionSettings.ENABLED_PROPERTY, "true");
-        userProps.setProperty(DistributionSettings.BROKER_URL_PROPERTY, "http://127.0.0.1:1");
+        userProps.setProperty(DistributionSettings.COORDINATOR_URL_PROPERTY, "http://127.0.0.1:1");
         userProps.setProperty(DistributionSettings.FALLBACK_LOCAL_PROPERTY, "false");
         MavenSession session = mockSession(List.of(project), userProps);
 

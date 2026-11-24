@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-package org.citrusframework.distribution.broker;
+package org.citrusframework.distribution.coordinator;
 
 import java.util.ArrayList;
 import java.util.HashSet;
@@ -69,13 +69,13 @@ import org.slf4j.LoggerFactory;
 /**
  * Thread-safe coordinator for build sessions, LPT partition scheduling, worker matching, and fault recovery.
  */
-public final class BrokerSessionCoordinator {
+public final class SessionCoordinator {
 
-    private static final Logger LOG = LoggerFactory.getLogger(BrokerSessionCoordinator.class);
+    private static final Logger LOG = LoggerFactory.getLogger(SessionCoordinator.class);
 
-    private final DistributionBrokerConfig config;
+    private final DistributionCoordinatorConfig config;
     private final DistributionStore store;
-    private final BrokerEventStreamHub eventHub;
+    private final CoordinatorEventStreamHub eventHub;
     private final LptPartitionScheduler scheduler = new LptPartitionScheduler();
 
     private final Map<String, SessionRuntime> sessions = new ConcurrentHashMap<>();
@@ -84,7 +84,7 @@ public final class BrokerSessionCoordinator {
     private final Map<String, WorkerConnection> workers = new ConcurrentHashMap<>();
     private long assignmentSequence;
 
-    public BrokerSessionCoordinator(DistributionBrokerConfig config, DistributionStore store, BrokerEventStreamHub eventHub) {
+    public SessionCoordinator(DistributionCoordinatorConfig config, DistributionStore store, CoordinatorEventStreamHub eventHub) {
         this.config = config;
         this.store = store;
         this.eventHub = eventHub;
@@ -142,7 +142,7 @@ public final class BrokerSessionCoordinator {
                         .anyMatch(value -> value != null && value.contains(DistributionSettings.WORKSPACE_TOKEN)));
         List<WorkUnitSpec> units = request.workUnits() != null ? request.workUnits() : List.of();
         if (needsWorkspace) {
-            units = units.stream().map(BrokerSessionCoordinator::requireWorkspaceCapability).toList();
+            units = units.stream().map(SessionCoordinator::requireWorkspaceCapability).toList();
         }
         List<String> keys = units.stream().map(WorkUnitSpec::key).toList();
         Map<String, Long> historicalDurations = store.findHistoricalDurationsMs(keys, 10, session.historyScope);
@@ -1120,7 +1120,7 @@ public final class BrokerSessionCoordinator {
         }
         BuildSessionRecord record = stored.get();
         int defaultPartitionSize = config.defaultMaxPartitionSize();
-        // Sessions created before the requested size was stored keep the fixed broker default.
+        // Sessions created before the requested size was stored keep the fixed coordinator default.
         int requestedMaxPartitionSize = store.findRequestedMaxPartitionSize(sessionId)
                 .orElse(Math.max(1, defaultPartitionSize));
         int maxPartitionSize = requestedMaxPartitionSize > 0 ? requestedMaxPartitionSize : defaultPartitionSize;

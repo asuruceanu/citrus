@@ -68,7 +68,7 @@ import org.junit.platform.engine.CancellationToken;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-class BrokerBlobClientCacheTest {
+class CoordinatorBlobClientCacheTest {
 
     private static final String BLOB_PATH = "/api/v1/cache/blobs/";
 
@@ -138,7 +138,7 @@ class BrokerBlobClientCacheTest {
         blobHandler = exchange -> respond(exchange, 200, content);
 
         try (WorkerFileCache cache = WorkerFileCache.open(tempDir.resolve("cache"), true, 0L);
-             BrokerBlobClient blobs = new BrokerBlobClient(config(tempDir.resolve("cache")), cache)) {
+             CoordinatorBlobClient blobs = new CoordinatorBlobClient(config(tempDir.resolve("cache")), cache)) {
             Path first = blobs.ensureCached(ref);
             assertThat(blobGets).hasValue(1);
             assertThat(first).hasBinaryContent(content);
@@ -182,7 +182,7 @@ class BrokerBlobClientCacheTest {
         // Buffer exactly met while the seeded blob exists: only the Content-Length can create a deficit.
         WorkerFileCache.DiskSpaceProbe probe = dir -> Files.exists(seededBlob) ? 1_000L : Long.MAX_VALUE / 4;
         try (WorkerFileCache cache = WorkerFileCache.open(cacheDir, true, 1_000L, probe, Clock.systemUTC());
-             BrokerBlobClient blobs = new BrokerBlobClient(config(cacheDir), cache)) {
+             CoordinatorBlobClient blobs = new CoordinatorBlobClient(config(cacheDir), cache)) {
             assertThat(seededBlob).as("not evicted at startup").exists();
 
             Path stored = blobs.ensureCached(unsized);
@@ -202,8 +202,8 @@ class BrokerBlobClientCacheTest {
         byte[] corrupt = "the fake content".getBytes(StandardCharsets.UTF_8);
 
         try (WorkerFileCache cache = WorkerFileCache.open(cacheDir, true, 0L);
-             BrokerBlobClient production = new BrokerBlobClient(config(cacheDir), cache);
-             BrokerBlobClient blobs = new BrokerBlobClient(config(cacheDir), cache, 4 * 1024L)) {
+             CoordinatorBlobClient production = new CoordinatorBlobClient(config(cacheDir), cache);
+             CoordinatorBlobClient blobs = new CoordinatorBlobClient(config(cacheDir), cache, 4 * 1024L)) {
             // The production cap is enforced before sending a request.
             ArtifactRef tooLarge = new ArtifactRef("big.bin", sha, ArtifactKind.REGULAR_FILE,
                     ClasspathPackager.MAX_BLOB_BYTES + 1);
@@ -259,7 +259,7 @@ class BrokerBlobClientCacheTest {
         Arrays.fill(large, (byte) 3);
         String largeSha = ClasspathPackager.sha256Hex(large);
         try (WorkerFileCache cache = WorkerFileCache.open(tempDir.resolve("cache-severed"), true, 0L);
-             BrokerBlobClient blobs = new BrokerBlobClient(config(tempDir.resolve("cache-severed")), cache)) {
+             CoordinatorBlobClient blobs = new CoordinatorBlobClient(config(tempDir.resolve("cache-severed")), cache)) {
             blobHandler = exchange -> {
                 exchange.sendResponseHeaders(200, large.length);
                 OutputStream out = exchange.getResponseBody();
@@ -283,7 +283,7 @@ class BrokerBlobClientCacheTest {
         Path partitionCache = tempDir.resolve("cache-enospc");
         DistributionWorkerConfig config = config(partitionCache);
         try (WorkerFileCache cache = WorkerFileCache.open(partitionCache, true, 0L);
-             BrokerBlobClient blobs = new BrokerBlobClient(config, cache)) {
+             CoordinatorBlobClient blobs = new CoordinatorBlobClient(config, cache)) {
             AtomicBoolean diskFull = new AtomicBoolean(true);
             blobs.tempFileOpener(tmp -> {
                 OutputStream out = Files.newOutputStream(tmp);
@@ -344,7 +344,7 @@ class BrokerBlobClientCacheTest {
         Path cacheDir = tempDir.resolve("cache-stall");
         DistributionWorkerConfig config = configBuilder(cacheDir).blobReadIdleTimeout(Duration.ofMillis(400)).build();
         try (WorkerFileCache cache = WorkerFileCache.open(cacheDir, true, 0L);
-             BrokerBlobClient blobs = new BrokerBlobClient(config, cache);
+             CoordinatorBlobClient blobs = new CoordinatorBlobClient(config, cache);
              ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
             IsolatedPartitionRunner runner = new IsolatedPartitionRunner(config, cache, blobs);
             PartitionAssignPayload assignment = new PartitionAssignPayload("p-stall", "s1", 1,
@@ -369,14 +369,14 @@ class BrokerBlobClientCacheTest {
 
     @Test
     void shouldKeepCacheOwnershipUntilAnInFlightStagingWriteAndCleanupFinish() throws Exception {
-        byte[] content = "broker payload".getBytes(StandardCharsets.UTF_8);
+        byte[] content = "coordinator payload".getBytes(StandardCharsets.UTF_8);
         blobHandler = exchange -> respond(exchange, 200, content);
         Path cacheDir = tempDir.resolve("closing-staging-cache");
         CountDownLatch writing = new CountDownLatch(1);
         CountDownLatch releaseWrite = new CountDownLatch(1);
 
         try (WorkerFileCache cache = WorkerFileCache.open(cacheDir, false, 0L);
-             BrokerBlobClient blobs = new BrokerBlobClient(config(cacheDir), cache);
+             CoordinatorBlobClient blobs = new CoordinatorBlobClient(config(cacheDir), cache);
              ExecutorService executor = Executors.newFixedThreadPool(2)) {
             blobs.tempFileOpener(tmp -> new FilterOutputStream(Files.newOutputStream(tmp)) {
                 @Override
@@ -457,7 +457,7 @@ class BrokerBlobClientCacheTest {
         Path cacheDir = tempDir.resolve("cache-open-enospc");
         DistributionWorkerConfig config = config(cacheDir);
         try (WorkerFileCache cache = WorkerFileCache.open(cacheDir, true, 0L);
-             BrokerBlobClient blobs = new BrokerBlobClient(config, cache)) {
+             CoordinatorBlobClient blobs = new CoordinatorBlobClient(config, cache)) {
             blobs.tempFileOpener(tmp -> {
                 assertThat(tmp).exists();
                 throw new IOException("No space left on device");
@@ -506,7 +506,7 @@ class BrokerBlobClientCacheTest {
                         throw new AssertionError("blobs are verified through WorkerFileCache only");
                     }
                 });
-             BrokerBlobClient blobs = new BrokerBlobClient(config, cache)) {
+             CoordinatorBlobClient blobs = new CoordinatorBlobClient(config, cache)) {
             IsolatedPartitionRunner runner = new IsolatedPartitionRunner(config, cache, blobs);
             for (int run = 0; run < 2; run++) {
                 PartitionAssignPayload assignment = new PartitionAssignPayload("p-" + UUID.randomUUID(), "s1", 1,
@@ -530,7 +530,7 @@ class BrokerBlobClientCacheTest {
         DistributionWorkerConfig config = config(cacheDir);
         AtomicLong usable = new AtomicLong(Long.MAX_VALUE);
         try (WorkerFileCache cache = WorkerFileCache.open(cacheDir, true, 1L, p -> usable.get(), Clock.systemUTC());
-             BrokerBlobClient blobs = new BrokerBlobClient(config, cache)) {
+             CoordinatorBlobClient blobs = new CoordinatorBlobClient(config, cache)) {
             PartitionAssignPayload assignment = new PartitionAssignPayload("p-" + UUID.randomUUID(), "s1", 1,
                     List.of(classes.ref(), jar.ref()), Map.of(), List.of(unit(JarResourceFixture.class, "readsJarResource")));
             IsolatedPartitionRunner.PartitionExecutionResult result = new IsolatedPartitionRunner(config, cache, blobs)
@@ -551,7 +551,7 @@ class BrokerBlobClientCacheTest {
             Path fdDir = Path.of("/proc/self/fd");
             if (Files.isDirectory(fdDir)) {
                 try (Stream<Path> fds = Files.list(fdDir)) {
-                    List<String> openJar = fds.map(BrokerBlobClientCacheTest::linkTarget)
+                    List<String> openJar = fds.map(CoordinatorBlobClientCacheTest::linkTarget)
                             .filter(target -> target.startsWith(namedJar.toString()) || target.startsWith(jarBlob.toString()))
                             .toList();
                     assertThat(openJar).as("no open handle keeps the evicted jar's inode alive").isEmpty();
@@ -596,7 +596,7 @@ class BrokerBlobClientCacheTest {
     private DistributionWorkerConfig.Builder configBuilder(Path cacheDir) {
         return DistributionWorkerConfig.builder()
                 .workerId("blob-" + UUID.randomUUID().toString().substring(0, 6))
-                .brokerUrl("http://127.0.0.1:" + server.getAddress().getPort())
+                .coordinatorUrl("http://127.0.0.1:" + server.getAddress().getPort())
                 .cacheDir(cacheDir)
                 .cacheCleanup(true)
                 .cacheFreeSpaceBufferBytes(0L)

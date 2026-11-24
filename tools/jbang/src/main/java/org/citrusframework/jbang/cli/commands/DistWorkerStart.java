@@ -35,13 +35,13 @@ import org.citrusframework.distribution.worker.DistributionWorkerClient;
 import org.citrusframework.distribution.worker.DistributionWorkerConfig;
 import org.citrusframework.jbang.cli.CitrusJBangMain;
 
-@CommandDefinition(name = "start", description = "Start a Citrus Test Distribution worker connected to a broker")
+@CommandDefinition(name = "start", description = "Start a Citrus Test Distribution worker connected to a coordinator")
 public class DistWorkerStart extends CitrusCommand {
 
     private static final List<String> COMMAND_WORDS = List.of("dist", "worker", "start");
 
     /** Options of this command that take a separate value token, which is never parsed as a cache option. */
-    private static final Set<String> VALUE_OPTIONS = Set.of("--broker-url", "-b", "--worker-id", "-w",
+    private static final Set<String> VALUE_OPTIONS = Set.of("--coordinator-url", "-u", "--worker-id", "-w",
             "--auth-token", "--capabilities", "-C", "--duration-seconds");
 
     /** Drain timeout plus slack for closing the worker client after a shutdown request. */
@@ -54,8 +54,8 @@ public class DistWorkerStart extends CitrusCommand {
     @Option(name = "help", shortName = 'h', hasValue = false, description = "Display this help and exit")
     boolean helpRequested;
 
-    @Option(name = "broker-url", shortName = 'b', defaultValue = "http://localhost:8765", description = "Broker base URL")
-    String brokerUrl;
+    @Option(name = "coordinator-url", shortName = 'u', defaultValue = "http://localhost:8765", description = "Coordinator base URL")
+    String coordinatorUrl;
 
     @Option(name = "worker-id", shortName = 'w', description = "Unique worker identifier")
     String workerId;
@@ -166,7 +166,7 @@ public class DistWorkerStart extends CitrusCommand {
 
     DistributionWorkerConfig buildWorkerConfig() {
         DistributionWorkerConfig.Builder builder = DistributionWorkerConfig.builder()
-                .brokerUrl(brokerUrl)
+                .coordinatorUrl(coordinatorUrl)
                 .capabilities(DistributionSettings.detectHostCapabilities(capabilities));
         if (workerId != null && !workerId.isBlank()) {
             builder.workerId(workerId);
@@ -212,7 +212,7 @@ public class DistWorkerStart extends CitrusCommand {
 
         try (DistributionWorkerClient client = new DistributionWorkerClient(config)) {
             client.start();
-            printer().println("Citrus Test Distribution Worker " + config.workerId() + " connected to " + config.brokerUrl());
+            printer().println("Citrus Test Distribution Worker " + config.workerId() + " connected to " + config.coordinatorUrl());
             if (durationSeconds > 0) {
                 stopLatch.await(durationSeconds, TimeUnit.SECONDS);
             } else {

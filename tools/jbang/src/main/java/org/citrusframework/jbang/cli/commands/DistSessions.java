@@ -36,14 +36,14 @@ import org.citrusframework.distribution.config.DistributionJson;
 import org.citrusframework.distribution.model.BuildSessionRecord;
 import org.citrusframework.jbang.cli.CitrusJBangMain;
 
-@CommandDefinition(name = "sessions", description = "List recent distributed test sessions on the broker", generateHelp = true)
+@CommandDefinition(name = "sessions", description = "List recent distributed test sessions on the coordinator", generateHelp = true)
 public class DistSessions extends CitrusCommand {
 
     @ParentCommand
     Dist parent;
 
-    @Option(name = "broker-url", shortName = 'b', defaultValue = "http://localhost:8765", description = "Broker base URL")
-    String brokerUrl;
+    @Option(name = "coordinator-url", shortName = 'u', defaultValue = "http://localhost:8765", description = "Coordinator base URL")
+    String coordinatorUrl;
 
     @Option(name = "auth-token", description = "Shared Bearer authentication token")
     String authToken;
@@ -73,7 +73,7 @@ public class DistSessions extends CitrusCommand {
     @Override
     public CommandResult execute(CommandInvocation invocation) {
         try {
-            String base = brokerUrl.endsWith("/") ? brokerUrl.substring(0, brokerUrl.length() - 1) : brokerUrl;
+            String base = coordinatorUrl.endsWith("/") ? coordinatorUrl.substring(0, coordinatorUrl.length() - 1) : coordinatorUrl;
             HttpRequest.Builder req = HttpRequest.newBuilder(URI.create(base + "/api/v1/sessions?limit=" + limit))
                     .timeout(Duration.ofSeconds(10))
                     .GET();
@@ -82,7 +82,7 @@ public class DistSessions extends CitrusCommand {
             }
             HttpResponse<String> response = HttpClient.newHttpClient().send(req.build(), HttpResponse.BodyHandlers.ofString());
             if (response.statusCode() != 200) {
-                printer().println("Broker returned HTTP " + response.statusCode() + ": " + response.body());
+                printer().println("Coordinator returned HTTP " + response.statusCode() + ": " + response.body());
                 return CommandResult.FAILURE;
             }
             if (json) {
@@ -101,7 +101,7 @@ public class DistSessions extends CitrusCommand {
             printer().println(table);
             return CommandResult.SUCCESS;
         } catch (Exception e) {
-            printer().println("Failed to query sessions from " + brokerUrl + ": " + e.getMessage());
+            printer().println("Failed to query sessions from " + coordinatorUrl + ": " + e.getMessage());
             return CommandResult.FAILURE;
         }
     }

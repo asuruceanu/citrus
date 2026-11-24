@@ -56,9 +56,9 @@ import org.slf4j.LoggerFactory;
  * download that fails verification is retried once. Reads time out after a period without data, and temporary files
  * are removed on every outcome.
  */
-final class BrokerBlobClient implements AutoCloseable {
+final class CoordinatorBlobClient implements AutoCloseable {
 
-    private static final Logger LOG = LoggerFactory.getLogger(BrokerBlobClient.class);
+    private static final Logger LOG = LoggerFactory.getLogger(CoordinatorBlobClient.class);
 
     static final int CHUNK_BYTES = 64 * 1024;
 
@@ -72,11 +72,11 @@ final class BrokerBlobClient implements AutoCloseable {
     private final AtomicLong downloadRequests = new AtomicLong();
     private volatile WorkerFileCache.DownloadFileOpener tempFileOpener = Files::newOutputStream;
 
-    BrokerBlobClient(DistributionWorkerConfig config, WorkerFileCache cache) {
+    CoordinatorBlobClient(DistributionWorkerConfig config, WorkerFileCache cache) {
         this(config, cache, ClasspathPackager.MAX_BLOB_BYTES);
     }
 
-    BrokerBlobClient(DistributionWorkerConfig config, WorkerFileCache cache, long maxBlobBytes) {
+    CoordinatorBlobClient(DistributionWorkerConfig config, WorkerFileCache cache, long maxBlobBytes) {
         this.config = config;
         this.maxBlobBytes = maxBlobBytes;
         this.cache = Objects.requireNonNull(cache, "cache");
@@ -148,7 +148,7 @@ final class BrokerBlobClient implements AutoCloseable {
                         .build(),
                 HttpResponse.BodyHandlers.ofString());
         if (missingResponse.statusCode() != 200) {
-            throw new IOException("Failed to query missing blobs from broker: HTTP " + missingResponse.statusCode());
+            throw new IOException("Failed to query missing blobs from coordinator: HTTP " + missingResponse.statusCode());
         }
         MissingDigestsResponse missing = DistributionJson.fromJson(missingResponse.body(), MissingDigestsResponse.class);
         for (String sha256 : missing.missing() != null ? missing.missing() : List.<String>of()) {
@@ -162,7 +162,7 @@ final class BrokerBlobClient implements AutoCloseable {
                             .build(),
                     HttpResponse.BodyHandlers.ofString());
             if (put.statusCode() != 200 && put.statusCode() != 201) {
-                throw new IOException("Failed to upload blob " + sha256 + " to broker: HTTP " + put.statusCode());
+                throw new IOException("Failed to upload blob " + sha256 + " to coordinator: HTTP " + put.statusCode());
             }
         }
     }
@@ -195,7 +195,7 @@ final class BrokerBlobClient implements AutoCloseable {
     private Path storeResponse(HttpResponse<InputStream> response, InputStream body, String sha256, long expectedBytes)
             throws IOException {
         if (response.statusCode() != 200) {
-            throw new IOException("Failed to download blob " + sha256 + " from broker: HTTP " + response.statusCode());
+            throw new IOException("Failed to download blob " + sha256 + " from coordinator: HTTP " + response.statusCode());
         }
         OptionalLong contentLength = response.headers().firstValueAsLong("Content-Length");
         if (contentLength.isPresent()) {
@@ -271,7 +271,7 @@ final class BrokerBlobClient implements AutoCloseable {
     }
 
     private HttpRequest.Builder request(String path) {
-        HttpRequest.Builder builder = HttpRequest.newBuilder(URI.create(config.brokerUrl() + path));
+        HttpRequest.Builder builder = HttpRequest.newBuilder(URI.create(config.coordinatorUrl() + path));
         if (config.authToken() != null && !config.authToken().isBlank()) {
             builder.header("Authorization", "Bearer " + config.authToken());
         }
@@ -291,7 +291,7 @@ final class BrokerBlobClient implements AutoCloseable {
     @Override
     public void close() {
         if (closed.compareAndSet(false, true)) {
-            openBodies.forEach(BrokerBlobClient::closeBody);
+            openBodies.forEach(CoordinatorBlobClient::closeBody);
             httpClient.shutdownNow();
             readWatchdog.shutdownNow();
         }

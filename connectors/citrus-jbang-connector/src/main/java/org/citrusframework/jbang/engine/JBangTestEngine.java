@@ -80,7 +80,7 @@ public class JBangTestEngine extends AbstractTestEngine {
         List<String> packagesToRun = Optional.ofNullable(configuration.getPackages())
                 .orElseGet(Collections::emptyList)
                 .stream()
-                .map(packageName -> packageName.replace(".", "/"))
+                .map(selector -> new File(selector).isAbsolute() ? selector : selector.replace(".", "/"))
                 .collect(Collectors.toList());
 
         if (packagesToRun.isEmpty()) {

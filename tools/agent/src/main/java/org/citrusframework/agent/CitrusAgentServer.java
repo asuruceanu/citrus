@@ -36,6 +36,7 @@ import org.citrusframework.CitrusSettings;
 import org.citrusframework.agent.CitrusAgentOptions.ParsedOptions;
 import org.citrusframework.agent.util.ConfigurationHelper;
 import org.citrusframework.api.agent.CitrusAgentConfiguration;
+import org.citrusframework.distribution.worker.DistributionWorkerConfig;
 import org.citrusframework.exceptions.CitrusRuntimeException;
 import org.citrusframework.message.MessageType;
 import org.citrusframework.server.Server;
@@ -222,8 +223,9 @@ public class CitrusAgentServer implements Server {
 
         // Validate worker settings and acquire its cache lock before accepting HTTP requests.
         if (configuration.isWorkerMode()) {
-            logger.info("Starting Citrus agent in test distribution worker mode connecting to {}", configuration.getBrokerUrl());
-            workerBridge = new DistributionWorkerBridge(configuration);
+            DistributionWorkerConfig workerConfig = DistributionWorkerBridge.buildWorkerConfig(configuration);
+            logger.info("Starting Citrus agent in test distribution worker mode connecting to {}", workerConfig.coordinatorUrl());
+            workerBridge = new DistributionWorkerBridge(workerConfig);
             workerBridge.start();
             Thread hook = new Thread(this::stopWorker, "citrus-agent-worker-drain");
             Runtime.getRuntime().addShutdownHook(hook);

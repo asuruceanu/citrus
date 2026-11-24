@@ -28,6 +28,7 @@ import java.util.function.UnaryOperator;
 import org.citrusframework.distribution.config.DistributionSettings.DeclaredPathSpec;
 import org.citrusframework.distribution.model.ArtifactKind;
 import org.citrusframework.distribution.model.ArtifactRef;
+import org.citrusframework.distribution.model.CoordinatorEvent;
 import org.citrusframework.distribution.model.PartitionAssignPayload;
 import org.citrusframework.distribution.model.PartitionCompletedPayload;
 import org.citrusframework.distribution.model.PartitionPolicy;
@@ -44,30 +45,64 @@ class DistributionSettingsAndPathRewriterTest {
     private static final String TOKEN = DistributionSettings.WORKSPACE_TOKEN;
 
     @Test
-    void shouldResolveAdaptiveBrokerSettingsFromSystemProperties() {
-        String duration = DistributionSettings.BROKER_MIN_PARTITION_DURATION_MS_PROPERTY;
-        String waves = DistributionSettings.BROKER_MAX_WAVES_PER_WORKER_PROPERTY;
+    void shouldResolveAdaptiveCoordinatorSettingsFromSystemProperties() {
+        String duration = DistributionSettings.COORDINATOR_MIN_PARTITION_DURATION_MS_PROPERTY;
+        String waves = DistributionSettings.COORDINATOR_MAX_WAVES_PER_WORKER_PROPERTY;
+        assertThat(duration).isEqualTo("citrus.test.distribution.coordinator.minPartitionDurationMs");
+        assertThat(waves).isEqualTo("citrus.test.distribution.coordinator.maxWavesPerWorker");
         String previousDuration = System.getProperty(duration);
         String previousWaves = System.getProperty(waves);
         try {
             System.setProperty(duration, "4500");
             System.setProperty(waves, "3");
-            assertThat(DistributionSettings.getBrokerMinPartitionDurationMs()).isEqualTo(4_500L);
-            assertThat(DistributionSettings.getBrokerMaxWavesPerWorker()).isEqualTo(3);
+            assertThat(DistributionSettings.getCoordinatorMinPartitionDurationMs()).isEqualTo(4_500L);
+            assertThat(DistributionSettings.getCoordinatorMaxWavesPerWorker()).isEqualTo(3);
 
             System.setProperty(duration, "-1");
             System.setProperty(waves, "-1");
-            assertThat(DistributionSettings.getBrokerMinPartitionDurationMs()).isZero();
-            assertThat(DistributionSettings.getBrokerMaxWavesPerWorker()).isZero();
+            assertThat(DistributionSettings.getCoordinatorMinPartitionDurationMs()).isZero();
+            assertThat(DistributionSettings.getCoordinatorMaxWavesPerWorker()).isZero();
 
             System.setProperty(duration, "invalid");
             System.setProperty(waves, "invalid");
-            assertThat(DistributionSettings.getBrokerMinPartitionDurationMs()).isEqualTo(5_000L);
-            assertThat(DistributionSettings.getBrokerMaxWavesPerWorker()).isEqualTo(2);
+            assertThat(DistributionSettings.getCoordinatorMinPartitionDurationMs()).isEqualTo(5_000L);
+            assertThat(DistributionSettings.getCoordinatorMaxWavesPerWorker()).isEqualTo(2);
         } finally {
             restoreProperty(duration, previousDuration);
             restoreProperty(waves, previousWaves);
         }
+    }
+
+    @Test
+    void shouldReadCoordinatorUrlFromSystemProperty() {
+        String key = "citrus.test.distribution.coordinatorUrl";
+        String previous = System.getProperty(key);
+        try {
+            System.setProperty(key, "http://coordinator:9000");
+            assertThat(DistributionSettings.COORDINATOR_URL_PROPERTY).isEqualTo(key);
+            assertThat(DistributionSettings.getCoordinatorUrl()).isEqualTo("http://coordinator:9000");
+        } finally {
+            restoreProperty(key, previous);
+        }
+    }
+
+    @Test
+    void shouldPreserveEventJsonFields() {
+        CoordinatorEvent event = new CoordinatorEvent(1L, "partition.assigned", "s1", "p1", "w1", 1_000L,
+                Map.of("attempt", 1, "workUnits", 2));
+        String json = DistributionJson.toJson(event);
+        assertThat(DistributionJson.mapper().readTree(json)).isEqualTo(DistributionJson.mapper().readTree("""
+                {
+                  "sequence": 1,
+                  "type": "partition.assigned",
+                  "sessionId": "s1",
+                  "partitionId": "p1",
+                  "workerId": "w1",
+                  "timestamp": 1000,
+                  "data": {"attempt": 1, "workUnits": 2}
+                }
+                """));
+        assertThat(DistributionJson.fromJson(json, CoordinatorEvent.class)).isEqualTo(event);
     }
 
     private static void restoreProperty(String key, String previous) {

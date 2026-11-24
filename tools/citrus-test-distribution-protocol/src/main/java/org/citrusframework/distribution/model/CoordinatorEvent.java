@@ -18,7 +18,7 @@ package org.citrusframework.distribution.model;
 
 import java.util.Map;
 
-public record BrokerEvent(
+public record CoordinatorEvent(
         long sequence,
         String type,
         String sessionId,

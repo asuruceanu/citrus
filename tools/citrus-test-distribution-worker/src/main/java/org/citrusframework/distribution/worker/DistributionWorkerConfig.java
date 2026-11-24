@@ -38,7 +38,7 @@ public final class DistributionWorkerConfig {
 
     private final String workerId;
     private final String hostName;
-    private final String brokerUrl;
+    private final String coordinatorUrl;
     private final String authToken;
     private final Path cacheDir;
     private final boolean cacheCleanup;
@@ -54,7 +54,7 @@ public final class DistributionWorkerConfig {
     private DistributionWorkerConfig(Builder builder) {
         this.workerId = builder.workerId;
         this.hostName = builder.hostName;
-        this.brokerUrl = builder.brokerUrl;
+        this.coordinatorUrl = builder.coordinatorUrl;
         this.authToken = builder.authToken;
         // Cache settings fall back to system property / environment / default only when not set explicitly, so an
         // invalid lower-tier value cannot break a configuration whose explicit option overrides it.
@@ -94,8 +94,8 @@ public final class DistributionWorkerConfig {
         return hostName;
     }
 
-    public String brokerUrl() {
-        return brokerUrl;
+    public String coordinatorUrl() {
+        return coordinatorUrl;
     }
 
     public String authToken() {
@@ -161,7 +161,7 @@ public final class DistributionWorkerConfig {
     public static final class Builder {
         private String workerId = "worker-" + UUID.randomUUID().toString().substring(0, 8);
         private String hostName = resolveHostName();
-        private String brokerUrl = normalizeBrokerBaseUrl(DistributionSettings.getBrokerUrl());
+        private String coordinatorUrl = normalizeCoordinatorBaseUrl(DistributionSettings.getCoordinatorUrl());
         private String authToken = DistributionSettings.getAuthToken();
         /** Explicit cache settings; {@code null} means "resolve from settings in {@link #build()}". */
         private Path cacheDir;
@@ -195,16 +195,16 @@ public final class DistributionWorkerConfig {
             return this;
         }
 
-        public Builder brokerUrl(String brokerUrl) {
-            if (brokerUrl != null && !brokerUrl.isBlank()) {
-                this.brokerUrl = normalizeBrokerBaseUrl(brokerUrl);
+        public Builder coordinatorUrl(String coordinatorUrl) {
+            if (coordinatorUrl != null && !coordinatorUrl.isBlank()) {
+                this.coordinatorUrl = normalizeCoordinatorBaseUrl(coordinatorUrl);
             }
             return this;
         }
 
-        private static String normalizeBrokerBaseUrl(String rawUrl) {
+        private static String normalizeCoordinatorBaseUrl(String rawUrl) {
             if (rawUrl == null || rawUrl.isBlank()) {
-                return DistributionSettings.DEFAULT_BROKER_URL;
+                return DistributionSettings.DEFAULT_COORDINATOR_URL;
             }
             String normalized = rawUrl.trim().replaceAll("/+$", "");
             if (normalized.startsWith("wss://")) {

@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-package org.citrusframework.distribution.broker;
+package org.citrusframework.distribution.coordinator;
 
 import java.net.URI;
 import java.net.http.HttpClient;
@@ -28,18 +28,18 @@ import org.junit.jupiter.api.io.TempDir;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-class DistributionBrokerUiTest {
+class DistributionCoordinatorUiTest {
 
     @TempDir
     Path tempDir;
 
     @Test
     void shouldServeOfflineCapableWebUiWithWaterfallAndAllViews() throws Exception {
-        DistributionBrokerConfig config = DistributionBrokerConfig.builder()
+        DistributionCoordinatorConfig config = DistributionCoordinatorConfig.builder()
                 .port(0)
                 .authToken("ui-token")
                 .cacheDir(tempDir.resolve("ui-cache"))
-                .jdbcUrl("jdbc:hsqldb:mem:broker_ui_" + System.nanoTime())
+                .jdbcUrl("jdbc:hsqldb:mem:coordinator_ui_" + System.nanoTime())
                 .build();
 
         HttpClient client = HttpClient.newBuilder()
@@ -47,7 +47,7 @@ class DistributionBrokerUiTest {
                 .connectTimeout(Duration.ofSeconds(5))
                 .build();
 
-        try (DistributionBrokerServer server = new DistributionBrokerServer(config)) {
+        try (DistributionCoordinatorServer server = new DistributionCoordinatorServer(config)) {
             server.start();
 
             HttpResponse<String> rootResp = client.send(

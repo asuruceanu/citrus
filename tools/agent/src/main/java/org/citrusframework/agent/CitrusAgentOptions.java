@@ -59,18 +59,18 @@ public class CitrusAgentOptions extends CitrusAppOptions<CitrusAgentConfiguratio
             }
         });
 
-        options.add(new CliOption<>("b", "broker-url", "Test distribution broker URL") {
+        options.add(new CliOption<>("u", "coordinator-url", "Test distribution coordinator URL") {
             @Override
             protected void doProcess(CitrusAgentConfiguration configuration, String arg, String value, LinkedList<String> remainingArgs) {
                 if (StringUtils.hasText(value)) {
-                    configuration.setBrokerUrl(value);
+                    configuration.setCoordinatorUrl(value);
                 } else {
-                    throw new CitrusRuntimeException("Missing parameter value for -b/--broker-url option");
+                    throw new CitrusRuntimeException("Missing parameter value for -u/--coordinator-url option");
                 }
             }
         });
 
-        options.add(new CliOption<>("t", "auth-token", "Test distribution broker auth token") {
+        options.add(new CliOption<>("t", "auth-token", "Test distribution coordinator auth token") {
             @Override
             protected void doProcess(CitrusAgentConfiguration configuration, String arg, String value, LinkedList<String> remainingArgs) {
                 configuration.setAuthToken(value != null ? value : "");

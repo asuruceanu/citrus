@@ -89,12 +89,12 @@ public final class IsolatedPartitionRunner implements PartitionRunner {
 
     private final DistributionWorkerConfig config;
     private final WorkerFileCache sharedCache;
-    private final BrokerBlobClient sharedBlobs;
+    private final CoordinatorBlobClient sharedBlobs;
 
     /**
      * Runs partitions against the worker's shared cache and blob client, both owned by the caller.
      */
-    IsolatedPartitionRunner(DistributionWorkerConfig config, WorkerFileCache cache, BrokerBlobClient blobs) {
+    IsolatedPartitionRunner(DistributionWorkerConfig config, WorkerFileCache cache, CoordinatorBlobClient blobs) {
         this.config = Objects.requireNonNull(config, "config");
         this.sharedCache = Objects.requireNonNull(cache, "cache");
         this.sharedBlobs = Objects.requireNonNull(blobs, "blobs");
@@ -150,7 +150,7 @@ public final class IsolatedPartitionRunner implements PartitionRunner {
             LOG.warn("Partition {} failed: cannot open the worker cache", assignment.partitionId(), e);
             return new PartitionExecutionResult(false, e.getMessage() != null ? e.getMessage() : e.getClass().getName());
         }
-        try (cache; BrokerBlobClient blobs = new BrokerBlobClient(config, cache)) {
+        try (cache; CoordinatorBlobClient blobs = new CoordinatorBlobClient(config, cache)) {
             return execute(assignment, cancellationToken, eventSink, cache, blobs);
         }
     }
@@ -164,7 +164,7 @@ public final class IsolatedPartitionRunner implements PartitionRunner {
             CancellationToken cancellationToken,
             Consumer<WorkerTestEventPayload> eventSink,
             WorkerFileCache cache,
-            BrokerBlobClient blobs) {
+            CoordinatorBlobClient blobs) {
         WorkerWorkspaceRegistry.Workspace workspace = null;
         ThreadScopedProperties systemProps = null;
         Properties previousScope = null;

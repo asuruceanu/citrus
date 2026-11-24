@@ -14,23 +14,23 @@
  * limitations under the License.
  */
 
-package org.citrusframework.distribution.broker;
+package org.citrusframework.distribution.coordinator;
 
 import java.nio.file.Path;
 
 import org.citrusframework.distribution.config.DistributionSettings;
 
 /**
- * Configuration for {@link DistributionBrokerServer}.
+ * Configuration for {@link DistributionCoordinatorServer}.
  */
-public final class DistributionBrokerConfig {
+public final class DistributionCoordinatorConfig {
 
     public static final String MIN_PARTITION_DURATION_MS_PROPERTY =
-            DistributionSettings.BROKER_MIN_PARTITION_DURATION_MS_PROPERTY;
-    public static final String MIN_PARTITION_DURATION_MS_ENV = DistributionSettings.BROKER_MIN_PARTITION_DURATION_MS_ENV;
-    public static final String MAX_WAVES_PER_WORKER_PROPERTY = DistributionSettings.BROKER_MAX_WAVES_PER_WORKER_PROPERTY;
+            DistributionSettings.COORDINATOR_MIN_PARTITION_DURATION_MS_PROPERTY;
+    public static final String MIN_PARTITION_DURATION_MS_ENV = DistributionSettings.COORDINATOR_MIN_PARTITION_DURATION_MS_ENV;
+    public static final String MAX_WAVES_PER_WORKER_PROPERTY = DistributionSettings.COORDINATOR_MAX_WAVES_PER_WORKER_PROPERTY;
 
-    public static final String MAX_WAVES_PER_WORKER_ENV = DistributionSettings.BROKER_MAX_WAVES_PER_WORKER_ENV;
+    public static final String MAX_WAVES_PER_WORKER_ENV = DistributionSettings.COORDINATOR_MAX_WAVES_PER_WORKER_ENV;
 
     private final String host;
     private final int port;
@@ -46,7 +46,7 @@ public final class DistributionBrokerConfig {
     private final int maxWavesPerWorker;
     private final long leaseTimeoutMs;
 
-    private DistributionBrokerConfig(Builder builder) {
+    private DistributionCoordinatorConfig(Builder builder) {
         this.host = builder.host;
         this.port = builder.port;
         this.authToken = builder.authToken;
@@ -66,7 +66,7 @@ public final class DistributionBrokerConfig {
         return new Builder();
     }
 
-    public static DistributionBrokerConfig fromSettings() {
+    public static DistributionCoordinatorConfig fromSettings() {
         return builder()
                 .authToken(DistributionSettings.getAuthToken())
                 .cacheDir(Path.of(DistributionSettings.getCacheDir()))
@@ -135,15 +135,15 @@ public final class DistributionBrokerConfig {
         private String host = "0.0.0.0";
         private int port = 8084;
         private String authToken;
-        private Path cacheDir = Path.of(System.getProperty("user.home"), ".citrus", "dist-broker-cache");
+        private Path cacheDir = Path.of(System.getProperty("user.home"), ".citrus", "dist-coordinator-cache");
         private String jdbcUrl = "jdbc:hsqldb:file:" + Path.of(System.getProperty("user.home"), ".citrus", "dist-db", "citrus_dist");
         private String jdbcUsername = "SA";
         private String jdbcPassword = "";
         private int defaultMaxPartitionSize = 10;
         private int defaultMaxRetries = 1;
         private long defaultDurationMs = 5_000L;
-        private long minPartitionDurationMs = DistributionSettings.getBrokerMinPartitionDurationMs();
-        private int maxWavesPerWorker = DistributionSettings.getBrokerMaxWavesPerWorker();
+        private long minPartitionDurationMs = DistributionSettings.getCoordinatorMinPartitionDurationMs();
+        private int maxWavesPerWorker = DistributionSettings.getCoordinatorMaxWavesPerWorker();
         private long leaseTimeoutMs = 60_000L;
 
         public Builder host(String host) {
@@ -211,8 +211,8 @@ public final class DistributionBrokerConfig {
             return this;
         }
 
-        public DistributionBrokerConfig build() {
-            return new DistributionBrokerConfig(this);
+        public DistributionCoordinatorConfig build() {
+            return new DistributionCoordinatorConfig(this);
         }
     }
 }

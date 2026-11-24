@@ -46,8 +46,8 @@ import java.util.stream.Stream;
 import com.sun.net.httpserver.HttpServer;
 import org.citrusframework.distribution.annotations.LocalOnly;
 import org.citrusframework.distribution.annotations.RemoteOnly;
-import org.citrusframework.distribution.broker.DistributionBrokerConfig;
-import org.citrusframework.distribution.broker.DistributionBrokerServer;
+import org.citrusframework.distribution.coordinator.DistributionCoordinatorConfig;
+import org.citrusframework.distribution.coordinator.DistributionCoordinatorServer;
 import org.citrusframework.distribution.cache.BlobCacheDirectory;
 import org.citrusframework.distribution.cache.ClasspathPackager;
 import org.citrusframework.distribution.config.DistributionJson;
@@ -65,6 +65,7 @@ import org.citrusframework.distribution.model.WorkerTestEventPayload;
 import org.citrusframework.distribution.worker.DistributionWorkerClient;
 import org.citrusframework.distribution.worker.DistributionWorkerConfig;
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DynamicContainer;
 import org.junit.jupiter.api.DynamicTest;
 import org.junit.jupiter.api.Nested;
@@ -89,10 +90,22 @@ class DistributedLauncherTest {
     @TempDir
     Path tempDir;
 
+    private String outerRole;
+
+    @BeforeEach
+    void enterLauncherRole() {
+        // Each test acts as the launcher of its own distribution session.
+        outerRole = System.getProperty(DistributionSettings.ROLE_PROPERTY);
+        System.clearProperty(DistributionSettings.ROLE_PROPERTY);
+    }
+
     @AfterEach
     void resetProps() {
+        if (outerRole != null) {
+            System.setProperty(DistributionSettings.ROLE_PROPERTY, outerRole);
+        }
         System.clearProperty(DistributionSettings.ENABLED_PROPERTY);
-        System.clearProperty(DistributionSettings.BROKER_URL_PROPERTY);
+        System.clearProperty(DistributionSettings.COORDINATOR_URL_PROPERTY);
         System.clearProperty(DistributionSettings.FALLBACK_LOCAL_PROPERTY);
         System.clearProperty(DistributionSettings.REPORT_DIR_PROPERTY);
         System.clearProperty(DistributionSettings.CONNECT_TIMEOUT_MS_PROPERTY);
@@ -124,7 +137,7 @@ class DistributedLauncherTest {
             cluster.client.submitWork(sessionId, cluster.siblingWithOutputs(sessionId, SiblingOutputFixture.class));
 
             System.setProperty(DistributionSettings.ENABLED_PROPERTY, "true");
-            System.setProperty(DistributionSettings.BROKER_URL_PROPERTY, cluster.broker.baseUrl());
+            System.setProperty(DistributionSettings.COORDINATOR_URL_PROPERTY, cluster.coordinator.baseUrl());
             System.setProperty(DistributionSettings.SESSION_ID_PROPERTY, sessionId);
             System.setProperty(DistributionSettings.BASEDIR_PROPERTY, module.toString());
             System.setProperty(DistributionSettings.INPUTS_PROPERTY, "src/test/resources");
@@ -151,7 +164,7 @@ class DistributedLauncherTest {
         try (Cluster cluster = Cluster.start(tempDir)) {
             Path module = Files.createDirectories(tempDir.resolve("module-crash"));
             System.setProperty(DistributionSettings.ENABLED_PROPERTY, "true");
-            System.setProperty(DistributionSettings.BROKER_URL_PROPERTY, cluster.broker.baseUrl());
+            System.setProperty(DistributionSettings.COORDINATOR_URL_PROPERTY, cluster.coordinator.baseUrl());
             System.setProperty(DistributionSettings.BASEDIR_PROPERTY, module.toString());
             System.setProperty(DistributionSettings.OUTPUTS_PROPERTY, "target/citrus-docs");
 
@@ -166,7 +179,7 @@ class DistributedLauncherTest {
     void shouldReplayRemoteResultsAgainstTheTestPlanInsideStartedClassContainers() throws Exception {
         try (Cluster cluster = Cluster.start(tempDir)) {
             System.setProperty(DistributionSettings.ENABLED_PROPERTY, "true");
-            System.setProperty(DistributionSettings.BROKER_URL_PROPERTY, cluster.broker.baseUrl());
+            System.setProperty(DistributionSettings.COORDINATOR_URL_PROPERTY, cluster.coordinator.baseUrl());
 
             SurefireLikeListener listener = new SurefireLikeListener();
             new DistributedLauncher(LauncherFactory.create()).execute(LauncherDiscoveryRequestBuilder.request()
@@ -188,7 +201,7 @@ class DistributedLauncherTest {
     void shouldReportAClassSplitBetweenLocalAndRemoteUnitsAsOneTestSet() throws Exception {
         try (Cluster cluster = Cluster.start(tempDir)) {
             System.setProperty(DistributionSettings.ENABLED_PROPERTY, "true");
-            System.setProperty(DistributionSettings.BROKER_URL_PROPERTY, cluster.broker.baseUrl());
+            System.setProperty(DistributionSettings.COORDINATOR_URL_PROPERTY, cluster.coordinator.baseUrl());
 
             SurefireLikeListener listener = new SurefireLikeListener();
             new DistributedLauncher(LauncherFactory.create()).execute(LauncherDiscoveryRequestBuilder.request()
@@ -207,7 +220,7 @@ class DistributedLauncherTest {
     void shouldReportEachTestOnceToListenersRegisteredOnTheLauncher() throws Exception {
         try (Cluster cluster = Cluster.start(tempDir)) {
             System.setProperty(DistributionSettings.ENABLED_PROPERTY, "true");
-            System.setProperty(DistributionSettings.BROKER_URL_PROPERTY, cluster.broker.baseUrl());
+            System.setProperty(DistributionSettings.COORDINATOR_URL_PROPERTY, cluster.coordinator.baseUrl());
 
             List<String> finished = new CopyOnWriteArrayList<>();
             DistributedLauncher launcher = new DistributedLauncher(LauncherFactory.create());
@@ -231,7 +244,7 @@ class DistributedLauncherTest {
     void shouldReportLocallyRunTestsLiveWithTheirRealDurationAndOutcome() throws Exception {
         try (Cluster cluster = Cluster.start(tempDir)) {
             System.setProperty(DistributionSettings.ENABLED_PROPERTY, "true");
-            System.setProperty(DistributionSettings.BROKER_URL_PROPERTY, cluster.broker.baseUrl());
+            System.setProperty(DistributionSettings.COORDINATOR_URL_PROPERTY, cluster.coordinator.baseUrl());
 
             Map<String, Long> startedAt = new java.util.concurrent.ConcurrentHashMap<>();
             Map<String, Long> durations = new java.util.concurrent.ConcurrentHashMap<>();
@@ -334,7 +347,7 @@ class DistributedLauncherTest {
         try (Cluster cluster = Cluster.start(tempDir)) {
             Path module = Files.createDirectories(tempDir.resolve("module-conflict"));
             System.setProperty(DistributionSettings.ENABLED_PROPERTY, "true");
-            System.setProperty(DistributionSettings.BROKER_URL_PROPERTY, cluster.broker.baseUrl());
+            System.setProperty(DistributionSettings.COORDINATOR_URL_PROPERTY, cluster.coordinator.baseUrl());
             System.setProperty(DistributionSettings.BASEDIR_PROPERTY, module.toString());
             System.setProperty(DistributionSettings.OUTPUTS_PROPERTY, "target/citrus-docs");
             System.setProperty(DistributionSettings.MAX_PARTITION_SIZE_PROPERTY, "1");
@@ -343,9 +356,9 @@ class DistributedLauncherTest {
                     .isInstanceOf(IllegalStateException.class)
                     .hasMessageContaining("target/citrus-docs/conflict.txt");
             assertThat(module.resolve("target/citrus-docs/conflict.txt")).doesNotExist();
-            assertThat(cluster.broker.store().listSessions(1).getFirst().status())
+            assertThat(cluster.coordinator.store().listSessions(1).getFirst().status())
                     .isEqualTo(org.citrusframework.distribution.model.SessionStatus.FAILED);
-            assertThat(cluster.broker.store().listSessions(1).getFirst().failureReason())
+            assertThat(cluster.coordinator.store().listSessions(1).getFirst().failureReason())
                     .as("the launcher reports why its own session failed")
                     .contains("target/citrus-docs/conflict.txt");
         }
@@ -356,14 +369,14 @@ class DistributedLauncherTest {
         try (Cluster cluster = Cluster.start(tempDir)) {
             Path module = Files.createDirectories(tempDir.resolve("module-missing"));
             System.setProperty(DistributionSettings.ENABLED_PROPERTY, "true");
-            System.setProperty(DistributionSettings.BROKER_URL_PROPERTY, cluster.broker.baseUrl());
+            System.setProperty(DistributionSettings.COORDINATOR_URL_PROPERTY, cluster.coordinator.baseUrl());
             System.setProperty(DistributionSettings.BASEDIR_PROPERTY, module.toString());
             System.setProperty(DistributionSettings.INPUTS_PROPERTY, "src/test/resources,?optional/dir");
 
             assertThatThrownBy(() -> run(RemoteWorkspaceFixture.class))
                     .hasMessageContaining("src/test/resources");
             HttpResponse<String> sessions = HttpClient.newHttpClient().send(
-                    HttpRequest.newBuilder(URI.create(cluster.broker.baseUrl() + "/api/v1/sessions")).GET().build(),
+                    HttpRequest.newBuilder(URI.create(cluster.coordinator.baseUrl() + "/api/v1/sessions")).GET().build(),
                     HttpResponse.BodyHandlers.ofString());
             assertThat(sessions.body()).as("nothing reached the coordinator").isEqualTo("[]");
         }
@@ -452,22 +465,22 @@ class DistributedLauncherTest {
         return new WorkUnitSpec(fixture.getName(), fixture.getName(), null, null, Map.of(), 0L);
     }
 
-    /** An embedded broker with two workers. */
-    private record Cluster(DistributionBrokerServer broker, List<DistributionWorkerClient> workers, BrokerHttpClient client)
+    /** An embedded coordinator with two workers. */
+    private record Cluster(DistributionCoordinatorServer coordinator, List<DistributionWorkerClient> workers, CoordinatorHttpClient client)
             implements AutoCloseable {
 
         static Cluster start(Path tempDir) throws Exception {
-            DistributionBrokerServer broker = new DistributionBrokerServer(DistributionBrokerConfig.builder()
+            DistributionCoordinatorServer coordinator = new DistributionCoordinatorServer(DistributionCoordinatorConfig.builder()
                     .port(0)
-                    .cacheDir(tempDir.resolve("broker-cache"))
+                    .cacheDir(tempDir.resolve("coordinator-cache"))
                     .jdbcUrl("jdbc:hsqldb:mem:launcher_ws_" + System.nanoTime())
                     .build());
-            broker.start();
+            coordinator.start();
             List<DistributionWorkerClient> workers = new ArrayList<>();
             for (int i = 0; i < 2; i++) {
                 DistributionWorkerClient worker = new DistributionWorkerClient(DistributionWorkerConfig.builder()
                         .workerId("ws-worker-" + i)
-                        .brokerUrl(broker.baseUrl())
+                        .coordinatorUrl(coordinator.baseUrl())
                         .cacheDir(tempDir.resolve("worker-cache-" + i))
                         .forkJvmArgs(List.of("-Xmx384m"))
                         .build());
@@ -475,7 +488,7 @@ class DistributedLauncherTest {
                 assertThat(worker.awaitRegistration(5, TimeUnit.SECONDS)).isTrue();
                 workers.add(worker);
             }
-            return new Cluster(broker, workers, new BrokerHttpClient(broker.baseUrl(), "", 3_000L));
+            return new Cluster(coordinator, workers, new CoordinatorHttpClient(coordinator.baseUrl(), "", 3_000L));
         }
 
         /**
@@ -504,27 +517,27 @@ class DistributedLauncherTest {
         @Override
         public void close() {
             workers.forEach(DistributionWorkerClient::close);
-            broker.close();
+            coordinator.close();
         }
     }
 
     @Test
     void shouldDistributeRemoteTestsPinLocalOnlyAndWriteSurefireXml() throws Exception {
-        LocalPinnedFixture.EXECUTED_IN_COORDINATOR.set(false);
-        RemoteSampleFixture.EXECUTED_IN_COORDINATOR.set(false);
+        LocalPinnedFixture.EXECUTED_ON_LAUNCHER_HOST.set(false);
+        RemoteSampleFixture.EXECUTED_ON_LAUNCHER_HOST.set(false);
 
-        DistributionBrokerConfig brokerCfg = DistributionBrokerConfig.builder()
+        DistributionCoordinatorConfig coordinatorCfg = DistributionCoordinatorConfig.builder()
                 .port(0)
-                .cacheDir(tempDir.resolve("broker-cache"))
+                .cacheDir(tempDir.resolve("coordinator-cache"))
                 .jdbcUrl("jdbc:hsqldb:mem:junit_dist_" + System.nanoTime())
                 .build();
 
-        try (DistributionBrokerServer broker = new DistributionBrokerServer(brokerCfg)) {
-            broker.start();
+        try (DistributionCoordinatorServer coordinator = new DistributionCoordinatorServer(coordinatorCfg)) {
+            coordinator.start();
 
             DistributionWorkerConfig workerCfg = DistributionWorkerConfig.builder()
                     .workerId("worker-1")
-                    .brokerUrl(broker.baseUrl())
+                    .coordinatorUrl(coordinator.baseUrl())
                     .cacheDir(tempDir.resolve("worker-cache"))
                     .capabilities(Map.of("os", "linux"))
                     .build();
@@ -534,7 +547,7 @@ class DistributedLauncherTest {
 
                 Path reportDir = tempDir.resolve("surefire-reports");
                 System.setProperty(DistributionSettings.ENABLED_PROPERTY, "true");
-                System.setProperty(DistributionSettings.BROKER_URL_PROPERTY, broker.baseUrl());
+                System.setProperty(DistributionSettings.COORDINATOR_URL_PROPERTY, coordinator.baseUrl());
                 System.setProperty(DistributionSettings.REPORT_DIR_PROPERTY, reportDir.toString());
 
                 Launcher rawLauncher = LauncherFactory.create();
@@ -557,19 +570,19 @@ class DistributedLauncherTest {
                 });
 
                 assertThat(passedCount.get()).isEqualTo(2);
-                assertThat(LocalPinnedFixture.EXECUTED_IN_COORDINATOR.get()).isTrue();
+                assertThat(LocalPinnedFixture.EXECUTED_ON_LAUNCHER_HOST.get()).isTrue();
                 // RemoteSampleFixture ran inside IsolatedPartitionRunner's child ClassLoader, NOT coordinator static!
-                assertThat(RemoteSampleFixture.EXECUTED_IN_COORDINATOR.get()).isFalse();
+                assertThat(RemoteSampleFixture.EXECUTED_ON_LAUNCHER_HOST.get()).isFalse();
 
                 Path xmlReport = reportDir.resolve("TEST-" + RemoteSampleFixture.class.getName() + ".xml");
                 assertThat(Files.exists(xmlReport)).isTrue();
                 assertThat(Files.readString(xmlReport)).contains("shouldRunOnRemoteWorker");
 
-                String sid = broker.store().listSessions(1).getFirst().sessionId();
-                assertThat(broker.store().listTestExecutions(sid))
+                String sid = coordinator.store().listSessions(1).getFirst().sessionId();
+                assertThat(coordinator.store().listTestExecutions(sid))
                         .extracting(e -> e.className() + "#" + e.testName() + "@" + e.partitionId())
                         .anyMatch(s -> s.startsWith(RemoteSampleFixture.class.getName() + "#shouldRunOnRemoteWorker"))
-                        .anyMatch(s -> s.startsWith(LocalPinnedFixture.class.getName() + "#shouldStayOnCoordinator") && s.endsWith("@local"));
+                        .anyMatch(s -> s.startsWith(LocalPinnedFixture.class.getName() + "#shouldStayOnLauncherHost") && s.endsWith("@local"));
             }
         }
     }
@@ -577,27 +590,27 @@ class DistributedLauncherTest {
     @Test
     void shouldRunSmallModuleLocallyOnWarmHistorySkipRemoteDispatchAndReportLocalTests() throws Exception {
         try (Cluster cluster = Cluster.start(tempDir)) {
-            System.setProperty(DistributionSettings.BROKER_URL_PROPERTY, cluster.broker.baseUrl());
+            System.setProperty(DistributionSettings.COORDINATOR_URL_PROPERTY, cluster.coordinator.baseUrl());
             System.setProperty(DistributionSettings.MIN_REMOTE_DURATION_MS_PROPERTY, "2000");
             System.setProperty(DistributionSettings.BASEDIR_PROPERTY, tempDir.toString());
-            RemoteSampleFixture.EXECUTED_IN_COORDINATOR.set(false);
+            RemoteSampleFixture.EXECUTED_ON_LAUNCHER_HOST.set(false);
 
             assertThat(run(RemoteSampleFixture.class)).isEqualTo(new Outcome(1, 0));
-            assertThat(RemoteSampleFixture.EXECUTED_IN_COORDINATOR.get()).isFalse();
+            assertThat(RemoteSampleFixture.EXECUTED_ON_LAUNCHER_HOST.get()).isFalse();
             String key = RemoteSampleFixture.class.getName();
-            assertThat(cluster.broker.store().findHistoricalDurationsMs(List.of(key), 10).get(key))
+            assertThat(cluster.coordinator.store().findHistoricalDurationsMs(List.of(key), 10).get(key))
                     .isNotNull().isLessThan(2_000L);
 
             String sessionId = cluster.createSession();
             System.setProperty(DistributionSettings.SESSION_ID_PROPERTY, sessionId);
             Path reportDir = tempDir.resolve("warm-reports");
             System.setProperty(DistributionSettings.REPORT_DIR_PROPERTY, reportDir.toString());
-            RemoteSampleFixture.EXECUTED_IN_COORDINATOR.set(false);
+            RemoteSampleFixture.EXECUTED_ON_LAUNCHER_HOST.set(false);
 
             assertThat(run(RemoteSampleFixture.class)).isEqualTo(new Outcome(1, 0));
-            assertThat(RemoteSampleFixture.EXECUTED_IN_COORDINATOR.get()).isTrue();
-            assertThat(cluster.broker.store().listPartitions(sessionId)).isEmpty();
-            assertThat(cluster.broker.store().listTestExecutions(sessionId)).singleElement().satisfies(execution -> {
+            assertThat(RemoteSampleFixture.EXECUTED_ON_LAUNCHER_HOST.get()).isTrue();
+            assertThat(cluster.coordinator.store().listPartitions(sessionId)).isEmpty();
+            assertThat(cluster.coordinator.store().listTestExecutions(sessionId)).singleElement().satisfies(execution -> {
                 assertThat(execution.partitionId()).isEqualTo("local");
                 assertThat(execution.workUnitKey()).isEqualTo(key);
             });
@@ -609,37 +622,37 @@ class DistributedLauncherTest {
     @Test
     void shouldKeepDistributingWhenRemoteOnlyPresentOrHistoryEndpointUnavailable() throws Exception {
         try (Cluster cluster = Cluster.start(tempDir)) {
-            System.setProperty(DistributionSettings.BROKER_URL_PROPERTY, cluster.broker.baseUrl());
+            System.setProperty(DistributionSettings.COORDINATOR_URL_PROPERTY, cluster.coordinator.baseUrl());
             System.setProperty(DistributionSettings.MIN_REMOTE_DURATION_MS_PROPERTY, "2000");
             System.setProperty(DistributionSettings.BASEDIR_PROPERTY, tempDir.toString());
             assertThat(run(StrictRemoteOnlyFixture.class)).isEqualTo(new Outcome(1, 0));
 
-            String seededSession = cluster.broker.store().listSessions(1).getFirst().sessionId();
-            String key = cluster.broker.store().listPartitions(seededSession).getFirst().workUnits().getFirst().key();
-            assertThat(cluster.broker.store().findHistoricalDurationsMs(List.of(key), 10).get(key))
+            String seededSession = cluster.coordinator.store().listSessions(1).getFirst().sessionId();
+            String key = cluster.coordinator.store().listPartitions(seededSession).getFirst().workUnits().getFirst().key();
+            assertThat(cluster.coordinator.store().findHistoricalDurationsMs(List.of(key), 10).get(key))
                     .isNotNull().isLessThan(2_000L);
             String sessionId = cluster.createSession();
             System.setProperty(DistributionSettings.SESSION_ID_PROPERTY, sessionId);
             assertThat(run(StrictRemoteOnlyFixture.class)).isEqualTo(new Outcome(1, 0));
-            assertThat(cluster.broker.store().listPartitions(sessionId)).hasSize(1);
+            assertThat(cluster.coordinator.store().listPartitions(sessionId)).hasSize(1);
 
             AtomicInteger historyRequests = new AtomicInteger();
             AtomicReference<SubmitWorkRequest> submission = new AtomicReference<>();
-            HttpServer oldBroker = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
-            oldBroker.createContext("/api/v1/history/durations", exchange -> {
+            HttpServer oldCoordinator = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+            oldCoordinator.createContext("/api/v1/history/durations", exchange -> {
                 try (exchange) {
                     historyRequests.incrementAndGet();
                     exchange.sendResponseHeaders(404, -1);
                 }
             });
-            oldBroker.createContext("/api/v1/cache/missing", exchange -> {
+            oldCoordinator.createContext("/api/v1/cache/missing", exchange -> {
                 try (exchange) {
                     byte[] body = "{\"missing\":[]}".getBytes(StandardCharsets.UTF_8);
                     exchange.sendResponseHeaders(200, body.length);
                     exchange.getResponseBody().write(body);
                 }
             });
-            oldBroker.createContext("/api/v1/sessions/" + sessionId + "/work", exchange -> {
+            oldCoordinator.createContext("/api/v1/sessions/" + sessionId + "/work", exchange -> {
                 try (exchange) {
                     submission.set(DistributionJson.fromJson(
                             new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8),
@@ -649,20 +662,20 @@ class DistributedLauncherTest {
                     exchange.getResponseBody().write(body);
                 }
             });
-            oldBroker.start();
+            oldCoordinator.start();
             try {
-                String oldBrokerUrl = "http://127.0.0.1:" + oldBroker.getAddress().getPort();
-                System.setProperty(DistributionSettings.BROKER_URL_PROPERTY, oldBrokerUrl);
-                assertThat(new BrokerHttpClient(oldBrokerUrl, "", 500).findHistoricalDurations(List.of(key), 10)).isEmpty();
-                RemoteSampleFixture.EXECUTED_IN_COORDINATOR.set(false);
+                String oldCoordinatorUrl = "http://127.0.0.1:" + oldCoordinator.getAddress().getPort();
+                System.setProperty(DistributionSettings.COORDINATOR_URL_PROPERTY, oldCoordinatorUrl);
+                assertThat(new CoordinatorHttpClient(oldCoordinatorUrl, "", 500).findHistoricalDurations(List.of(key), 10)).isEmpty();
+                RemoteSampleFixture.EXECUTED_ON_LAUNCHER_HOST.set(false);
                 run(RemoteSampleFixture.class);
-                assertThat(RemoteSampleFixture.EXECUTED_IN_COORDINATOR.get()).isFalse();
+                assertThat(RemoteSampleFixture.EXECUTED_ON_LAUNCHER_HOST.get()).isFalse();
                 assertThat(historyRequests.get()).isEqualTo(2);
                 assertThat(submission.get()).isNotNull();
                 assertThat(submission.get().workUnits()).extracting(WorkUnitSpec::key)
                         .containsExactly(RemoteSampleFixture.class.getName());
             } finally {
-                oldBroker.stop(0);
+                oldCoordinator.stop(0);
             }
         }
     }
@@ -670,14 +683,14 @@ class DistributedLauncherTest {
     @Test
     void shouldBypassOnColdHistoryWhenMinRemoteColdUnitsThresholdMatches() throws Exception {
         try (Cluster cluster = Cluster.start(tempDir)) {
-            System.setProperty(DistributionSettings.BROKER_URL_PROPERTY, cluster.broker.baseUrl());
+            System.setProperty(DistributionSettings.COORDINATOR_URL_PROPERTY, cluster.coordinator.baseUrl());
             System.setProperty(DistributionSettings.MIN_REMOTE_COLD_UNITS_PROPERTY, "2");
             System.setProperty(DistributionSettings.BASEDIR_PROPERTY, tempDir.toString());
-            RemoteSampleFixture.EXECUTED_IN_COORDINATOR.set(false);
+            RemoteSampleFixture.EXECUTED_ON_LAUNCHER_HOST.set(false);
 
             assertThat(run(RemoteSampleFixture.class)).isEqualTo(new Outcome(1, 0));
-            assertThat(RemoteSampleFixture.EXECUTED_IN_COORDINATOR.get()).isTrue();
-            assertThat(cluster.broker.store().listSessions(10)).isEmpty();
+            assertThat(RemoteSampleFixture.EXECUTED_ON_LAUNCHER_HOST.get()).isTrue();
+            assertThat(cluster.coordinator.store().listSessions(10)).isEmpty();
             assertThat(tempDir.resolve("target/.citrus-dist")).doesNotExist();
         }
     }
@@ -686,8 +699,8 @@ class DistributedLauncherTest {
     void shouldIgnoreMalformedHistoryAndTimeOutEvenAfterResponseHeadersArrive() throws Exception {
         AtomicBoolean stall = new AtomicBoolean();
         CountDownLatch releaseBody = new CountDownLatch(1);
-        HttpServer broker = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
-        broker.createContext("/api/v1/history/durations", exchange -> {
+        HttpServer coordinator = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        coordinator.createContext("/api/v1/history/durations", exchange -> {
             try (exchange) {
                 if (stall.get()) {
                     exchange.sendResponseHeaders(200, 0);
@@ -704,9 +717,9 @@ class DistributedLauncherTest {
                 Thread.currentThread().interrupt();
             }
         });
-        broker.start();
+        coordinator.start();
         try {
-            BrokerHttpClient client = new BrokerHttpClient("http://127.0.0.1:" + broker.getAddress().getPort(), "", 500);
+            CoordinatorHttpClient client = new CoordinatorHttpClient("http://127.0.0.1:" + coordinator.getAddress().getPort(), "", 500);
             assertThat(client.findHistoricalDurations(List.of("test"), 10)).isEmpty();
             stall.set(true);
             long start = System.nanoTime();
@@ -714,7 +727,7 @@ class DistributedLauncherTest {
             assertThat(Duration.ofNanos(System.nanoTime() - start)).isLessThan(Duration.ofSeconds(4));
         } finally {
             releaseBody.countDown();
-            broker.stop(0);
+            coordinator.stop(0);
         }
     }
 
@@ -723,8 +736,8 @@ class DistributedLauncherTest {
         String key = RemoteSampleFixture.class.getName();
         CountDownLatch reportStarted = new CountDownLatch(1);
         CountDownLatch releaseBody = new CountDownLatch(1);
-        HttpServer broker = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
-        broker.createContext("/api/v1/history/durations", exchange -> {
+        HttpServer coordinator = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        coordinator.createContext("/api/v1/history/durations", exchange -> {
             try (exchange) {
                 byte[] body = DistributionJson.toJson(Map.of("durationsMs", Map.of(key, 1L)))
                         .getBytes(StandardCharsets.UTF_8);
@@ -732,7 +745,7 @@ class DistributedLauncherTest {
                 exchange.getResponseBody().write(body);
             }
         });
-        broker.createContext("/api/v1/sessions/reactor/local-tests", exchange -> {
+        coordinator.createContext("/api/v1/sessions/reactor/local-tests", exchange -> {
             try (exchange) {
                 exchange.sendResponseHeaders(200, 0);
                 exchange.getResponseBody().write('{');
@@ -744,21 +757,21 @@ class DistributedLauncherTest {
                 Thread.currentThread().interrupt();
             }
         });
-        broker.start();
-        System.setProperty(DistributionSettings.BROKER_URL_PROPERTY, "http://127.0.0.1:" + broker.getAddress().getPort());
+        coordinator.start();
+        System.setProperty(DistributionSettings.COORDINATOR_URL_PROPERTY, "http://127.0.0.1:" + coordinator.getAddress().getPort());
         System.setProperty(DistributionSettings.CONNECT_TIMEOUT_MS_PROPERTY, "500");
         System.setProperty(DistributionSettings.SESSION_ID_PROPERTY, "reactor");
         System.setProperty(DistributionSettings.BASEDIR_PROPERTY, tempDir.toString());
-        RemoteSampleFixture.EXECUTED_IN_COORDINATOR.set(false);
+        RemoteSampleFixture.EXECUTED_ON_LAUNCHER_HOST.set(false);
         var execution = new FutureTask<>(() -> run(RemoteSampleFixture.class));
         Thread launch = Thread.ofVirtual().start(execution);
         try {
             assertThat(reportStarted.await(5, TimeUnit.SECONDS)).isTrue();
             assertThat(execution.get(4, TimeUnit.SECONDS)).isEqualTo(new Outcome(1, 0));
-            assertThat(RemoteSampleFixture.EXECUTED_IN_COORDINATOR.get()).isTrue();
+            assertThat(RemoteSampleFixture.EXECUTED_ON_LAUNCHER_HOST.get()).isTrue();
         } finally {
             releaseBody.countDown();
-            broker.stop(0);
+            coordinator.stop(0);
             launch.join(Duration.ofSeconds(5));
         }
     }
@@ -777,8 +790,8 @@ class DistributedLauncherTest {
         CountDownLatch historyStarted = new CountDownLatch(1);
         CountDownLatch releaseHistory = new CountDownLatch(1);
         AtomicInteger sessionRequests = new AtomicInteger();
-        HttpServer broker = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
-        broker.createContext("/api/v1/history/durations", exchange -> {
+        HttpServer coordinator = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        coordinator.createContext("/api/v1/history/durations", exchange -> {
             try (exchange) {
                 historyStarted.countDown();
                 releaseHistory.await(10, TimeUnit.SECONDS);
@@ -787,18 +800,18 @@ class DistributedLauncherTest {
                 Thread.currentThread().interrupt();
             }
         });
-        broker.createContext("/api/v1/sessions", exchange -> {
+        coordinator.createContext("/api/v1/sessions", exchange -> {
             try (exchange) {
                 sessionRequests.incrementAndGet();
                 exchange.sendResponseHeaders(503, -1);
             }
         });
-        broker.start();
-        System.setProperty(DistributionSettings.BROKER_URL_PROPERTY, "http://127.0.0.1:" + broker.getAddress().getPort());
+        coordinator.start();
+        System.setProperty(DistributionSettings.COORDINATOR_URL_PROPERTY, "http://127.0.0.1:" + coordinator.getAddress().getPort());
         System.setProperty(DistributionSettings.CONNECT_TIMEOUT_MS_PROPERTY, "10000");
         System.setProperty(DistributionSettings.MIN_REMOTE_COLD_UNITS_PROPERTY, Integer.toString(coldThreshold));
         System.setProperty(DistributionSettings.BASEDIR_PROPERTY, tempDir.toString());
-        RemoteSampleFixture.EXECUTED_IN_COORDINATOR.set(false);
+        RemoteSampleFixture.EXECUTED_ON_LAUNCHER_HOST.set(false);
         AtomicReference<Throwable> failure = new AtomicReference<>();
         AtomicBoolean interruptPreserved = new AtomicBoolean();
         Thread launch = Thread.ofVirtual().start(() -> {
@@ -817,11 +830,11 @@ class DistributedLauncherTest {
             assertThat(failure.get()).isInstanceOf(IllegalStateException.class)
                     .hasMessageContaining("interrupted before test execution");
             assertThat(interruptPreserved.get()).isTrue();
-            assertThat(RemoteSampleFixture.EXECUTED_IN_COORDINATOR.get()).isFalse();
+            assertThat(RemoteSampleFixture.EXECUTED_ON_LAUNCHER_HOST.get()).isFalse();
             assertThat(sessionRequests.get()).isZero();
         } finally {
             releaseHistory.countDown();
-            broker.stop(0);
+            coordinator.stop(0);
             launch.join(Duration.ofSeconds(5));
         }
     }
@@ -868,7 +881,7 @@ class DistributedLauncherTest {
         try (Cluster cluster = Cluster.start(tempDir)) {
             String sessionId = cluster.createSession();
             System.setProperty(DistributionSettings.ENABLED_PROPERTY, "true");
-            System.setProperty(DistributionSettings.BROKER_URL_PROPERTY, cluster.broker.baseUrl());
+            System.setProperty(DistributionSettings.COORDINATOR_URL_PROPERTY, cluster.coordinator.baseUrl());
             System.setProperty(DistributionSettings.SESSION_ID_PROPERTY, sessionId);
 
             Outcome outcome = run(LocalPinnedFixture.class);
@@ -877,15 +890,15 @@ class DistributedLauncherTest {
             cluster.client.completeSession(sessionId,
                     new org.citrusframework.distribution.model.CompleteSessionRequest(0, 0, 0, 0L));
 
-            var session = cluster.broker.store().findSession(sessionId).orElseThrow();
+            var session = cluster.coordinator.store().findSession(sessionId).orElseThrow();
             assertThat(session.status()).isEqualTo(org.citrusframework.distribution.model.SessionStatus.PASSED);
             assertThat(session.totalTests()).isEqualTo(1);
             assertThat(session.passedTests()).isEqualTo(1);
-            assertThat(cluster.broker.store().listTestExecutions(sessionId))
+            assertThat(cluster.coordinator.store().listTestExecutions(sessionId))
                     .singleElement()
                     .satisfies(exec -> {
                         assertThat(exec.className()).isEqualTo(LocalPinnedFixture.class.getName());
-                        assertThat(exec.testName()).isEqualTo("shouldStayOnCoordinator()");
+                        assertThat(exec.testName()).isEqualTo("shouldStayOnLauncherHost()");
                         assertThat(exec.partitionId()).isEqualTo("local");
                     });
         }
@@ -922,10 +935,10 @@ class DistributedLauncherTest {
     }
 
     @Test
-    void shouldFallbackLocallyWhenBrokerUnreachableAndFailFastOnRemoteOnly() {
-        RemoteSampleFixture.EXECUTED_IN_COORDINATOR.set(false);
+    void shouldFallbackLocallyWhenCoordinatorUnreachableAndFailFastOnRemoteOnly() {
+        RemoteSampleFixture.EXECUTED_ON_LAUNCHER_HOST.set(false);
         System.setProperty(DistributionSettings.ENABLED_PROPERTY, "true");
-        System.setProperty(DistributionSettings.BROKER_URL_PROPERTY, "http://127.0.0.1:1");
+        System.setProperty(DistributionSettings.COORDINATOR_URL_PROPERTY, "http://127.0.0.1:1");
         System.setProperty(DistributionSettings.CONNECT_TIMEOUT_MS_PROPERTY, "500");
         System.setProperty(DistributionSettings.FALLBACK_LOCAL_PROPERTY, "true");
 
@@ -934,14 +947,14 @@ class DistributedLauncherTest {
                 .selectors(DiscoverySelectors.selectClass(RemoteSampleFixture.class))
                 .build();
         distributed.execute(fallbackReq);
-        assertThat(RemoteSampleFixture.EXECUTED_IN_COORDINATOR.get()).isTrue();
+        assertThat(RemoteSampleFixture.EXECUTED_ON_LAUNCHER_HOST.get()).isTrue();
 
         LauncherDiscoveryRequest remoteOnlyReq = LauncherDiscoveryRequestBuilder.request()
                 .selectors(DiscoverySelectors.selectClass(StrictRemoteOnlyFixture.class))
                 .build();
         assertThatThrownBy(() -> distributed.execute(remoteOnlyReq))
                 .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("broker unreachable");
+                .hasMessageContaining("coordinator unreachable");
     }
 
     @Test
@@ -950,7 +963,7 @@ class DistributedLauncherTest {
         source.setProperty("citrus.default.timeout", "15000");
         source.setProperty("spring.profiles.active", "integration");
         source.setProperty("custom.service.port", "19090");
-        source.setProperty("citrus.test.distribution.broker.url", "http://127.0.0.1:18080");
+        source.setProperty(DistributionSettings.COORDINATOR_URL_PROPERTY, "http://127.0.0.1:18080");
         source.setProperty("junit.platform.launcher.interceptors.enabled", "true");
         source.setProperty("java.home", "/host/jdk-21");
         source.setProperty("user.dir", "/host/workspace");
@@ -971,7 +984,7 @@ class DistributedLauncherTest {
                 .containsEntry(WorkspaceLease.ENABLED_PROPERTY, "true")
                 .doesNotContainKeys(
                         WorkspaceLease.TICKET_PROPERTY,
-                        "citrus.test.distribution.broker.url",
+                        DistributionSettings.COORDINATOR_URL_PROPERTY,
                         "junit.platform.launcher.interceptors.enabled",
                         "java.home",
                         "user.dir",
@@ -984,27 +997,27 @@ class DistributedLauncherTest {
 
     @Test
     void shouldReuseWorkerLocalFileCacheAcrossSessionsAndPersistAfterWorkerRestart() throws Exception {
-        Path brokerCacheDir = tempDir.resolve("broker-cache");
+        Path coordinatorCacheDir = tempDir.resolve("coordinator-cache");
         Path workerCacheDir = tempDir.resolve("worker-file-cache");
         Path module = Files.createDirectories(tempDir.resolve("module-warm"));
         Files.createDirectories(module.resolve("src/test/resources"));
         Files.writeString(module.resolve("src/test/resources/data.txt"), WarmCacheFixture.EXPECTED_DATA);
 
-        DistributionBrokerServer broker = new DistributionBrokerServer(DistributionBrokerConfig.builder()
+        DistributionCoordinatorServer coordinator = new DistributionCoordinatorServer(DistributionCoordinatorConfig.builder()
                 .port(0)
-                .cacheDir(brokerCacheDir)
+                .cacheDir(coordinatorCacheDir)
                 .jdbcUrl("jdbc:hsqldb:mem:launcher_warm_" + System.nanoTime())
                 .build());
-        broker.start();
+        coordinator.start();
         try {
-            BrokerHttpClient client = new BrokerHttpClient(broker.baseUrl(), "", 3_000L);
+            CoordinatorHttpClient client = new CoordinatorHttpClient(coordinator.baseUrl(), "", 3_000L);
             System.setProperty(DistributionSettings.ENABLED_PROPERTY, "true");
-            System.setProperty(DistributionSettings.BROKER_URL_PROPERTY, broker.baseUrl());
+            System.setProperty(DistributionSettings.COORDINATOR_URL_PROPERTY, coordinator.baseUrl());
             System.setProperty(DistributionSettings.BASEDIR_PROPERTY, module.toString());
             System.setProperty(DistributionSettings.INPUTS_PROPERTY, "src/test/resources");
 
-            // Session 1: a cold worker cache, filled from the broker.
-            try (DistributionWorkerClient worker = startCachingWorker(broker, "warm-worker-1", workerCacheDir)) {
+            // Session 1: a cold worker cache, filled from the coordinator.
+            try (DistributionWorkerClient worker = startCachingWorker(coordinator, "warm-worker-1", workerCacheDir)) {
                 Outcome outcome = run(WarmCacheFixture.class);
                 assertThat(outcome.failed()).isZero();
                 assertThat(outcome.passed()).isEqualTo(1);
@@ -1013,7 +1026,7 @@ class DistributedLauncherTest {
                 assertThat(workerCacheDir.resolve(".lock")).isRegularFile();
                 assertThat(filesUnder(workerCacheDir.resolve("tmp"))).as("no download leftovers").isEmpty();
 
-                WorkerCacheStats stats = awaitCacheStats(broker.baseUrl(), "warm-worker-1", s -> s.blobCount() > 0);
+                WorkerCacheStats stats = awaitCacheStats(coordinator.baseUrl(), "warm-worker-1", s -> s.blobCount() > 0);
                 assertThat(stats.cleanupEnabled()).isTrue();
                 assertThat(stats.freeSpaceBufferBytes()).isZero();
                 assertThat(stats.blobCount()).isPositive();
@@ -1022,19 +1035,19 @@ class DistributedLauncherTest {
                 assertThat(stats.lowDiskSpace()).isFalse();
             }
 
-            // The broker loses every blob: session 2 can only run from the worker's local file cache.
+            // The coordinator loses every blob: session 2 can only run from the worker's local file cache.
             DistributedLauncher.WorkspaceSettings workspace = DistributedLauncher.WorkspaceSettings.resolve();
             assertThat(workspace.inputArtifacts()).hasSize(1);
-            Path brokerInputBlob = new BlobCacheDirectory(brokerCacheDir)
+            Path coordinatorInputBlob = new BlobCacheDirectory(coordinatorCacheDir)
                     .resolveBlobPath(workspace.inputArtifacts().get(0).artifact().sha256());
-            assertThat(brokerInputBlob).isRegularFile();
-            deleteRecursively(brokerCacheDir.resolve("blobs"));
-            assertThat(brokerInputBlob).doesNotExist();
+            assertThat(coordinatorInputBlob).isRegularFile();
+            deleteRecursively(coordinatorCacheDir.resolve("blobs"));
+            assertThat(coordinatorInputBlob).doesNotExist();
 
             // Session 2: a restarted worker on the same cache directory. Submitted directly, without the launcher's
-            // upload step, so nothing repopulates the broker's blob cache.
-            try (DistributionWorkerClient worker = startCachingWorker(broker, "warm-worker-2", workerCacheDir)) {
-                WorkerCacheStats restarted = awaitCacheStats(broker.baseUrl(), "warm-worker-2", s -> s.blobCount() > 0);
+            // upload step, so nothing repopulates the coordinator's blob cache.
+            try (DistributionWorkerClient worker = startCachingWorker(coordinator, "warm-worker-2", workerCacheDir)) {
+                WorkerCacheStats restarted = awaitCacheStats(coordinator.baseUrl(), "warm-worker-2", s -> s.blobCount() > 0);
                 assertThat(restarted.cachedBytes()).as("cache survives the worker restart").isPositive();
 
                 List<ArtifactRef> classpath = new ArrayList<>();
@@ -1082,10 +1095,10 @@ class DistributedLauncherTest {
 
                 assertThat(partitionStates).containsExactly("partition.completed:COMPLETED");
                 assertThat(testStatuses).containsExactly("readInputFromWarmCache():PASSED");
-                assertThat(brokerInputBlob).as("nothing re-uploaded the input to the broker").doesNotExist();
+                assertThat(coordinatorInputBlob).as("nothing re-uploaded the input to the coordinator").doesNotExist();
             }
         } finally {
-            broker.close();
+            coordinator.close();
         }
     }
 
@@ -1112,11 +1125,11 @@ class DistributedLauncherTest {
         }
     }
 
-    private static DistributionWorkerClient startCachingWorker(DistributionBrokerServer broker, String workerId,
+    private static DistributionWorkerClient startCachingWorker(DistributionCoordinatorServer coordinator, String workerId,
                                                                Path cacheDir) throws Exception {
         DistributionWorkerClient worker = new DistributionWorkerClient(DistributionWorkerConfig.builder()
                 .workerId(workerId)
-                .brokerUrl(broker.baseUrl())
+                .coordinatorUrl(coordinator.baseUrl())
                 .cacheDir(cacheDir)
                 .cacheCleanup(true)
                 .cacheFreeSpaceBufferBytes(0L)
@@ -1137,10 +1150,10 @@ class DistributedLauncherTest {
     }
 
     /** Polls {@code GET /api/v1/workers} until the worker reports cache statistics matching {@code condition}. */
-    private static WorkerCacheStats awaitCacheStats(String brokerUrl, String workerId,
+    private static WorkerCacheStats awaitCacheStats(String coordinatorUrl, String workerId,
                                                     Predicate<WorkerCacheStats> condition)
             throws Exception {
-        HttpRequest request = HttpRequest.newBuilder(URI.create(brokerUrl + "/api/v1/workers")).GET().build();
+        HttpRequest request = HttpRequest.newBuilder(URI.create(coordinatorUrl + "/api/v1/workers")).GET().build();
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
         WorkerCacheStats last = null;
         try (HttpClient http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build()) {
@@ -1339,24 +1352,24 @@ class DistributedLauncherTest {
     }
 
     public static class RemoteSampleFixture {
-        static final AtomicBoolean EXECUTED_IN_COORDINATOR = new AtomicBoolean(false);
+        static final AtomicBoolean EXECUTED_ON_LAUNCHER_HOST = new AtomicBoolean(false);
 
         @Test
         void shouldRunOnRemoteWorker() {
             if (!DistributionSettings.isWorkerRole()) {
-                EXECUTED_IN_COORDINATOR.set(true);
+                EXECUTED_ON_LAUNCHER_HOST.set(true);
             }
         }
     }
 
     @LocalOnly
     public static class LocalPinnedFixture {
-        static final AtomicBoolean EXECUTED_IN_COORDINATOR = new AtomicBoolean(false);
+        static final AtomicBoolean EXECUTED_ON_LAUNCHER_HOST = new AtomicBoolean(false);
 
         @Test
-        void shouldStayOnCoordinator() {
+        void shouldStayOnLauncherHost() {
             if (!DistributionSettings.isWorkerRole()) {
-                EXECUTED_IN_COORDINATOR.set(true);
+                EXECUTED_ON_LAUNCHER_HOST.set(true);
             }
         }
     }

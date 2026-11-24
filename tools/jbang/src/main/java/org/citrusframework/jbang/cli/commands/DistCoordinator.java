@@ -26,18 +26,18 @@ import org.aesh.command.invocation.CommandInvocation;
 import org.aesh.command.option.ParentCommand;
 import org.citrusframework.jbang.cli.CitrusJBangMain;
 
-@CommandDefinition(name = "broker", description = "Manage Citrus Test Distribution broker", generateHelp = true,
-        groupCommands = {DistBrokerStart.class})
-public class DistBroker extends CitrusCommand implements GroupCommand<CommandInvocation> {
+@CommandDefinition(name = "coordinator", description = "Manage Citrus Test Distribution coordinator", generateHelp = true,
+        groupCommands = {DistCoordinatorStart.class})
+public class DistCoordinator extends CitrusCommand implements GroupCommand<CommandInvocation> {
 
     @ParentCommand
     Dist parent;
 
-    public DistBroker() {
+    public DistCoordinator() {
         super(null);
     }
 
-    public DistBroker(CitrusJBangMain main) {
+    public DistCoordinator(CitrusJBangMain main) {
         super(main);
     }
 
@@ -57,6 +57,6 @@ public class DistBroker extends CitrusCommand implements GroupCommand<CommandInv
 
     @Override
     public List<Command<CommandInvocation>> getCommands() {
-        return List.of(new DistBrokerStart(getMain()));
+        return List.of(new DistCoordinatorStart(getMain()));
     }
 }

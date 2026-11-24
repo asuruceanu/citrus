@@ -25,15 +25,15 @@ import org.aesh.command.CommandResult;
 import org.aesh.command.invocation.CommandInvocation;
 import org.aesh.command.option.Option;
 import org.aesh.command.option.ParentCommand;
-import org.citrusframework.distribution.broker.DistributionBrokerConfig;
-import org.citrusframework.distribution.broker.DistributionBrokerServer;
+import org.citrusframework.distribution.coordinator.DistributionCoordinatorConfig;
+import org.citrusframework.distribution.coordinator.DistributionCoordinatorServer;
 import org.citrusframework.jbang.cli.CitrusJBangMain;
 
-@CommandDefinition(name = "start", description = "Start Citrus Test Distribution broker and web UI", generateHelp = true)
-public class DistBrokerStart extends CitrusCommand {
+@CommandDefinition(name = "start", description = "Start Citrus Test Distribution coordinator and web UI", generateHelp = true)
+public class DistCoordinatorStart extends CitrusCommand {
 
     @ParentCommand
-    DistBroker parent;
+    DistCoordinator parent;
 
     @Option(name = "host", defaultValue = "0.0.0.0", description = "Bind host (default: 0.0.0.0)")
     String host;
@@ -59,11 +59,11 @@ public class DistBrokerStart extends CitrusCommand {
     @Option(name = "duration-seconds", defaultValue = "0", description = "Optional bounded run duration in seconds (0 runs until Ctrl+C)")
     int durationSeconds;
 
-    public DistBrokerStart() {
+    public DistCoordinatorStart() {
         super(null);
     }
 
-    public DistBrokerStart(CitrusJBangMain main) {
+    public DistCoordinatorStart(CitrusJBangMain main) {
         super(main);
     }
 
@@ -77,7 +77,7 @@ public class DistBrokerStart extends CitrusCommand {
 
     @Override
     public CommandResult execute(CommandInvocation invocation) {
-        DistributionBrokerConfig.Builder builder = DistributionBrokerConfig.builder()
+        DistributionCoordinatorConfig.Builder builder = DistributionCoordinatorConfig.builder()
                 .host(host)
                 .port(port)
                 .defaultMaxPartitionSize(maxPartitionSize)
@@ -93,12 +93,12 @@ public class DistBrokerStart extends CitrusCommand {
         }
 
         CountDownLatch stopLatch = new CountDownLatch(1);
-        Thread hook = new Thread(stopLatch::countDown, "citrus-dist-broker-shutdown");
+        Thread hook = new Thread(stopLatch::countDown, "citrus-dist-coordinator-shutdown");
         Runtime.getRuntime().addShutdownHook(hook);
 
-        try (DistributionBrokerServer server = new DistributionBrokerServer(builder.build())) {
+        try (DistributionCoordinatorServer server = new DistributionCoordinatorServer(builder.build())) {
             server.start();
-            printer().println("Citrus Test Distribution Broker listening on " + server.baseUrl() + " (UI: " + server.baseUrl() + "/ui/)");
+            printer().println("Citrus Test Distribution Coordinator listening on " + server.baseUrl() + " (UI: " + server.baseUrl() + "/ui/)");
             if (durationSeconds > 0) {
                 stopLatch.await(durationSeconds, TimeUnit.SECONDS);
             } else {
@@ -109,7 +109,7 @@ public class DistBrokerStart extends CitrusCommand {
             Thread.currentThread().interrupt();
             return CommandResult.SUCCESS;
         } catch (Exception e) {
-            printer().println("Failed to start Citrus Test Distribution Broker: " + e.getMessage());
+            printer().println("Failed to start Citrus Test Distribution Coordinator: " + e.getMessage());
             return CommandResult.FAILURE;
         } finally {
             try {

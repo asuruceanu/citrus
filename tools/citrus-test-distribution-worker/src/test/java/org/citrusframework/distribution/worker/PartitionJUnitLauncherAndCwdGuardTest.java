@@ -303,6 +303,7 @@ class PartitionJUnitLauncherAndCwdGuardTest {
 
     @Test
     void shouldRedirectBasedirReportsAndExpandWorkspaceTokenPerPartition() {
+        String outerBasedir = System.getProperty("basedir");
         List<WorkerTestEventPayload> events = new CopyOnWriteArrayList<>();
         IsolatedPartitionRunner.PartitionExecutionResult result = runner(WorkerCwdCheckMode.FAIL).execute(
                 assignment(Map.of(
@@ -316,8 +317,8 @@ class PartitionJUnitLauncherAndCwdGuardTest {
         assertThat(result.outputArtifacts()).isEmpty();
         assertThat(finished(events)).singleElement()
                 .satisfies(e -> assertThat(e.status()).as(e.errorMessage()).isEqualTo(TestOutcomeStatus.PASSED));
-        assertThat(System.getProperty("basedir")).as("overrides never leak into the worker JVM")
-                .satisfiesAnyOf(b -> assertThat(b).isNull(), b -> assertThat(b).doesNotContain("cdist-"));
+        assertThat(System.getProperty("basedir")).as("restores the enclosing JVM's basedir")
+                .isEqualTo(outerBasedir);
         assertThat(System.getProperty("citrus.report.directory")).isNull();
         assertThat(System.getProperty("custom.dir")).isNull();
         assertThat(System.getProperty(WorkspaceLease.TICKET_PROPERTY)).isNull();

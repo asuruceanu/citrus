@@ -26,8 +26,8 @@ import org.aesh.command.invocation.CommandInvocation;
 import org.aesh.command.option.ParentCommand;
 import org.citrusframework.jbang.cli.CitrusJBangMain;
 
-@CommandDefinition(name = "dist", description = "Manage Citrus Test Distribution broker, workers, and sessions", generateHelp = true,
-        groupCommands = {DistBroker.class, DistWorker.class, DistSessions.class, DistStatus.class})
+@CommandDefinition(name = "dist", description = "Manage Citrus Test Distribution coordinator, workers, and sessions", generateHelp = true,
+        groupCommands = {DistCoordinator.class, DistWorker.class, DistSessions.class, DistStatus.class})
 public class Dist extends CitrusCommand implements GroupCommand<CommandInvocation> {
 
     @ParentCommand
@@ -58,7 +58,7 @@ public class Dist extends CitrusCommand implements GroupCommand<CommandInvocatio
     @Override
     public List<Command<CommandInvocation>> getCommands() {
         return List.of(
-                new DistBroker(getMain()),
+                new DistCoordinator(getMain()),
                 new DistWorker(getMain()),
                 new DistSessions(getMain()),
                 new DistStatus(getMain()));

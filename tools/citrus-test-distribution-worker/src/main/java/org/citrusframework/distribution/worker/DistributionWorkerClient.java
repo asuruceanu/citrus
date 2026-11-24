@@ -48,9 +48,9 @@ import org.slf4j.LoggerFactory;
 
 /**
  * Persistent WebSocket worker client that registers host capabilities with the Citrus Test
- * Distribution Broker, executes assigned partitions, and supports graceful SIGTERM draining.
+ * Distribution Coordinator, executes assigned partitions, and supports graceful SIGTERM draining.
  * <p>
- * The client owns the worker's exclusive {@link WorkerFileCache} and one {@link BrokerBlobClient}, shared by the
+ * The client owns the worker's exclusive {@link WorkerFileCache} and one {@link CoordinatorBlobClient}, shared by the
  * in-process and forked runners. {@link #start()} locks the cache directory before connecting (failing fast when
  * another worker holds it); {@link #close()} releases it after in-flight partitions have ended. Cache statistics are
  * attached to registration and heartbeats.
@@ -74,7 +74,7 @@ public final class DistributionWorkerClient implements AutoCloseable {
 
     // Opened by the first start(), released by close(); partitions only run while they are set.
     private volatile WorkerFileCache workerCache;
-    private volatile BrokerBlobClient blobClient;
+    private volatile CoordinatorBlobClient blobClient;
     private volatile IsolatedPartitionRunner inProcessRunner;
     private volatile ForkedPartitionRunner forkedRunner;
 
@@ -96,7 +96,7 @@ public final class DistributionWorkerClient implements AutoCloseable {
     }
 
     /**
-     * Locks the worker cache (on the first call), connects to the broker and starts heartbeats.
+     * Locks the worker cache (on the first call), connects to the coordinator and starts heartbeats.
      *
      * @throws IllegalStateException if the cache directory cannot be locked, for example because another worker uses
      *                               it, or if this client is closed
@@ -130,7 +130,7 @@ public final class DistributionWorkerClient implements AutoCloseable {
         WorkerFileCache cache = WorkerFileCache.open(config.cacheDir(), config.cacheCleanup(),
                 config.cacheFreeSpaceBufferBytes());
         try {
-            BrokerBlobClient blobs = new BrokerBlobClient(config, cache);
+            CoordinatorBlobClient blobs = new CoordinatorBlobClient(config, cache);
             inProcessRunner = new IsolatedPartitionRunner(config, cache, blobs);
             forkedRunner = new ForkedPartitionRunner(config, cache, blobs);
             blobClient = blobs;
@@ -147,7 +147,7 @@ public final class DistributionWorkerClient implements AutoCloseable {
     }
 
     /** The shared blob client, or {@code null} before the first {@link #start()}. */
-    BrokerBlobClient blobClient() {
+    CoordinatorBlobClient blobClient() {
         return blobClient;
     }
 
@@ -161,7 +161,7 @@ public final class DistributionWorkerClient implements AutoCloseable {
     }
 
     /**
-     * Gracefully drains this worker: notifies the broker to stop assigning new partitions and
+     * Gracefully drains this worker: notifies the coordinator to stop assigning new partitions and
      * waits for any in-flight partition execution to finish.
      */
     public void drain(long timeout, TimeUnit unit) {
@@ -198,7 +198,7 @@ public final class DistributionWorkerClient implements AutoCloseable {
         }
         try {
             assignments.cancel(null, 0);
-            BrokerBlobClient blobs = blobClient;
+            CoordinatorBlobClient blobs = blobClient;
             if (blobs != null) {
                 blobs.close();
             }
@@ -242,7 +242,7 @@ public final class DistributionWorkerClient implements AutoCloseable {
      * eviction, which must not block other users of the monitor such as {@link #sendMessageSafe}.
      */
     private void closeResources() {
-        BrokerBlobClient blobs;
+        CoordinatorBlobClient blobs;
         WorkerFileCache cache;
         synchronized (this) {
             blobs = blobClient;
@@ -294,7 +294,7 @@ public final class DistributionWorkerClient implements AutoCloseable {
     }
 
     private URI buildWsUri() {
-        String base = config.brokerUrl();
+        String base = config.coordinatorUrl();
         String wsBase;
         if (base.startsWith("https://")) {
             wsBase = "wss://" + base.substring("https://".length());
