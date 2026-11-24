@@ -605,8 +605,8 @@ public class BlobCacheDirectory {
 
     /**
      * Places {@code ref} on the classpath from a blob the caller has already verified, without hashing it again: a
-     * {@link ArtifactKind#JAR} becomes its named jar, a {@link ArtifactKind#DIRECTORY_ZIP} is extracted into
-     * {@code <workspaceDir>/extracted/<sha256>/}.
+     * {@link ArtifactKind#JAR} becomes its named jar. A {@link ArtifactKind#DIRECTORY_ZIP} is extracted under
+     * {@code <workspaceDir>/extracted/} using its digest and, for Maven reactor outputs, its module name.
      *
      * @param verifiedBlob this cache's blob path for {@code ref}, verified by the caller
      * @throws IllegalArgumentException if {@code verifiedBlob} is not this cache's blob path for {@code ref}
