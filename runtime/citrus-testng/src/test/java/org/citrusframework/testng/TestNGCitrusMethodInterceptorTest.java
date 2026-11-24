@@ -30,26 +30,32 @@ import org.junit.platform.launcher.listeners.SummaryGeneratingListener;
 import org.testng.annotations.Test;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.junit.platform.engine.discovery.DiscoverySelectors.selectClass;
+import static org.junit.platform.engine.discovery.DiscoverySelectors.selectMethod;
 
 public class TestNGCitrusMethodInterceptorTest {
 
     @Test
     public void reportsEachPlainSourceOnce() {
-        assertInvocations(PlainSourceFixture.class, PlainSourceFixture.SOURCES, "EchoTest", "SecondEchoTest");
+        assertInvocations(PlainSourceFixture.class, "runSources", PlainSourceFixture.SOURCES, "EchoTest", "SecondEchoTest");
     }
 
     @Test
     public void reportsEachSpringSourceOnce() {
-        assertInvocations(SpringSourceFixture.class, SpringSourceFixture.SOURCES, "EchoActionIT", "FailActionIT");
+        assertInvocations(SpringSourceFixture.class, "runSources", SpringSourceFixture.SOURCES, "EchoActionIT", "FailActionIT");
     }
 
-    private static void assertInvocations(Class<?> fixture, List<String> sources, String... expected) {
+    @Test
+    public void retainsExplicitInvocationsPerSource() {
+        assertInvocations(PlainSourceFixture.class, "repeatSources", PlainSourceFixture.SOURCES,
+                "EchoTest", "SecondEchoTest", "EchoTest", "SecondEchoTest");
+    }
+
+    private static void assertInvocations(Class<?> fixture, String method, List<String> sources, String... expected) {
         sources.clear();
         var summaryListener = new SummaryGeneratingListener();
         List<String> invocationIds = new ArrayList<>();
         LauncherFactory.create().execute(LauncherDiscoveryRequestBuilder.request()
-                .selectors(selectClass(fixture))
+                .selectors(selectMethod(fixture, method))
                 .build(), summaryListener, new TestExecutionListener() {
                     @Override
                     public void dynamicTestRegistered(TestIdentifier test) {

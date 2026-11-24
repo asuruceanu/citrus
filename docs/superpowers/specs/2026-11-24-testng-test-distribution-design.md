@@ -11,7 +11,7 @@
 ## Goals, Non-Goals, and Anti-Goals
 
 - **Goals:**
-  - Execute `runtime/citrus-testng` unit (`*Test`), integration (`*IT`), acceptance (`*AT`), and expected-failure (`ShouldFailGroup`) tests on `surefire-junit-platform` via `org.junit.support:testng-engine:1.1.0`, both locally and on Citrus Test Distribution workers (`AUTO` and `ALWAYS` fork modes). Check the actual shared-JVM and forked paths and verify distinct test membership for each Maven execution, including the expected-failure group.
+  - Execute `runtime/citrus-testng` unit (`*Test`), integration (`*IT`), acceptance (`*AT`), and expected-failure (`ShouldFailGroup`) tests on `surefire-junit-platform` via `org.junit.support:testng-engine:1.1.0`, both locally and on Citrus Test Distribution workers (`AUTO` and `ALWAYS` fork modes). Check the actual shared-JVM and forked paths and verify distinct test membership for each Maven execution, including the expected-failure group. Disable the live run’s cold-unit threshold so the single-test acceptance execution runs remotely.
   - Ensure `IsolatedPartitionRunner.PartitionClassLoader` loads `org.junit.support.*` child-first from the partition classpath alongside `org.testng.*`.
   - Ensure `DiscoveredWorkExtractor.partiallySelectedClasses` counts discovery-time empty `MethodSource` containers (such as TestNG `@DataProvider` / `invocationCount` methods and Jupiter `@ParameterizedTest` methods) so group-filtered or `-Dtest`-filtered classes split into method work units accurately.
   - Document how TestNG modules run on Citrus Test Distribution in `src/manual/tools-test-distribution.adoc`.
@@ -43,7 +43,7 @@
   - In `IsolatedPartitionRunner.PartitionClassLoader`, narrow shared JUnit prefixes from `org.junit.` / `org/junit/` to `org.junit.platform.` / `org/junit/platform/` and `org.junit.jupiter.` / `org/junit/jupiter/` (retaining `META-INF/services/org.junit.`), so `org.junit.support.testng.engine.*` always loads from the partition classloader alongside `org.testng.*`.
 - **Work Extraction (`tools/citrus-test-distribution`):**
   - In `DiscoveredWorkExtractor.countTests`, count discovery-time leaf `MethodSource` containers (`plan.getChildren(node).isEmpty()`) alongside `node.isTest()`, ensuring `partiallySelectedClasses` detects pruned classes that contain data-driven or parameterized test methods.
-- **Multi-source Citrus tests:** Set the TestNG invocation count to the resolved source count for multi-source methods when it exceeds the existing count, and return the original method instance once. The bridge uses invocation count to classify the method as a container. Citrus selects the source using the current invocation index.
+- **Multi-source Citrus tests:** For multi-source methods, multiply the existing TestNG invocation count by the resolved source count and return the original method instance once. This preserves explicit repeats per source. The bridge uses invocation count to classify the method as a container. Citrus selects the source using the current invocation index.
 - **Documentation (`src/manual/tools-test-distribution.adoc`):**
   - Add a brief note explaining how TestNG suites run on Citrus Test Distribution using `surefire-junit-platform` and `org.junit.support:testng-engine`.
 
@@ -51,4 +51,4 @@
 
 - Reproduce the provider change with the actual `CitrusXmlAnnotationIT` fixture and test that each resolved source executes exactly once under both Citrus TestNG support classes with the default invocation count.
 - Unit and integration tests in `citrus-test-distribution-worker`, `citrus-test-distribution`, and `citrus-testng` covering `PartitionClassLoader` isolation for `org.junit.support.*`, `DiscoveredWorkExtractor` partial-class splitting with container `MethodSource` descriptors, multi-source `@CitrusTestSource` execution under `testng-engine`, and distributed TestNG execution (including groups and `@DataProvider`).
-- End-to-end verification of `./mvnw verify -pl runtime/citrus-testng` both locally (distribution disabled) and distributed against a coordinator and worker (`AUTO` and `ALWAYS` fork modes). Check the actual shared-JVM and forked paths and verify distinct test membership for each Maven execution, including the expected-failure group.
+- End-to-end verification of `./mvnw verify -pl runtime/citrus-testng` both locally (distribution disabled) and distributed against a coordinator and worker (`AUTO` and `ALWAYS` fork modes). Check the actual shared-JVM and forked paths and verify distinct test membership for each Maven execution, including the expected-failure group. Disable the live run’s cold-unit threshold so the single-test acceptance execution runs remotely.

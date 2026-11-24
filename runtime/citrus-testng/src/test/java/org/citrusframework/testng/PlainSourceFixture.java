@@ -25,6 +25,8 @@ import org.citrusframework.api.common.TestLoader;
 import org.testng.annotations.Test;
 
 public class PlainSourceFixture extends TestNGCitrusSupport {
+    private static final String FIRST = "classpath:org/citrusframework/testng/main/echo.citrus.it.yaml";
+    private static final String SECOND = "classpath:org/citrusframework/testng/main/second-echo.citrus.it.yaml";
     static final List<String> SOURCES = new ArrayList<>();
 
     @Override
@@ -33,10 +35,12 @@ public class PlainSourceFixture extends TestNGCitrusSupport {
     }
 
     @Test
-    @CitrusTestSource(type = TestLoader.YAML, sources = {
-            "classpath:org/citrusframework/testng/main/echo.citrus.it.yaml",
-            "classpath:org/citrusframework/testng/main/second-echo.citrus.it.yaml"
-    })
+    @CitrusTestSource(type = TestLoader.YAML, sources = {FIRST, SECOND})
     public void runSources() {
+    }
+
+    @Test(invocationCount = 2)
+    @CitrusTestSource(type = TestLoader.YAML, sources = {FIRST, SECOND})
+    public void repeatSources() {
     }
 }

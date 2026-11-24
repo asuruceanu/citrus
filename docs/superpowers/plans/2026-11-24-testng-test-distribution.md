@@ -24,7 +24,7 @@
 1. **Worker parent classloader also contains `org.junit.support.*` classes/resources (e.g. in-JVM `ForkMode.AUTO` tests)** — `PartitionClassLoader` must still load `org.junit.support.*` child-first from the partition classpath alongside `org.testng.*`, while continuing to share `org.junit.platform.*`, `org.junit.jupiter.*`, and `META-INF/services/org.junit.*` with the worker. *(Pinned in Task 1)*
 2. **Tag/group-filtered class whose excluded method is a discovery-time empty `MethodSource` container (`@DataProvider`, `invocationCount > 1`, `@TestTemplate`, `@ParameterizedTest`)** — `DiscoveredWorkExtractor.partiallySelectedClasses` must detect the excluded container method and split the class into method-level `WorkUnitSpec`s instead of emitting a whole-class `WorkUnitSpec` that runs the excluded method on the worker. *(Pinned in Task 2)*
 3. **Multi-source `@CitrusTestSource` (`names`, `sources`, `packageScan`) in `TestNGCitrusSupport` / `TestNGCitrusSpringSupport` under `testng-engine`** — Citrus XML sources must execute exactly once with accurate JUnit reporting. TestNG multiplies duplicate method instances by invocation count, so use one scheduling mechanism. *(Pinned in Task 3)*
-4. **Distributed TestNG `@DataProvider` dynamic `[invocation:N]` events and mixed-group (`ShouldFailGroup`) classes on workers across `WorkerForkMode.AUTO` and `WorkerForkMode.ALWAYS`** — dynamic invocations must resolve to the parent `WorkUnitSpec` without triggering unmatched-unit errors and replay cleanly on the host, while group-excluded methods in mixed classes never run on the worker. *(Pinned in Task 4)*
+4. **Distributed TestNG `@DataProvider` dynamic `[invoc:N]` events and mixed-group (`ShouldFailGroup`) classes on workers across `WorkerForkMode.AUTO` and `WorkerForkMode.ALWAYS`** — dynamic invocations must resolve to the parent `WorkUnitSpec` without triggering unmatched-unit errors and replay cleanly on the host, while group-excluded methods in mixed classes never run on the worker. *(Pinned in Task 4)*
 5. **Published `citrus-testng` dependency tree and all four Maven test executions (`surefire:test`, `failsafe:default`, `failsafe:acceptance-tests`, `failsafe:failure-tests`)** — `citrus-testng` must keep `testng-engine` out of `compile`/`runtime` scope while passing all executions both locally and against a live coordinator + worker. *(Pinned in Tasks 3 & 4)*
 
 ---
@@ -145,7 +145,8 @@ git commit -m "fix(test-distribution): count container test methods when detecti
 - Modify: `runtime/citrus-testng/pom.xml:25-65`
 - Modify: `runtime/citrus-testng/src/main/java/org/citrusframework/testng/TestNGCitrusMethodInterceptor.java`
 - Modify: `runtime/citrus-testng/src/main/java/org/citrusframework/testng/spring/TestNGCitrusSpringMethodInterceptor.java`
-- Create: `runtime/citrus-testng/src/test/java/org/citrusframework/testng/TestNGCitrusMethodInterceptorTest.java`
+- Create: `runtime/citrus-testng/src/test/java/org/citrusframework/testng/TestNGCitrusMethodInterceptorTest.java`, `PlainSourceFixture.java`, and `SpringSourceFixture.java`
+- Create: `runtime/citrus-testng/src/test/resources/org/citrusframework/testng/main/second-echo.citrus.it.yaml`
 
 **Interfaces:**
 - Consumes: `org.junit.support:testng-engine:1.1.0` (`[engine:testng]`), `ITestNGMethod.setInvocationCount(int)`
@@ -164,11 +165,11 @@ git commit -m "fix(test-distribution): count container test methods when detecti
 
 - [ ] **Step 2: Record the baseline with the provider switched**
 
-Run the real XML integration fixture and the focused regression. Record the source executions and the JUnit result. A generic TestNG probe may succeed with duplicate entries, so validate against Citrus support.
+Run the real XML integration fixture and the focused regression. The provider-only baseline passed all seven cases in `CitrusXmlAnnotationIT`. The focused regression ran both sources but reported no distinct invocation IDs for either interceptor.
 
 - [ ] **Step 3: Schedule multi-source methods through TestNG invocation count**
 
-In both interceptors, retain a single `IMethodInstance` per input and use `setInvocationCount` to raise the count to the resolved source count when needed. Preserve a larger explicit invocation count. Verify each resolved source runs once for the default count and the launcher reports each invocation successfully.
+In both interceptors, retain a single `IMethodInstance` per input and use `setInvocationCount` to schedule the source count multiplied by the existing invocation count. Preserve an explicit invocation count per source, matching the previous TestNG scheduling behavior. Verify each source runs once with the default count and repeat counts produce distinct successful launcher results.
 
 - [ ] **Step 4: Run `runtime/citrus-testng` full `verify` lifecycle and check runtime dependency scope**
 
@@ -185,7 +186,7 @@ git add pom.xml \
         runtime/citrus-testng/pom.xml \
         runtime/citrus-testng/src/main/java/org/citrusframework/testng/TestNGCitrusMethodInterceptor.java \
         runtime/citrus-testng/src/main/java/org/citrusframework/testng/spring/TestNGCitrusSpringMethodInterceptor.java \
-        runtime/citrus-testng/src/test/java/org/citrusframework/testng/TestNGCitrusMethodInterceptorTest.java
+        runtime/citrus-testng/src/test
 git commit -m "feat(testng): run citrus-testng on JUnit Platform via testng-engine"
 ```
 
@@ -196,6 +197,7 @@ git commit -m "feat(testng): run citrus-testng on JUnit Platform via testng-engi
 **Files:**
 - Modify: `tools/citrus-test-distribution/pom.xml`
 - Create: `tools/citrus-test-distribution/src/test/java/org/citrusframework/distribution/junit/TestNgDistributionTest.java`
+- Modify: `runtime/citrus-testng/src/test/java/org/citrusframework/acceptance/CitrusSpringConfigAT.java`
 - Modify: `src/manual/tools-test-distribution.adoc:28-64,705-742`
 
 **Interfaces:**
@@ -223,8 +225,8 @@ Update `src/manual/tools-test-distribution.adoc` (under **Quickstart with Maven*
 1. Install the modified modules into the local repository without skipping compilation:
    `./mvnw install -DskipTests -pl runtime/citrus-testng,tools/citrus-test-distribution-protocol,tools/citrus-test-distribution-coordinator,tools/citrus-test-distribution-worker,tools/citrus-test-distribution,tools/maven/citrus-test-distribution-maven-extension -am`
 2. Register the installed extension in the worktree’s Maven extension configuration for the verification run. Start the local coordinator and worker once per worker mode and run:
-   `./mvnw verify -pl runtime/citrus-testng -Dcitrus.test.distribution.enabled=true -Dcitrus.test.distribution.coordinatorUrl=... -Dcitrus.test.distribution.fallbackLocal=false -Dcitrus.test.distribution.minRemoteDurationMs=0 -Dcitrus.test.distribution.minRemoteColdUnits=1`
-   Expected: `BUILD SUCCESS`, all 4 executions (`surefire:test`, `failsafe:integration-test`, `failsafe:acceptance-tests`, `failsafe:failure-tests`) pass with remote worker partition assignments and zero failures. Inspect each execution’s reports and coordinator results to show that it ran tests remotely. Verify a known `ShouldFailGroup` test passes in the failure execution and is absent from the default integration execution.
+   `./mvnw verify -pl runtime/citrus-testng -Dcitrus.test.distribution.enabled=true -Dcitrus.test.distribution.coordinatorUrl=... -Dcitrus.test.distribution.fallbackLocal=false -Dcitrus.test.distribution.minRemoteDurationMs=0 -Dcitrus.test.distribution.minRemoteColdUnits=0`
+   Expected: `BUILD SUCCESS`, all 4 executions (`surefire:test`, `failsafe:integration-test`, `failsafe:acceptance-tests`, `failsafe:failure-tests`) pass with remote worker partition assignments and zero failures. Inspect each execution’s reports and coordinator results to show that it ran tests remotely. Verify a known `ShouldFailGroup` test passes in the failure execution and is absent from the default integration execution. Disable both size and duration thresholds so the single-test acceptance execution reaches a worker. Keep the Spring acceptance assertion scoped to its configured action listeners by excluding the runtime endpoint collector.
 
 - [ ] **Step 5: Commit**
 

@@ -25,7 +25,7 @@ import org.testng.ITestContext;
 import java.util.List;
 
 /**
- * Schedules one invocation per resolved source for Citrus annotated TestNG methods.
+ * Applies the configured TestNG invocation count to each resolved Citrus test source.
  *
  * @since 1.3.1
  */
@@ -40,8 +40,9 @@ public class TestNGCitrusMethodInterceptor implements IMethodInterceptor {
                 CitrusTestSource annotation = testMethod.getAnnotation(CitrusTestSource.class);
                 if (annotation != null) {
                     int sources = TestSourceResolver.resolve(annotation, testMethod).size();
-                    if (sources > testngMethod.getInvocationCount()) {
-                        testngMethod.setInvocationCount(sources);
+                    if (sources > 1) {
+                        // TestNG repeats each source according to the configured invocation count.
+                        testngMethod.setInvocationCount(Math.multiplyExact(sources, testngMethod.getInvocationCount()));
                     }
                 }
             }
