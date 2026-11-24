@@ -76,7 +76,7 @@ TIP: Projects that do not use the Maven extension can add `org.citrusframework:c
 |auto-detected
 
 |`citrus.test.distribution.fallbackLocal` / `CITRUS_DIST_FALLBACK_LOCAL`
-|When `true`, falls back to local execution if the coordinator is unreachable (unless `@RemoteOnly` tests are present) and re-runs permanently `LOST` partitions locally.
+|When `true`, allows local execution if the coordinator is unreachable or partitions are permanently `LOST`. A selection containing `@RemoteOnly` tests requires workers.
 |`true`
 
 |`citrus.test.distribution.maxPartitionSize` / `CITRUS_DIST_MAX_PARTITION_SIZE`
@@ -447,28 +447,27 @@ embedded JUnit launch to a separate executor, set the per-request configuration 
 to the Citrus Jupiter engine, use normal placement rules.
 
 
-For the Citrus JBang CLI `RunTest`, resolve the runtime dependencies of `citrus-groovy`, `citrus-cucumber` and
-`citrus-cucumber-core` on the build host and supply their classpath through `additionalWorkerClasspath`.
+=== Citrus suites that require workers
 
-For the JBang connector, use the method selectors for `JBangTestEngineTest` and run workers with Java and JBang.
+With distribution enabled, the Citrus JBang CLI `RunTest`, the four external-process methods in
+`JBangTestEngineTest`, and the Quarkus `DemoApplicationTest` require workers through `@RemoteOnly`.
+Normal Maven builds with distribution disabled can run these tests locally.
+
+The JBang CLI test classpath includes its Groovy and Cucumber modules. Reactor builds require workers that preserve
+module names in classpath directory entries. The connector workers need Java and JBang.
 Set `CITRUS_JBANG_EXECUTABLE` on a worker to select a provisioned executable. Workers need access to the JBang app
 catalog and its dependencies or an already populated cache. Distribution serializes partitions containing Jupiter
-`@Isolated` classes or their nested tests that share the same JVM user home, including local distribution fallback. Use current launchers
-and workers so both observe the same lock.
+`@Isolated` classes or their nested tests that share the same JVM user home, including local distribution fallback.
 
-For the Maven Quarkus integration test, use upgraded workers advertising `citrus.workspace.quarkus.v1=true`.
-The distribution launcher transfers the Maven-generated `quarkus/bootstrap` directory and model dependencies
-and remaps model paths in the forked worker workspace. The Citrus Quarkus test module also requires clearing
-its module-wide skip setting.
+The Quarkus test requires workers advertising `citrus.workspace.quarkus.v1=true`. The distribution launcher transfers
+the Maven-generated `quarkus/bootstrap` directory and model dependencies and remaps model paths in the forked worker
+workspace.
 
 [source,bash]
 ----
 ./mvnw test -pl runtime/citrus-quarkus/citrus-quarkus-it -Dtest=DemoApplicationTest \
-  -Dcitrus.test.distribution.enabled=true -Dcitrus.test.distribution.skip=false \
-  -Dcitrus.test.distribution.fallbackLocal=false \
-  -Dcitrus.test.distribution.remoteLocalOnlyClasses=org.citrusframework.quarkus.app.DemoApplicationTest
+  -Dcitrus.test.distribution.enabled=true
 ----
-
 
 [[tools-test-distribution-external-resources]]
 == External Test Resources

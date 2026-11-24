@@ -121,9 +121,9 @@ public class TestDistributionLifecycleParticipant extends AbstractMavenLifecycle
                 throw new MavenExecutionException(
                         "Failed to open Citrus Test Distribution session on broker " + brokerUrl, e);
             }
-            LOG.warn("Citrus Test Distribution broker {} unreachable ({}); Surefire/Failsafe will run locally",
+            // Keep the interceptor active so the module launcher can enforce @RemoteOnly during fallback.
+            LOG.warn("Citrus Test Distribution broker {} unreachable ({}); module launchers will apply fallback policy",
                     brokerUrl, e.getMessage());
-            return;
         }
 
         List<Path> runtimeJars = resolveInterceptorClasspathJars();

@@ -22,7 +22,7 @@ import java.nio.file.Path;
 import java.util.Comparator;
 import java.util.List;
 
-import org.citrusframework.distribution.annotations.LocalOnly;
+import org.citrusframework.distribution.annotations.RemoteOnly;
 import org.citrusframework.jbang.cli.CitrusJBangMain;
 import org.citrusframework.spi.Resources;
 import org.junit.jupiter.api.Assertions;
@@ -30,7 +30,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.parallel.ResourceLock;
 
 @ResourceLock("citrus-jbang-run")
-@LocalOnly(reason = "Resolves Citrus modules through Maven unless they are on java.class.path by name, which is not the case on workers")
+@RemoteOnly(reason = "Verifies nested JUnit launches in a worker JVM")
 public class RunTest extends CommandTest {
 
     @Test

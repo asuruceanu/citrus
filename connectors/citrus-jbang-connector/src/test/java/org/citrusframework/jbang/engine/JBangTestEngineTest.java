@@ -23,7 +23,7 @@ import org.citrusframework.TestSource;
 import org.citrusframework.exceptions.CitrusRuntimeException;
 import org.citrusframework.api.main.TestEngine;
 import org.citrusframework.api.main.TestRunConfiguration;
-import org.citrusframework.distribution.annotations.LocalOnly;
+import org.citrusframework.distribution.annotations.RemoteOnly;
 import org.citrusframework.spi.Resources;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
@@ -33,14 +33,14 @@ import org.junit.jupiter.api.parallel.Isolated;
 public class JBangTestEngineTest {
 
     @Test
-    @LocalOnly(reason = "Starts a real JBang process that downloads Citrus and runs in the host working directory")
+    @RemoteOnly(reason = "Starts a real JBang process in a worker workspace")
     public void testRunFromWorkDirectory() {
         TestRunConfiguration configuration = new TestRunConfiguration();
         runTestEngine(configuration, Resources.fromClasspath("org/citrusframework/jbang/sample").file().toPath());
     }
 
     @Test
-    @LocalOnly(reason = "Starts a real JBang process that downloads Citrus and runs in the host working directory")
+    @RemoteOnly(reason = "Starts a real JBang process in a worker workspace")
     public void testRunDirectory() {
         TestRunConfiguration configuration = new TestRunConfiguration();
         configuration.setPackages(Collections.singletonList(Resources.fromClasspath("org/citrusframework/jbang/sample").file().getAbsolutePath()));
@@ -48,7 +48,7 @@ public class JBangTestEngineTest {
     }
 
     @Test
-    @LocalOnly(reason = "Starts a real JBang process that downloads Citrus and runs in the host working directory")
+    @RemoteOnly(reason = "Starts a real JBang process in a worker workspace")
     public void testRunSource() {
         TestRunConfiguration configuration = new TestRunConfiguration();
         configuration.setTestSources(Collections.singletonList(new TestSource("yaml", "hello",
@@ -58,7 +58,7 @@ public class JBangTestEngineTest {
     }
 
     @Test
-    @LocalOnly(reason = "Starts a real JBang process that downloads Citrus and runs in the host working directory")
+    @RemoteOnly(reason = "Starts a real JBang process in a worker workspace")
     public void testRunNoMatch() {
         TestRunConfiguration configuration = new TestRunConfiguration();
         configuration.setPackages(Collections.singletonList("some.foo.directory"));

@@ -155,6 +155,24 @@
     </dependency>
 
     <dependency>
+      <groupId>org.citrusframework</groupId>
+      <artifactId>citrus-groovy</artifactId>
+      <version>${project.version}</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.citrusframework</groupId>
+      <artifactId>citrus-cucumber</artifactId>
+      <version>${project.version}</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.citrusframework</groupId>
+      <artifactId>citrus-cucumber-core</artifactId>
+      <version>${project.version}</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
       <groupId>org.junit.platform</groupId>
       <artifactId>junit-platform-launcher</artifactId>
       <scope>test</scope>
