@@ -393,7 +393,7 @@ Every worker automatically advertises host capabilities (`os`, `arch`, `jdk`, `c
 [[tools-test-distribution-annotations]]
 == Placement Annotations
 
-* `@LocalOnly` — Pins a test class or method to the local build host JVM (executed locally and reported to the coordinator under `partitionId="local"`).
+* `@LocalOnly` — Pins a test class or method to the build host JVM by default. Local executions are reported under `partitionId="local"`.
 * `@RemoteOnly` — Requires execution on a remote worker and fails fast when the coordinator is unreachable regardless of `fallbackLocal`.
 * `@AgentRequirement(key = "docker", value = "true")` — Repeatable capability filter matched against registered worker capabilities. Supports exact string matching (`os=linux`, `docker=true`) and numeric threshold expressions (`memoryMb>=4096`, `cpuCores>=4`, `jdk>=21`).
 
@@ -415,12 +415,54 @@ class KafkaTestcontainersIT implements TestActionSupport {
     @Test
     @LocalOnly
     void shouldInspectDeveloperLocalKeystore() {
-        // Always executed on the local build machine
+        // Runs on the local build machine by default
     }
 }
 ----
 
 Declarative XML and YAML tests produced via `@CitrusTestFactory` are also split into individual distributable work units so large declarative test suites scale across workers automatically.
+
+=== Opting local tests into worker execution
+
+Use these JVM properties on a distribution-enabled Maven invocation. Scope each invocation to the intended module
+with `-pl` so supplemental classpath entries apply only where needed.
+
+* `citrus.test.distribution.remoteLocalOnlyClasses` takes comma-separated fully qualified class names.
+  It clears the class-level pin for each selected class.
+* `citrus.test.distribution.remoteLocalOnlyMethods` takes comma-separated selectors such as
+  `com.example.ExampleTest#shouldRun`. For methods with parameters, use the signature, for example
+  `com.example.ExampleTest#run(java.lang.String,int)`. A class or enclosing class can still pin the method locally.
+* `citrus.test.distribution.additionalWorkerClasspath` takes existing host directories and JARs separated by the
+  host's Java classpath separator (`:` on Unix and `;` on Windows). Distribution transfers the entries, appends them
+  to the worker classpath and forks the partition JVM. It does not change the Maven host classpath.
+
+An opt-in makes a test eligible for distribution. Normal placement rules, including warm local bypass and local
+fallback, still apply. For a worker-only verification, disable local fallback and set both local bypass thresholds
+(`minRemoteDurationMs` and `minRemoteColdUnits`) to zero. A test with an effective `@RemoteOnly` requirement is
+ineligible for local execution.
+
+For the Citrus JBang CLI `RunTest`, resolve the runtime dependencies of `citrus-groovy`, `citrus-cucumber` and
+`citrus-cucumber-core` on the build host and supply their classpath through `additionalWorkerClasspath`.
+
+For the JBang connector, use the method selectors for `JBangTestEngineTest` and run workers with Java and JBang.
+Set `CITRUS_JBANG_EXECUTABLE` on a worker to select a provisioned executable. Workers need access to the JBang app
+catalog and its dependencies or an already populated cache. Distribution serializes partitions containing Jupiter
+`@Isolated` classes that share the same JVM user home, including local distribution fallback. Use current launchers
+and workers so both observe the same lock.
+
+For the Maven Quarkus integration test, use upgraded workers advertising `citrus.workspace.quarkus.v1=true`.
+The distribution launcher transfers the Maven-generated `quarkus/bootstrap` directory and model dependencies
+and remaps model paths in the forked worker workspace. The Citrus Quarkus test module also requires clearing
+its module-wide skip setting.
+
+[source,bash]
+----
+./mvnw test -pl runtime/citrus-quarkus/citrus-quarkus-it -Dtest=DemoApplicationTest \
+  -Dcitrus.test.distribution.enabled=true -Dcitrus.test.distribution.skip=false \
+  -Dcitrus.test.distribution.fallbackLocal=false \
+  -Dcitrus.test.distribution.remoteLocalOnlyClasses=org.citrusframework.quarkus.app.DemoApplicationTest
+----
+
 
 [[tools-test-distribution-external-resources]]
 == External Test Resources
@@ -457,8 +499,8 @@ partition and workspace (for tests that depend on files written by other test cl
 different values for the same capability are rejected.
 |`LPT`
 |`citrus.test.distribution.skip`
-|`true` keeps the module's tests local, exactly as without Test Distribution, for suites that cannot run on a worker
-(for example `@QuarkusTest`, which bootstraps from the Maven project layout). Taken from the command line, then the
+|`true` keeps the module's tests local, exactly as without Test Distribution. Set it to `false` on the command
+line to override a module's skip setting for an opt-in run. The value is taken from the command line, then the
 module's `<properties>`, then the environment variable `CITRUS_DIST_SKIP`.
 |`false`
 |===

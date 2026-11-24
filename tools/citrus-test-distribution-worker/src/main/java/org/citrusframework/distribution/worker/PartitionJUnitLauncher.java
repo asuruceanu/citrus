@@ -32,6 +32,7 @@ import org.citrusframework.distribution.config.CitrusEndpointCollector;
 import org.citrusframework.distribution.model.TestOutcomeStatus;
 import org.citrusframework.distribution.model.WorkUnitSpec;
 import org.citrusframework.distribution.model.WorkerTestEventPayload;
+import org.citrusframework.distribution.workspace.IsolatedTestLock;
 import org.junit.platform.engine.CancellationToken;
 import org.junit.platform.engine.DiscoverySelector;
 import org.junit.platform.engine.TestExecutionResult;
@@ -86,7 +87,8 @@ public final class PartitionJUnitLauncher {
         Thread thread = Thread.currentThread();
         ClassLoader previous = thread.getContextClassLoader();
         thread.setContextClassLoader(testClassLoader);
-        try (CitrusEndpointCollector endpointCollector = CitrusEndpointCollector.install(testClassLoader)) {
+        try (IsolatedTestLock isolation = IsolatedTestLock.acquire(workUnits, testClassLoader);
+             CitrusEndpointCollector endpointCollector = CitrusEndpointCollector.install(testClassLoader)) {
             resetCitrusExtensionIfPresent(testClassLoader);
             List<WorkUnitSpec> regular = new ArrayList<>();
             List<WorkUnitSpec> dynamic = new ArrayList<>();

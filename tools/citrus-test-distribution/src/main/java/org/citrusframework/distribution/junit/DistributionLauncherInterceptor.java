@@ -16,6 +16,8 @@
 
 package org.citrusframework.distribution.junit;
 
+import java.util.concurrent.atomic.AtomicInteger;
+
 import org.citrusframework.distribution.config.DistributionSettings;
 import org.junit.platform.launcher.Launcher;
 import org.junit.platform.launcher.LauncherInterceptor;
@@ -26,7 +28,7 @@ import org.junit.platform.launcher.LauncherInterceptor;
  */
 public class DistributionLauncherInterceptor implements LauncherInterceptor {
 
-    private static final InheritableThreadLocal<LocalExecution> LOCAL_EXECUTION = new InheritableThreadLocal<>();
+    private static final AtomicInteger LOCAL_EXECUTIONS = new AtomicInteger();
 
     @Override
     @SuppressWarnings("unchecked")
@@ -43,29 +45,17 @@ public class DistributionLauncherInterceptor implements LauncherInterceptor {
     }
 
     static boolean isExecutingLocally() {
-        LocalExecution execution = LOCAL_EXECUTION.get();
-        return execution != null && execution.active;
+        return LOCAL_EXECUTIONS.get() > 0;
     }
 
     static void runLocally(Runnable run) {
-        if (isExecutingLocally()) {
-            run.run();
-            return;
-        }
-
-        // JUnit can create executor threads for a local plan. They inherit the guard for that plan's lifetime.
-        LocalExecution execution = new LocalExecution();
-        LOCAL_EXECUTION.set(execution);
+        // Nested launchers can be created on existing executor threads in the same test JVM.
+        LOCAL_EXECUTIONS.incrementAndGet();
         try {
             run.run();
         } finally {
-            execution.active = false;
-            LOCAL_EXECUTION.remove();
+            LOCAL_EXECUTIONS.decrementAndGet();
         }
-    }
-
-    private static final class LocalExecution {
-        private volatile boolean active = true;
     }
 
     @Override
