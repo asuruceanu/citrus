@@ -16,13 +16,12 @@ import java.util.stream.Stream;
 import jakarta.validation.constraints.NotNull;
 import org.apache.maven.plugin.MojoExecutionException;
 import org.apache.maven.plugin.MojoFailureException;
-import org.apache.maven.plugin.testing.AbstractMojoTestCase;
 import org.apache.maven.project.MavenProject;
-import org.assertj.core.api.Assertions;
 import org.citrusframework.exceptions.CitrusRuntimeException;
 import org.citrusframework.exceptions.TestCaseFailedException;
 import org.citrusframework.maven.plugin.TestApiGeneratorMojo.ApiConfig;
 import org.citrusframework.maven.plugin.stubs.CitrusOpenApiGeneratorMavenProjectStub;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
@@ -39,6 +38,7 @@ import static java.util.Collections.emptyMap;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.fail;
 import static org.citrusframework.maven.plugin.TestApiGeneratorMojo.CITRUS_TEST_SCHEMA;
 import static org.citrusframework.maven.plugin.TestApiGeneratorMojo.replaceDynamicVars;
 import static org.citrusframework.maven.plugin.TestApiGeneratorMojo.replaceDynamicVarsToLowerCase;
@@ -48,7 +48,9 @@ import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.verify;
 import static org.springframework.test.util.ReflectionTestUtils.getField;
 
-public class TestApiGeneratorMojoIntegrationTest extends AbstractMojoTestCase {
+public class TestApiGeneratorMojoIntegrationTest {
+
+    private final MojoHarness harness = new MojoHarness();
 
     public static final String OTHER_META_FILE_CONTENT = "somenamespace=somevalue";
 
@@ -131,9 +133,13 @@ public class TestApiGeneratorMojoIntegrationTest extends AbstractMojoTestCase {
     }
 
     @BeforeEach
-    @SuppressWarnings("JUnitMixedFramework")
     void beforeEachSetup() throws Exception {
-        setUp();
+        harness.start();
+    }
+
+    @AfterEach
+    void afterEachCleanup() {
+        harness.stop();
     }
 
     @SuppressWarnings("unchecked")
@@ -145,7 +151,7 @@ public class TestApiGeneratorMojoIntegrationTest extends AbstractMojoTestCase {
         try {
             fixture = fixtureFromPom(configName);
         } catch (MojoExecutionException | MojoFailureException e) {
-            Assertions.fail("Test setup failed!", e);
+            fail("Test setup failed!", e);
         }
 
         @SuppressWarnings("unchecked")
@@ -206,7 +212,7 @@ public class TestApiGeneratorMojoIntegrationTest extends AbstractMojoTestCase {
                 File file = new File(filePath);
                 if (!file.getParentFile().exists() && !new File(filePath).getParentFile()
                     .mkdirs()) {
-                    Assertions.fail("Unable to prepare test data.");
+                    fail("Unable to prepare test data.");
                 }
 
                 try (FileWriter fileWriter = new FileWriter(filePath)) {
@@ -403,17 +409,17 @@ public class TestApiGeneratorMojoIntegrationTest extends AbstractMojoTestCase {
     private TestApiGeneratorMojo fixtureFromPom(String configName) throws Exception {
         String goal = "create-test-api";
 
-        File pomFile = new File(getBasedir(),
+        File pomFile = new File(harness.baseDir(),
             String.format("src/test/resources/%s/%s", getClass().getSimpleName(),
                 configName + ".xml"));
         assertThat(pomFile).exists();
 
         MavenProject mavenProject = new CitrusOpenApiGeneratorMavenProjectStub(configName);
 
-        TestApiGeneratorMojo testApiGeneratorMojo = (TestApiGeneratorMojo) lookupMojo(goal,
+        TestApiGeneratorMojo testApiGeneratorMojo = (TestApiGeneratorMojo) harness.mojo(goal,
             pomFile);
         testApiGeneratorMojo.setMavenProject(mavenProject);
-        testApiGeneratorMojo.setMojoExecution(newMojoExecution(goal));
+        testApiGeneratorMojo.setMojoExecution(harness.execution(goal));
 
         return spy(testApiGeneratorMojo);
     }

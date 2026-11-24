@@ -82,6 +82,34 @@ receive("someEndpoint")
 </receive>
 ----
 
+[[plaintext-validation-binary-payloads]]
+=== Binary payloads
+
+By default plaintext validation applies Citrus type conversion to the received payload. Binary payloads such as
+`byte[]` or `InputStream` may therefore not match the expected text.
+
+Enable automatic binary payload conversion to decode `byte[]` and `InputStream` values with the configured
+file encoding before comparison. The setting is disabled by default.
+
+.Binary payload auto-conversion settings
+[source,properties]
+----
+citrus.plaintext.validation.content.auto.conversion=true
+CITRUS_PLAINTEXT_VALIDATION_CONTENT_AUTO_CONVERSION=true
+----
+
+You can also enable it directly on the validator bean:
+
+.Java
+[source,java,indent=0,role="primary"]
+----
+PlainTextMessageValidator validator = new PlainTextMessageValidator();
+validator.setAutoConvertContent(true);
+----
+
+When `citrus.message.cache.input.stream=false`, auto-conversion reads the original `InputStream` and later consumers
+cannot read it again. The default (`true`) caches the stream, so validation and later consumers each receive a fresh stream.
+
 [[plaintext-validation-whitespaces]]
 === Whitespace characters
 

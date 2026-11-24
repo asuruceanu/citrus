@@ -11,6 +11,7 @@ import java.util.Map;
 import java.util.UUID;
 
 import jakarta.servlet.http.Cookie;
+import org.citrusframework.Completable;
 import org.citrusframework.dsl.TestActionSupport;
 import org.citrusframework.TestActor;
 import org.citrusframework.TestCaseRunner;
@@ -62,11 +63,13 @@ import org.springframework.context.annotation.Bean;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.citrusframework.actions.PurgeEndpointAction.Builder.purgeEndpoints;
 import static org.citrusframework.http.actions.HttpActionBuilder.http;
 import static org.citrusframework.openapi.generator.util.MultipartConverter.multipartMessageToMap;
 import static org.citrusframework.util.FileUtils.copyToByteArray;
 import static org.citrusframework.util.FileUtils.readToString;
 import static org.citrusframework.util.SocketUtils.findAvailableTcpPort;
+import static org.citrusframework.util.TestUtils.waitForCompletion;
 import static org.springframework.http.HttpStatus.BAD_REQUEST;
 import static org.springframework.http.HttpStatus.NO_CONTENT;
 import static org.springframework.http.HttpStatus.OK;
@@ -3617,10 +3620,27 @@ class GeneratedRestApiIT {
     @Nested
     class NegativeTests {
 
+        /**
+         * Forked sends may outlive a failed test. Wait for them before the test ends so the next
+         * test's purge can drain their messages deterministically.
+         * Citrus {@code ParameterResolver} also resolves {@code @CitrusResource} on {@code @AfterEach},
+         * including {@code @CitrusTestSource} XML methods. For XML methods the runner holds an empty
+         * test case that is already done, so this is a no-op and the purge below remains the primary isolation.
+         */
+        @AfterEach
+        void awaitForkedRequests(@CitrusResource TestCaseRunner runner, @CitrusResource TestContext context) {
+            if (runner.getTestCase() instanceof Completable completable && !completable.isDone(context)) {
+                waitForCompletion(completable, context, 15000L);
+            }
+        }
+
         // One OK test to ensure correctness
         @Test
         void java_perform_request_with_all_required_parameter(
             @CitrusResource TestCaseRunner runner) {
+
+            runner.given(purgeEndpoints()
+                .endpoint("httpServer"));
 
             runner.variable("petId", "5678");
             runner.when(extPetApi.sendTagPet("${petId}", "tag1", "tag2")
@@ -3667,6 +3687,9 @@ class GeneratedRestApiIT {
         void java_perform_request_with_missing_all_required_parameters(
             @CitrusResource TestCaseRunner runner) {
 
+            runner.given(purgeEndpoints()
+                .endpoint("httpServer"));
+
             // Note that petId is a path parameter and is a must-have because it is part of th URI
             runner.when(extPetApi.sendTagPet("1234", null, null)
                 .autoFill(AutoFillType.NONE) // do not autofill as required parameters would be set
@@ -3689,14 +3712,18 @@ class GeneratedRestApiIT {
         void java_perform_request_with_missing_required_query_parameter(
             @CitrusResource TestCaseRunner runner) {
 
-            runner.when(extPetApi.sendTagPet("1234", null, null)
+            runner.given(purgeEndpoints()
+                .endpoint("httpServer"));
+
+            runner.when(extPetApi.sendTagPet("1234", null, "tag2")
                 .autoFill(AutoFillType.NONE) // do not autofill as required parameters would be set
                 .schemaValidation(false) // do not validate as this would fail
                 .fork(true));
             runner.then(http().server(httpServer)
                 .receive()
                 .put("/api/v3/ext/pet/tag/1234")
-                .message());
+                .message()
+                .header("headerTag", "tag2"));
 
             runner.then(http().server(httpServer)
                 .send()
@@ -3715,6 +3742,9 @@ class GeneratedRestApiIT {
         void java_perform_request_with_missing_required_header_parameter(
             @CitrusResource TestCaseRunner runner) {
 
+            runner.given(purgeEndpoints()
+                .endpoint("httpServer"));
+
             runner.when(extPetApi.sendTagPet("1234", "tag1", null)
                 .autoFill(AutoFillType.NONE) // do not autofill as required parameters would be set
                 .schemaValidation(false) // do not validate as this would fail
@@ -3722,7 +3752,8 @@ class GeneratedRestApiIT {
             runner.then(http().server(httpServer)
                 .receive()
                 .put("/api/v3/ext/pet/tag/1234")
-                .message());
+                .message()
+                .queryParam("queryTag", "tag1"));
 
             runner.then(http().server(httpServer)
                 .send()

@@ -17,6 +17,8 @@
 package org.citrusframework.dsl.schema.generator;
 
 import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -40,11 +42,14 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import tools.jackson.databind.JsonNode;
 
+import static org.citrusframework.dsl.schema.generator.TestFileSupport.deleteRecursively;
+
 public class CitrusSchemaGeneratorTest {
 
     private final JsonTextMessageValidator validator = new JsonTextMessageValidator();
     private static final String KNOWN_ACTION = "{\"echo\":{\"message\":\"Hello Citrus\"}}";
     private static final String UNKNOWN_ACTION = "{\"assert-log\":{\"message\":\"Unknown\"}}";
+    private static final Path CATALOG_DIR = Path.of("target/schema/citrus", CitrusVersion.version());
 
     /** Test cases that nest the action placeholder inside each kind of action container. */
     private static final List<String> NESTED_ACTION_CONTAINERS = List.of(
@@ -66,14 +71,36 @@ public class CitrusSchemaGeneratorTest {
     private SimpleJsonSchema testCaseSchema;
 
     @BeforeEach
-    public void setup() {
+    public void setup() throws IOException {
         context.setVariable("citrus.version", CitrusVersion.version());
         context.setVariable("camel.version", new DefaultCamelCatalog().getCatalogVersion());
 
-        CitrusSchemaGenerator.main(new String[]{"target/schema"});
+        deleteRecursively(Path.of("target/schema"));
+        CitrusSchemaGenerator.main(new String[]{"target/schema", CitrusVersion.version()});
 
-        testCaseSchema = new SimpleJsonSchema(Resources.create("target/schema/citrus/citrus-testcase.json"));
+        testCaseSchema = new SimpleJsonSchema(Resources.create(CATALOG_DIR.resolve("citrus-testcase.json").toString()));
         testCaseSchema.initialize();
+    }
+
+    @Test
+    public void verifyOnlyVersionedCatalogCopies() {
+        Assertions.assertFalse(Files.exists(Path.of("target/schema/citrus/index.json")),
+                "Unversioned catalog index must not be generated");
+        Assertions.assertFalse(Files.exists(Path.of("target/schema/citrus/citrus-testcase.json")),
+                "Unversioned catalog files must not be generated");
+        Assertions.assertTrue(Files.exists(CATALOG_DIR.resolve("citrus-testcase.json")));
+    }
+
+    @Test
+    public void verifyCatalogIndexEntriesExist() throws IOException {
+        JsonNode index = JsonSupport.json().readTree(
+                FileUtils.readToString(Resources.create("target/schema/index.json")));
+
+        for (JsonNode definition : index.path("definitions")) {
+            Path target = Path.of("target/schema").resolve(definition.path("fileName").asString());
+            Assertions.assertTrue(Files.exists(target),
+                    "Catalog index entry does not resolve: " + target);
+        }
     }
 
     @Test
@@ -129,7 +156,7 @@ public class CitrusSchemaGeneratorTest {
     @Test
     public void verifyDockerRequiredProperties() throws IOException {
         JsonNode catalog = JsonSupport.json().readTree(FileUtils.readToString(
-                Resources.create("target/schema/citrus/citrus-catalog-aggregate-test-actions.json")));
+                Resources.create(CATALOG_DIR.resolve("citrus-catalog-aggregate-test-actions.json").toString())));
 
         assertRequiredProperties(catalog, "docker:create", "image");
         assertRequiredProperties(catalog, "docker:inspect", "container");
@@ -230,6 +257,9 @@ public class CitrusSchemaGeneratorTest {
         assertValidTestCase("""
                 {"name":"PlaywrightLocatorAndSnapshotTest","actions":[{"playwright":{"click":{"element":{"role":"button","name":"Apply","within":{"ref":"e2"}}}}},{"playwright":{"extract":{"value":"aria-snapshot","ariaMode":"ai","boxes":true,"depth":2,"timeout":1500,"variable":"snap"}}}]}
                 """);
+        assertValidTestCase("""
+                {"name":"PlaywrightScreencastAndOptionsTest","actions":[{"playwright":{"screencast":{"command":"start","path":"target/run.webm","fps":24}}},{"playwright":{"screencast":{"command":"show-actions","cursor":"pointer","stylePoint":"color: red","styleHighlight":"border: 1px solid blue","styleTitle":"font-size: 18px"}}},{"playwright":{"credentials":{"command":"create","origin":"https://example.com","signCount":5}}},{"playwright":{"extract":{"value":"page-source","includeShadow":true,"variable":"pageHtml"}}},{"playwright":{"cookies":{"command":"clear","name":"sid","domain":"example.com","path":"/api"}}}]}
+                """);
 
         for (String container : NESTED_ACTION_CONTAINERS) {
             assertValidTestCase(container.formatted(KNOWN_ACTION));
@@ -238,7 +268,7 @@ public class CitrusSchemaGeneratorTest {
 
     @Test
     public void verifyNoGenericTestActionReferences() throws IOException {
-        String schema = FileUtils.readToString(Resources.create("target/schema/citrus/citrus-testcase.json"));
+        String schema = FileUtils.readToString(Resources.create(CATALOG_DIR.resolve("citrus-testcase.json").toString()));
         Assertions.assertFalse(schema.contains("TestActionBuilder_"),
                 "Test case schema must not reference the open generic TestActionBuilder definition");
     }
@@ -246,7 +276,7 @@ public class CitrusSchemaGeneratorTest {
     @Test
     public void verifyRuntimeYamlActionsInSchema() throws IOException {
         JsonNode schema = JsonSupport.json().readTree(FileUtils.readToString(
-                Resources.create("target/schema/citrus/citrus-testcase.json")));
+                Resources.create(CATALOG_DIR.resolve("citrus-testcase.json").toString())));
         JsonNode schemaActions = schema.path("definitions").path("TestActions").path("properties");
 
         List<String> missing = YamlTestActionBuilder.lookup().keySet().stream()
@@ -258,7 +288,7 @@ public class CitrusSchemaGeneratorTest {
     }
 
     private void verifyGeneratedFile(String fileName) throws IOException {
-        Message generated = new DefaultMessage(FileUtils.readToString(Resources.create("target/schema/citrus/" + fileName)));
+        Message generated = new DefaultMessage(FileUtils.readToString(Resources.create(CATALOG_DIR.resolve(fileName).toString())));
         Message control = new DefaultMessage(FileUtils.readToString(Resources.create("control/" + fileName)));
         validator.validateMessage(generated, control, context, new JsonMessageValidationContext());
     }
@@ -273,7 +303,7 @@ public class CitrusSchemaGeneratorTest {
 
     private void verifyCatalogDescriptions(String fileName) throws IOException {
         JsonNode catalog = JsonSupport.json().readTree(FileUtils.readToString(
-                Resources.create("target/schema/citrus/" + fileName)));
+                Resources.create(CATALOG_DIR.resolve(fileName).toString())));
         List<String> missing = new ArrayList<>();
 
         for (Map.Entry<String, JsonNode> entry : catalog.properties()) {
