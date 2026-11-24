@@ -149,8 +149,11 @@ public final class DiscoveredWorkExtractor {
 
     /** Number of tests below every class container under {@code node}, keyed by the container's unique id. */
     private static int countTests(TestPlan plan, TestIdentifier node, Map<String, Integer> counts) {
-        int tests = node.isTest() ? 1 : 0;
-        for (TestIdentifier child : plan.getChildren(node)) {
+        Set<TestIdentifier> children = plan.getChildren(node);
+        boolean testMethod = node.getSource().orElse(null) instanceof MethodSource;
+        // Template and data-driven methods can add their test invocations during execution.
+        int tests = node.isTest() || (testMethod && children.isEmpty()) ? 1 : 0;
+        for (TestIdentifier child : children) {
             tests += countTests(plan, child, counts);
         }
         if (node.isContainer() && node.getSource().orElse(null) instanceof ClassSource) {
