@@ -43,9 +43,9 @@ public class PlainSourceFixture extends TestNGCitrusSupport {
         assertThat(Thread.currentThread()).isSameAs(launcherThread);
     }
 
-    @Test(invocationCount = 2)
+    @Test(invocationCount = 2, invocationTimeOut = 10_000)
     @CitrusTestSource(type = TestLoader.YAML, sources = {FIRST, SECOND})
-    public void repeatSources() {
+    public void repeatTimedSources() {
     }
 
     @Test(invocationTimeOut = 10_000)

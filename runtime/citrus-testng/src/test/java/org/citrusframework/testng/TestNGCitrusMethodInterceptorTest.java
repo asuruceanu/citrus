@@ -50,8 +50,8 @@ public class TestNGCitrusMethodInterceptorTest {
     }
 
     @Test
-    public void retainsExplicitInvocationsPerSource() {
-        assertInvocations(PlainSourceFixture.class, "repeatSources", PlainSourceFixture.SOURCES,
+    public void retainsExplicitInvocationsPerTimedSource() {
+        assertInvocations(PlainSourceFixture.class, "repeatTimedSources", PlainSourceFixture.SOURCES,
                 "EchoTest", "SecondEchoTest", "EchoTest", "SecondEchoTest");
     }
 

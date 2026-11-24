@@ -177,7 +177,6 @@ public final class TestNGHelper {
                     timedMethod.setTimeOut(timedMethod.getInvocationTimeOut());
                 }
                 timedMethod.setInvocationTimeOut(0);
-                invocations = 1;
             }
             if (testngMethod.getTimeOut() > 0 && (invocations <= 1 || threadPoolSize <= 1)) {
                 timedSources.put(testngMethod, new AtomicInteger());
