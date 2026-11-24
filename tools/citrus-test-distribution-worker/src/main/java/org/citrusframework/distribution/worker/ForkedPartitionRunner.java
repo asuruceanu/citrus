@@ -64,6 +64,8 @@ import org.citrusframework.distribution.cache.BlobCacheDirectory;
 import org.citrusframework.distribution.cache.WorkspacePackager;
 import org.citrusframework.distribution.config.DistributionJson;
 import org.citrusframework.distribution.config.DistributionSettings;
+import org.citrusframework.distribution.config.QuarkusWorkspace;
+import org.citrusframework.distribution.model.ArtifactKind;
 import org.citrusframework.distribution.model.ArtifactRef;
 import org.citrusframework.distribution.model.PartitionAssignPayload;
 import org.citrusframework.distribution.model.WorkerTestEventPayload;
@@ -241,6 +243,9 @@ final class ForkedPartitionRunner implements PartitionRunner {
             }
 
             // Verification and downloads may block. Only materialization can recreate paths removed by cleanup.
+            String layout = assignment.systemProperties() == null ? null
+                    : assignment.systemProperties().get(QuarkusWorkspace.PROPERTY);
+            QuarkusWorkspace quarkus = layout == null ? null : DistributionJson.fromJson(layout, QuarkusWorkspace.class);
             List<Path> classpath = new ArrayList<>();
             for (ArtifactRef artifact : classpathArtifacts) {
                 Path verified = blobs.ensureCached(artifact);
@@ -248,7 +253,16 @@ final class ForkedPartitionRunner implements PartitionRunner {
                     if (jvmStopping) {
                         return cancelledResult();
                     }
-                    classpath.add(cache.materializeForClasspath(artifact, verified, fork.partitionRoot));
+                    String directory = quarkus == null ? null : quarkus.classpathDirectories().get(classpath.size());
+                    if (directory == null) {
+                        classpath.add(cache.materializeForClasspath(artifact, verified, fork.partitionRoot));
+                    } else {
+                        if (artifact.kind() != ArtifactKind.DIRECTORY_ZIP) {
+                            throw new IOException("Quarkus workspace classpath entry is not a directory: " + directory);
+                        }
+                        cache.materializeIntoDirectory(new WorkspaceFileSet(directory, artifact), verified, workspace);
+                        classpath.add(workspace.resolve(WorkspacePackager.validateRelativePath(directory)));
+                    }
                 }
             }
             for (WorkspaceFileSet input : assignment.inputArtifacts()) {
@@ -260,6 +274,15 @@ final class ForkedPartitionRunner implements PartitionRunner {
                     cache.materializeIntoDirectory(input, verified, workspace);
                 }
             }
+            Path quarkusModel = null;
+            if (quarkus != null) {
+                synchronized (fork.cleanupMonitor) {
+                    if (jvmStopping) {
+                        return cancelledResult();
+                    }
+                    quarkusModel = QuarkusModelMaterializer.rewrite(quarkus, workspace, classpath);
+                }
+            }
             Map<String, String> baseline = WorkspacePackager.snapshotBaselineHashes(workspace, assignment.outputPaths());
             verifyJUnitPlatform(classpath);
             String classpathLine = argfileClasspathLine(childClasspath(classpath)) + System.lineSeparator();
@@ -269,6 +292,10 @@ final class ForkedPartitionRunner implements PartitionRunner {
             String token = HexFormat.of().formatHex(secret);
             Map<String, String> properties = new LinkedHashMap<>(
                     IsolatedPartitionRunner.workspaceOverrides(assignment.systemProperties(), workspace));
+            properties.remove(QuarkusWorkspace.PROPERTY);
+            if (quarkusModel != null) {
+                properties.put(QuarkusWorkspace.MODEL_PROPERTY, quarkusModel.toString());
+            }
             IsolatedPartitionRunner.addWorkspaceLeaseTicket(properties, fork.workspace);
             properties.put(DistributionSettings.ROLE_PROPERTY, DistributionSettings.ROLE_WORKER);
             String requestJson = DistributionJson.toJson(new ForkedPartitionMain.ForkRequest(assignment.partitionId(),

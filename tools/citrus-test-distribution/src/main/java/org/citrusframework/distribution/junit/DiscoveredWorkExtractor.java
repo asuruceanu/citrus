@@ -58,15 +58,37 @@ public final class DiscoveredWorkExtractor {
      *                                 class unit would run the tests the host excluded
      */
     public static ExtractedWork extract(TestPlan testPlan, long defaultDurationMs, Set<String> partiallySelectedClasses) {
-        PARTIAL.set(partiallySelectedClasses != null ? partiallySelectedClasses : Set.of());
-        try {
-            return extractWork(testPlan, defaultDurationMs);
-        } finally {
-            PARTIAL.remove();
-        }
+        return extract(testPlan, defaultDurationMs, partiallySelectedClasses, Set.of(), Set.of());
     }
 
-    private static final ThreadLocal<Set<String>> PARTIAL = ThreadLocal.withInitial(Set::of);
+    static ExtractedWork extract(TestPlan testPlan, long defaultDurationMs, Set<String> partiallySelectedClasses,
+                                 Set<String> remoteLocalOnlyClasses, Set<String> remoteLocalOnlyMethods) {
+        Selection selection = new Selection(
+                partiallySelectedClasses != null ? partiallySelectedClasses : Set.of(), remoteLocalOnlyClasses,
+                remoteLocalOnlyMethods);
+        return extractWork(testPlan, defaultDurationMs, selection);
+    }
+
+    private record Selection(Set<String> partialClasses, Set<String> remoteLocalOnlyClasses,
+                             Set<String> remoteLocalOnlyMethods) {
+
+        boolean isLocalOnly(Class<?> testClass) {
+            return !remoteLocalOnlyClasses.contains(testClass.getName())
+                    && CapabilityMatcher.isLocalOnly(testClass, null);
+        }
+
+        boolean overridesMethodPin(Class<?> testClass, String methodSelector) {
+            return remoteLocalOnlyMethods.contains(testClass.getName() + "#" + methodSelector);
+        }
+
+        boolean isLocalOnly(Class<?> testClass, Method method, String methodSelector) {
+            if (CapabilityMatcher.isLocalOnly(null, method) && overridesMethodPin(testClass, methodSelector)) {
+                return isLocalOnly(testClass);
+            }
+            return CapabilityMatcher.isLocalOnly(
+                    remoteLocalOnlyClasses.contains(testClass.getName()) ? null : testClass, method);
+        }
+    }
 
     /**
      * Class containers of {@code testPlan} that hold fewer tests than the same classes discovered without filters:
@@ -121,14 +143,14 @@ public final class DiscoveredWorkExtractor {
         return tests;
     }
 
-    private static ExtractedWork extractWork(TestPlan testPlan, long defaultDurationMs) {
+    private static ExtractedWork extractWork(TestPlan testPlan, long defaultDurationMs, Selection selection) {
         Map<String, WorkUnitSpec> localByKey = new LinkedHashMap<>();
         Map<String, WorkUnitSpec> remoteByKey = new LinkedHashMap<>();
         boolean[] hasRemoteOnly = {false};
 
         for (TestIdentifier root : testPlan.getRoots()) {
             for (TestIdentifier topChild : testPlan.getChildren(root)) {
-                collectClassOrMethodNode(testPlan, topChild, defaultDurationMs, localByKey, remoteByKey, hasRemoteOnly);
+                collectClassOrMethodNode(testPlan, topChild, defaultDurationMs, localByKey, remoteByKey, hasRemoteOnly, selection);
             }
         }
         return new ExtractedWork(
@@ -142,15 +164,16 @@ public final class DiscoveredWorkExtractor {
                                                  long defaultDurationMs,
                                                  Map<String, WorkUnitSpec> localByKey,
                                                  Map<String, WorkUnitSpec> remoteByKey,
-                                                 boolean[] hasRemoteOnly) {
+                                                 boolean[] hasRemoteOnly,
+                                                 Selection selection) {
         Optional<TestSource> srcOpt = node.getSource();
         if (srcOpt.isPresent() && srcOpt.get() instanceof ClassSource classSource) {
             Class<?> testClass = classSource.getJavaClass();
-            inspectTestClass(plan, node, testClass, defaultDurationMs, localByKey, remoteByKey, hasRemoteOnly);
+            inspectTestClass(plan, node, testClass, defaultDurationMs, localByKey, remoteByKey, hasRemoteOnly, selection);
             return;
         }
         for (TestIdentifier child : plan.getChildren(node)) {
-            collectClassOrMethodNode(plan, child, defaultDurationMs, localByKey, remoteByKey, hasRemoteOnly);
+            collectClassOrMethodNode(plan, child, defaultDurationMs, localByKey, remoteByKey, hasRemoteOnly, selection);
         }
     }
 
@@ -160,14 +183,15 @@ public final class DiscoveredWorkExtractor {
                                          long defaultDurationMs,
                                          Map<String, WorkUnitSpec> localByKey,
                                          Map<String, WorkUnitSpec> remoteByKey,
-                                         boolean[] hasRemoteOnly) {
+                                         boolean[] hasRemoteOnly,
+                                         Selection selection) {
         Set<TestIdentifier> children = plan.getChildren(classNode);
         // Classes enclosing this one in the plan (outermost first): for an inherited @Nested class this is the
         // subclass, which the worker must select it through. Their class-level pins and capabilities apply here too.
         List<Class<?>> enclosing = enclosingClasses(plan, classNode);
         List<String> enclosingNames = enclosing.stream().map(Class::getName).toList();
         String keyPrefix = enclosingNames.isEmpty() ? "" : String.join("/", enclosingNames) + "/";
-        boolean enclosingLocal = enclosing.stream().anyMatch(c -> CapabilityMatcher.isLocalOnly(c, null));
+        boolean enclosingLocal = enclosing.stream().anyMatch(selection::isLocalOnly);
         boolean enclosingRemote = enclosing.stream().anyMatch(c -> CapabilityMatcher.isRemoteOnly(c, null));
         Map<String, String> enclosingCaps = new LinkedHashMap<>();
         enclosing.forEach(c -> enclosingCaps.putAll(CapabilityMatcher.extractRequiredCapabilities(c, null)));
@@ -178,28 +202,35 @@ public final class DiscoveredWorkExtractor {
         boolean hasNestedClasses = children.stream().anyMatch(
                 child -> child.getSource().orElse(null) instanceof ClassSource);
         List<Method> factoryMethods = new ArrayList<>();
+        boolean keepFactoryMethodSelection = false;
 
         for (TestIdentifier child : children) {
             if (child.getSource().isPresent() && child.getSource().get() instanceof MethodSource ms) {
                 Method javaMethod = resolveMethod(testClass, ms);
                 if (javaMethod != null) {
-                    if (CapabilityMatcher.isLocalOnly(testClass, javaMethod)
+                    String methodSelector = buildMethodSelectorName(ms);
+                    boolean methodPin = CapabilityMatcher.isLocalOnly(null, javaMethod);
+                    if (methodPin || selection.isLocalOnly(testClass, javaMethod, methodSelector)
                             || CapabilityMatcher.isRemoteOnly(testClass, javaMethod)
                             || !CapabilityMatcher.extractRequiredCapabilities(null, javaMethod).isEmpty()) {
                         hasSpecialMethodAnnotations = true;
                     }
                     if (CitrusJupiterSupport.isFactoryMethod(testClass, javaMethod)) {
                         factoryMethods.add(javaMethod);
+                        keepFactoryMethodSelection |= methodPin && (selection.remoteLocalOnlyClasses().contains(testClass.getName())
+                                || selection.overridesMethodPin(testClass, methodSelector));
                     }
                 }
             }
         }
 
-        if (!factoryMethods.isEmpty() && children.size() == factoryMethods.size()) {
+        // Source splitting uses the class pin for all sources. Keep method selection when an override would
+        // make the placement of a pinned factory method differ from its class.
+        if (!keepFactoryMethodSelection && !factoryMethods.isEmpty() && children.size() == factoryMethods.size()) {
             List<WorkUnitSpec> factoryUnits = probeCitrusTestFactory(testClass, factoryMethods, defaultDurationMs);
             if (!factoryUnits.isEmpty()) {
                 for (WorkUnitSpec spec : factoryUnits) {
-                    boolean local = CapabilityMatcher.isLocalOnly(testClass, null);
+                    boolean local = selection.isLocalOnly(testClass);
                     if (CapabilityMatcher.isRemoteOnly(testClass, null)) {
                         hasRemoteOnly[0] = true;
                     }
@@ -209,9 +240,9 @@ public final class DiscoveredWorkExtractor {
             }
         }
 
-        boolean pruned = PARTIAL.get().contains(classNode.getUniqueId());
+        boolean pruned = selection.partialClasses().contains(classNode.getUniqueId());
         if (!hasSpecialMethodAnnotations && !hasNestedClasses && !pruned && !children.isEmpty()) {
-            boolean local = enclosingLocal || CapabilityMatcher.isLocalOnly(testClass, null);
+            boolean local = enclosingLocal || selection.isLocalOnly(testClass);
             if (enclosingRemote || CapabilityMatcher.isRemoteOnly(testClass, null)) {
                 hasRemoteOnly[0] = true;
             }
@@ -226,20 +257,20 @@ public final class DiscoveredWorkExtractor {
         for (TestIdentifier child : children) {
             if (child.getSource().isPresent() && child.getSource().get() instanceof MethodSource ms) {
                 Method javaMethod = resolveMethod(testClass, ms);
-                boolean local = enclosingLocal || CapabilityMatcher.isLocalOnly(testClass, javaMethod);
+                String methodSelector = buildMethodSelectorName(ms);
+                boolean local = enclosingLocal || selection.isLocalOnly(testClass, javaMethod, methodSelector);
                 if (enclosingRemote || CapabilityMatcher.isRemoteOnly(testClass, javaMethod)) {
                     hasRemoteOnly[0] = true;
                 }
                 Map<String, String> caps = new LinkedHashMap<>(enclosingCaps);
                 caps.putAll(CapabilityMatcher.extractRequiredCapabilities(testClass, javaMethod));
-                String methodSelector = buildMethodSelectorName(ms);
                 String key = keyPrefix + testClass.getName() + "#" + methodSelector;
                 WorkUnitSpec unit = new WorkUnitSpec(
                         key, testClass.getName(), methodSelector, null, caps, defaultDurationMs, enclosingNames);
                 (local ? localByKey : remoteByKey).putIfAbsent(key, unit);
             } else if (child.getSource().isPresent() && child.getSource().get() instanceof ClassSource) {
                 // @Nested classes are not covered by the outer class's method units: give them their own units.
-                collectClassOrMethodNode(plan, child, defaultDurationMs, localByKey, remoteByKey, hasRemoteOnly);
+                collectClassOrMethodNode(plan, child, defaultDurationMs, localByKey, remoteByKey, hasRemoteOnly, selection);
             }
         }
     }

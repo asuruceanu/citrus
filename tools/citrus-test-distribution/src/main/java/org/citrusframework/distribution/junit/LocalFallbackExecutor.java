@@ -309,7 +309,8 @@ public final class LocalFallbackExecutor {
                 }
             };
 
-            execute.accept(mergeListeners(additionalListeners, countingListener));
+            DistributionLauncherInterceptor.runLocally(
+                    () -> execute.accept(mergeListeners(additionalListeners, countingListener)));
         }
 
         long durationMs = Math.max(1L, (System.nanoTime() - startNs) / 1_000_000L);

@@ -22,9 +22,11 @@ import org.junit.platform.launcher.LauncherInterceptor;
 
 /**
  * JUnit Platform {@link LauncherInterceptor} wrapping coordinator {@link Launcher} instances with
- * {@link DistributedLauncher} when {@code citrus.test.distribution.enabled=true} and not on a worker JVM.
+ * {@link DistributedLauncher} when distribution is enabled and the launcher is outside a local execution or worker.
  */
 public class DistributionLauncherInterceptor implements LauncherInterceptor {
+
+    private static final InheritableThreadLocal<LocalExecution> LOCAL_EXECUTION = new InheritableThreadLocal<>();
 
     @Override
     @SuppressWarnings("unchecked")
@@ -37,7 +39,33 @@ public class DistributionLauncherInterceptor implements LauncherInterceptor {
     }
 
     static boolean isActiveForCurrentProcess() {
-        return DistributionSettings.isEnabled() && !DistributionSettings.isWorkerRole();
+        return DistributionSettings.isEnabled() && !DistributionSettings.isWorkerRole() && !isExecutingLocally();
+    }
+
+    static boolean isExecutingLocally() {
+        LocalExecution execution = LOCAL_EXECUTION.get();
+        return execution != null && execution.active;
+    }
+
+    static void runLocally(Runnable run) {
+        if (isExecutingLocally()) {
+            run.run();
+            return;
+        }
+
+        // JUnit can create executor threads for a local plan. They inherit the guard for that plan's lifetime.
+        LocalExecution execution = new LocalExecution();
+        LOCAL_EXECUTION.set(execution);
+        try {
+            run.run();
+        } finally {
+            execution.active = false;
+            LOCAL_EXECUTION.remove();
+        }
+    }
+
+    private static final class LocalExecution {
+        private volatile boolean active = true;
     }
 
     @Override

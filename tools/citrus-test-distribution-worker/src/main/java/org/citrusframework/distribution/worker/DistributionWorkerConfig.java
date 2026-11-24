@@ -26,6 +26,7 @@ import java.util.Objects;
 import java.util.UUID;
 
 import org.citrusframework.distribution.config.DistributionSettings;
+import org.citrusframework.distribution.config.QuarkusWorkspace;
 import org.citrusframework.distribution.config.DistributionSettings.WorkerCwdCheckMode;
 import org.citrusframework.distribution.config.DistributionSettings.WorkerForkMode;
 
@@ -63,6 +64,7 @@ public final class DistributionWorkerConfig {
                 ? builder.cacheFreeSpaceBufferBytes : DistributionSettings.getWorkerCacheFreeSpaceBufferBytes();
         Map<String, String> caps = new LinkedHashMap<>(builder.capabilities);
         caps.putIfAbsent(DistributionSettings.WORKSPACE_CAPABILITY_KEY, "true");
+        caps.putIfAbsent(QuarkusWorkspace.CAPABILITY, "true");
         this.capabilities = Collections.unmodifiableMap(caps);
         this.heartbeatIntervalMs = builder.heartbeatIntervalMs;
         this.reconnectDelayMs = builder.reconnectDelayMs;
