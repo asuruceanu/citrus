@@ -35,6 +35,9 @@ import org.junit.platform.launcher.TestIdentifier;
  */
 public class DistributionLauncherInterceptor implements LauncherInterceptor {
 
+    /** JUnit discovery parameter for a launcher embedded in a locally executing test. */
+    public static final String EMBEDDED_LAUNCHER_PARAMETER = "citrus.junit.jupiter.embeddedLauncher";
+
     private static final AtomicInteger LOCAL_EXECUTIONS = new AtomicInteger();
     private static final ThreadLocal<Boolean> LOCAL_SCOPE = new ThreadLocal<>();
     private static final Map<Thread, Integer> LOCAL_TEST_THREADS = new ConcurrentHashMap<>();

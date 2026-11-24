@@ -42,7 +42,6 @@ import tools.jackson.databind.JsonNode;
 /** Packages Maven's Quarkus test model and the artifacts that its augmentation classloader needs. */
 record QuarkusBootstrapInputs(QuarkusWorkspace layout, List<WorkspaceFileSet> inputs) {
 
-    private static final String SUPPORT_DIR = "target/.citrus-quarkus/";
     private static final Path BOOTSTRAP_DIR = Path.of("quarkus", "bootstrap");
 
     static Path findModel(Path moduleDir) {
@@ -85,7 +84,8 @@ record QuarkusBootstrapInputs(QuarkusWorkspace layout, List<WorkspaceFileSet> in
             JsonNode module = artifact.path("module");
             Path root = absolutePath(module.path("module-dir").asString(""));
             if (root != null) {
-                moduleRoots.computeIfAbsent(root, path -> SUPPORT_DIR + "modules/" + pathHash(path));
+                moduleRoots.computeIfAbsent(root, path -> WorkspacePackager.DEPENDENCY_STAGING_DIR
+                        + "modules/" + pathHash(path));
             }
             addPaths(artifact.path("resolved-paths"), requiredPaths);
             addPaths(module.path("test-additional-cp-elements"), requiredPaths);
@@ -142,7 +142,8 @@ record QuarkusBootstrapInputs(QuarkusWorkspace layout, List<WorkspaceFileSet> in
             }
         }
         return new QuarkusWorkspace.Location(null,
-                SUPPORT_DIR + "artifacts/" + pathHash(path.getParent()) + "/" + path.getFileName());
+                WorkspacePackager.DEPENDENCY_STAGING_DIR + "artifacts/"
+                        + pathHash(path.getParent()) + "/" + path.getFileName());
     }
 
     private static void addPaths(JsonNode array, Set<Path> paths) {

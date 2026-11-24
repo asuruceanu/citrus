@@ -47,6 +47,8 @@ import org.citrusframework.distribution.model.SessionSummary;
 import org.citrusframework.distribution.model.SubmitWorkRequest;
 import org.citrusframework.distribution.model.SubmitWorkResponse;
 import org.citrusframework.distribution.model.TestExecutionRecord;
+import org.citrusframework.distribution.model.WorkspaceChange;
+import org.citrusframework.distribution.model.TestHistoryRun;
 import org.citrusframework.distribution.model.TestHistorySummary;
 import org.citrusframework.distribution.model.TestOutcomeStatus;
 import org.citrusframework.distribution.model.WorkUnitSpec;
@@ -104,12 +106,11 @@ public final class BrokerSessionCoordinator {
                 0L,
                 0, 0, 0, 0, 0, 0, 0L, 0L
         );
-        store.saveSession(record, request.maxPartitionSize());
-        if (request.changedFiles() != null && !request.changedFiles().isEmpty()) {
-            store.saveChangedFiles(sessionId, request.changedFiles());
-        }
+        String historyScope = DistributionSettings.historyScope(request.projectKey(), record.projectName());
+        store.saveSession(record, request.maxPartitionSize(), historyScope);
+        store.saveChangedFiles(sessionId, request.changedFiles(), request.workspaceChanges());
 
-        sessions.put(sessionId, new SessionRuntime(record, maxPartSize, maxRetries, request.maxPartitionSize()));
+        sessions.put(sessionId, new SessionRuntime(record, maxPartSize, maxRetries, request.maxPartitionSize(), historyScope));
         eventHub.publish("session.created", sessionId, null, null, Map.of(
                 "projectName", record.projectName(),
                 "status", record.status().name()));
@@ -144,7 +145,7 @@ public final class BrokerSessionCoordinator {
             units = units.stream().map(BrokerSessionCoordinator::requireWorkspaceCapability).toList();
         }
         List<String> keys = units.stream().map(WorkUnitSpec::key).toList();
-        Map<String, Long> historicalDurations = store.findHistoricalDurationsMs(keys, 10);
+        Map<String, Long> historicalDurations = store.findHistoricalDurationsMs(keys, 10, session.historyScope);
 
         boolean adaptive = session.requestedMaxPartitionSize <= 0 && request.outputPaths().isEmpty();
 
@@ -480,12 +481,11 @@ public final class BrokerSessionCoordinator {
     }
 
     public synchronized Optional<SessionDetailResponse> getSessionDetail(String sessionId) {
-        return store.findSession(sessionId).map(session -> new SessionDetailResponse(
-                session,
-                store.findChangedFiles(sessionId),
-                store.listPartitions(sessionId),
-                store.listTestExecutions(sessionId)
-        ));
+        return store.findSession(sessionId).map(session -> {
+            List<WorkspaceChange> changes = store.findWorkspaceChanges(sessionId);
+            return new SessionDetailResponse(session, changes.stream().map(WorkspaceChange::path).toList(),
+                    store.listPartitions(sessionId), store.listTestExecutions(sessionId), changes);
+        });
     }
 
     public List<BuildSessionRecord> listSessions(int limit) {
@@ -500,7 +500,16 @@ public final class BrokerSessionCoordinator {
         return store.listTestHistory(limit);
     }
 
+    public List<TestHistoryRun> listTestHistoryRuns(String scope, String workUnitKey, String className,
+                                                   String testName, int limit) {
+        return store.listTestHistoryRuns(scope, workUnitKey, className, testName, limit);
+    }
+
     public Map<String, Long> findHistoricalDurations(List<String> testKeys, int limit) {
+        return findHistoricalDurations(testKeys, limit, null);
+    }
+
+    public Map<String, Long> findHistoricalDurations(List<String> testKeys, int limit, String historyScope) {
         if (testKeys == null || testKeys.isEmpty()) {
             return Map.of();
         }
@@ -510,13 +519,7 @@ public final class BrokerSessionCoordinator {
                 .distinct()
                 .toList();
         int recentLimit = limit <= 0 ? 10 : Math.min(limit, 100);
-        return store.findHistoricalDurationsMs(keys, recentLimit);
-    }
-
-    public int seedDemoData() {
-        int count = DemoDataSeeder.seed(store);
-        eventHub.publish("demo.seeded", null, null, null, Map.of("sessionsSeeded", count));
-        return count;
+        return store.findHistoricalDurationsMs(keys, recentLimit, historyScope);
     }
 
     public synchronized void registerWorker(String connectionId, WorkerRegisterPayload payload, Consumer<WorkerWsMessage> sender) {
@@ -1122,7 +1125,9 @@ public final class BrokerSessionCoordinator {
                 .orElse(Math.max(1, defaultPartitionSize));
         int maxPartitionSize = requestedMaxPartitionSize > 0 ? requestedMaxPartitionSize : defaultPartitionSize;
         SessionRuntime rehydrated = new SessionRuntime(
-                record, maxPartitionSize, config.defaultMaxRetries(), requestedMaxPartitionSize);
+                record, maxPartitionSize, config.defaultMaxRetries(), requestedMaxPartitionSize,
+                store.findSessionHistoryScope(sessionId)
+                        .orElseGet(() -> DistributionSettings.historyScope(null, record.projectName())));
         rehydrated.cachedBlobs = Math.max(0, record.cachedBlobs());
         rehydrated.uploadedBlobs = Math.max(0, record.totalBlobs() - record.cachedBlobs());
         Set<String> seenPartitionIds = new HashSet<>();
@@ -1170,6 +1175,7 @@ public final class BrokerSessionCoordinator {
         private final int maxPartitionSize;
         private final int maxRetries;
         private final int requestedMaxPartitionSize;
+        private final String historyScope;
         private final List<String> partitionIds = new ArrayList<>();
         private final Set<String> failedOrInterruptedTests = new HashSet<>();
         private final Map<String, TestExecutionRecord> latestExecutionsByTest = new LinkedHashMap<>();
@@ -1180,11 +1186,13 @@ public final class BrokerSessionCoordinator {
         private int submittedUnitCount;
         private int reportedLocalTestCount;
 
-        private SessionRuntime(BuildSessionRecord record, int maxPartitionSize, int maxRetries, int requestedMaxPartitionSize) {
+        private SessionRuntime(BuildSessionRecord record, int maxPartitionSize, int maxRetries,
+                               int requestedMaxPartitionSize, String historyScope) {
             this.record = record;
             this.maxPartitionSize = maxPartitionSize;
             this.maxRetries = maxRetries;
             this.requestedMaxPartitionSize = requestedMaxPartitionSize;
+            this.historyScope = historyScope;
         }
 
         private String testKey(String workUnitKey, String className, String testName, String uniqueId) {

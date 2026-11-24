@@ -49,6 +49,9 @@ import org.citrusframework.distribution.model.WorkspaceFileSet;
  */
 public final class WorkspacePackager {
 
+    /** Worker workspace directory for dependencies staged outside the project's own directory layout. */
+    public static final String DEPENDENCY_STAGING_DIR = ".citrus-dist/dependencies/";
+
     private static final Set<String> RESERVED_DEVICE_NAMES = Set.of(
             "CON", "PRN", "AUX", "NUL",
             "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",

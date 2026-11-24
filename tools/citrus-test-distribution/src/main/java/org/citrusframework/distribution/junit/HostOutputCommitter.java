@@ -44,8 +44,6 @@ import java.util.stream.Stream;
 import org.citrusframework.distribution.cache.BlobCacheDirectory;
 import org.citrusframework.distribution.cache.WorkspacePackager;
 import org.citrusframework.distribution.model.WorkspaceFileSet;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 /**
  * Collects output files produced by remote partitions and writes them into the module directory all-or-nothing.
@@ -60,7 +58,7 @@ import org.slf4j.LoggerFactory;
  */
 final class HostOutputCommitter {
 
-    private static final Logger LOG = LoggerFactory.getLogger(HostOutputCommitter.class);
+    private static final System.Logger LOG = System.getLogger(HostOutputCommitter.class.getName());
     private static final Map<Path, ReentrantLock> JVM_LOCKS = new ConcurrentHashMap<>();
 
     private record Origin(String relativePath, String partitionId, String sha256, Path stagedFile) {
@@ -104,13 +102,25 @@ final class HostOutputCommitter {
      * @param excludedPaths further module-relative paths remote outputs may not write into (e.g. a host cache)
      */
     HostOutputCommitter(Path hostBaseDir, List<String> declaredOutputs, List<String> excludedPaths) {
+        this(hostBaseDir, hostBaseDir.resolve("target"), declaredOutputs, excludedPaths);
+    }
+
+    HostOutputCommitter(Path hostBaseDir, Path buildDirectory, List<String> declaredOutputs, List<String> excludedPaths) {
         this.hostBaseDir = hostBaseDir.toAbsolutePath().normalize();
-        this.outputsDir = this.hostBaseDir.resolve("target").resolve(".citrus-dist-outputs");
+        this.outputsDir = outputsDirectory(this.hostBaseDir, buildDirectory);
         this.txDir = outputsDir.resolve("tx-" + UUID.randomUUID());
         this.declaredOutputs = List.copyOf(declaredOutputs);
         List<String> excluded = new ArrayList<>(INTERNAL_PATHS);
+        excluded.add(this.hostBaseDir.relativize(outputsDir).toString().replace('\\', '/'));
         excluded.addAll(excludedPaths);
         this.excludedPaths = List.copyOf(excluded);
+    }
+
+    static Path outputsDirectory(Path hostBaseDir, Path buildDirectory) {
+        Path build = buildDirectory.toAbsolutePath().normalize();
+        // Keep the transaction on the host workspace's filesystem when the build writes elsewhere.
+        Path parent = build.startsWith(hostBaseDir) ? build : hostBaseDir;
+        return parent.resolve(".citrus-dist-outputs");
     }
 
     /**
@@ -121,6 +131,10 @@ final class HostOutputCommitter {
                                              BlobCacheDirectory cache) throws IOException {
         if (outputArtifacts == null || outputArtifacts.isEmpty()) {
             return;
+        }
+        Path link = BlobCacheDirectory.findSymlinkComponent(hostBaseDir, outputsDir);
+        if (link != null) {
+            throw new IOException("Distribution output staging passes through a symbolic link or junction: " + link);
         }
         Path partitionDir = txDir.resolve("staged").resolve(stagingCounter++ + "-" + safeName(partitionId));
         for (WorkspaceFileSet output : outputArtifacts) {
@@ -302,7 +316,7 @@ final class HostOutputCommitter {
         try {
             Files.setPosixFilePermissions(to, Files.getPosixFilePermissions(from, LinkOption.NOFOLLOW_LINKS));
         } catch (UnsupportedOperationException | IOException e) {
-            LOG.debug("Could not keep permissions of {}", to, e);
+            LOG.log(System.Logger.Level.DEBUG, "Could not keep permissions of " + to, e);
         }
     }
 
@@ -342,11 +356,11 @@ final class HostOutputCommitter {
                 try {
                     Files.deleteIfExists(path);
                 } catch (IOException e) {
-                    LOG.debug("Could not delete {}", path, e);
+                    LOG.log(System.Logger.Level.DEBUG, "Could not delete " + path, e);
                 }
             });
         } catch (IOException e) {
-            LOG.warn("Could not delete output staging directory {}", root, e);
+            LOG.log(System.Logger.Level.WARNING, "Could not delete output staging directory " + root, e);
         }
     }
 }

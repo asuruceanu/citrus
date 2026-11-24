@@ -25,7 +25,6 @@ import java.util.concurrent.atomic.AtomicInteger;
 import org.citrusframework.distribution.annotations.LocalOnly;
 import org.citrusframework.distribution.annotations.RemoteOnly;
 import org.citrusframework.distribution.config.DistributionSettings;
-import org.citrusframework.junit.jupiter.JUnitJupiterEngine;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInfo;
 import org.junit.jupiter.api.TestReporter;
@@ -54,7 +53,7 @@ class DistributionPlacementFollowupTest {
                 .build();
         var embedded = LauncherDiscoveryRequestBuilder.request()
                 .selectors(DiscoverySelectors.selectMethod(RemoteSuite.class, "remoteOnly"))
-                .configurationParameter(JUnitJupiterEngine.EMBEDDED_LAUNCHER_PARAMETER, "true")
+                .configurationParameter(DistributionLauncherInterceptor.EMBEDDED_LAUNCHER_PARAMETER, "true")
                 .build();
         try (var executor = Executors.newSingleThreadExecutor()) {
             executor.submit(() -> { }).get(5, TimeUnit.SECONDS);

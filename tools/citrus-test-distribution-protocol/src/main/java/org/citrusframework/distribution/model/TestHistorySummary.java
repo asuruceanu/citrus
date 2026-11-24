@@ -26,8 +26,17 @@ public record TestHistorySummary(
         int passedRuns,
         int failedRuns,
         int flakyRuns,
-        TestOutcomeStatus lastStatus
+        TestOutcomeStatus lastStatus,
+        String projectScope,
+        String projectName
 ) {
+
+    public TestHistorySummary(String workUnitKey, String className, String testName,
+                              long avgDurationMs, long maxDurationMs, int totalRuns, int passedRuns,
+                              int failedRuns, int flakyRuns, TestOutcomeStatus lastStatus) {
+        this(workUnitKey, className, testName, avgDurationMs, maxDurationMs, totalRuns, passedRuns,
+                failedRuns, flakyRuns, lastStatus, null, null);
+    }
 
     public TestHistorySummary(String workUnitKey,
                               String className,

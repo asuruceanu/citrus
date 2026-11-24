@@ -133,8 +133,8 @@ public final class DistributionBrokerVerticle extends AbstractVerticle {
 
         router.get("/api/v1/workers").handler(ctx -> writeJson(ctx, 200, coordinator.listWorkers()));
         router.get("/api/v1/tests/history").handler(this::handleTestHistory);
+        router.get("/api/v1/tests/history/runs").handler(this::handleTestHistoryRuns);
         router.post("/api/v1/history/durations").handler(this::handleHistoricalDurations);
-        router.post("/api/v1/demo/seed").handler(this::handleSeedDemo);
 
         leaseTimerId = vertx.setPeriodic(5_000L, id -> coordinator.sweepExpiredLeases());
 
@@ -336,6 +336,21 @@ public final class DistributionBrokerVerticle extends AbstractVerticle {
                 .onFailure(err -> writeError(ctx, err));
     }
 
+    private void handleTestHistoryRuns(RoutingContext ctx) {
+        String scope = ctx.request().getParam("projectScope");
+        String workUnitKey = ctx.request().getParam("workUnitKey");
+        String className = ctx.request().getParam("className");
+        String testName = ctx.request().getParam("testName");
+        int limit = parseIntParam(ctx.request().getParam("limit"), 30);
+        if (scope == null || scope.isBlank()) {
+            writeError(ctx, new IllegalArgumentException("Missing projectScope"));
+            return;
+        }
+        vertx.executeBlocking(() -> coordinator.listTestHistoryRuns(scope, workUnitKey, className, testName, limit))
+                .onSuccess(list -> writeJson(ctx, 200, list))
+                .onFailure(err -> writeError(ctx, err));
+    }
+
     private void handleHistoricalDurations(RoutingContext ctx) {
         vertx.executeBlocking(() -> {
             String body = ctx.body().asString();
@@ -351,14 +366,8 @@ public final class DistributionBrokerVerticle extends AbstractVerticle {
             if (request.testKeys().size() > MAX_HISTORY_TEST_KEYS) {
                 throw new IllegalArgumentException("At most " + MAX_HISTORY_TEST_KEYS + " test keys are allowed");
             }
-            return new HistoricalDurationsResponse(coordinator.findHistoricalDurations(request.testKeys(), request.limit()));
+            return new HistoricalDurationsResponse(coordinator.findHistoricalDurations(request.testKeys(), request.limit(), request.historyScope()));
         }).onSuccess(response -> writeJson(ctx, 200, response))
-                .onFailure(err -> writeError(ctx, err));
-    }
-
-    private void handleSeedDemo(RoutingContext ctx) {
-        vertx.executeBlocking(coordinator::seedDemoData)
-                .onSuccess(count -> writeJson(ctx, 200, Map.of("seededSessions", count, "status", "OK")))
                 .onFailure(err -> writeError(ctx, err));
     }
 

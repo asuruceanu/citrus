@@ -48,6 +48,39 @@ class JdbcDistributionStoreTest {
     Path tempDir;
 
     @Test
+    void keepsTimingHistorySeparateForProjectsWithTheSameDisplayNameAndTestClass() {
+        String key = "pkg.SharedTest";
+        String jdbcUrl = "jdbc:hsqldb:file:" + tempDir.resolve("scoped-history");
+        try (JdbcDistributionStore store = new JdbcDistributionStore(jdbcUrl, "SA", "")) {
+            store.initialize();
+            store.saveSession(new BuildSessionRecord("first", "shared", "main", "abc123", SessionStatus.PASSED,
+                    1, 2, 1, 1, 0, 0, 0, 0, 8, 8), 0, "key:example.first:shared");
+            store.saveSession(new BuildSessionRecord("second", "shared", "main", "def456", SessionStatus.PASSED,
+                    1, 2, 1, 1, 0, 0, 0, 0, 4000, 4000), 0, "key:example.second:shared");
+            saveDuration(store, key, "first", 1, TestOutcomeStatus.PASSED, 8, 1);
+            saveDuration(store, key, "second", 1, TestOutcomeStatus.PASSED, 4000, 2);
+        }
+        try (JdbcDistributionStore store = new JdbcDistributionStore(jdbcUrl, "SA", "")) {
+            store.initialize();
+            assertThat(store.findSessionHistoryScope("first")).contains("key:example.first:shared");
+            assertThat(store.findHistoricalDurationsMs(List.of(key), 10, "key:example.first:shared"))
+                    .containsEntry(key, 8L);
+            assertThat(store.findHistoricalDurationsMs(List.of(key), 10, "key:example.second:shared"))
+                    .containsEntry(key, 4000L);
+            assertThat(store.findHistoricalDurationsMs(List.of(key), 10, "name:shared")).isEmpty();
+            assertThat(store.listTestHistoryRuns("key:example.first:shared", key, key, "test", 30))
+                    .singleElement().satisfies(run -> {
+                        assertThat(run.sessionId()).isEqualTo("first");
+                        assertThat(run.gitCommit()).isEqualTo("abc123");
+                        assertThat(run.durationMs()).isEqualTo(8);
+                    });
+            assertThat(store.listTestHistory(10)).extracting(h -> h.projectScope(), h -> h.avgDurationMs(), h -> h.totalRuns())
+                    .containsExactly(tuple("key:example.second:shared", 4000L, 1),
+                            tuple("key:example.first:shared", 8L, 1));
+        }
+    }
+
+    @Test
     void shouldSumMethodDurationsPerSessionAndKeepOnlyLatestAttemptWhenComputingHistoricalDurations() {
         String key = "pkg.MultiMethodTest";
         try (JdbcDistributionStore store = new JdbcDistributionStore("jdbc:hsqldb:mem:duration_history", "SA", "")) {

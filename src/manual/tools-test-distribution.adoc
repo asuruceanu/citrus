@@ -112,7 +112,7 @@ TIP: Projects that do not use the Maven extension can add `org.citrusframework:c
 |`.citrus-dist/cache`
 |===
 
-Local bypass applies when the selection has no `@RemoteOnly` tests, remote capability requirements, declared workspace inputs or outputs, or explicit workspace fork. The launcher runs the discovered tests directly and reports the results to an existing Maven reactor session, when present.
+Local bypass applies when the selection has no `@RemoteOnly` tests, remote capability requirements, declared workspace inputs or outputs, or explicit workspace fork. The launcher runs the discovered tests directly and reports the results to an existing Maven reactor session, when present. Scheduling and warm bypass use timing history scoped to the Maven root group ID and artifact ID. Set `citrus.test.distribution.projectKey` to distinguish builds that share coordinates. Older sessions without a project key retain their recorded timing history under their project name.
 
 For module-level workspace and isolation settings (`inputs`, `outputs`, `fork`, `partitionPolicy`, `skip`), see <<tools-test-distribution-external-resources>>.
 
@@ -142,8 +142,8 @@ Adaptive sizing applies to LPT submissions that do not declare workspace outputs
 
 [source,bash]
 ----
-# Start coordinator + Web UI with pre-seeded demo telemetry on port 8765
-citrus dist broker start --port=8765 --demo
+# Start coordinator and Web UI on port 8765
+citrus dist broker start --port=8765
 
 # Start coordinator backed by PostgreSQL and Bearer token auth
 citrus dist broker start \
@@ -196,17 +196,13 @@ citrus dist sessions --broker-url=http://localhost:8765 --limit=20
 |`--duration-seconds`
 |Optional bounded run duration in seconds (`0` runs until `Ctrl+C` / `SIGTERM`).
 |`0`
-
-|`--demo`
-|Seeds realistic sample sessions, workers, multi-attempt retries, workspace resources, and failure stack traces at startup.
-|`false`
 |===
 
-When embedding `DistributionBrokerConfig.fromSettings()`, the coordinator also reads `citrus.test.distribution.jdbcUrl` (`CITRUS_DIST_JDBC_URL`), `citrus.test.distribution.jdbcUser` (`CITRUS_DIST_JDBC_USER`, default `SA`), `citrus.test.distribution.jdbcPassword` (`CITRUS_DIST_JDBC_PASSWORD`), `citrus.test.distribution.cacheDir` (`CITRUS_DIST_CACHE_DIR`), `citrus.test.distribution.authToken` (`CITRUS_DIST_AUTH_TOKEN`), and `citrus.test.distribution.demo.data` (`CITRUS_DIST_DEMO_DATA`).
+When embedding `DistributionBrokerConfig.fromSettings()`, the coordinator also reads `citrus.test.distribution.jdbcUrl` (`CITRUS_DIST_JDBC_URL`), `citrus.test.distribution.jdbcUser` (`CITRUS_DIST_JDBC_USER`, default `SA`), `citrus.test.distribution.jdbcPassword` (`CITRUS_DIST_JDBC_PASSWORD`), `citrus.test.distribution.cacheDir` (`CITRUS_DIST_CACHE_DIR`), `citrus.test.distribution.authToken` (`CITRUS_DIST_AUTH_TOKEN`).
 
 === Coordinator HTTP, SSE, and WebSocket Endpoints
 
-When `--auth-token` is configured, all `/api/*` and `/ws/v1/worker` endpoints require either an `Authorization: Bearer <token>` header or a `?token=<token>` query parameter (used by browser `EventSource` and WebSocket clients). `/health` and static `/ui/*` assets remain unauthenticated so load-balancer health probes and the Web UI login prompt can load cleanly.
+When `--auth-token` is configured, all `/api/*` and `/ws/v1/worker` endpoints require either an `Authorization: Bearer <token>` header or a `?token=<token>` query parameter (used by WebSocket clients). `/health` and static `/ui/*` assets remain unauthenticated for load-balancer health probes and dashboard loading.
 
 .Coordinator service endpoints
 [cols="2,1,4",options="header"]
@@ -275,11 +271,11 @@ When `--auth-token` is configured, all `/api/*` and `/ws/v1/worker` endpoints re
 
 |`/api/v1/tests/history?limit=100`
 |`GET`
-|Returns aggregated cross-session `TestHistorySummary` records (`totalRuns`, `passedRuns`, `failedRuns`, `flakyRuns`, `avgDurationMs`, `maxDurationMs`, `lastStatus`).
+|Returns project-scoped cross-session `TestHistorySummary` records (`totalRuns`, `passedRuns`, `failedRuns`, `flakyRuns`, `avgDurationMs`, `maxDurationMs`, `lastStatus`).
 
-|`/api/v1/demo/seed`
-|`POST`
-|Idempotently seeds sample workers, build sessions, multi-attempt partition timelines, workspace metadata, and failure traces for UI exploration.
+|`/api/v1/tests/history/runs`
+|`GET`
+|Lists recorded attempts for a test identified by `projectScope`, `workUnitKey`, `className`, and `testName`, with the originating session and revision.
 |===
 
 [[tools-test-distribution-ui]]
@@ -293,8 +289,8 @@ The UI is a zero-Node ES module single-page application built with lightweight `
 
 * *Live SSE with Automatic Polling Fallback:* On load, the UI opens an `EventSource` stream against `/api/v1/events/stream` (`Live SSE` badge in the top bar) and coalesces burst events so rapid `test.event` updates refresh views smoothly without flooding the browser. If SSE disconnects or is blocked by a reverse proxy, the UI switches to a 4-second background HTTP polling loop (`Polling` badge), ticks elapsed clocks for `RUNNING` sessions locally, and automatically reconnects `EventSource` once the coordinator becomes reachable again.
 * *URL Hash Routing:* Views and session sub-tabs synchronize with the URL hash (`#overview`, `#sessions`, `#session/<sessionId>/<tab>`, `#workers`, `#history`), preserving navigation state across browser reloads and shareable links.
-* *Bearer Token Authentication:* Clicking `🔑 Auth` in the top bar (or submitting the prompt shown automatically on HTTP `401`) stores the shared Bearer token in browser `localStorage`, attaching `Authorization: Bearer <token>` to REST requests and `?token=<token>` to SSE connections.
-* *Demo Telemetry & Theme Toggle:* Clicking `✦ Seed Demo Data` populates sample sessions and workers via `POST /api/v1/demo/seed`. The sun/moon toggle switches between dark and light themes.
+* *Authenticated Dashboard Access:* To serve the dashboard on a coordinator with bearer authentication enabled, use a trusted reverse proxy that supplies the bearer header for the dashboard’s API and SSE requests.
+* *Theme Toggle:* The sun/moon toggle switches between dark and light themes.
 
 === UI Views and Telemetry Binding
 
@@ -318,7 +314,7 @@ Inspects a single build session across five session KPIs (`Passed Tests`, `Faile
 * *Execution Waterfall (`waterfall`):* Renders an interactive worker-swimlane SVG Gantt chart of all partition attempts, colored by Maven module with a legend, alongside the *Partition Breakdown* table. When a worker disconnects or stalls mid-partition, attempt `#1` remains visible as `LOST` on the original worker swimlane while attempt `#2` renders on the recovery worker swimlane. Clicking any waterfall bar or partition row opens the *Partition Detail Modal* showing state, attempt number, worker assignment, required capabilities, Failure / Eviction Reason (`errorMessage`), *Workspace & External Test Resources* (`moduleName`, `forkWorkspace` isolation mode, `workingDirectory`, materialized `inputPaths`, declared `outputPaths`, and collected `producedOutputs`), work units, and executed tests.
 * *Test Executions (`tests`):* Lists every remote and `@LocalOnly` test execution with status pills (`ALL`, `FAILED`, `FLAKY`, `PASSED`, `SKIPPED`) and search across test class, method, worker ID, or *Citrus Endpoints*. During execution on both remote workers and local fallback runs, Citrus automatically hooks `CitrusInstanceManager` / `TestActionListener` to record the deduplicated Citrus endpoint names (or endpoint URIs) exercised by each test, displaying them as inline badges and in the *Test Execution Detail Modal*.
 * *Failing Tests (`failures`):* Surfaces full stack traces with one-click `Copy Trace` buttons for every `FAILED` test execution, *and* renders partition-level crash or eviction diagnostic cards whenever a partition fails or is lost (`FAILED` or `LOST` with `errorMessage`) — ensuring forked JVM crashes, `ClassNotFoundException`, undeclared working-directory writes (`cwdCheck=FAIL`), or aborted partitions are immediately visible even when zero individual JUnit tests completed.
-* *Changed Files (`files`):* Displays the workspace Git delta (`Δ <path>`) captured when the session started.
+* *Changed Files (`files`):* Shows the status of each tracked workspace file captured when the Maven session started. Expand a file to see its captured Git diff preview and line counts where available. The broker stores at most 8 KiB of preview output per file and 32 KiB per session. Older sessions display the recorded file paths.
 
 Long lists (build sessions, partitions, test executions and test history) are paginated; a table returns to its first page when the selected session or one of its filters changes.
 
@@ -573,17 +569,17 @@ paths are not rewritten.
 Output files are collected from every partition and written into the module only after all partitions finished:
 
 * Only files new or changed during the run are copied; unchanged inputs are not.
-* Files outside the declared output paths, and files under `target/.citrus-dist-outputs` or the host cache, are rejected.
+* Files outside the declared output paths, and files under the distribution staging directory or host cache, are rejected.
 * The same file produced with identical content by several partitions is written once. Different content, or names that
 differ only in letter case, is a conflict: the build fails and nothing is written.
 * Before writing, every destination is checked (no symbolic links or junctions, no directory in the way). Replaced files
 are backed up and their permissions kept; if any step fails, all changes are rolled back. Commits to the same module are
-serialized within the JVM and across JVMs (lock file `target/.citrus-dist-outputs/commit.lock`).
+serialized within the JVM and across JVMs using the staging directory’s `commit.lock`.
 * A partition that crashed or did not complete fails the build, even when it reported no test results.
 
-Staging happens in `target/.citrus-dist-outputs/tx-*` and is removed afterwards; downloaded blobs are kept in
-`target/.citrus-dist/cache` (configurable with `citrus.test.distribution.cacheDir`; a relative value is resolved below
-the module's `target/`) and are not evicted automatically. `citrus.test.distribution.cacheDir` only applies to the
+Staging uses `.citrus-dist-outputs/tx-*` and is removed afterwards. Downloaded blobs are kept in
+`.citrus-dist/cache` under the Maven build directory (configurable with `citrus.test.distribution.cacheDir`; a relative value is resolved below
+the module’s build directory) and are not evicted automatically. `citrus.test.distribution.cacheDir` only applies to the
 caches of the build host and the coordinator. Workers keep their own local file cache, by default in
 `${user.home}/.citrus-test-distribution-agent/file-cache` (see `citrus.test.distribution.worker.cacheDir` below).
 

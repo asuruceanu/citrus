@@ -55,8 +55,6 @@ import java.util.zip.ZipInputStream;
 
 import org.citrusframework.distribution.model.ArtifactKind;
 import org.citrusframework.distribution.model.ArtifactRef;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 /**
  * Content-addressed local directory store indexed by validated 64-char lowercase SHA-256 hex digests.
@@ -67,7 +65,7 @@ import org.slf4j.LoggerFactory;
  */
 public class BlobCacheDirectory {
 
-    private static final Logger LOG = LoggerFactory.getLogger(BlobCacheDirectory.class);
+    private static final System.Logger LOG = System.getLogger(BlobCacheDirectory.class.getName());
 
     public static final Pattern SHA256_HEX_PATTERN = Pattern.compile("^[a-f0-9]{64}$");
 
@@ -437,7 +435,7 @@ public class BlobCacheDirectory {
 
             @Override
             public FileVisitResult visitFileFailed(Path file, IOException exc) {
-                LOG.warn("Skipping unreadable cache entry {}: {}", file, exc.toString());
+                LOG.log(System.Logger.Level.WARNING, "Skipping unreadable cache entry {0}: {1}", file, exc.toString());
                 return FileVisitResult.CONTINUE;
             }
         });
@@ -483,7 +481,7 @@ public class BlobCacheDirectory {
         } catch (DirectoryNotEmptyException | NoSuchFileException ignored) {
             // still shared with other blobs, or already gone
         } catch (IOException e) {
-            LOG.debug("Could not prune empty cache directory {}: {}", dir, e.toString());
+            LOG.log(System.Logger.Level.DEBUG, "Could not prune empty cache directory {0}: {1}", dir, e.toString());
         }
     }
 
@@ -545,7 +543,7 @@ public class BlobCacheDirectory {
                         removed++;
                     }
                 } catch (IOException e) {
-                    LOG.warn("Could not delete temporary cache file {}: {}", child, e.toString());
+                    LOG.log(System.Logger.Level.WARNING, "Could not delete temporary cache file {0}: {1}", child, e.toString());
                 }
             }
         } catch (DirectoryIteratorException e) {

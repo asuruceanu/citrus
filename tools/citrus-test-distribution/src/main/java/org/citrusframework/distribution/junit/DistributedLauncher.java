@@ -53,15 +53,12 @@ import org.citrusframework.distribution.model.WorkUnitSpec;
 import org.citrusframework.distribution.model.WorkerTestEventPayload;
 import org.citrusframework.distribution.model.WorkspaceFileSet;
 import org.citrusframework.distribution.workspace.WorkspaceLease;
-import org.citrusframework.junit.jupiter.JUnitJupiterEngine;
 import org.junit.platform.launcher.Launcher;
 import org.junit.platform.launcher.LauncherDiscoveryListener;
 import org.junit.platform.launcher.LauncherDiscoveryRequest;
 import org.junit.platform.launcher.LauncherExecutionRequest;
 import org.junit.platform.launcher.TestExecutionListener;
 import org.junit.platform.launcher.TestPlan;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 /**
  * Decorating JUnit Platform {@link Launcher} that partitions discovered tests across Citrus Test Distribution
@@ -69,7 +66,7 @@ import org.slf4j.LoggerFactory;
  */
 public class DistributedLauncher implements Launcher {
 
-    private static final Logger LOG = LoggerFactory.getLogger(DistributedLauncher.class);
+    private static final System.Logger LOG = System.getLogger(DistributedLauncher.class.getName());
     // Exact class names whose class-level local pin the build explicitly overrides.
     private static final String REMOTE_LOCAL_ONLY_CLASSES_PROPERTY = "citrus.test.distribution.remoteLocalOnlyClasses";
     // Fully qualified Class#method selectors for overriding individual method-level pins.
@@ -129,13 +126,13 @@ public class DistributedLauncher implements Launcher {
         // Only requests explicitly marked as embedded can use a local execution on another thread.
         if (DistributionLauncherInterceptor.isInLocalScope()
                 || (DistributionLauncherInterceptor.isExecutingLocally() && testPlan.getConfigurationParameters()
-                        .getBoolean(JUnitJupiterEngine.EMBEDDED_LAUNCHER_PARAMETER).orElse(false))) {
+                        .getBoolean(DistributionLauncherInterceptor.EMBEDDED_LAUNCHER_PARAMETER).orElse(false))) {
             executeDelegateLocally(testPlan, callListeners);
             return;
         }
 
         JacksonClasspathCheck.conflicts(Thread.currentThread().getContextClassLoader())
-                .forEach(conflict -> LOG.warn("Citrus Test Distribution: {}", conflict));
+                .forEach(conflict -> LOG.log(System.Logger.Level.WARNING, "Citrus Test Distribution: {0}", conflict));
         DiscoveredWorkExtractor.ExtractedWork extracted = DiscoveredWorkExtractor.extract(
                 testPlan, DistributionSettings.getDefaultTestDurationMs(),
                 DiscoveredWorkExtractor.partiallySelectedClasses(delegate, testPlan),
@@ -162,7 +159,7 @@ public class DistributedLauncher implements Launcher {
                             sharedSessionId,
                             new ReportLocalTestsRequest("local-host", onlyLocal.executions()));
                 } catch (Exception e) {
-                    LOG.warn("Failed to report @LocalOnly test executions to session {}: {}",
+                    LOG.log(System.Logger.Level.WARNING, "Failed to report @LocalOnly test executions to session {0}: {1}",
                             sharedSessionId, e.getMessage());
                 }
             }
@@ -181,7 +178,17 @@ public class DistributedLauncher implements Launcher {
         BrokerHttpClient client = new BrokerHttpClient(
                 brokerUrl, authToken, DistributionSettings.getConnectTimeoutMs());
 
-        boolean bypassRemote = shouldBypassRemoteDistribution(extracted, workspace, client);
+        Path rootName = workspace.hostBaseDir().getFileName();
+        String configuredProjectName = System.getProperty(DistributionSettings.PROJECT_NAME_PROPERTY);
+        String projectName = configuredProjectName == null || configuredProjectName.isBlank()
+                ? (rootName == null ? "junit-project" : rootName.toString()) : configuredProjectName;
+        String projectKey = System.getProperty(DistributionSettings.PROJECT_KEY_PROPERTY);
+        if ((projectKey == null || projectKey.isBlank()) && configuredProjectName == null) {
+            projectKey = "workspace:" + ClasspathPackager.sha256Hex(
+                    workspace.hostBaseDir().toString().getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        }
+        boolean bypassRemote = shouldBypassRemoteDistribution(extracted, workspace, client,
+                DistributionSettings.historyScope(projectKey, projectName));
         if (Thread.currentThread().isInterrupted()) {
             throw new IllegalStateException("Citrus Test Distribution interrupted before test execution");
         }
@@ -196,9 +203,9 @@ public class DistributedLauncher implements Launcher {
                             externalSessionId, new ReportLocalTestsRequest("local-host", stats.executions()));
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
-                    LOG.warn("Interrupted while reporting local test executions to session {}", externalSessionId);
+                    LOG.log(System.Logger.Level.WARNING, "Interrupted while reporting local test executions to session {0}", externalSessionId);
                 } catch (IOException | RuntimeException e) {
-                    LOG.warn("Failed to report local test executions to session {}: {}", externalSessionId, e.getMessage());
+                    LOG.log(System.Logger.Level.WARNING, "Failed to report local test executions to session {0}: {1}", externalSessionId, e.getMessage());
                 }
             }
             return;
@@ -207,14 +214,13 @@ public class DistributedLauncher implements Launcher {
         String sessionId = externalSessionId;
         try {
             if (ownsSession) {
-                String projectName = System.getProperty(DistributionSettings.PROJECT_NAME_PROPERTY, "citrus");
                 BuildSessionResponse created = client.createSession(new CreateSessionRequest(
                         projectName,
                         "local",
                         "HEAD",
                         List.of(),
                         DistributionSettings.findConfiguredMaxPartitionSize().orElse(0),
-                        DistributionSettings.getMaxRetries()));
+                        DistributionSettings.getMaxRetries(), List.of(), projectKey));
                 sessionId = created.sessionId();
             }
         } catch (Exception e) {
@@ -223,7 +229,7 @@ public class DistributedLauncher implements Launcher {
                         "Citrus Test Distribution broker unreachable at " + brokerUrl
                                 + " and remote execution is required", e);
             }
-            LOG.warn("Broker {} unreachable ({}); falling back to local execution", brokerUrl, e.getMessage());
+            LOG.log(System.Logger.Level.WARNING, "Broker {0} unreachable ({1}); falling back to local execution", brokerUrl, e.getMessage());
             List<WorkUnitSpec> all = new ArrayList<>(extracted.localUnits());
             all.addAll(extracted.remoteUnits());
             LocalFallbackExecutor.executeLocally(delegate, all,
@@ -292,7 +298,7 @@ public class DistributedLauncher implements Launcher {
             Set<String> submittedPartitions = Set.copyOf(submitted.partitionIds());
             Set<String> pendingPartitions = new HashSet<>(submitted.partitionIds());
             List<WorkUnitSpec> lostUnits = new ArrayList<>();
-            PartitionOutcomes outcomes = new PartitionOutcomes(new HostOutputCommitter(workspace.hostBaseDir(),
+            PartitionOutcomes outcomes = new PartitionOutcomes(new HostOutputCommitter(workspace.hostBaseDir(), workspace.hostBuildDir(),
                     workspace.outputPaths(), workspace.cacheExclusion()), workspace.cache());
             Map<String, WorkUnitSpec> unitsByKey = new LinkedHashMap<>();
             extracted.remoteUnits().forEach(unit -> unitsByKey.putIfAbsent(unit.key(), unit));
@@ -309,7 +315,7 @@ public class DistributedLauncher implements Launcher {
                         try {
                             client.reportLocalTests(sessionId, new ReportLocalTestsRequest("local-host", localStats.executions()));
                         } catch (Exception e) {
-                            LOG.warn("Failed to report @LocalOnly test executions to session {}: {}", sessionId, e.getMessage());
+                            LOG.log(System.Logger.Level.WARNING, "Failed to report @LocalOnly test executions to session {0}: {1}", sessionId, e.getMessage());
                         }
                     }
                     if (!pendingPartitions.isEmpty()) {
@@ -324,7 +330,7 @@ public class DistributedLauncher implements Launcher {
                         if (!fallbackLocal || extracted.hasRemoteOnlyUnits()) {
                             throw new IllegalStateException("Remote partitions were lost: " + lostUnits.size());
                         }
-                        LOG.warn("Executing {} lost remote work unit(s) locally", lostUnits.size());
+                        LOG.log(System.Logger.Level.WARNING, "Executing {0} lost remote work unit(s) locally", lostUnits.size());
                         lostStats = LocalFallbackExecutor.executeLocally(delegate, lostUnits,
                                 new TestExecutionListener[] {replayer.liveListener()});
                         replayer.localUnitsDone(keysOf(lostUnits));
@@ -334,7 +340,7 @@ public class DistributedLauncher implements Launcher {
                                         sessionId,
                                         new ReportLocalTestsRequest("local-fallback", lostStats.executions()));
                             } catch (Exception e) {
-                                LOG.warn("Failed to report fallback test executions to session {}: {}",
+                                LOG.log(System.Logger.Level.WARNING, "Failed to report fallback test executions to session {0}: {1}",
                                         sessionId, e.getMessage());
                             }
                         }
@@ -387,7 +393,8 @@ public class DistributedLauncher implements Launcher {
     }
 
     private static boolean shouldBypassRemoteDistribution(DiscoveredWorkExtractor.ExtractedWork extracted,
-                                                          WorkspaceSettings workspace, BrokerHttpClient client) {
+                                                          WorkspaceSettings workspace, BrokerHttpClient client,
+                                                          String historyScope) {
         if (extracted.hasRemoteOnlyUnits() || workspace.forkWorkspace()
                 || extracted.remoteUnits().stream().anyMatch(unit ->
                         unit.requiredCapabilities() != null && !unit.requiredCapabilities().isEmpty())) {
@@ -402,7 +409,7 @@ public class DistributedLauncher implements Launcher {
 
         List<String> remoteKeys = extracted.remoteUnits().stream().map(WorkUnitSpec::key).toList();
         Optional<Map<String, Long>> history = minRemoteDurationMs > 0
-                ? client.findHistoricalDurations(remoteKeys, 10) : Optional.empty();
+                ? client.findHistoricalDurations(remoteKeys, 10, historyScope) : Optional.empty();
         if (history.isPresent()) {
             Map<String, Long> durations = history.get();
             if (remoteKeys.stream().allMatch(key -> durations.get(key) != null && durations.get(key) >= 0)) {
@@ -435,7 +442,7 @@ public class DistributedLauncher implements Launcher {
                     true,
                     describe(cause)));
         } catch (Exception e) {
-            LOG.warn("Failed to mark failed session {} as completed on broker: {}", sessionId, e.getMessage());
+            LOG.log(System.Logger.Level.WARNING, "Failed to mark failed session {0} as completed on broker: {1}", sessionId, e.getMessage());
         }
     }
 
@@ -665,14 +672,13 @@ public class DistributedLauncher implements Launcher {
      * Workspace settings of this module run: the module base directory, declared inputs (already packaged into the
      * host cache), additional worker classpath, declared outputs, fork flag and partition policy.
      */
-    record WorkspaceSettings(Path hostBaseDir, BlobCacheDirectory cache, List<WorkspaceFileSet> inputArtifacts,
+    record WorkspaceSettings(Path hostBaseDir, Path hostBuildDir, BlobCacheDirectory cache, List<WorkspaceFileSet> inputArtifacts,
                              List<String> outputPaths, boolean forkWorkspace, PartitionPolicy partitionPolicy,
                              List<Path> additionalClasspath, Path quarkusModel, String workingDirectory) {
 
         /**
          * {@code userDir} relative to {@code hostBaseDir} ({@code /}-separated), or empty when it is the module directory
-         * or lies outside it. In Citrus, Surefire runs tests in {@code target/} and Failsafe in the module directory;
-         * forked workers reproduce this inside the workspace so relative paths resolve as they do locally.
+         * or lies outside it. Forked workers reproduce the working directory inside the workspace.
          */
         static String relativeWorkingDirectory(Path hostBaseDir, Path userDir) {
             Path base = hostBaseDir.toAbsolutePath().normalize();
@@ -714,12 +720,17 @@ public class DistributedLauncher implements Launcher {
         static WorkspaceSettings resolve() {
             List<Path> additionalClasspath = additionalWorkerClasspath();
             Path hostBaseDir = resolveHostBaseDir();
+            String buildSetting = setting(DistributionSettings.BUILD_DIRECTORY_PROPERTY, null);
+            Path hostBuildDir = hostBaseDir.resolve(buildSetting == null ? "target" : buildSetting).normalize();
             String cacheDir = setting(DistributionSettings.CACHE_DIR_PROPERTY, DistributionSettings.CACHE_DIR_ENV);
-            // A relative cache directory lives under target/, keeping the module root free of tool directories.
-            BlobCacheDirectory cache = new BlobCacheDirectory(cacheDir != null && !cacheDir.isBlank()
-                    ? hostBaseDir.resolve("target").resolve(cacheDir)
-                    : hostBaseDir.resolve("target").resolve(".citrus-dist").resolve("cache"));
+            BlobCacheDirectory cache = new BlobCacheDirectory(hostBuildDir.resolve(
+                    cacheDir == null ? ".citrus-dist/cache" : cacheDir));
             List<String> internal = new ArrayList<>(List.of("target/.citrus-dist-outputs", "target/.citrus-dist"));
+            internal.add(hostBaseDir.relativize(HostOutputCommitter.outputsDirectory(hostBaseDir, hostBuildDir))
+                    .toString().replace('\\', '/'));
+            if (hostBuildDir.startsWith(hostBaseDir)) {
+                internal.add(hostBaseDir.relativize(hostBuildDir.resolve(".citrus-dist")).toString().replace('\\', '/'));
+            }
             internal.addAll(cacheExclusion(hostBaseDir, cache));
 
             List<DistributionSettings.DeclaredPathSpec> declaredInputs = DistributionSettings.parseDeclaredPaths(
@@ -756,7 +767,7 @@ public class DistributedLauncher implements Launcher {
                     setting(DistributionSettings.PARTITION_POLICY_PROPERTY, DistributionSettings.PARTITION_POLICY_ENV));
             Path quarkusModel = QuarkusBootstrapInputs.findModel(hostBaseDir);
             // Inputs and the Quarkus model need a private workspace. Extra classpath entries need a JVM classpath.
-            return new WorkspaceSettings(hostBaseDir, cache, List.copyOf(inputs), outputs,
+            return new WorkspaceSettings(hostBaseDir, hostBuildDir, cache, List.copyOf(inputs), outputs,
                     fork || quarkusModel != null || !additionalClasspath.isEmpty() || !declaredInputs.isEmpty()
                             || !outputs.isEmpty(), policy, additionalClasspath, quarkusModel,
                     relativeWorkingDirectory(hostBaseDir, Path.of(System.getProperty("user.dir", ""))));

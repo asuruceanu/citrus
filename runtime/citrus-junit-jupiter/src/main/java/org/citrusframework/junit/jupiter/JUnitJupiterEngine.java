@@ -68,9 +68,6 @@ public class JUnitJupiterEngine extends AbstractTestEngine {
     /** Logger */
     private static final Logger logger = LoggerFactory.getLogger(JUnitJupiterEngine.class);
 
-    /** Configuration parameter for callers that explicitly embed a launcher in a local test. */
-    public static final String EMBEDDED_LAUNCHER_PARAMETER = "citrus.junit.jupiter.embeddedLauncher";
-
     private final Set<TestExecutionListener> testExecutionListeners = new LinkedHashSet<>();
 
     public JUnitJupiterEngine(TestRunConfiguration configuration) {

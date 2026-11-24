@@ -59,9 +59,6 @@ public class DistBrokerStart extends CitrusCommand {
     @Option(name = "duration-seconds", defaultValue = "0", description = "Optional bounded run duration in seconds (0 runs until Ctrl+C)")
     int durationSeconds;
 
-    @Option(name = "demo", hasValue = false, description = "Pre-seed realistic demo sessions, workers, and failure traces")
-    boolean demo;
-
     public DistBrokerStart() {
         super(null);
     }
@@ -84,8 +81,7 @@ public class DistBrokerStart extends CitrusCommand {
                 .host(host)
                 .port(port)
                 .defaultMaxPartitionSize(maxPartitionSize)
-                .defaultMaxRetries(maxRetries)
-                .demoData(demo);
+                .defaultMaxRetries(maxRetries);
         if (jdbcUrl != null && !jdbcUrl.isBlank()) {
             builder.jdbcUrl(jdbcUrl);
         }

@@ -265,6 +265,11 @@ public final class SurefirePluginMutator {
             setChildValue(sysProps, DistributionSettings.BASEDIR_PROPERTY,
                     project.getBasedir().toPath().toAbsolutePath().normalize().toString());
         }
+        String buildDirectory = project.getBuild().getDirectory();
+        if (buildDirectory != null && !buildDirectory.isBlank()
+                && !resolution.cliUserProperties().containsKey(DistributionSettings.BUILD_DIRECTORY_PROPERTY)) {
+            setChildValue(sysProps, DistributionSettings.BUILD_DIRECTORY_PROPERTY, buildDirectory);
+        }
         for (WorkspaceSetting setting : WorkspaceSetting.values()) {
             Winner winner = winningValue(setting, project, sysProps, resolution);
             if (winner != null) {

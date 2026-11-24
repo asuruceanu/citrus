@@ -48,6 +48,12 @@ public final class DistributionSettings {
     public static final String MODULE_NAME_PROPERTY = "citrus.test.distribution.moduleName";
     public static final String REPORT_DIR_PROPERTY = "citrus.test.distribution.reportDir";
     public static final String PROJECT_NAME_PROPERTY = "citrus.test.distribution.projectName";
+    public static final String PROJECT_KEY_PROPERTY = "citrus.test.distribution.projectKey";
+
+    /** Separates stable build identities from legacy display-name based sessions. */
+    public static String historyScope(String projectKey, String projectName) {
+        return projectKey != null && !projectKey.isBlank() ? "key:" + projectKey : "name:" + projectName;
+    }
 
     public static final String BROKER_URL_PROPERTY = "citrus.test.distribution.brokerUrl";
     public static final String BROKER_URL_ENV = "CITRUS_DIST_BROKER_URL";
@@ -139,6 +145,9 @@ public final class DistributionSettings {
     public static final String NONE_SENTINEL = "none";
 
     public static final String BASEDIR_PROPERTY = "citrus.test.distribution.basedir";
+
+    /** Host build output directory, supplied by the build-tool integration when available. */
+    public static final String BUILD_DIRECTORY_PROPERTY = "citrus.test.distribution.buildDirectory";
 
     public static final String INPUTS_PROPERTY = "citrus.test.distribution.inputs";
     public static final String INPUTS_ENV = "CITRUS_DIST_INPUTS";
