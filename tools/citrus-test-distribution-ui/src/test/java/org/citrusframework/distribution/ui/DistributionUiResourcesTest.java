@@ -74,12 +74,9 @@ class DistributionUiResourcesTest {
                     .contains("/abort")
                     .contains("POLL_INTERVAL_MS")
                     .contains("EventSource.CLOSED")
-                    .contains("state.authTokenDraft = state.authToken;", "value=${state.authTokenDraft}")
-                    .contains("onInput=${e => { state.authTokenDraft = e.target.value; }}")
-                    .contains("function requireApiAccess(response, authToken)", "if (authToken === state.authToken)")
-                    .containsPattern("(?s)function apiPost[^}]+.*?requireApiAccess\\(res, authToken\\);")
-                    .contains("onClick=${() => commitAuthToken('')}",
-                            "onClick=${() => commitAuthToken(state.authTokenDraft.trim())}")
+                    .contains("function requireApiAccess(response)", "The dashboard needs authenticated access")
+                    .doesNotContain("Broker Bearer Authentication", "commitAuthToken")
+                    .contains("renderHistoryRuns", "/api/v1/tests/history/runs", "Open session")
                     .contains("forkWorkspace")
                     .contains("inputPaths")
                     .contains("producedOutputs")
@@ -105,7 +102,7 @@ class DistributionUiResourcesTest {
                     .contains("paginate('sessions', filtered, 25, `${state.sessionStatusFilter}|${q}`)")
                     .contains("paginate('partitions', partitions, 25, state.selectedSessionId)")
                     .contains("paginate('tests', filteredTests, 50, `${state.selectedSessionId}|${state.testStatusFilter}|${tq}`)")
-                    .contains("paginate('history', filtered, 25, `${state.historyFlakyOnly}|${q}`)")
+                    .contains("paginate('history', filtered, 25,", "historyPage.controls")
                     .contains("class=\"pager\"");
 
             String htmText = new String(htm.readAllBytes(), StandardCharsets.UTF_8);

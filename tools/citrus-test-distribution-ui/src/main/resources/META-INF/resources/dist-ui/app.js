@@ -7,12 +7,16 @@
 
 import { html } from './vendor/htm-mini.js';
 
-const STORAGE_TOKEN_KEY = 'citrus.dist.authToken';
 const STORAGE_THEME_KEY = 'citrus.dist.theme';
 const POLL_INTERVAL_MS = 4000;
 // Full session detail can be several MB for large suites: reload it at most this often during live updates.
 const DETAIL_MIN_INTERVAL_MS = 2000;
 const VALID_DETAIL_TABS = new Set(['waterfall', 'tests', 'failures', 'files']);
+const INTERNAL_WORKSPACE_CAPABILITIES = new Set(['citrus.workspace.v1', 'citrus.workspace.quarkus.v1', 'citrus.workspace.jvm-options.v1', 'citrus.workspace.jvm-layout.v1']);
+
+function visibleCapabilities(capabilities) {
+  return Object.entries(capabilities || {}).filter(([key]) => !INTERNAL_WORKSPACE_CAPABILITIES.has(key));
+}
 
 const state = {
   view: 'overview', // 'overview' | 'sessions' | 'session-detail' | 'workers' | 'history'
@@ -20,9 +24,6 @@ const state = {
   sidebarCollapsed: false,
   mobileMenuOpen: false,
   theme: localStorage.getItem(STORAGE_THEME_KEY) || 'light',
-  authToken: localStorage.getItem(STORAGE_TOKEN_KEY) || '',
-  authTokenDraft: '',
-  showAuthModal: false,
   authError: '',
   sseConnected: false,
   toastMessage: '',
@@ -41,13 +42,17 @@ const state = {
   workerQuery: '',
   workerStateFilter: 'ALL',
   historyQuery: '',
-  historyFlakyOnly: false,
+  historyOutcome: 'all',
+  historyProject: '',
+  historySort: 'attention',
+  historyRunDetails: null,
 
   // Modals
   selectedPartition: null,
   pages: {}, // current page per paginated table
   pageContexts: {}, // session and filters each table's current page belongs to
-  selectedTestExecution: null
+  selectedTestExecution: null,
+  expandedWorkspaceChange: null
 };
 
 document.documentElement.setAttribute('data-theme', state.theme);
@@ -79,6 +84,9 @@ function showToast(msg) {
 function buildHash() {
   if (state.view === 'session-detail' && state.selectedSessionId) {
     return `#session/${encodeURIComponent(state.selectedSessionId)}/${state.detailTab || 'waterfall'}`;
+  }
+  if (state.view === 'history' && state.historyOutcome !== 'all') {
+    return `#history?outcome=${state.historyOutcome}`;
   }
   return `#${state.view || 'overview'}`;
 }
@@ -115,7 +123,17 @@ function applyHashFromLocation() {
       return true;
     }
   }
-  if (['overview', 'sessions', 'session-detail', 'workers', 'history'].includes(raw)) {
+  const [view, query] = raw.split('?', 2);
+  if (view === 'history') {
+    const outcome = new URLSearchParams(query).get('outcome');
+    state.historyOutcome = ['failed', 'flaky'].includes(outcome) ? outcome : 'all';
+    state.historyProject = '';
+    state.historyQuery = '';
+    state.historyRunDetails = null;
+    state.view = 'history';
+    return true;
+  }
+  if (['overview', 'sessions', 'session-detail', 'workers'].includes(raw)) {
     state.view = raw;
     return true;
   }
@@ -135,53 +153,24 @@ function setView(view, detailTab = null) {
   }
 }
 
-function openAuthModal() {
-  if (!state.showAuthModal) {
-    state.authTokenDraft = state.authToken;
-    state.showAuthModal = true;
-  }
-  renderApp();
+function openFlakyHistory() {
+  state.historyOutcome = 'flaky';
+  state.historyProject = '';
+  state.historyQuery = '';
+  state.historyRunDetails = null;
+  setView('history');
 }
 
-function closeAuthModal() {
-  state.showAuthModal = false;
-  state.authTokenDraft = '';
-}
-
-function commitAuthToken(token) {
-  if (token) {
-    localStorage.setItem(STORAGE_TOKEN_KEY, token);
-  } else {
-    localStorage.removeItem(STORAGE_TOKEN_KEY);
-  }
-  state.authToken = token;
-  state.authError = '';
-  closeAuthModal();
-  connectSse();
-  refreshAll();
-}
-
-function apiHeaders() {
-  const headers = { 'Accept': 'application/json' };
-  if (state.authToken) {
-    headers['Authorization'] = `Bearer ${state.authToken}`;
-  }
-  return headers;
-}
-
-function requireApiAccess(response, authToken) {
+function requireApiAccess(response) {
   if (response.status !== 401) return;
-  if (authToken === state.authToken) {
-    state.authError = 'Bearer token required to access broker API.';
-    openAuthModal();
-  }
+  state.authError = 'The dashboard needs authenticated access to the coordinator API.';
+  renderApp();
   throw new Error('Unauthorized');
 }
 
 async function apiGet(path) {
-  const authToken = state.authToken;
-  const res = await fetch(path, { headers: apiHeaders() });
-  requireApiAccess(res, authToken);
+  const res = await fetch(path, { headers: { 'Accept': 'application/json' } });
+  requireApiAccess(res);
   if (!res.ok) {
     throw new Error(`HTTP ${res.status}`);
   }
@@ -189,13 +178,12 @@ async function apiGet(path) {
 }
 
 async function apiPost(path, body = {}) {
-  const authToken = state.authToken;
   const res = await fetch(path, {
     method: 'POST',
-    headers: { ...apiHeaders(), 'Content-Type': 'application/json' },
+    headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' },
     body: JSON.stringify(body)
   });
-  requireApiAccess(res, authToken);
+  requireApiAccess(res);
   if (!res.ok) {
     throw new Error(`HTTP ${res.status}`);
   }
@@ -381,8 +369,7 @@ function connectSse() {
   if (eventSource) {
     eventSource.close();
   }
-  const tokenQuery = state.authToken ? `?token=${encodeURIComponent(state.authToken)}` : '';
-  eventSource = new EventSource(`/api/v1/events/stream${tokenQuery}`);
+  eventSource = new EventSource('/api/v1/events/stream');
   eventSource.onopen = () => {
     state.sseConnected = true;
     renderApp();
@@ -398,8 +385,7 @@ function connectSse() {
     'session.created', 'session.completed', 'session.aborted', 'work.submitted',
     'partition.assigned', 'partition.started', 'partition.requeued',
     'partition.completed', 'partition.lost', 'test.event',
-    'worker.registered', 'worker.draining', 'worker.offline', 'worker.disconnected',
-    'demo.seeded'
+    'worker.registered', 'worker.draining', 'worker.offline', 'worker.disconnected'
   ];
   for (const evt of eventTypes) {
     eventSource.addEventListener(evt, () => {
@@ -413,20 +399,6 @@ function toggleTheme() {
   localStorage.setItem(STORAGE_THEME_KEY, state.theme);
   document.documentElement.setAttribute('data-theme', state.theme);
   renderApp();
-}
-
-async function handleSeedDemo() {
-  try {
-    const res = await apiPost('/api/v1/demo/seed', {});
-    await refreshAll();
-    showToast(res.seededSessions > 0
-      ? `Seeded ${res.seededSessions} demo Citrus sessions & 6 workers`
-      : 'Demo dataset refreshed');
-  } catch (err) {
-    if (err.message !== 'Unauthorized') {
-      showToast(`Failed to seed demo data: ${err.message}`);
-    }
-  }
 }
 
 async function handleAbortSession(sessionId) {
@@ -524,18 +496,8 @@ function renderTopbar() {
           <span class="sse-dot"></span>
           ${state.sseConnected ? 'Live SSE' : 'Polling'}
         </span>
-        <button class="icon-btn" onClick=${handleSeedDemo} title="Populate realistic Citrus demo dataset">
-          ✦ Seed Demo Data
-        </button>
         <button class="icon-btn" onClick=${toggleTheme} aria-label="Toggle dark or light theme">
           ${state.theme === 'light' ? '☾ Dark' : '☀ Light'}
-        </button>
-        <button
-          class="icon-btn"
-          onClick=${openAuthModal}
-          aria-label="Configure Bearer token"
-        >
-          🔑 ${state.authToken ? 'Auth Set' : 'Auth'}
         </button>
       </div>
     </header>
@@ -551,10 +513,15 @@ function renderSidebar() {
     state.mobileMenuOpen ? 'mobile-open' : ''
   ].filter(Boolean).join(' ');
 
-  const navItem = (id, label, iconChar, badgeVal) => html`
+  const navItem = (id, label, iconChar, badgeVal, onOpen) => html`
     <button
       class=${`nav-btn ${state.view === id ? 'active' : ''}`}
+      title=${onOpen ? 'Show tests recovered on retry' : label}
       onClick=${() => {
+        if (onOpen) {
+          onOpen();
+          return;
+        }
         if (id === 'session-detail' && !state.sessionDetail && state.sessions.length > 0) {
           loadSessionDetail(state.sessions[0].sessionId, true);
           return;
@@ -579,7 +546,8 @@ function renderSidebar() {
         ${navItem('session-detail', 'Session Waterfall', '⇶', state.sessionDetail ? state.sessionDetail.session.status : null)}
         <div class="nav-section-label" style="margin-top:10px">Infrastructure & Quality</div>
         ${navItem('workers', 'Workers Pool', '⚙', `${activeWorkers}/${state.workers.length}`)}
-        ${navItem('history', 'Test History & Flakiness', '⚡', flakyCount > 0 ? `${flakyCount} flaky` : state.history.length)}
+        ${navItem('history', 'Test History & Flakiness', '⚡',
+          flakyCount > 0 ? `${flakyCount} flaky` : state.history.length, flakyCount > 0 ? openFlakyHistory : null)}
       </div>
 
       <div class="sidebar-footer">
@@ -697,7 +665,7 @@ function renderOverview() {
 
 function renderSessionsTable(rows) {
   if (!rows || rows.length === 0) {
-    return html`<div class="empty-state">No matching build sessions found. Click "Seed Demo Data" in the header to explore sample runs.</div>`;
+    return html`<div class="empty-state">No matching build sessions found.</div>`;
   }
   return html`
     <div class="table-wrap">
@@ -1069,6 +1037,88 @@ function collectLatestTestFailures(tests) {
   return out;
 }
 
+const workspaceChangeLabels = {
+  ADDED: 'Added', MODIFIED: 'Modified', DELETED: 'Deleted', RENAMED: 'Renamed',
+  COPIED: 'Copied', TYPE_CHANGED: 'Type changed', CONFLICTED: 'Conflicted', UNKNOWN: 'File recorded'
+};
+
+function renderWorkspaceChanges(sessionId, changes) {
+  const anyDetails = changes.some(change => (change.kind && change.kind !== 'UNKNOWN') || change.patch);
+  return html`
+    <section class="card workspace-changes">
+      <div class="card-header">
+        <div>
+          <h2 class="card-title">Git Changed Workspace Files (${changes.length})</h2>
+          <p class="workspace-changes-caption">
+            ${anyDetails ? 'Snapshot taken when this session started.' : changes.length ? 'This session recorded file paths only.' : ''}
+          </p>
+        </div>
+      </div>
+      <div class="card-body">
+        ${changes.length ? html`
+          <ul class="workspace-change-list">
+            ${changes.map((change, index) => {
+              const path = change.path;
+              const separator = path.lastIndexOf('/');
+              const filename = path.slice(separator + 1);
+              const directory = path.slice(0, separator + 1);
+              const kind = Object.hasOwn(workspaceChangeLabels, change.kind) ? change.kind : 'UNKNOWN';
+              const expanded = state.expandedWorkspaceChange?.sessionId === sessionId
+                && state.expandedWorkspaceChange.path === path;
+              const hasCounts = Number.isInteger(change.additions) && Number.isInteger(change.deletions);
+              const diffId = `workspace-diff-${index}`;
+              const heading = html`
+                <span class="workspace-file">
+                  <span class="mono workspace-file-name">${filename}</span>
+                  ${directory ? html`<span class="mono workspace-file-directory">${directory}</span>` : null}
+                  ${change.previousPath ? html`<span class="mono workspace-file-directory">From ${change.previousPath}</span>` : null}
+                </span>
+                <span class=${`workspace-change-kind ${kind.toLowerCase()}`}>${workspaceChangeLabels[kind]}</span>
+                ${hasCounts ? html`
+                  <span class="mono workspace-change-counts" aria-label=${`${change.additions} additions, ${change.deletions} deletions`}>
+                    <span class="workspace-added">+${change.additions}</span>
+                    <span class="workspace-deleted">−${change.deletions}</span>
+                  </span>
+                ` : null}
+              `;
+              return html`
+                <li class="workspace-change-item">
+                  ${change.patch ? html`
+                    <button type="button" class="workspace-change-row workspace-change-trigger"
+                        data-focus-id=${`workspace-file-${index}`} aria-expanded=${String(expanded)} aria-controls=${diffId}
+                        onClick=${() => {
+                          state.expandedWorkspaceChange = expanded ? null : { sessionId, path };
+                          renderApp();
+                        }}>
+                      ${heading}<span class="workspace-change-toggle" aria-hidden="true">${expanded ? '▾' : '›'}</span>
+                    </button>
+                    <div id=${diffId} hidden=${!expanded}>
+                      ${expanded ? html`
+                        <pre class="workspace-diff mono" tabindex="0" aria-label=${`Git diff for ${path}`}>${change.patch
+                          .split('\n').filter((line, i, lines) => line || i !== lines.length - 1)
+                          .map(line => {
+                            let style = '';
+                            if (line.startsWith('@@')) style = 'workspace-diff-hunk';
+                            else if (/^\+(?!\+\+)/.test(line)) style = 'workspace-diff-add';
+                            else if (/^-(?!--)/.test(line)) style = 'workspace-diff-delete';
+                            return html`<span class=${style}>${line || ' '}</span>`;
+                          })}</pre>
+                        ${change.patchTruncated ? html`<p class="workspace-diff-note">Preview truncated.</p>` : null}
+                      ` : null}
+                    </div>
+                  ` : html`<div class="workspace-change-row">${heading}
+                    ${kind !== 'UNKNOWN' ? html`<span class="workspace-change-unavailable">No preview captured</span>` : null}
+                  </div>`}
+                </li>
+              `;
+            })}
+          </ul>
+        ` : html`<div class="empty-state">Clean workspace — no modified files recorded.</div>`}
+      </div>
+    </section>
+  `;
+}
+
 function renderSessionDetail() {
   if (!state.sessionDetail || !state.sessionDetail.session) {
     return html`
@@ -1078,7 +1128,8 @@ function renderSessionDetail() {
     `;
   }
 
-  const { session, changedFiles = [], partitions = [], tests = [] } = state.sessionDetail;
+  const { session, changedFiles = [], workspaceChanges, partitions = [], tests = [] } = state.sessionDetail;
+  const fileChanges = workspaceChanges?.length ? workspaceChanges : changedFiles.map(path => ({ path }));
   const failures = collectLatestTestFailures(tests);
   const partitionFailures = collectPartitionFailures(partitions);
   const totalFailureItems = failures.length + partitionFailures.length;
@@ -1132,17 +1183,14 @@ function renderSessionDetail() {
               title="Cancel active worker partitions and abort this build session"
             >✕ Abort Session</button>
           ` : null}
-          <select
-            class="search-input"
-            style="min-width:220px"
-            aria-label="Switch build session"
-            value=${session.sessionId}
-            onChange=${e => loadSessionDetail(e.target.value, false)}
-          >
-            ${state.sessions.map(s => html`
-              <option value=${s.sessionId}>${s.sessionId} (${s.status})</option>
-            `)}
-          </select>
+          <span class="dashboard-select session-switcher">
+            <select aria-label="Switch build session" data-focus-id="session-switcher"
+                value=${session.sessionId} onChange=${e => loadSessionDetail(e.target.value, false)}>
+              ${state.sessions.map(s => html`
+                <option value=${s.sessionId}>${s.sessionId} (${s.status})</option>
+              `)}
+            </select>
+          </span>
         </div>
       </div>
 
@@ -1195,7 +1243,7 @@ function renderSessionDetail() {
           Failing Tests (${totalFailureItems})
         </button>
         <button class=${`subtab-btn ${state.detailTab === 'files' ? 'active' : ''}`} onClick=${() => setView('session-detail', 'files')}>
-          Changed Files (${changedFiles.length})
+          Changed Files (${fileChanges.length})
         </button>
       </div>
 
@@ -1232,7 +1280,7 @@ function renderSessionDetail() {
                     const dur = (p.startedAt > 0 && p.finishedAt > 0)
                       ? formatDuration(p.finishedAt - p.startedAt)
                       : (p.state === 'RUNNING' ? 'running…' : formatDuration(p.estimatedDurationMs));
-                    const caps = Object.entries(p.requiredCapabilities || {});
+                    const caps = visibleCapabilities(p.requiredCapabilities);
                     const inCount = (p.inputPaths || []).length;
                     const outCount = (p.producedOutputs || []).length || (p.outputPaths || []).length;
                     return html`
@@ -1249,11 +1297,10 @@ function renderSessionDetail() {
                         <td class="mono">#${p.attempt}</td>
                         <td>${(p.workUnits || []).length} units</td>
                         <td>
-                          ${caps.length === 0 && !p.forkWorkspace && inCount === 0 && outCount === 0
+                          ${caps.length === 0 && inCount === 0 && outCount === 0
                             ? html`<span style="color:var(--text-muted)">default</span>`
                             : html`
                                 ${caps.map(([k, v]) => html`<span class="tag mono">${k}=${v}</span>`)}
-                                ${p.forkWorkspace ? html`<span class="tag tag-resource mono">forked-workspace</span>` : null}
                                 ${inCount > 0 ? html`<span class="tag tag-resource mono">${inCount} input(s)</span>` : null}
                                 ${outCount > 0 ? html`<span class="tag tag-resource mono">${outCount} output(s)</span>` : null}
                               `}
@@ -1393,26 +1440,7 @@ function renderSessionDetail() {
         </div>
       ` : null}
 
-      ${state.detailTab === 'files' ? html`
-        <div class="card">
-          <div class="card-header">
-            <h2 class="card-title">Git Changed Workspace Files (${changedFiles.length})</h2>
-          </div>
-          <div class="card-body">
-            ${changedFiles.length === 0
-              ? html`<div class="empty-state">Clean workspace — no modified files recorded.</div>`
-              : html`
-                <div style="display:flex;flex-direction:column;gap:8px">
-                  ${changedFiles.map(fp => html`
-                    <div class="mono" style="padding:8px 12px;border-radius:8px;background:var(--bg-subtle);font-size:12.5px">
-                      Δ ${fp}
-                    </div>
-                  `)}
-                </div>
-              `}
-          </div>
-        </div>
-      ` : null}
+      ${state.detailTab === 'files' ? renderWorkspaceChanges(session.sessionId, fileChanges) : null}
     </div>
   `;
 }
@@ -1537,7 +1565,7 @@ function renderWorkersPool() {
                 </div>
 
                 <div>
-                  ${Object.entries(w.capabilities || {}).map(([k, v]) => html`
+                  ${visibleCapabilities(w.capabilities).map(([k, v]) => html`
                     <span class="tag mono">${k}=${v}</span>
                   `)}
                 </div>
@@ -1551,104 +1579,223 @@ function renderWorkersPool() {
   `;
 }
 
+function historyProjectLabel(test) {
+  const scope = test.projectScope || '';
+  return scope.startsWith('key:') && !scope.startsWith('key:workspace:')
+    ? scope.slice(4)
+    : (test.projectName || 'Unknown project');
+}
+
+async function openHistoryRuns(test) {
+  const selection = { test, runs: null, error: false };
+  state.historyRunDetails = selection;
+  renderApp();
+  document.querySelector('[data-focus-id="close-test-runs"]')?.focus();
+  const query = new URLSearchParams({
+    projectScope: test.projectScope || 'name:',
+    workUnitKey: test.workUnitKey || '',
+    className: test.className || '',
+    testName: test.testName || '',
+    limit: '30'
+  });
+  try {
+    selection.runs = await apiGet(`/api/v1/tests/history/runs?${query}`);
+  } catch {
+    selection.error = true;
+  }
+  if (state.historyRunDetails === selection) renderApp();
+}
+
 function renderTestHistory() {
   const q = state.historyQuery.trim().toLowerCase();
-  const filtered = state.history.filter(h => {
-    if (state.historyFlakyOnly && (!h.flakyRuns || h.flakyRuns <= 0)) return false;
-    if (!q) return true;
-    return (h.className || '').toLowerCase().includes(q)
-      || (h.testName || '').toLowerCase().includes(q)
-      || (h.workUnitKey || '').toLowerCase().includes(q);
+  const projects = new Map(state.history.map(h => [h.projectScope || 'name:', historyProjectLabel(h)]));
+  const matching = state.history.filter(h =>
+    (!state.historyProject || (h.projectScope || 'name:') === state.historyProject)
+    && (!q || [h.className, h.testName, h.workUnitKey, historyProjectLabel(h)]
+      .some(value => (value || '').toLowerCase().includes(q))));
+  const failed = matching.filter(h => h.lastStatus === 'FAILED');
+  const flaky = matching.filter(h => h.flakyRuns > 0);
+  const filtered = state.historyOutcome === 'flaky' ? flaky
+    : state.historyOutcome === 'failed' ? failed : [...matching];
+  filtered.sort((a, b) => {
+    if (state.historySort === 'duration') return b.avgDurationMs - a.avgDurationMs;
+    if (state.historySort === 'attempts') return b.totalRuns - a.totalRuns;
+    return Number(b.lastStatus === 'FAILED') - Number(a.lastStatus === 'FAILED')
+      || (b.flakyRuns || 0) - (a.flakyRuns || 0) || b.avgDurationMs - a.avgDurationMs;
   });
+  const historyPage = paginate('history', filtered, 25,
+    `${state.historyProject}|${state.historyOutcome}|${state.historySort}|${q}`);
+  const filters = [
+    ['all', 'All tests', matching.length],
+    ['failed', 'Last attempt failed', failed.length],
+    ['flaky', 'Flaky', flaky.length]
+  ];
 
   return html`
     <div>
       <div class="page-header">
         <div>
-          <h1 class="page-title">Test History & Flakiness Telemetry</h1>
-          <p class="page-subtitle">Historical LPT duration estimates, pass rates, and retry-recovered flaky tests across sessions.</p>
+          <h1 class="page-title">Test History</h1>
+          <p class="page-subtitle">Find failing, flaky, or slow tests and open the sessions that recorded them.</p>
         </div>
       </div>
 
-      <div class="toolbar">
-        <input
-          class="search-input"
-          data-focus-id="history-search"
-          type="search"
-          placeholder="Filter by test class or method…"
-          value=${state.historyQuery}
-          onInput=${e => { state.historyQuery = e.target.value; renderApp(); }}
-        />
-        <button
-          class=${`btn ${state.historyFlakyOnly ? 'btn-primary' : ''}`}
-          onClick=${() => { state.historyFlakyOnly = !state.historyFlakyOnly; renderApp(); }}
-        >
-          ⚡ Flaky Only
-        </button>
+      <div class="history-controls">
+        <div class="toolbar">
+          <input class="search-input" data-focus-id="history-search" type="search" aria-label="Search tests"
+            placeholder="Search by test class or method…" value=${state.historyQuery}
+            onInput=${e => { state.historyQuery = e.target.value; renderApp(); }} />
+          <span class="dashboard-select">
+            <select aria-label="Project" data-focus-id="history-project" value=${state.historyProject}
+                onChange=${e => { state.historyProject = e.target.value; renderApp(); }}>
+              <option value="">All projects</option>
+              ${[...projects].sort((a, b) => a[1].localeCompare(b[1])).map(([key, label]) =>
+                html`<option value=${key}>${label}</option>`)}
+            </select>
+          </span>
+          <span class="dashboard-select">
+            <select aria-label="Sort tests" data-focus-id="history-sort" value=${state.historySort}
+                onChange=${e => { state.historySort = e.target.value; renderApp(); }}>
+              <option value="attention">Failures and flaky first</option>
+              <option value="duration">Slowest first</option>
+              <option value="attempts">Most attempts first</option>
+            </select>
+          </span>
+        </div>
+        <div class="pill-group" aria-label="Filter by outcome">
+          ${filters.map(([id, label, count]) => html`
+            <button class=${`filter-pill${state.historyOutcome === id ? ' active' : ''}`}
+                aria-pressed=${String(state.historyOutcome === id)}
+                data-focus-id=${`history-filter-${id}`}
+                onClick=${() => { state.historyOutcome = id; syncHash(); renderApp(); }}>
+              ${label} <span class="history-filter-count">${count}</span>
+            </button>
+          `)}
+        </div>
+        ${state.historyOutcome === 'flaky' ? html`
+          <p class="history-filter-note">Tests that passed after a worker retry. Select View runs to see the attempts by session.</p>
+        ` : null}
       </div>
 
       <div class="card">
         ${filtered.length === 0
-          ? html`<div class="empty-state">No historical test records match the filter.</div>`
+          ? html`<div class="empty-state">No test records match these filters.</div>`
           : html`
             <div class="table-wrap">
               <table>
-                <thead>
-                  <tr>
-                    <th>Test Case</th>
-                    <th>Runs</th>
-                    <th>Pass Rate</th>
-                    <th>Flaky Recoveries</th>
-                    <th>Avg Duration</th>
-                    <th>Max Duration</th>
-                    <th>Last Outcome</th>
-                  </tr>
-                </thead>
+                <thead><tr>
+                  <th>Test case</th><th>Attempts</th><th>Attempt pass rate</th><th>Avg duration</th>
+                  <th>Last outcome</th><th>Sessions</th>
+                </tr></thead>
                 <tbody>
-                  ${paginate('history', filtered, 25, `${state.historyFlakyOnly}|${q}`).items.map(h => {
-                    const passedRuns = typeof h.passedRuns === 'number'
-                      ? h.passedRuns
-                      : Math.max(0, (h.totalRuns || 0) - (h.failedRuns || 0));
-                    const rate = h.totalRuns > 0 ? Math.round((passedRuns / h.totalRuns) * 100) : 0;
-                    const maxMs = h.maxDurationMs > 0 ? h.maxDurationMs : h.avgDurationMs;
+                  ${historyPage.items.map((h, index) => {
+                    const passed = h.passedRuns ?? Math.max(0, (h.totalRuns || 0) - (h.failedRuns || 0));
+                    const rate = h.totalRuns > 0 ? Math.round(passed / h.totalRuns * 100) : 0;
                     return html`
                       <tr>
                         <td>
-                          <div style="font-weight:700">${h.testName}</div>
-                          <div class="mono" style="font-size:11.5px;color:var(--text-muted)">${h.className}</div>
+                          <div class="history-test-name">${h.testName || h.workUnitKey}</div>
+                          <div class="mono history-test-context">${h.className}</div>
+                          <div class="history-test-context">${historyProjectLabel(h)}</div>
                         </td>
                         <td class="mono">${h.totalRuns}</td>
                         <td>
-                          <div style="display:flex;align-items:center;gap:8px">
-                            <div class="progress-mini">
-                              <span class="progress-seg-pass" style=${`width:${rate}%`}></span>
-                              <span class="progress-seg-fail" style=${`width:${100 - rate}%`}></span>
-                            </div>
-                            <span class="mono" style="font-size:12px;font-weight:700">${rate}%</span>
+                          <div class="history-rate">
+                            <div class="progress-mini"><span class="progress-seg-pass" style=${`width:${rate}%`}></span></div>
+                            <span class="mono">${rate}%</span>
                           </div>
                         </td>
-                        <td>
-                          ${h.flakyRuns > 0
-                            ? html`<span class="badge badge-flaky">${h.flakyRuns} flaky</span>`
-                            : html`<span style="color:var(--text-muted)">0</span>`}
-                        </td>
                         <td class="mono">${formatDuration(h.avgDurationMs)}</td>
-                        <td class="mono">${formatDuration(maxMs)}</td>
-                        <td>${statusBadge(h.lastStatus)}</td>
+                        <td>
+                          ${statusBadge(h.lastStatus)}
+                          ${h.flakyRuns > 0 ? html`<div class="history-recovery">${h.flakyRuns} ${h.flakyRuns === 1 ? "recovery" : "recoveries"}</div>` : null}
+                        </td>
+                        <td><button type="button" class="btn btn-sm history-open"
+                            data-focus-id=${`history-runs-${index}`} onClick=${() => openHistoryRuns(h)}>View runs →</button></td>
                       </tr>
                     `;
                   })}
                 </tbody>
               </table>
             </div>
-            ${paginate('history', filtered, 25, `${state.historyFlakyOnly}|${q}`).controls}
+            ${historyPage.controls}
           `}
       </div>
     </div>
   `;
 }
 
+function renderHistoryRuns(details) {
+  const { test, runs, error } = details;
+  const grouped = new Map();
+  for (const [index, attempt] of (runs || []).entries()) {
+    const key = attempt.sessionId || `ungrouped-${index}`;
+    if (!grouped.has(key)) grouped.set(key, []);
+    grouped.get(key).push(attempt);
+  }
+  const close = () => { state.historyRunDetails = null; renderApp(); };
+  return html`
+    <div class="modal-backdrop" onClick=${close}>
+      <div class="modal-panel history-runs-panel" role="dialog" aria-modal="true"
+          aria-labelledby="history-runs-title" onClick=${e => e.stopPropagation()}>
+        <div class="modal-header">
+          <div>
+            <strong id="history-runs-title">${test.testName || test.workUnitKey}</strong>
+            <div class="history-test-context">${historyProjectLabel(test)} · ${test.className}</div>
+          </div>
+          <button class="btn btn-sm" data-focus-id="close-test-runs" onClick=${close}>Close</button>
+        </div>
+        <div class="modal-body">
+          ${error ? html`<div class="empty-state">Could not load test runs. <button class="btn btn-sm" onClick=${() => openHistoryRuns(test)}>Retry</button></div>`
+            : runs === null ? html`<div class="empty-state" role="status">Loading test runs…</div>`
+            : grouped.size === 0 ? html`<div class="empty-state">No recorded attempts for this test.</div>` : html`
+              <div class="history-runs-heading">Latest ${runs.length} ${runs.length === 1 ? 'attempt' : 'attempts'} · ${grouped.size} ${grouped.size === 1 ? 'session' : 'sessions'}</div>
+              <ul class="history-run-groups">
+                ${[...grouped.values()].map(attempts => {
+                  const recent = attempts[0];
+                  return html`
+                    <li class="history-run-group">
+                      <div class="history-run-session">
+                        <div>
+                          <div class="history-run-session-title">${recent.gitBranch || 'Session'}
+                            ${recent.gitCommit ? html`<code>${recent.gitCommit.slice(0, 8)}</code>` : null}
+                          </div>
+                          <div class="history-test-context">${recent.recordedAt > 0 ? new Date(recent.recordedAt).toLocaleString() : ''}
+                            ${recent.sessionId ? html`<span class="mono"> · ${recent.sessionId}</span>` : null}
+                          </div>
+                        </div>
+                        ${recent.sessionId ? html`
+                          <a class="btn btn-sm" href=${`#session/${encodeURIComponent(recent.sessionId)}/tests`}
+                              onClick=${() => {
+                                state.historyRunDetails = null;
+                                state.testQuery = test.testName || test.className || '';
+                                state.testStatusFilter = 'ALL';
+                              }}>Open session →</a>` : null}
+                      </div>
+                      <ul class="history-attempts">
+                        ${attempts.map(run => html`
+                          <li>
+                            <span>${statusBadge(run.status)}
+                              ${run.flaky ? html`<span class="badge badge-flaky">Recovered</span>` : null}
+                            </span>
+                            <span class="history-test-context">Attempt ${run.attempt || 1}
+                              ${run.workerId ? ` · ${run.workerId}` : ''}${run.moduleName ? ` · ${run.moduleName}` : ''}</span>
+                            <span class="mono">${formatDuration(run.durationMs)}</span>
+                          </li>
+                        `)}
+                      </ul>
+                    </li>
+                  `;
+                })}
+              </ul>`}
+        </div>
+      </div>
+    </div>
+  `;
+}
+
 function renderModals() {
+  if (state.historyRunDetails && state.view === 'history') return renderHistoryRuns(state.historyRunDetails);
   if (state.selectedPartition) {
     const p = state.selectedPartition;
     const partTests = (state.sessionDetail?.tests || []).filter(
@@ -1657,6 +1804,7 @@ function renderModals() {
     const inputPaths = p.inputPaths || [];
     const outputPaths = p.outputPaths || [];
     const producedOutputs = p.producedOutputs || [];
+    const visibleRequirements = visibleCapabilities(p.requiredCapabilities);
     const hasWorkspaceDetails = Boolean(
       p.moduleName
       || p.forkWorkspace
@@ -1675,7 +1823,6 @@ function renderModals() {
                 <strong class="mono" style="font-size:16px">${p.partitionId}</strong>
                 ${statusBadge(p.state)}
                 <span class="tag mono">attempt #${p.attempt}</span>
-                ${p.forkWorkspace ? html`<span class="tag tag-resource mono">forked-workspace</span>` : null}
               </div>
               <div style="font-size:12px;color:var(--text-muted);margin-top:3px">
                 Assigned worker: <strong class="mono">${p.workerId || 'unassigned'}</strong> · Est. ${formatDuration(p.estimatedDurationMs)}
@@ -1716,9 +1863,9 @@ function renderModals() {
 
             <h3 style="margin:0 0 8px;font-size:13px;text-transform:uppercase;color:var(--text-muted)">Required Capabilities</h3>
             <div style="margin-bottom:16px">
-              ${Object.entries(p.requiredCapabilities || {}).length === 0
-                ? html`<span style="color:var(--text-muted)">No special placement constraints</span>`
-                : Object.entries(p.requiredCapabilities).map(([k, v]) => html`<span class="tag mono">${k}=${v}</span>`)}
+              ${visibleRequirements.length === 0
+                ? html`<span style="color:var(--text-muted)">No additional placement constraints</span>`
+                : visibleRequirements.map(([k, v]) => html`<span class="tag mono">${k}=${v}</span>`)}
             </div>
 
             ${hasWorkspaceDetails ? html`
@@ -1731,7 +1878,7 @@ function renderModals() {
                   </div>
                   <div class="kv-box">
                     <div class="kv-label">Isolation Mode</div>
-                    <div class="kv-val">${p.forkWorkspace ? 'Forked JVM + Workspace' : 'In-Process ClassLoader'}</div>
+                    <div class="kv-val">${p.forkWorkspace ? 'Isolated JVM' : 'Worker JVM'}</div>
                   </div>
                   <div class="kv-box">
                     <div class="kv-label">Working Directory</div>
@@ -1826,43 +1973,6 @@ function renderModals() {
     `;
   }
 
-  if (state.showAuthModal) {
-    return html`
-      <div class="modal-backdrop" onClick=${() => { closeAuthModal(); renderApp(); }}>
-        <div class="modal-panel" style="max-width:440px" onClick=${e => e.stopPropagation()}>
-          <div class="modal-header">
-            <strong style="font-size:16px">Broker Bearer Authentication</strong>
-            <button class="btn btn-sm" onClick=${() => { closeAuthModal(); renderApp(); }}>✕</button>
-          </div>
-          <div class="modal-body">
-            ${state.authError ? html`<div style="margin-bottom:12px;padding:8px 12px;border-radius:8px;background:var(--rose-bg);color:var(--rose-text);font-weight:600">${state.authError}</div>` : null}
-            <label style="display:block;font-size:12.5px;font-weight:600;margin-bottom:6px">Shared Bearer Token</label>
-            <input
-              id="auth-token-input"
-              data-focus-id="auth-token-input"
-              class="search-input"
-              style="width:100%;margin-bottom:16px"
-              type="password"
-              placeholder="Enter broker --auth-token value…"
-              value=${state.authTokenDraft}
-              onInput=${e => { state.authTokenDraft = e.target.value; }}
-            />
-            <div style="display:flex;justify-content:flex-end;gap:8px">
-              <button
-                class="btn"
-                onClick=${() => commitAuthToken('')}
-              >Clear</button>
-              <button
-                class="btn btn-primary"
-                onClick=${() => commitAuthToken(state.authTokenDraft.trim())}
-              >Save & Connect</button>
-            </div>
-          </div>
-        </div>
-      </div>
-    `;
-  }
-
   return null;
 }
 
@@ -1892,6 +2002,7 @@ export function renderApp() {
       <div class="shell">
         ${renderSidebar()}
         <main class="main-content">
+          ${state.authError ? html`<div class="alert-banner alert-banner-amber" role="status">${state.authError}</div>` : null}
           ${renderMainView()}
         </main>
       </div>
@@ -1928,14 +2039,15 @@ window.addEventListener('hashchange', () => {
       return;
     }
     renderApp();
+    if (state.view === 'history') loadHistory();
   }
 });
 
 window.addEventListener('keydown', e => {
-  if (e.key === 'Escape' && (state.selectedPartition || state.selectedTestExecution || state.showAuthModal)) {
+  if (e.key === 'Escape' && (state.selectedPartition || state.selectedTestExecution || state.historyRunDetails)) {
     state.selectedPartition = null;
     state.selectedTestExecution = null;
-    closeAuthModal();
+    state.historyRunDetails = null;
     renderApp();
   }
 });

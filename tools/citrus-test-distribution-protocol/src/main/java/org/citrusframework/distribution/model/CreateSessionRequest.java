@@ -24,6 +24,16 @@ public record CreateSessionRequest(
         String gitCommit,
         List<String> changedFiles,
         int maxPartitionSize,
-        int maxRetries
+        int maxRetries,
+        List<WorkspaceChange> workspaceChanges,
+        String projectKey
 ) {
+    public CreateSessionRequest(String projectName, String gitBranch, String gitCommit, List<String> changedFiles,
+                                int maxPartitionSize, int maxRetries) {
+        this(projectName, gitBranch, gitCommit, changedFiles, maxPartitionSize, maxRetries, List.of(), null);
+    }
+    public CreateSessionRequest(String projectName, String gitBranch, String gitCommit, List<String> changedFiles,
+                                int maxPartitionSize, int maxRetries, List<WorkspaceChange> workspaceChanges) {
+        this(projectName, gitBranch, gitCommit, changedFiles, maxPartitionSize, maxRetries, workspaceChanges, null);
+    }
 }

@@ -15,9 +15,6 @@
 
   <properties>
     <maven.deploy.skip>true</maven.deploy.skip>
-    <!-- Citrus Test Distribution: @QuarkusTest bootstraps from this module's Maven project layout (pom.xml, target/),
-         which workers do not have, so these tests always run locally. -->
-    <citrus.test.distribution.skip>true</citrus.test.distribution.skip>
   </properties>
 
   <dependencyManagement>

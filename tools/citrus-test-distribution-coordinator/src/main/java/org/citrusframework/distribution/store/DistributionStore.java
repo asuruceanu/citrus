@@ -28,6 +28,8 @@ import org.citrusframework.distribution.model.SessionStatus;
 import org.citrusframework.distribution.model.SessionSummary;
 import org.citrusframework.distribution.model.SubmitWorkResponse;
 import org.citrusframework.distribution.model.TestExecutionRecord;
+import org.citrusframework.distribution.model.WorkspaceChange;
+import org.citrusframework.distribution.model.TestHistoryRun;
 import org.citrusframework.distribution.model.TestHistorySummary;
 import org.citrusframework.distribution.model.WorkerRecord;
 
@@ -44,6 +46,14 @@ public interface DistributionStore extends AutoCloseable {
     /** Saves the session and its requested partition size. A non-positive size requests broker-managed sizing. */
     default void saveSession(BuildSessionRecord session, int requestedMaxPartitionSize) {
         saveSession(session);
+    }
+
+    default void saveSession(BuildSessionRecord session, int requestedMaxPartitionSize, String historyScope) {
+        saveSession(session, requestedMaxPartitionSize);
+    }
+
+    default Optional<String> findSessionHistoryScope(String sessionId) {
+        return Optional.empty();
     }
 
     /** Returns the original requested size when available, including zero for broker-managed sizing. */
@@ -64,7 +74,13 @@ public interface DistributionStore extends AutoCloseable {
 
     List<BuildSessionRecord> listSessions(int limit);
 
-    void saveChangedFiles(String sessionId, List<String> changedFiles);
+    default void saveChangedFiles(String sessionId, List<String> changedFiles) {
+        saveChangedFiles(sessionId, changedFiles, List.of());
+    }
+
+    void saveChangedFiles(String sessionId, List<String> changedFiles, List<WorkspaceChange> workspaceChanges);
+
+    List<WorkspaceChange> findWorkspaceChanges(String sessionId);
 
     List<String> findChangedFiles(String sessionId);
 
@@ -84,9 +100,16 @@ public interface DistributionStore extends AutoCloseable {
 
     List<TestExecutionRecord> listTestExecutions(String sessionId);
 
-    Map<String, Long> findHistoricalDurationsMs(Collection<String> workUnitKeys, int recentLimit);
+    default Map<String, Long> findHistoricalDurationsMs(Collection<String> workUnitKeys, int recentLimit) {
+        return findHistoricalDurationsMs(workUnitKeys, recentLimit, null);
+    }
+
+    Map<String, Long> findHistoricalDurationsMs(Collection<String> workUnitKeys, int recentLimit, String historyScope);
 
     List<TestHistorySummary> listTestHistory(int limit);
+
+    List<TestHistoryRun> listTestHistoryRuns(String projectScope, String workUnitKey, String className,
+                                            String testName, int limit);
 
     @Override
     void close();

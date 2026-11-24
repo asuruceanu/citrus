@@ -45,7 +45,6 @@ public final class DistributionBrokerConfig {
     private final long minPartitionDurationMs;
     private final int maxWavesPerWorker;
     private final long leaseTimeoutMs;
-    private final boolean demoData;
 
     private DistributionBrokerConfig(Builder builder) {
         this.host = builder.host;
@@ -61,7 +60,6 @@ public final class DistributionBrokerConfig {
         this.minPartitionDurationMs = Math.max(0L, builder.minPartitionDurationMs);
         this.maxWavesPerWorker = Math.max(0, builder.maxWavesPerWorker);
         this.leaseTimeoutMs = builder.leaseTimeoutMs;
-        this.demoData = builder.demoData;
     }
 
     public static Builder builder() {
@@ -133,10 +131,6 @@ public final class DistributionBrokerConfig {
         return leaseTimeoutMs;
     }
 
-    public boolean demoData() {
-        return demoData;
-    }
-
     public static final class Builder {
         private String host = "0.0.0.0";
         private int port = 8084;
@@ -151,9 +145,6 @@ public final class DistributionBrokerConfig {
         private long minPartitionDurationMs = DistributionSettings.getBrokerMinPartitionDurationMs();
         private int maxWavesPerWorker = DistributionSettings.getBrokerMaxWavesPerWorker();
         private long leaseTimeoutMs = 60_000L;
-        private boolean demoData = Boolean.parseBoolean(
-                System.getProperty("citrus.test.distribution.demo.data",
-                        System.getenv().getOrDefault("CITRUS_DIST_DEMO_DATA", "false")));
 
         public Builder host(String host) {
             this.host = host;
@@ -217,11 +208,6 @@ public final class DistributionBrokerConfig {
 
         public Builder leaseTimeoutMs(long leaseTimeoutMs) {
             this.leaseTimeoutMs = leaseTimeoutMs;
-            return this;
-        }
-
-        public Builder demoData(boolean demoData) {
-            this.demoData = demoData;
             return this;
         }
 

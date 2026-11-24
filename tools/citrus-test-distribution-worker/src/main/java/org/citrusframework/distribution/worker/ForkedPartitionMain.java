@@ -31,6 +31,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import org.citrusframework.distribution.config.DistributionJson;
+import org.citrusframework.distribution.config.ForkedJvmOptions;
 import org.citrusframework.distribution.model.WorkUnitSpec;
 import org.citrusframework.distribution.workspace.WorkspaceLease;
 import org.junit.platform.engine.CancellationToken;
@@ -159,7 +160,9 @@ public final class ForkedPartitionMain {
             if (key == null || key.startsWith("java.") || key.startsWith("os.") || key.startsWith("user.dir")) {
                 return;
             }
-            if (value == null) {
+            if (ForkedJvmOptions.ASSERTIONS_PROPERTY.equals(key)) {
+                ClassLoader.getSystemClassLoader().setDefaultAssertionStatus(Boolean.parseBoolean(value));
+            } else if (value == null) {
                 System.clearProperty(key);
             } else {
                 System.setProperty(key, value);

@@ -21,7 +21,11 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 
-public record HistoricalDurationsRequest(List<String> testKeys, int limit) {
+public record HistoricalDurationsRequest(List<String> testKeys, int limit, String historyScope) {
+
+    public HistoricalDurationsRequest(List<String> testKeys, int limit) {
+        this(testKeys, limit, null);
+    }
 
     public HistoricalDurationsRequest {
         testKeys = testKeys == null ? List.of() : Collections.unmodifiableList(new ArrayList<>(testKeys));

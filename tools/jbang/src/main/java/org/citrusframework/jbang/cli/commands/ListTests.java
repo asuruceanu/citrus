@@ -20,6 +20,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Objects;
 
 import com.github.freva.asciitable.AsciiTable;
 import com.github.freva.asciitable.Column;
@@ -75,13 +76,16 @@ public class ListTests extends CitrusCommand {
         final long cur = ProcessHandle.current().pid();
         ProcessHandle.allProcesses()
                 .filter(ph -> ph.pid() != cur)
-                .filter(ph -> isTestProcess(ph.info()))
                 .forEach(ph -> {
+                    ProcessHandle.Info info = ph.info();
+                    if (!isTestProcess(info)) {
+                        return;
+                    }
                     Row row = new Row();
                     row.pid = "" + ph.pid();
                     row.uptime = extractSince(ph);
                     row.ago = printSince(row.uptime);
-                    row.name = extractName(ph);
+                    row.name = Objects.requireNonNullElse(findProcessName(info), "");
                     row.status = ph.isAlive() ? "Running" : "Finished";
                     rows.add(row);
                 });
@@ -105,19 +109,26 @@ public class ListTests extends CitrusCommand {
     }
 
     protected boolean isTestProcess(ProcessHandle.Info info) {
-        return info.commandLine().orElse("").contains(CitrusJBang.class.getSimpleName());
+        return findProcessName(info) != null;
     }
 
-    private String extractName(ProcessHandle ph) {
-        String cl = ph.info().commandLine().orElse("");
-        String citrusJBangRun = getJBangRunCommand();
-        if (cl.contains(citrusJBangRun)) {
-            return cl.substring(cl.indexOf(citrusJBangRun) + citrusJBangRun.length());
-        } else if (cl.contains(getJBangAgentCommand())) {
-            return "citrus-agent";
+    private String findProcessName(ProcessHandle.Info info) {
+        String[] arguments = info.arguments().orElseGet(() -> info.commandLine().orElse("").split("\\s+"));
+        for (int index = 0; index + 1 < arguments.length; index++) {
+            String entryPoint = arguments[index];
+            if (!CitrusJBang.class.getName().equals(entryPoint) && !CitrusJBangMain.class.getName().equals(entryPoint)) {
+                continue;
+            }
+            String command = CitrusJBang.class.getName() + " " + arguments[index + 1] + " ";
+            if (getJBangRunCommand().equals(command)) {
+                return String.join(" ", Arrays.copyOfRange(arguments, index + 2, arguments.length));
+            }
+            if (getJBangAgentCommand().equals(command)) {
+                return "citrus-agent";
+            }
+            break;
         }
-
-        return "";
+        return null;
     }
 
     protected String getJBangRunCommand() {

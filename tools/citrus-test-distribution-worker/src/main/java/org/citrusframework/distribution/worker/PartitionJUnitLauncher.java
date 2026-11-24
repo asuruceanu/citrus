@@ -25,6 +25,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Consumer;
 
@@ -32,6 +33,7 @@ import org.citrusframework.distribution.config.CitrusEndpointCollector;
 import org.citrusframework.distribution.model.TestOutcomeStatus;
 import org.citrusframework.distribution.model.WorkUnitSpec;
 import org.citrusframework.distribution.model.WorkerTestEventPayload;
+import org.citrusframework.distribution.workspace.IsolatedTestLock;
 import org.junit.platform.engine.CancellationToken;
 import org.junit.platform.engine.DiscoverySelector;
 import org.junit.platform.engine.TestExecutionResult;
@@ -86,7 +88,9 @@ public final class PartitionJUnitLauncher {
         Thread thread = Thread.currentThread();
         ClassLoader previous = thread.getContextClassLoader();
         thread.setContextClassLoader(testClassLoader);
-        try (CitrusEndpointCollector endpointCollector = CitrusEndpointCollector.install(testClassLoader)) {
+        try (IsolatedTestLock isolation = IsolatedTestLock.acquire(workUnits, testClassLoader,
+                     () -> isCancelled(cancellationToken));
+             CitrusEndpointCollector endpointCollector = CitrusEndpointCollector.install(testClassLoader)) {
             resetCitrusExtensionIfPresent(testClassLoader);
             List<WorkUnitSpec> regular = new ArrayList<>();
             List<WorkUnitSpec> dynamic = new ArrayList<>();
@@ -135,6 +139,8 @@ public final class PartitionJUnitLauncher {
                 return new ExecutionSummary(false, "Work units matched no tests on the worker: " + String.join(", ", unmatched));
             }
             return new ExecutionSummary(true, null);
+        } catch (CancellationException e) {
+            return new ExecutionSummary(false, e.getMessage());
         } catch (Throwable t) {
             if (t instanceof InterruptedException) {
                 thread.interrupt();

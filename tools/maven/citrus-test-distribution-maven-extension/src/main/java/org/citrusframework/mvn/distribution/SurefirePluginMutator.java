@@ -26,6 +26,7 @@ import org.apache.maven.model.Plugin;
 import org.apache.maven.model.PluginExecution;
 import org.apache.maven.project.MavenProject;
 import org.citrusframework.distribution.config.DistributionSettings;
+import org.citrusframework.distribution.config.ForkedJvmOptions;
 import org.codehaus.plexus.util.xml.Xpp3Dom;
 
 /**
@@ -215,18 +216,26 @@ public final class SurefirePluginMutator {
                                      Map<String, String> sharedProperties,
                                      Resolution resolution) {
         Xpp3Dom config = ensureDom(plugin.getConfiguration());
-        applyDomMutations(project, config, sessionId, extraClasspathJars, sharedProperties, resolution);
+        String assertions = assertionSetting(config, resolution.cliUserProperties().getProperty("enableAssertions",
+                project.getProperties() == null ? "true" : project.getProperties().getProperty("enableAssertions", "true")));
+        applyDomMutations(project, config, sessionId, extraClasspathJars, sharedProperties, resolution, assertions);
         plugin.setConfiguration(config);
 
         if (plugin.getExecutions() != null) {
             for (PluginExecution execution : plugin.getExecutions()) {
                 if (execution.getConfiguration() != null) {
                     Xpp3Dom execDom = ensureDom(execution.getConfiguration());
-                    applyDomMutations(project, execDom, sessionId, extraClasspathJars, sharedProperties, resolution);
+                    applyDomMutations(project, execDom, sessionId, extraClasspathJars, sharedProperties, resolution,
+                            assertionSetting(execDom, assertions));
                     execution.setConfiguration(execDom);
                 }
             }
         }
+    }
+
+    private static String assertionSetting(Xpp3Dom config, String fallback) {
+        Xpp3Dom value = config.getChild("enableAssertions");
+        return value != null && value.getValue() != null && !value.getValue().isBlank() ? value.getValue() : fallback;
     }
 
     private static void applyDomMutations(MavenProject project,
@@ -234,7 +243,7 @@ public final class SurefirePluginMutator {
                                           String sessionId,
                                           List<Path> extraClasspathJars,
                                           Map<String, String> sharedProperties,
-                                          Resolution resolution) {
+                                          Resolution resolution, String assertions) {
         Xpp3Dom additionalCp = getOrCreateChild(config, "additionalClasspathElements");
         for (Path jar : extraClasspathJars) {
             String absPath = jar.toAbsolutePath().toString();
@@ -247,6 +256,7 @@ public final class SurefirePluginMutator {
 
         Xpp3Dom sysProps = getOrCreateChild(config, "systemPropertyVariables");
         setChildValue(sysProps, "junit.platform.launcher.interceptors.enabled", "true");
+        setChildValue(sysProps, ForkedJvmOptions.ASSERTIONS_PROPERTY, assertions);
         setChildValue(sysProps, DistributionSettings.ENABLED_PROPERTY, "true");
         if (sessionId != null && !sessionId.isBlank()) {
             setChildValue(sysProps, DistributionSettings.SESSION_ID_PROPERTY, sessionId);
@@ -264,6 +274,11 @@ public final class SurefirePluginMutator {
         if (!resolution.cliUserProperties().containsKey(DistributionSettings.BASEDIR_PROPERTY) && project.getBasedir() != null) {
             setChildValue(sysProps, DistributionSettings.BASEDIR_PROPERTY,
                     project.getBasedir().toPath().toAbsolutePath().normalize().toString());
+        }
+        String buildDirectory = project.getBuild().getDirectory();
+        if (buildDirectory != null && !buildDirectory.isBlank()
+                && !resolution.cliUserProperties().containsKey(DistributionSettings.BUILD_DIRECTORY_PROPERTY)) {
+            setChildValue(sysProps, DistributionSettings.BUILD_DIRECTORY_PROPERTY, buildDirectory);
         }
         for (WorkspaceSetting setting : WorkspaceSetting.values()) {
             Winner winner = winningValue(setting, project, sysProps, resolution);

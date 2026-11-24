@@ -50,8 +50,6 @@ import org.citrusframework.distribution.model.MissingDigestsResponse;
 import org.citrusframework.distribution.model.ReportLocalTestsRequest;
 import org.citrusframework.distribution.model.SubmitWorkRequest;
 import org.citrusframework.distribution.model.SubmitWorkResponse;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 import tools.jackson.core.JacksonException;
 
 /**
@@ -59,7 +57,7 @@ import tools.jackson.core.JacksonException;
  */
 public class BrokerHttpClient {
 
-    private static final Logger LOG = LoggerFactory.getLogger(BrokerHttpClient.class);
+    private static final System.Logger LOG = System.getLogger(BrokerHttpClient.class.getName());
 
     private final String baseUrl;
     private final String authToken;
@@ -82,26 +80,31 @@ public class BrokerHttpClient {
     }
 
     public Optional<Map<String, Long>> findHistoricalDurations(List<String> workUnitKeys, int recentLimit) {
+        return findHistoricalDurations(workUnitKeys, recentLimit, null);
+    }
+
+    public Optional<Map<String, Long>> findHistoricalDurations(List<String> workUnitKeys, int recentLimit,
+                                                                String historyScope) {
         if (workUnitKeys == null || workUnitKeys.isEmpty()) {
             return Optional.of(Map.of());
         }
         try {
             var response = sendJsonPostWithDeadline("/api/v1/history/durations",
-                    new HistoricalDurationsRequest(workUnitKeys, recentLimit));
+                    new HistoricalDurationsRequest(workUnitKeys, recentLimit, historyScope));
             if (response.statusCode() == 200) {
                 var history = DistributionJson.fromJson(response.body(), HistoricalDurationsResponse.class);
                 if (history != null) {
                     return Optional.of(history.durationsMs());
                 }
-                LOG.debug("Historical test durations unavailable (empty broker response)");
+                LOG.log(System.Logger.Level.DEBUG, "Historical test durations unavailable (empty broker response)");
             } else {
-                LOG.debug("Historical test durations unavailable (broker HTTP {})", response.statusCode());
+                LOG.log(System.Logger.Level.DEBUG, "Historical test durations unavailable (broker HTTP {0})", response.statusCode());
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            LOG.debug("Historical test duration lookup interrupted", e);
+            LOG.log(System.Logger.Level.DEBUG, "Historical test duration lookup interrupted", e);
         } catch (IOException | JacksonException | IllegalArgumentException e) {
-            LOG.debug("Historical test durations unavailable", e);
+            LOG.log(System.Logger.Level.DEBUG, "Historical test durations unavailable", e);
         }
         return Optional.empty();
     }

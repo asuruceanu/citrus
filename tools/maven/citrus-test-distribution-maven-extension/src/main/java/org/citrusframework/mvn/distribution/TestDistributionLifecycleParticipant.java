@@ -33,6 +33,7 @@ import org.apache.maven.AbstractMavenLifecycleParticipant;
 import org.apache.maven.MavenExecutionException;
 import org.apache.maven.execution.MavenSession;
 import org.apache.maven.project.MavenProject;
+import org.citrusframework.distribution.config.DistributionJson;
 import org.citrusframework.distribution.config.DistributionSettings;
 import org.citrusframework.distribution.junit.BrokerHttpClient;
 import org.citrusframework.distribution.junit.DistributionLauncherInterceptor;
@@ -84,6 +85,10 @@ public class TestDistributionLifecycleParticipant extends AbstractMavenLifecycle
         if (projectName == null || projectName.isBlank()) {
             projectName = defaultProjectName;
         }
+        MavenProject rootProject = executionRootProject(session);
+        String projectKey = resolveProperty(session, DistributionSettings.PROJECT_KEY_PROPERTY,
+                rootProject == null || rootProject.getGroupId() == null ? null
+                        : rootProject.getGroupId() + ":" + rootProject.getArtifactId());
         Path rootDir = session.getExecutionRootDirectory() != null
                 ? Path.of(session.getExecutionRootDirectory())
                 : (topProject != null && topProject.getBasedir() != null ? topProject.getBasedir().toPath() : null);
@@ -110,7 +115,9 @@ public class TestDistributionLifecycleParticipant extends AbstractMavenLifecycle
                     gitInfo.commit(),
                     gitInfo.changedFiles(),
                     maxPartitionSize.orElse(0),
-                    maxRetries));
+                    maxRetries,
+                    gitInfo.workspaceChanges(),
+                    projectKey));
             sessionId = created.sessionId();
             this.activeSessionId = sessionId;
             this.activeBrokerClient = client;
@@ -121,9 +128,9 @@ public class TestDistributionLifecycleParticipant extends AbstractMavenLifecycle
                 throw new MavenExecutionException(
                         "Failed to open Citrus Test Distribution session on broker " + brokerUrl, e);
             }
-            LOG.warn("Citrus Test Distribution broker {} unreachable ({}); Surefire/Failsafe will run locally",
+            // Keep the interceptor active so the module launcher can enforce @RemoteOnly during fallback.
+            LOG.warn("Citrus Test Distribution broker {} unreachable ({}); module launchers will apply fallback policy",
                     brokerUrl, e.getMessage());
-            return;
         }
 
         List<Path> runtimeJars = resolveInterceptorClasspathJars();
@@ -147,12 +154,33 @@ public class TestDistributionLifecycleParticipant extends AbstractMavenLifecycle
         }
         sharedProps.put(DistributionSettings.MAX_RETRIES_PROPERTY, Integer.toString(maxRetries));
         sharedProps.put(DistributionSettings.PROJECT_NAME_PROPERTY, projectName);
+        if (projectKey != null && !projectKey.isBlank()) {
+            sharedProps.put(DistributionSettings.PROJECT_KEY_PROPERTY, projectKey);
+        }
 
         if (session.getProjects() != null) {
+            Map<String, String> outputDirectories = new LinkedHashMap<>();
+            List<MavenProject> reactor = session.getAllProjects() == null ? session.getProjects() : session.getAllProjects();
+            for (MavenProject project : reactor) {
+                if (project.getBuild() != null && project.getBasedir() != null) {
+                    addOutputDirectory(outputDirectories, project, project.getBuild().getOutputDirectory());
+                    addOutputDirectory(outputDirectories, project, project.getBuild().getTestOutputDirectory());
+                }
+            }
+            if (!outputDirectories.isEmpty()) {
+                sharedProps.put(DistributionSettings.MAVEN_OUTPUT_DIRECTORIES_PROPERTY, DistributionJson.toJson(outputDirectories));
+            }
             for (MavenProject project : session.getProjects()) {
                 SurefirePluginMutator.configureProject(project, sessionId, runtimeJars, sharedProps,
                         session.getUserProperties(), System::getenv);
             }
+        }
+    }
+
+    private static void addOutputDirectory(Map<String, String> directories, MavenProject project, String output) {
+        if (output != null && !output.isBlank()) {
+            Path directory = project.getBasedir().toPath().toAbsolutePath().resolve(output).normalize();
+            directories.putIfAbsent(directory.toString(), project.getArtifactId());
         }
     }
 
@@ -340,8 +368,7 @@ public class TestDistributionLifecycleParticipant extends AbstractMavenLifecycle
 
     /**
      * Jars appended to the Surefire/Failsafe test classpath so the launcher interceptor can run in modules that do not
-     * depend on Test Distribution themselves: the launcher, the protocol, and Jackson 3 (the protocol's JSON codec,
-     * including the Jackson 2.x annotations it reuses). JUnit Platform and SLF4J come from the module's own classpath.
+     * depend on Test Distribution themselves: the launcher, the protocol and Jackson. The module supplies JUnit Platform.
      */
     static List<Path> resolveInterceptorClasspathJars() {
         List<Path> paths = new ArrayList<>();

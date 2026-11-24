@@ -40,6 +40,7 @@ import org.citrusframework.distribution.config.DistributionSettings;
 import org.citrusframework.distribution.model.TestOutcomeStatus;
 import org.citrusframework.distribution.model.WorkUnitSpec;
 import org.citrusframework.distribution.model.WorkerTestEventPayload;
+import org.citrusframework.distribution.workspace.IsolatedTestLock;
 import org.junit.platform.engine.DiscoverySelector;
 import org.junit.platform.engine.TestExecutionResult;
 import org.junit.platform.engine.TestSource;
@@ -99,7 +100,7 @@ public final class LocalFallbackExecutor {
         }
 
         AtomicReference<String> activeDynamicUnitKey = new AtomicReference<>();
-        return collectExecutions(additionalListeners, (plan, identifier) -> {
+        return collectExecutions(units, additionalListeners, (plan, identifier) -> {
             String className = resolveClassName(identifier, unitKeysByClass);
             return new ExecutionUnit(className, resolveWorkUnitKey(
                     identifier, className, activeDynamicUnitKey.get(), unitKeysByMethod, unitKeysByClass));
@@ -144,7 +145,7 @@ public final class LocalFallbackExecutor {
                                                              TestExecutionListener[] additionalListeners) {
         Map<String, List<WorkUnitSpec>> unitsByClass = units.stream()
                 .collect(Collectors.groupingBy(WorkUnitSpec::className));
-        LocalExecutionStats stats = collectExecutions(additionalListeners,
+        LocalExecutionStats stats = collectExecutions(units, additionalListeners,
                 (plan, identifier) -> resolvePlanUnit(plan, identifier, unitsByClass),
                 merged -> delegate.execute(testPlan, merged));
 
@@ -208,7 +209,8 @@ public final class LocalFallbackExecutor {
                 || (method.getMethodName() + "(" + parameters + ")").equals(unit.methodName());
     }
 
-    private static LocalExecutionStats collectExecutions(TestExecutionListener[] additionalListeners,
+    private static LocalExecutionStats collectExecutions(List<WorkUnitSpec> units,
+                                                          TestExecutionListener[] additionalListeners,
                                                           BiFunction<TestPlan, TestIdentifier, ExecutionUnit> resolver,
                                                           Consumer<TestExecutionListener[]> execute) {
         AtomicInteger passed = new AtomicInteger();
@@ -218,8 +220,9 @@ public final class LocalFallbackExecutor {
         Map<String, Long> testStartTimes = new ConcurrentHashMap<>();
         long startNs = System.nanoTime();
 
-        try (CitrusEndpointCollector endpointCollector =
-                     CitrusEndpointCollector.install(Thread.currentThread().getContextClassLoader())) {
+        ClassLoader loader = Thread.currentThread().getContextClassLoader();
+        try (IsolatedTestLock isolation = IsolatedTestLock.acquire(units, loader);
+             CitrusEndpointCollector endpointCollector = CitrusEndpointCollector.install(loader)) {
             TestExecutionListener countingListener = new TestExecutionListener() {
                 private volatile TestPlan plan;
 
@@ -309,7 +312,12 @@ public final class LocalFallbackExecutor {
                 }
             };
 
-            execute.accept(mergeListeners(additionalListeners, countingListener));
+            DistributionLauncherInterceptor.runLocally(mergeListeners(additionalListeners, countingListener), execute);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("Interrupted while waiting for isolated tests", e);
+        } catch (IOException e) {
+            throw new UncheckedIOException("Failed to lock isolated tests", e);
         }
 
         long durationMs = Math.max(1L, (System.nanoTime() - startNs) / 1_000_000L);

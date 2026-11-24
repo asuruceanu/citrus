@@ -22,6 +22,11 @@ public record SessionDetailResponse(
         BuildSessionRecord session,
         List<String> changedFiles,
         List<PartitionRecord> partitions,
-        List<TestExecutionRecord> tests
+        List<TestExecutionRecord> tests,
+        List<WorkspaceChange> workspaceChanges
 ) {
+    public SessionDetailResponse(BuildSessionRecord session, List<String> changedFiles, List<PartitionRecord> partitions,
+                                 List<TestExecutionRecord> tests) {
+        this(session, changedFiles, partitions, tests, List.of());
+    }
 }

@@ -55,9 +55,6 @@ public final class DistributionBrokerServer implements AutoCloseable {
 
         store = new JdbcDistributionStore(config.jdbcUrl(), config.jdbcUsername(), config.jdbcPassword());
         store.initialize();
-        if (config.demoData()) {
-            DemoDataSeeder.seed(store);
-        }
         BrokerEventStreamHub eventHub = new BrokerEventStreamHub();
         BrokerSessionCoordinator coordinator = new BrokerSessionCoordinator(config, store, eventHub);
 

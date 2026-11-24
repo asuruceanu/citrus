@@ -13,6 +13,11 @@
   <name>Citrus :: Runtime :: JUnit Jupiter</name>
   <description>Citrus JUnit Jupiter framework integration</description>
 
+  <properties>
+    <!-- Keep launcher regression tests and the fixtures they invoke together in a forked worker JVM. -->
+    <citrus.test.distribution.fork>true</citrus.test.distribution.fork>
+  </properties>
+
   <dependencies>
     <dependency>
       <groupId>org.citrusframework</groupId>

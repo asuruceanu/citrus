@@ -37,6 +37,7 @@ import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.HexFormat;
 import java.util.List;
+import java.util.regex.Pattern;
 import java.util.zip.Deflater;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
@@ -56,6 +57,8 @@ public final class ClasspathPackager {
 
     /** Maximum compressed size of a single blob (256 MiB). */
     public static final long MAX_BLOB_BYTES = 256L * 1024 * 1024;
+
+    static final Pattern MAVEN_OUTPUT_ARCHIVE = Pattern.compile("[A-Za-z0-9][A-Za-z0-9._-]{0,119}-(?:test-)?classes\\.zip");
 
     /**
      * Fixed entry time inside the DOS date range, so no extended-timestamp extra field is written (the Unix
@@ -80,11 +83,30 @@ public final class ClasspathPackager {
     }
 
     public static PackagedArtifact packagePath(Path path) throws IOException {
+        return packagePath(path, null);
+    }
+
+    /** Packages a classpath entry using its build-provided artifact ID when known. */
+    public static PackagedArtifact packagePath(Path path, String artifactId) throws IOException {
         Path normalized = path.toAbsolutePath().normalize();
         if (Files.isDirectory(normalized)) {
             byte[] zipBytes = createDeterministicZip(normalized);
             String sha256 = sha256Hex(zipBytes);
             String name = normalized.getFileName() != null ? normalized.getFileName().toString() + ".zip" : "classes.zip";
+            Path parent = normalized.getParent();
+            if (artifactId != null) {
+                String moduleArchive = artifactId + "-classes.zip";
+                if (MAVEN_OUTPUT_ARCHIVE.matcher(moduleArchive).matches()) {
+                    name = moduleArchive;
+                }
+            } else if (("classes.zip".equals(name) || "test-classes.zip".equals(name))
+                    && parent != null && parent.endsWith("target") && parent.getParent() != null
+                    && parent.getParent().getFileName() != null) {
+                String moduleArchive = parent.getParent().getFileName() + "-" + name;
+                if (MAVEN_OUTPUT_ARCHIVE.matcher(moduleArchive).matches()) {
+                    name = moduleArchive;
+                }
+            }
             ArtifactRef ref = new ArtifactRef(name, sha256, ArtifactKind.DIRECTORY_ZIP, zipBytes.length);
             return new PackagedArtifact(ref, null, zipBytes);
         }

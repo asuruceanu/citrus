@@ -31,6 +31,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.OptionalInt;
 import java.util.PriorityQueue;
@@ -45,6 +46,8 @@ import org.citrusframework.distribution.model.SessionStatus;
 import org.citrusframework.distribution.model.SessionSummary;
 import org.citrusframework.distribution.model.SubmitWorkResponse;
 import org.citrusframework.distribution.model.TestExecutionRecord;
+import org.citrusframework.distribution.model.WorkspaceChange;
+import org.citrusframework.distribution.model.TestHistoryRun;
 import org.citrusframework.distribution.model.TestHistorySummary;
 import org.citrusframework.distribution.model.TestOutcomeStatus;
 import org.citrusframework.distribution.model.WorkUnitSpec;
@@ -136,10 +139,12 @@ public class JdbcDistributionStore implements DistributionStore {
                         "serial_duration_ms BIGINT, " +
                         "wall_duration_ms BIGINT, " +
                         "failure_reason VARCHAR(4096), " +
-                        "requested_max_partition_size INT)",
+                        "requested_max_partition_size INT, " +
+                        "history_scope VARCHAR(1024))",
                 "CREATE TABLE IF NOT EXISTS dist_session_changes (" +
                         "session_id VARCHAR(64), " +
                         "file_path VARCHAR(1024), " +
+                        "change_json " + longText + ", " +
                         "PRIMARY KEY (session_id, file_path))",
                 "CREATE TABLE IF NOT EXISTS dist_workers (" +
                         "worker_id VARCHAR(128) PRIMARY KEY, " +
@@ -236,9 +241,10 @@ public class JdbcDistributionStore implements DistributionStore {
         partitionColumns.put("produced_outputs_json", longText);
         partitionColumns.put("error_message", "VARCHAR(4096)");
         additions.put("dist_partitions", partitionColumns);
+        additions.put("dist_session_changes", Map.of("change_json", longText));
         additions.put("dist_workers", Map.of("cache_stats_json", "VARCHAR(2048)"));
         additions.put("dist_sessions", Map.of("failure_reason", "VARCHAR(4096)",
-                "requested_max_partition_size", "INT"));
+                "requested_max_partition_size", "INT", "history_scope", "VARCHAR(1024)"));
         additions.put("dist_test_executions", Map.of("unique_id", "VARCHAR(1024)"));
         for (Map.Entry<String, Map<String, String>> table : additions.entrySet()) {
             java.util.Set<String> columns = existing.getOrDefault(table.getKey(), java.util.Set.of());
@@ -306,23 +312,29 @@ public class JdbcDistributionStore implements DistributionStore {
 
     @Override
     public void saveSession(BuildSessionRecord s) {
-        saveSession(s, null);
+        saveSession(s, null, null);
     }
 
     @Override
     public void saveSession(BuildSessionRecord s, int requestedMaxPartitionSize) {
-        saveSession(s, Integer.valueOf(requestedMaxPartitionSize));
+        saveSession(s, Integer.valueOf(requestedMaxPartitionSize), null);
     }
 
-    private synchronized void saveSession(BuildSessionRecord s, Integer requestedMaxPartitionSize) {
+    @Override
+    public void saveSession(BuildSessionRecord s, int requestedMaxPartitionSize, String historyScope) {
+        saveSession(s, Integer.valueOf(requestedMaxPartitionSize), historyScope);
+    }
+
+    private synchronized void saveSession(BuildSessionRecord s, Integer requestedMaxPartitionSize, String historyScope) {
         String updateSql = "UPDATE dist_sessions SET project_name=?, git_branch=?, git_commit=?, status=?, " +
                 "started_at=?, finished_at=?, total_tests=?, passed_tests=?, failed_tests=?, skipped_tests=?, " +
                 "total_blobs=?, cached_blobs=?, serial_duration_ms=?, wall_duration_ms=?, failure_reason=?, " +
-                "requested_max_partition_size=COALESCE(?, requested_max_partition_size) WHERE session_id=?";
+                "requested_max_partition_size=COALESCE(?, requested_max_partition_size), " +
+                "history_scope=COALESCE(?, history_scope) WHERE session_id=?";
         String insertSql = "INSERT INTO dist_sessions (session_id, project_name, git_branch, git_commit, status, " +
                 "started_at, finished_at, total_tests, passed_tests, failed_tests, skipped_tests, " +
-                "total_blobs, cached_blobs, serial_duration_ms, wall_duration_ms, failure_reason, requested_max_partition_size) " +
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+                "total_blobs, cached_blobs, serial_duration_ms, wall_duration_ms, failure_reason, requested_max_partition_size, history_scope) " +
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
         try (Connection conn = dataSource.getConnection()) {
             try (PreparedStatement ps = conn.prepareStatement(updateSql)) {
                 ps.setString(1, s.projectName());
@@ -341,7 +353,8 @@ public class JdbcDistributionStore implements DistributionStore {
                 ps.setLong(14, s.wallDurationMs());
                 ps.setString(15, truncate(s.failureReason(), 4096));
                 ps.setObject(16, requestedMaxPartitionSize, Types.INTEGER);
-                ps.setString(17, s.sessionId());
+                ps.setString(17, historyScope);
+                ps.setString(18, s.sessionId());
                 if (ps.executeUpdate() > 0) {
                     return;
                 }
@@ -364,10 +377,25 @@ public class JdbcDistributionStore implements DistributionStore {
                 ps.setLong(15, s.wallDurationMs());
                 ps.setString(16, truncate(s.failureReason(), 4096));
                 ps.setObject(17, requestedMaxPartitionSize, Types.INTEGER);
+                ps.setString(18, historyScope);
                 ps.executeUpdate();
             }
         } catch (SQLException e) {
             throw new IllegalStateException("Failed to save build session " + s.sessionId(), e);
+        }
+    }
+
+    @Override
+    public Optional<String> findSessionHistoryScope(String sessionId) {
+        String sql = "SELECT history_scope FROM dist_sessions WHERE session_id=?";
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, sessionId);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? Optional.ofNullable(rs.getString(1)) : Optional.empty();
+            }
+        } catch (SQLException e) {
+            throw new IllegalStateException("Failed to read history scope for " + sessionId, e);
         }
     }
 
@@ -464,27 +492,66 @@ public class JdbcDistributionStore implements DistributionStore {
     }
 
     @Override
-    public synchronized void saveChangedFiles(String sessionId, List<String> changedFiles) {
-        if (changedFiles == null || changedFiles.isEmpty()) {
+    public synchronized void saveChangedFiles(String sessionId, List<String> changedFiles,
+                                              List<WorkspaceChange> workspaceChanges) {
+        Map<String, WorkspaceChange> files = new LinkedHashMap<>();
+        if (changedFiles != null) {
+            for (String path : changedFiles) {
+                if (path != null && !path.isEmpty()) {
+                    files.put(truncate(path, 1024), null);
+                }
+            }
+        }
+        if (workspaceChanges != null) {
+            for (WorkspaceChange change : workspaceChanges) {
+                if (change != null && change.path() != null && !change.path().isEmpty()) {
+                    files.put(truncate(change.path(), 1024), change);
+                }
+            }
+        }
+        if (files.isEmpty()) {
             return;
         }
         String deleteSql = "DELETE FROM dist_session_changes WHERE session_id=?";
-        String insertSql = "INSERT INTO dist_session_changes (session_id, file_path) VALUES (?, ?)";
-        try (Connection conn = dataSource.getConnection()) {
-            try (PreparedStatement del = conn.prepareStatement(deleteSql)) {
-                del.setString(1, sessionId);
-                del.executeUpdate();
+        String insertSql = "INSERT INTO dist_session_changes (session_id, file_path, change_json) VALUES (?, ?, ?)";
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement del = conn.prepareStatement(deleteSql);
+             PreparedStatement ins = conn.prepareStatement(insertSql)) {
+            conn.setAutoCommit(false);
+            del.setString(1, sessionId);
+            del.executeUpdate();
+            for (Map.Entry<String, WorkspaceChange> entry : files.entrySet()) {
+                ins.setString(1, sessionId);
+                ins.setString(2, entry.getKey());
+                ins.setString(3, entry.getValue() == null ? null : DistributionJson.toJson(entry.getValue()));
+                ins.addBatch();
             }
-            try (PreparedStatement ins = conn.prepareStatement(insertSql)) {
-                for (String path : changedFiles.stream().distinct().toList()) {
-                    ins.setString(1, sessionId);
-                    ins.setString(2, truncate(path, 1024));
-                    ins.addBatch();
-                }
-                ins.executeBatch();
-            }
+            ins.executeBatch();
+            conn.commit();
         } catch (SQLException e) {
             throw new IllegalStateException("Failed to save changed files for " + sessionId, e);
+        }
+    }
+
+    @Override
+    public List<WorkspaceChange> findWorkspaceChanges(String sessionId) {
+        String sql = "SELECT file_path, change_json FROM dist_session_changes WHERE session_id=? ORDER BY file_path ASC";
+        List<WorkspaceChange> changes = new ArrayList<>();
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, sessionId);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    String json = rs.getString("change_json");
+                    changes.add(json == null
+                            ? new WorkspaceChange(rs.getString("file_path"), WorkspaceChange.Kind.UNKNOWN,
+                                    null, null, null, null, false)
+                            : DistributionJson.fromJson(json, WorkspaceChange.class));
+                }
+            }
+            return changes;
+        } catch (SQLException e) {
+            throw new IllegalStateException("Failed to read workspace changes for " + sessionId, e);
         }
     }
 
@@ -861,7 +928,8 @@ public class JdbcDistributionStore implements DistributionStore {
     }
 
     @Override
-    public Map<String, Long> findHistoricalDurationsMs(Collection<String> workUnitKeys, int recentLimit) {
+    public Map<String, Long> findHistoricalDurationsMs(Collection<String> workUnitKeys, int recentLimit,
+                                                       String historyScope) {
         if (workUnitKeys == null || workUnitKeys.isEmpty()) {
             return Map.of();
         }
@@ -878,6 +946,9 @@ public class JdbcDistributionStore implements DistributionStore {
                                MAX(COALESCE(recorded_at, 0)) AS upper_at
                         FROM dist_test_executions
                         WHERE work_unit_key = ?
+                          AND (CAST(? AS VARCHAR(1024)) IS NULL OR session_id IN (
+                              SELECT session_id FROM dist_sessions
+                              WHERE COALESCE(history_scope, CONCAT('name:', project_name)) = ?))
                           AND (status IN ('PASSED', 'FAILED') OR (partition_id = 'local' AND status = 'SKIPPED'))
                         GROUP BY CASE WHEN TRIM(COALESCE(session_id, '')) = '' THEN 0 ELSE 1 END,
                                  CASE WHEN TRIM(COALESCE(session_id, '')) = '' THEN id ELSE session_id END
@@ -913,7 +984,7 @@ public class JdbcDistributionStore implements DistributionStore {
                 HistoryPage page = new HistoryPage(null, 0);
                 // On equal timestamps, an unread candidate could still win the session ID tie-break.
                 do {
-                    page = collectHistoryPage(ps, key, page.lastCandidate(), recent, runLimit);
+                    page = collectHistoryPage(ps, key, historyScope, page.lastCandidate(), recent, runLimit);
                 } while (page.candidateCount() == HISTORY_PAGE_SIZE
                         && (recent.size() < runLimit || page.lastCandidate().upperAt() >= recent.element().recordedAt()));
                 if (!recent.isEmpty()) {
@@ -931,19 +1002,22 @@ public class JdbcDistributionStore implements DistributionStore {
         }
     }
 
-    private static HistoryPage collectHistoryPage(PreparedStatement ps, String key, HistoryCursor after,
-                                                  PriorityQueue<DurationObservation> recent, int runLimit) throws SQLException {
+    private static HistoryPage collectHistoryPage(PreparedStatement ps, String key, String historyScope,
+                                                  HistoryCursor after, PriorityQueue<DurationObservation> recent,
+                                                  int runLimit) throws SQLException {
         long upperAt = after == null ? 0 : after.upperAt();
         int candidateKind = after == null ? LEGACY_HISTORY_ROW : after.kind();
         ps.setString(1, key);
-        ps.setInt(2, after == null ? 0 : 1);
-        ps.setLong(3, upperAt);
-        ps.setLong(4, upperAt);
-        ps.setInt(5, candidateKind);
-        ps.setInt(6, candidateKind);
-        ps.setString(7, after == null ? "" : after.id());
-        ps.setInt(8, HISTORY_PAGE_SIZE);
-        ps.setString(9, key);
+        ps.setString(2, historyScope);
+        ps.setString(3, historyScope);
+        ps.setInt(4, after == null ? 0 : 1);
+        ps.setLong(5, upperAt);
+        ps.setLong(6, upperAt);
+        ps.setInt(7, candidateKind);
+        ps.setInt(8, candidateKind);
+        ps.setString(9, after == null ? "" : after.id());
+        ps.setInt(10, HISTORY_PAGE_SIZE);
+        ps.setString(11, key);
 
         int count = 0;
         HistoryCursor cursor = null;
@@ -1057,21 +1131,33 @@ public class JdbcDistributionStore implements DistributionStore {
 
     @Override
     public List<TestHistorySummary> listTestHistory(int limit) {
-        String sql = "SELECT work_unit_key, class_name, test_name, " +
-                "AVG(duration_ms) AS avg_ms, MAX(duration_ms) AS max_ms, COUNT(*) AS total_runs, " +
-                "SUM(CASE WHEN status='PASSED' THEN 1 ELSE 0 END) AS passed_runs, " +
-                "SUM(CASE WHEN status='FAILED' THEN 1 ELSE 0 END) AS failed_runs, " +
-                "SUM(CASE WHEN flaky=TRUE THEN 1 ELSE 0 END) AS flaky_runs " +
-                "FROM dist_test_executions GROUP BY work_unit_key, class_name, test_name ORDER BY avg_ms DESC";
-        // Latest outcome of every test in one ordered pass (a per-test lookup scanned the whole table per row).
-        // Latest outcome per test: the rows at each test's newest recorded_at (one or a few per test), not the table.
-        String latestStatusSql = "SELECT e.work_unit_key, e.class_name, e.test_name, e.status, e.attempt, e.id " +
-                "FROM dist_test_executions e JOIN (SELECT work_unit_key, class_name, test_name, MAX(recorded_at) AS last_at " +
-                "FROM dist_test_executions GROUP BY work_unit_key, class_name, test_name) m " +
-                "ON COALESCE(e.work_unit_key, '') = COALESCE(m.work_unit_key, '') " +
-                "AND COALESCE(e.class_name, '') = COALESCE(m.class_name, '') " +
-                "AND COALESCE(e.test_name, '') = COALESCE(m.test_name, '') AND e.recorded_at = m.last_at " +
-                "ORDER BY e.attempt, e.id";
+        String scoped = """
+                WITH scoped_tests AS (
+                    SELECT e.*, s.project_name,
+                           COALESCE(s.history_scope, CONCAT('name:', COALESCE(s.project_name, ''))) AS project_scope
+                    FROM dist_test_executions e LEFT JOIN dist_sessions s ON e.session_id = s.session_id
+                )
+                """;
+        String sql = scoped + """
+                SELECT project_scope, MAX(project_name) AS project_name, work_unit_key, class_name, test_name,
+                       AVG(duration_ms) AS avg_ms, MAX(duration_ms) AS max_ms, COUNT(*) AS total_runs,
+                       SUM(CASE WHEN status='PASSED' THEN 1 ELSE 0 END) AS passed_runs,
+                       SUM(CASE WHEN status='FAILED' THEN 1 ELSE 0 END) AS failed_runs,
+                       SUM(CASE WHEN flaky=TRUE THEN 1 ELSE 0 END) AS flaky_runs
+                FROM scoped_tests GROUP BY project_scope, work_unit_key, class_name, test_name ORDER BY avg_ms DESC
+                """;
+        // Find the latest outcome per project and test in one ordered pass.
+        String latestStatusSql = scoped + """
+                SELECT e.project_scope, e.work_unit_key, e.class_name, e.test_name, e.status
+                FROM scoped_tests e JOIN (
+                    SELECT project_scope, work_unit_key, class_name, test_name, MAX(recorded_at) AS last_at
+                    FROM scoped_tests GROUP BY project_scope, work_unit_key, class_name, test_name
+                ) m ON e.project_scope = m.project_scope
+                    AND COALESCE(e.work_unit_key, '') = COALESCE(m.work_unit_key, '')
+                    AND COALESCE(e.class_name, '') = COALESCE(m.class_name, '')
+                    AND COALESCE(e.test_name, '') = COALESCE(m.test_name, '') AND e.recorded_at = m.last_at
+                ORDER BY e.attempt, e.id
+                """;
         List<TestHistorySummary> history = new ArrayList<>();
         try (Connection conn = dataSource.getConnection();
              PreparedStatement ps = conn.prepareStatement(sql);
@@ -1083,7 +1169,8 @@ public class JdbcDistributionStore implements DistributionStore {
                     String key = rs.getString("work_unit_key");
                     String className = rs.getString("class_name");
                     String testName = rs.getString("test_name");
-                    keys.add(new String[] {key, className, testName});
+                    String scope = rs.getString("project_scope");
+                    keys.add(new String[] {scope, key, className, testName});
                     history.add(new TestHistorySummary(
                             key,
                             className,
@@ -1094,20 +1181,22 @@ public class JdbcDistributionStore implements DistributionStore {
                             rs.getInt("passed_runs"),
                             rs.getInt("failed_runs"),
                             rs.getInt("flaky_runs"),
-                            TestOutcomeStatus.PASSED
+                            TestOutcomeStatus.PASSED,
+                            scope,
+                            rs.getString("project_name")
                     ));
                 }
             }
             Map<String, TestOutcomeStatus> latest = new java.util.HashMap<>();
             java.util.Set<String> wanted = new java.util.HashSet<>();
             for (String[] k : keys) {
-                wanted.add(historyKey(k[0], k[1], k[2]));
+                wanted.add(historyKey(k[0], k[1], k[2], k[3]));
             }
             latestPs.setFetchSize(2_000);
             try (ResultSet lrs = latestPs.executeQuery()) {
                 while (lrs.next()) {
-                    String k = historyKey(lrs.getString(1), lrs.getString(2), lrs.getString(3));
-                    String rawStatus = lrs.getString(4);
+                    String k = historyKey(lrs.getString(1), lrs.getString(2), lrs.getString(3), lrs.getString(4));
+                    String rawStatus = lrs.getString(5);
                     if (wanted.contains(k) && rawStatus != null && !rawStatus.isBlank()) {
                         latest.put(k, TestOutcomeStatus.valueOf(rawStatus));
                     }
@@ -1115,16 +1204,53 @@ public class JdbcDistributionStore implements DistributionStore {
             }
             for (int i = 0; i < history.size(); i++) {
                 TestHistorySummary h = history.get(i);
-                TestOutcomeStatus status = latest.get(historyKey(h.workUnitKey(), h.className(), h.testName()));
+                TestOutcomeStatus status = latest.get(historyKey(h.projectScope(), h.workUnitKey(), h.className(), h.testName()));
                 if (status != null && status != h.lastStatus()) {
                     history.set(i, new TestHistorySummary(h.workUnitKey(), h.className(), h.testName(),
                             h.avgDurationMs(), h.maxDurationMs(), h.totalRuns(), h.passedRuns(), h.failedRuns(),
-                            h.flakyRuns(), status));
+                            h.flakyRuns(), status, h.projectScope(), h.projectName()));
                 }
             }
             return history;
         } catch (SQLException e) {
             throw new IllegalStateException("Failed to query test history", e);
+        }
+    }
+
+    @Override
+    public List<TestHistoryRun> listTestHistoryRuns(String projectScope, String workUnitKey, String className,
+                                                   String testName, int limit) {
+        String sql = """
+                SELECT e.session_id, s.git_branch, s.git_commit, p.module_name, e.worker_id,
+                       e.status, e.duration_ms, e.attempt, e.flaky, e.recorded_at
+                FROM dist_test_executions e
+                LEFT JOIN dist_sessions s ON e.session_id = s.session_id
+                LEFT JOIN dist_partitions p ON e.partition_id = p.partition_id
+                    AND e.session_id = p.session_id AND e.attempt = p.attempt
+                WHERE COALESCE(e.work_unit_key, '') = ? AND COALESCE(e.class_name, '') = ?
+                      AND COALESCE(e.test_name, '') = ?
+                      AND COALESCE(s.history_scope, CONCAT('name:', COALESCE(s.project_name, ''))) = ?
+                ORDER BY e.recorded_at DESC NULLS LAST, e.attempt DESC, e.id
+                """;
+        List<TestHistoryRun> runs = new ArrayList<>();
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, Objects.requireNonNullElse(workUnitKey, ""));
+            ps.setString(2, Objects.requireNonNullElse(className, ""));
+            ps.setString(3, Objects.requireNonNullElse(testName, ""));
+            ps.setString(4, projectScope);
+            ps.setMaxRows(Math.max(1, Math.min(limit, 100)));
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    runs.add(new TestHistoryRun(rs.getString("session_id"), rs.getString("git_branch"),
+                            rs.getString("git_commit"), rs.getString("module_name"), rs.getString("worker_id"),
+                            TestOutcomeStatus.valueOf(rs.getString("status")), rs.getLong("duration_ms"),
+                            rs.getInt("attempt"), rs.getBoolean("flaky"), rs.getLong("recorded_at")));
+                }
+            }
+            return runs;
+        } catch (SQLException e) {
+            throw new IllegalStateException("Failed to query test run history", e);
         }
     }
 
@@ -1145,8 +1271,8 @@ public class JdbcDistributionStore implements DistributionStore {
         }
     }
 
-    private static String historyKey(String workUnitKey, String className, String testName) {
-        return (workUnitKey != null ? workUnitKey : "") + '\u0000' + (className != null ? className : "") + '\u0000'
+    private static String historyKey(String scope, String workUnitKey, String className, String testName) {
+        return scope + '\u0000' + (workUnitKey != null ? workUnitKey : "") + '\u0000' + (className != null ? className : "") + '\u0000'
                 + (testName != null ? testName : "");
     }
 

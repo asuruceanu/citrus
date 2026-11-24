@@ -55,8 +55,6 @@ import java.util.zip.ZipInputStream;
 
 import org.citrusframework.distribution.model.ArtifactKind;
 import org.citrusframework.distribution.model.ArtifactRef;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 /**
  * Content-addressed local directory store indexed by validated 64-char lowercase SHA-256 hex digests.
@@ -67,7 +65,7 @@ import org.slf4j.LoggerFactory;
  */
 public class BlobCacheDirectory {
 
-    private static final Logger LOG = LoggerFactory.getLogger(BlobCacheDirectory.class);
+    private static final System.Logger LOG = System.getLogger(BlobCacheDirectory.class.getName());
 
     public static final Pattern SHA256_HEX_PATTERN = Pattern.compile("^[a-f0-9]{64}$");
 
@@ -437,7 +435,7 @@ public class BlobCacheDirectory {
 
             @Override
             public FileVisitResult visitFileFailed(Path file, IOException exc) {
-                LOG.warn("Skipping unreadable cache entry {}: {}", file, exc.toString());
+                LOG.log(System.Logger.Level.WARNING, "Skipping unreadable cache entry {0}: {1}", file, exc.toString());
                 return FileVisitResult.CONTINUE;
             }
         });
@@ -483,7 +481,7 @@ public class BlobCacheDirectory {
         } catch (DirectoryNotEmptyException | NoSuchFileException ignored) {
             // still shared with other blobs, or already gone
         } catch (IOException e) {
-            LOG.debug("Could not prune empty cache directory {}: {}", dir, e.toString());
+            LOG.log(System.Logger.Level.DEBUG, "Could not prune empty cache directory {0}: {1}", dir, e.toString());
         }
     }
 
@@ -545,7 +543,7 @@ public class BlobCacheDirectory {
                         removed++;
                     }
                 } catch (IOException e) {
-                    LOG.warn("Could not delete temporary cache file {}: {}", child, e.toString());
+                    LOG.log(System.Logger.Level.WARNING, "Could not delete temporary cache file {0}: {1}", child, e.toString());
                 }
             }
         } catch (DirectoryIteratorException e) {
@@ -605,8 +603,8 @@ public class BlobCacheDirectory {
 
     /**
      * Places {@code ref} on the classpath from a blob the caller has already verified, without hashing it again: a
-     * {@link ArtifactKind#JAR} becomes its named jar, a {@link ArtifactKind#DIRECTORY_ZIP} is extracted into
-     * {@code <workspaceDir>/extracted/<sha256>/}.
+     * {@link ArtifactKind#JAR} becomes its named jar. A {@link ArtifactKind#DIRECTORY_ZIP} is extracted under
+     * {@code <workspaceDir>/extracted/} using its digest and, for Maven reactor outputs, its module name.
      *
      * @param verifiedBlob this cache's blob path for {@code ref}, verified by the caller
      * @throws IllegalArgumentException if {@code verifiedBlob} is not this cache's blob path for {@code ref}
@@ -641,7 +639,12 @@ public class BlobCacheDirectory {
             throw new IOException("Cached blob does not exist: " + ref.sha256());
         }
 
-        Path extractDir = workspaceDir.toAbsolutePath().normalize().resolve("extracted").resolve(ref.sha256());
+        String directoryName = ref.sha256();
+        // Preserve the reactor module name for classpath consumers that inspect entry names.
+        if (ref.name() != null && ClasspathPackager.MAVEN_OUTPUT_ARCHIVE.matcher(ref.name()).matches()) {
+            directoryName += "-" + ref.name().substring(0, ref.name().length() - ".zip".length());
+        }
+        Path extractDir = workspaceDir.toAbsolutePath().normalize().resolve("extracted").resolve(directoryName);
         Path marker = extractDir.resolve(".complete");
         if (Files.isRegularFile(marker)) {
             return extractDir;
