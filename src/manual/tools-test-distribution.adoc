@@ -52,6 +52,10 @@ citrus dist worker start --coordinator-url=http://127.0.0.1:18080 --capabilities
 
 Normal Maven builds without `-Dcitrus.test.distribution.enabled=true` execute locally with zero coordinator traffic. In multi-module Maven reactors, the extension automatically shares one coordinator `sessionId` across all modules, reports both remote partitions and `@LocalOnly` module executions into that session, and aborts the session on the coordinator if the Maven build is interrupted (`Ctrl+C`).
 
+TestNG modules can use distribution with the `surefire-junit-platform` provider and
+`org.junit.support:testng-engine` as a test-scoped project dependency. The engine maps TestNG groups to
+JUnit Platform tags, so Surefire and Failsafe group filters apply before work is sent to workers.
+
 TIP: Projects that do not use the Maven extension can add `org.citrusframework:citrus-test-distribution` to the test runtime classpath and enable JUnit Platform interceptor discovery (`-Djunit.platform.launcher.interceptors.enabled=true -Dcitrus.test.distribution.enabled=true`).
 
 .Build host system properties and environment variables
@@ -723,6 +727,8 @@ version.
 * Tests of a partition that crashed are missing from the Surefire reports; the build fails with the crash diagnostic.
 * A test class the worker cannot find in the partition's classpath fails the partition (`Test class not found`) after
 the partition's other tests have run.
+* TestNG data-provider and invocation-count methods run on workers with either fork mode. With `AUTO`, the
+  partition loads TestNG and its engine together from the module’s test classpath.
 * In the shared worker JVM (`forkMode=AUTO`) the JUnit Platform, SLF4J and the Log4j API come from the worker; the tests
 see no other worker classes except those of the worker's own `-javaagent` jars (for example a JaCoCo runtime).
 * Worker cache eviction is exact least-recently-used ordering while a worker runs. After a restart, files last used
