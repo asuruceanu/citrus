@@ -2,7 +2,7 @@
 
 **Date:** 2026-11-24
 
-**Status:** Draft — awaiting approval
+**Status:** Approved
 
 ## Intent and Why
 
@@ -48,5 +48,6 @@
 
 ## Left to the Builder
 
-- Unit and integration tests in `citrus-test-distribution-worker` and `citrus-test-distribution` covering `PartitionClassLoader` isolation for `org.junit.support.*`, `DiscoveredWorkExtractor` partial-class splitting with container `MethodSource` descriptors, and distributed TestNG execution (including groups and `@DataProvider`).
+- Synchronize `ITestNGMethod.setInvocationCount(count)` in `TestNGCitrusMethodInterceptor` and `TestNGCitrusSpringMethodInterceptor` when `@CitrusTestSource` expands a test method into multiple `IMethodInstance`s (`count > 1`), so `testng-engine` classifies multi-source methods as `Type.CONTAINER` and JUnit Platform's `ExecutionRecorder` registers each invocation cleanly without `PreconditionViolationException`.
+- Unit and integration tests in `citrus-test-distribution-worker`, `citrus-test-distribution`, and `citrus-testng` covering `PartitionClassLoader` isolation for `org.junit.support.*`, `DiscoveredWorkExtractor` partial-class splitting with container `MethodSource` descriptors, multi-source `@CitrusTestSource` execution under `testng-engine`, and distributed TestNG execution (including groups and `@DataProvider`).
 - End-to-end verification of `./mvnw verify -pl runtime/citrus-testng` both locally (distribution disabled) and distributed against a coordinator and worker (`AUTO` and `ALWAYS` fork modes).

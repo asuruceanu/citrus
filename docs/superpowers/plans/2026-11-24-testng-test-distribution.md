@@ -1,0 +1,237 @@
+# Citrus TestNG Test Distribution Support Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Enable `runtime/citrus-testng` unit, integration, acceptance, and expected-failure tests to execute on Citrus Test Distribution workers through `org.junit.support:testng-engine` on `surefire-junit-platform`.
+
+**Architecture:** Manage `org.junit.support:testng-engine:1.1.0` in the root POM, add it in `test` scope to `runtime/citrus-testng`, and drop `<surefire.provider>surefire-testng</surefire.provider>` so TestNG tests run through JUnit Platform `Launcher` and `DistributionLauncherInterceptor`. Make three targeted fixes so JUnit Platform + worker execution handles every TestNG construct cleanly: child-first partition classloading for `org.junit.support.*`, discovery-time counting of empty `MethodSource` containers in `DiscoveredWorkExtractor`, and `ITestNGMethod.setInvocationCount` synchronization for multi-source `@CitrusTestSource` methods in Citrus's TestNG method interceptors.
+
+**Tech Stack:** Java 21, Maven 3.9+, Maven Surefire/Failsafe 3.5.6 (`surefire-junit-platform`), JUnit Platform / Jupiter 6.1.3, TestNG 7.12.0, `org.junit.support:testng-engine` 1.1.0, AssertJ.
+
+**Spec:** `docs/superpowers/specs/2026-11-24-testng-test-distribution-design.md`
+
+## Global Constraints
+
+- Implement in isolated worktree `/Users/asuruceanu/.local/share/opencode/worktree/46a00c/citrus-testng-distribution` on branch `feature/test-distribution-testng` (based on `incubator/test-distribution`).
+- Keep root JUnit (`6.1.3`), TestNG (`7.12.0`), and Maven Surefire/Failsafe (`3.5.6`) versions unchanged.
+- Do not alter `citrus-testng`'s published `compile` or `runtime` transitive dependencies (`org.junit.support:testng-engine` must be `<scope>test</scope>`).
+- Do not introduce `org.testng.*` compile/runtime dependencies into `citrus-test-distribution` or `citrus-test-distribution-worker`.
+- Do not automatically rewrite `surefire-testng` provider dependencies in `citrus-test-distribution-maven-extension` or modify historical benchmark files under `docs/superpowers/metrics/`.
+- All new Java files must carry the standard Citrus Apache 2.0 license header.
+
+## Review Focus
+
+1. **Worker parent classloader also contains `org.junit.support.*` classes/resources (e.g. in-JVM `ForkMode.AUTO` tests)** — `PartitionClassLoader` must still load `org.junit.support.*` child-first from the partition classpath alongside `org.testng.*`, while continuing to share `org.junit.platform.*`, `org.junit.jupiter.*`, and `META-INF/services/org.junit.*` with the worker. *(Pinned in Task 1)*
+2. **Tag/group-filtered class whose excluded method is a discovery-time empty `MethodSource` container (`@DataProvider`, `invocationCount > 1`, `@TestTemplate`, `@ParameterizedTest`)** — `DiscoveredWorkExtractor.partiallySelectedClasses` must detect the excluded container method and split the class into method-level `WorkUnitSpec`s instead of emitting a whole-class `WorkUnitSpec` that runs the excluded method on the worker. *(Pinned in Task 2)*
+3. **Multi-source `@CitrusTestSource` (`names`, `sources`, `packageScan`) in `TestNGCitrusSupport` / `TestNGCitrusSpringSupport` under `testng-engine`** — duplicating `IMethodInstance`s without updating `ITestNGMethod.setInvocationCount(count)` leaves `MethodDescriptor` as `Type.TEST`, causing JUnit Platform 6.1.3 `ExecutionRecorder` to throw `PreconditionViolationException: TestDescriptor ... has already been started` on the second source. *(Pinned in Task 3)*
+4. **Distributed TestNG `@DataProvider` dynamic `[invocation:N]` events and mixed-group (`ShouldFailGroup`) classes on workers across `WorkerForkMode.AUTO` and `WorkerForkMode.ALWAYS`** — dynamic invocations must resolve to the parent `WorkUnitSpec` without triggering unmatched-unit errors and replay cleanly on the host, while group-excluded methods in mixed classes never run on the worker. *(Pinned in Task 4)*
+5. **Published `citrus-testng` dependency tree and all four Maven test executions (`surefire:test`, `failsafe:default`, `failsafe:acceptance-tests`, `failsafe:failure-tests`)** — `citrus-testng` must keep `testng-engine` out of `compile`/`runtime` scope while passing all executions both locally and against a live coordinator + worker. *(Pinned in Tasks 3 & 4)*
+
+---
+
+### Task 1: Isolate `org.junit.support.*` in `IsolatedPartitionRunner.PartitionClassLoader`
+
+**Files:**
+- Modify: `tools/citrus-test-distribution-worker/src/main/java/org/citrusframework/distribution/worker/IsolatedPartitionRunner.java:1085-1096,1295-1305`
+- Test: `tools/citrus-test-distribution-worker/src/test/java/org/citrusframework/distribution/worker/PartitionClassLoaderTest.java`
+
+**Interfaces:**
+- Consumes: package-private `IsolatedPartitionRunner.PartitionClassLoader(URL[] urls, ClassLoader parent)`
+- Produces: narrowed parent-first JUnit prefixes (`org.junit.platform.`, `org.junit.jupiter.` for classes; `org/junit/platform/`, `org/junit/jupiter/`, `META-INF/services/org.junit.` for resources) so `org.junit.support.*` loads child-first from partition URLs
+
+- [ ] **Step 1: Write the failing test in `PartitionClassLoaderTest`**
+
+Add `isolatesJUnitSupportPackagesFromParentWhileSharingPlatformAndJupiter` in `tools/citrus-test-distribution-worker/src/test/java/org/citrusframework/distribution/worker/PartitionClassLoaderTest.java`:
+- Compile or generate minimal valid class bytes for `org.junit.support.probe.SupportProbe` (using `javax.tools.ToolProvider.getSystemJavaCompiler()`) into two separate directories (`parentDir` and `partitionDir`), plus `org/junit/support/probe/source.txt` containing `"parent"` in `parentDir` and `"partition"` in `partitionDir`.
+- Construct `URLClassLoader parentWithSupport = new URLClassLoader(new URL[]{ parentDir.toUri().toURL() }, WORKER)` and `IsolatedPartitionRunner.PartitionClassLoader loader = new IsolatedPartitionRunner.PartitionClassLoader(new URL[]{ partitionDir.toUri().toURL() }, parentWithSupport)`.
+- Assert:
+  ```java
+  Class<?> partitionLoaded = Class.forName("org.junit.support.probe.SupportProbe", false, loader);
+  Class<?> parentLoaded = Class.forName("org.junit.support.probe.SupportProbe", false, parentWithSupport);
+  assertThat(partitionLoaded).isNotSameAs(parentLoaded);
+  assertThat(partitionLoaded.getClassLoader()).isSameAs(loader);
+  try (InputStream in = loader.getResourceAsStream("org/junit/support/probe/source.txt")) {
+      assertThat(in).isNotNull();
+      assertThat(new String(in.readAllBytes(), StandardCharsets.UTF_8)).isEqualTo("partition");
+  }
+  assertThat(Class.forName(TestEngine.class.getName(), false, loader)).isSameAs(TestEngine.class);
+  assertThat(Class.forName(Test.class.getName(), false, loader)).isSameAs(Test.class);
+  ```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `./mvnw test -Dtest=PartitionClassLoaderTest#isolatesJUnitSupportPackagesFromParentWhileSharingPlatformAndJupiter -pl tools/citrus-test-distribution-worker`
+Expected: FAIL — `partitionLoaded` is the same class as `parentLoaded` (`parentWithSupport`) because `shouldDelegateToParent` currently matches `name.startsWith("org.junit.")`.
+
+- [ ] **Step 3: Narrow JUnit parent delegation in `IsolatedPartitionRunner.PartitionClassLoader`**
+
+In `tools/citrus-test-distribution-worker/src/main/java/org/citrusframework/distribution/worker/IsolatedPartitionRunner.java`:
+- Replace `"org/junit/"` in `SHARED_RESOURCE_PREFIXES` with `"org/junit/platform/"` and `"org/junit/jupiter/"` (keeping `"META-INF/services/org.junit."` intact).
+- In `shouldDelegateToParent(String name)`, replace `name.startsWith("org.junit.")` with `name.startsWith("org.junit.platform.") || name.startsWith("org.junit.jupiter.")`.
+
+- [ ] **Step 4: Run worker unit tests to verify they pass**
+
+Run: `./mvnw test -pl tools/citrus-test-distribution-worker`
+Expected: PASS (`0` failures).
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add tools/citrus-test-distribution-worker/src/main/java/org/citrusframework/distribution/worker/IsolatedPartitionRunner.java \
+        tools/citrus-test-distribution-worker/src/test/java/org/citrusframework/distribution/worker/PartitionClassLoaderTest.java
+git commit -m "fix(test-distribution-worker): load org.junit.support child-first in PartitionClassLoader"
+```
+
+---
+
+### Task 2: Count Discovery-Time Empty `MethodSource` Containers in `DiscoveredWorkExtractor`
+
+**Files:**
+- Modify: `tools/citrus-test-distribution/src/main/java/org/citrusframework/distribution/junit/DiscoveredWorkExtractor.java:151-160`
+- Test: `tools/citrus-test-distribution/src/test/java/org/citrusframework/distribution/junit/DiscoveredWorkExtractorTest.java`
+
+**Interfaces:**
+- Consumes: `DiscoveredWorkExtractor.partiallySelectedClasses(Launcher launcher, TestPlan filteredPlan)` and `DiscoveredWorkExtractor.extract(TestPlan plan, long defaultDurationMs, Set<String> partiallySelectedClassIds)`
+- Produces: `partiallySelectedClasses(...)` detects filtered out discovery-time empty `MethodSource` containers (such as TestNG `@DataProvider` / `invocationCount` methods and Jupiter `@TestTemplate` / `@ParameterizedTest` methods)
+
+- [ ] **Step 1: Write the failing test in `DiscoveredWorkExtractorTest`**
+
+Add `tagFilteredContainerMethodClassSplitsIntoMethodUnits` in `tools/citrus-test-distribution/src/test/java/org/citrusframework/distribution/junit/DiscoveredWorkExtractorTest.java`:
+- Define static fixture `MixedTemplateClass` with two `@TestTemplate` methods (`fastTemplate()` and `@Tag("slow") slowTemplate()`) backed by a `@ExtendWith(SingleInvocationProvider.class)` `TestTemplateInvocationContextProvider` (at discovery time, JUnit Platform represents `@TestTemplate` methods as `Type.CONTAINER` with `MethodSource` and empty children — identical to `testng-engine` data-driven/multi-invocation methods).
+- Discover `MixedTemplateClass` with `TagFilter.excludeTags("slow")`:
+  ```java
+  Launcher launcher = LauncherFactory.create();
+  TestPlan plan = launcher.discover(LauncherDiscoveryRequestBuilder.request()
+          .selectors(DiscoverySelectors.selectClass(MixedTemplateClass.class))
+          .filters(TagFilter.excludeTags("slow"))
+          .build());
+  Set<String> partial = DiscoveredWorkExtractor.partiallySelectedClasses(launcher, plan);
+  DiscoveredWorkExtractor.Extraction extraction = DiscoveredWorkExtractor.extract(plan, 1000L, partial);
+  assertThat(partial).isNotEmpty();
+  assertThat(extraction.remote()).singleElement().satisfies(unit -> {
+      assertThat(unit.className()).isEqualTo(MixedTemplateClass.class.getName());
+      assertThat(unit.methodName()).isEqualTo("fastTemplate()");
+  });
+  ```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `./mvnw test -Dtest=DiscoveredWorkExtractorTest#tagFilteredContainerMethodClassSplitsIntoMethodUnits -pl tools/citrus-test-distribution`
+Expected: FAIL — `partial` is empty and `unit.methodName()` is `null` because `countTests` counts `0` for both `planned` and `available`.
+
+- [ ] **Step 3: Count leaf `MethodSource` containers in `DiscoveredWorkExtractor.countTests`**
+
+In `tools/citrus-test-distribution/src/main/java/org/citrusframework/distribution/junit/DiscoveredWorkExtractor.java`, update `countTests(TestPlan plan, TestIdentifier node, Map<String, Integer> counts)` so a node contributes `1` when `node.isTest()` OR when `node.getSource().orElse(null) instanceof MethodSource && plan.getChildren(node).isEmpty()`.
+
+- [ ] **Step 4: Run `DiscoveredWorkExtractorTest` to verify it passes**
+
+Run: `./mvnw test -Dtest=DiscoveredWorkExtractorTest -pl tools/citrus-test-distribution`
+Expected: PASS (`0` failures).
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add tools/citrus-test-distribution/src/main/java/org/citrusframework/distribution/junit/DiscoveredWorkExtractor.java \
+        tools/citrus-test-distribution/src/test/java/org/citrusframework/distribution/junit/DiscoveredWorkExtractorTest.java
+git commit -m "fix(test-distribution): count container test methods when detecting pruned classes"
+```
+
+---
+
+### Task 3: Bridge `runtime/citrus-testng` onto JUnit Platform via `org.junit.support:testng-engine`
+
+**Files:**
+- Modify: `pom.xml:315-321,634-640`
+- Modify: `runtime/citrus-testng/pom.xml:25-65`
+- Modify: `runtime/citrus-testng/src/main/java/org/citrusframework/testng/TestNGCitrusMethodInterceptor.java`
+- Modify: `runtime/citrus-testng/src/main/java/org/citrusframework/testng/spring/TestNGCitrusSpringMethodInterceptor.java`
+- Create: `runtime/citrus-testng/src/test/java/org/citrusframework/testng/TestNGCitrusMethodInterceptorTest.java`
+
+**Interfaces:**
+- Consumes: `org.junit.support:testng-engine:1.1.0` (`[engine:testng]`), `ITestNGMethod.setInvocationCount(int)`
+- Produces: `runtime/citrus-testng` executing on `surefire-junit-platform` + `testng-engine` (`<scope>test</scope>`), with `TestNGCitrusMethodInterceptor` and `TestNGCitrusSpringMethodInterceptor` synchronizing `ITestNGMethod.setInvocationCount(count)` whenever `intercept(...)` expands a `@CitrusTestSource` method to `count > testngMethod.getInvocationCount()` instances
+
+- [ ] **Step 1: Configure `testng-engine` in `pom.xml` and `runtime/citrus-testng/pom.xml`, and write the failing multi-source interceptor test**
+
+1. In root `pom.xml`:
+   - Update line 316 comment from `(runtime/citrus-testng, runtime/citrus-junit) override this property` to `(runtime/citrus-junit overrides this property)`.
+   - Add `<testng.engine.version>1.1.0</testng.engine.version>` next to `<testng.version>7.12.0</testng.version>`.
+   - Add `<dependencyManagement>` entry for `org.junit.support:testng-engine:${testng.engine.version}` next to `org.testng:testng`.
+2. In `runtime/citrus-testng/pom.xml`:
+   - Remove `<properties><surefire.provider>surefire-testng</surefire.provider></properties>`.
+   - Add `<dependency><groupId>org.junit.support</groupId><artifactId>testng-engine</artifactId><scope>test</scope></dependency>` and `<dependency><groupId>org.junit.platform</groupId><artifactId>junit-platform-launcher</artifactId><scope>test</scope></dependency>`.
+3. Create `runtime/citrus-testng/src/test/java/org/citrusframework/testng/TestNGCitrusMethodInterceptorTest.java` (with `@org.testng.annotations.Test`) that runs `LauncherFactory.create().execute(...)` (with `DiscoverySelectors.selectClass(MultiSourceFixture.class)` and a recording `TestExecutionListener`) on a static `MultiSourceFixture extends TestNGCitrusSupport` class annotated with `@CitrusTestSource(type = TestLoader.YAML, name = { "EchoActionTest", "DelayActionTest" }, packageName = "org.citrusframework.testng.actions.dsl")` (or two existing test YAML/XML sources on `runtime/citrus-testng`'s test classpath), asserting `2` test invocations succeed with `0` failures.
+
+- [ ] **Step 2: Run the new test to verify it fails before the interceptor fix**
+
+Run: `./mvnw test -Dtest=TestNGCitrusMethodInterceptorTest -pl runtime/citrus-testng`
+Expected: FAIL — JUnit Platform `ExecutionRecorder` rejects starting the `Type.TEST` `MethodDescriptor` a second time (`PreconditionViolationException` / failed container).
+
+- [ ] **Step 3: Synchronize `ITestNGMethod.setInvocationCount` in `TestNGCitrusMethodInterceptor` and `TestNGCitrusSpringMethodInterceptor`**
+
+In both `runtime/citrus-testng/src/main/java/org/citrusframework/testng/TestNGCitrusMethodInterceptor.java` and `runtime/citrus-testng/src/main/java/org/citrusframework/testng/spring/TestNGCitrusSpringMethodInterceptor.java`, before returning `interceptedMethods` from `intercept(...)`, count instances per `ITestNGMethod` (using `IdentityHashMap<ITestNGMethod, Integer>`) and update `testngMethod.setInvocationCount(count)` whenever `count > testngMethod.getInvocationCount()`.
+
+- [ ] **Step 4: Run `runtime/citrus-testng` full `verify` lifecycle and check runtime dependency scope**
+
+Run: `./mvnw verify -pl runtime/citrus-testng`
+Expected: PASS — Surefire unit tests and all three Failsafe executions (`default-cli`/`integration-tests`, `acceptance-tests`, and `failure-tests`) pass on `surefire-junit-platform` + `testng-engine` (`0` failures).
+
+Run: `./mvnw dependency:list -DincludeScope=runtime -pl runtime/citrus-testng`
+Expected: Output does NOT contain `testng-engine` or `junit-platform`.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add pom.xml \
+        runtime/citrus-testng/pom.xml \
+        runtime/citrus-testng/src/main/java/org/citrusframework/testng/TestNGCitrusMethodInterceptor.java \
+        runtime/citrus-testng/src/main/java/org/citrusframework/testng/spring/TestNGCitrusSpringMethodInterceptor.java \
+        runtime/citrus-testng/src/test/java/org/citrusframework/testng/TestNGCitrusMethodInterceptorTest.java
+git commit -m "feat(testng): run citrus-testng on JUnit Platform via testng-engine"
+```
+
+---
+
+### Task 4: End-to-End TestNG Worker Distribution Coverage, Live Worker Verification, and Documentation
+
+**Files:**
+- Modify: `tools/citrus-test-distribution/pom.xml`
+- Create: `tools/citrus-test-distribution/src/test/java/org/citrusframework/distribution/junit/TestNgDistributionTest.java`
+- Modify: `src/manual/tools-test-distribution.adoc:28-64,705-742`
+
+**Interfaces:**
+- Consumes: `DistributionCoordinatorServer`, `DistributionWorkerClient`, `DistributionWorkerConfig`, `DistributionSettings.WorkerForkMode` (`WorkerForkMode.AUTO`, `WorkerForkMode.ALWAYS`), `DistributedLauncher` (via `LauncherFactory`), `org.testng:testng` (`test`), `org.junit.support:testng-engine` (`test`)
+- Produces: automated end-to-end regression suite `TestNgDistributionTest` covering TestNG worker execution (`AUTO` and `ALWAYS` fork modes, `@DataProvider` invocations, and `TagFilter` group splitting) plus user guide documentation in `src/manual/tools-test-distribution.adoc`
+
+- [ ] **Step 1: Add `test`-scope `testng` and `testng-engine` to `tools/citrus-test-distribution/pom.xml` and write `TestNgDistributionTest`**
+
+1. In `tools/citrus-test-distribution/pom.xml`, add `<scope>test</scope>` dependencies on `org.testng:testng` and `org.junit.support:testng-engine`.
+2. Create `tools/citrus-test-distribution/src/test/java/org/citrusframework/distribution/junit/TestNgDistributionTest.java` (naming inner TestNG fixture classes `*NgFixture` so Maven Surefire never selects them directly):
+   - `executesTestNgDataProviderAndPrunedGroupsOnWorkerInAutoAndAlwaysForkModes`: parameterized over `WorkerForkMode.AUTO` and `WorkerForkMode.ALWAYS`, starts an embedded `DistributionCoordinatorServer` + `DistributionWorkerClient`, sets `citrus.test.distribution.enabled=true`, `minRemoteDurationMs=0`, `minRemoteColdUnits=1`, `fallbackLocal=false`, and executes `LauncherDiscoveryRequest` selecting `DataProviderNgFixture` (`@DataProvider` returning 3 rows) and `MixedGroupNgFixture` (one default `@org.testng.annotations.Test` method + one `@org.testng.annotations.Test(groups = "should-fail")` method that fails if invoked) with `TagFilter.excludeTags("should-fail")`.
+   - Assert: `0` test failures, `4` passed test executions (`3` data-provider invocations + `1` non-excluded method), `MixedGroupNgFixture`'s excluded method was never invoked on the worker, and coordinator recorded completed remote partitions on the worker.
+
+- [ ] **Step 2: Run `tools/citrus-test-distribution` test suite**
+
+Run: `./mvnw test -pl tools/citrus-test-distribution -am`
+Expected: PASS (`0` failures, including `TestNgDistributionTest` in both `AUTO` and `ALWAYS` fork modes).
+
+- [ ] **Step 3: Document TestNG support in `src/manual/tools-test-distribution.adoc`**
+
+Update `src/manual/tools-test-distribution.adoc` (under **Quickstart with Maven** and **Test Suite Compatibility**) to note that TestNG test suites run on Citrus Test Distribution when executed on `surefire-junit-platform` with `org.junit.support:testng-engine` in `test` scope, mapping TestNG `@Test(groups = ...)` to JUnit Platform tags.
+
+- [ ] **Step 4: Verify live distributed `./mvnw verify -pl runtime/citrus-testng` with the Maven extension**
+
+1. Install the modified modules into the local repository without skipping compilation:
+   `./mvnw install -DskipTests -pl runtime/citrus-testng,tools/citrus-test-distribution-protocol,tools/citrus-test-distribution-coordinator,tools/citrus-test-distribution-worker,tools/citrus-test-distribution,tools/maven/citrus-test-distribution-maven-extension -am`
+2. Start a temporary local `DistributionCoordinatorServer` and `DistributionWorkerClient` (once with `WorkerForkMode.AUTO`, once with `WorkerForkMode.ALWAYS`) and run:
+   `./mvnw verify -pl runtime/citrus-testng -Dmaven.ext.class.path=... -Dcitrus.test.distribution.enabled=true -Dcitrus.test.distribution.coordinatorUrl=... -Dcitrus.test.distribution.fallbackLocal=false -Dcitrus.test.distribution.minRemoteDurationMs=0 -Dcitrus.test.distribution.minRemoteColdUnits=1`
+   Expected: `BUILD SUCCESS`, all 4 executions (`surefire:test`, `failsafe:integration-test`, `failsafe:acceptance-tests`, `failsafe:failure-tests`) pass with remote worker partition assignments and `0` unintended failures.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add tools/citrus-test-distribution/pom.xml \
+        tools/citrus-test-distribution/src/test/java/org/citrusframework/distribution/junit/TestNgDistributionTest.java \
+        src/manual/tools-test-distribution.adoc
+git commit -m "test(test-distribution): add TestNG worker distribution coverage and docs"
+```
