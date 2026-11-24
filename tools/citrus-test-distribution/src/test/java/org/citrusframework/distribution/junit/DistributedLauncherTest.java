@@ -65,6 +65,7 @@ import org.citrusframework.distribution.model.WorkerTestEventPayload;
 import org.citrusframework.distribution.worker.DistributionWorkerClient;
 import org.citrusframework.distribution.worker.DistributionWorkerConfig;
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DynamicContainer;
 import org.junit.jupiter.api.DynamicTest;
 import org.junit.jupiter.api.Nested;
@@ -89,8 +90,20 @@ class DistributedLauncherTest {
     @TempDir
     Path tempDir;
 
+    private String outerRole;
+
+    @BeforeEach
+    void enterLauncherRole() {
+        // Each test acts as the launcher of its own distribution session.
+        outerRole = System.getProperty(DistributionSettings.ROLE_PROPERTY);
+        System.clearProperty(DistributionSettings.ROLE_PROPERTY);
+    }
+
     @AfterEach
     void resetProps() {
+        if (outerRole != null) {
+            System.setProperty(DistributionSettings.ROLE_PROPERTY, outerRole);
+        }
         System.clearProperty(DistributionSettings.ENABLED_PROPERTY);
         System.clearProperty(DistributionSettings.COORDINATOR_URL_PROPERTY);
         System.clearProperty(DistributionSettings.FALLBACK_LOCAL_PROPERTY);

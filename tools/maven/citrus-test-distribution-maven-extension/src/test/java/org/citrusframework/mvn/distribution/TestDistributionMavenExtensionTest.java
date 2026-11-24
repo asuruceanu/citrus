@@ -408,8 +408,9 @@ class TestDistributionMavenExtensionTest {
 
         assertThat(lines).isEmpty();
         assertThat(elapsedMs).isLessThan(2_000L);
+        TestDistributionLifecycleParticipant.runGit(tempDir, "init", "--quiet");
         assertThat(TestDistributionLifecycleParticipant.runGit(
-                Path.of("").toAbsolutePath(), "rev-parse", "--is-inside-work-tree"))
+                tempDir, "rev-parse", "--is-inside-work-tree"))
                 .isEqualTo("true");
     }
 

@@ -40,6 +40,7 @@ class IndependentJupiterEnginePlacementTest {
         Map<String, String> systemProperties = Map.of(
                 "junit.platform.launcher.interceptors.enabled", "true",
                 DistributionSettings.ENABLED_PROPERTY, "true",
+                DistributionSettings.ROLE_PROPERTY, "",
                 DistributionSettings.COORDINATOR_URL_PROPERTY, "http://127.0.0.1:0",
                 DistributionSettings.FALLBACK_LOCAL_PROPERTY, "false");
         var previous = new java.util.HashMap<String, String>();
