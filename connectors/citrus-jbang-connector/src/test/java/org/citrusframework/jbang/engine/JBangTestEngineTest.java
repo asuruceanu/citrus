@@ -16,8 +16,11 @@
 
 package org.citrusframework.jbang.engine;
 
+import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Collections;
+import java.util.List;
 
 import org.citrusframework.TestSource;
 import org.citrusframework.exceptions.CitrusRuntimeException;
@@ -27,6 +30,7 @@ import org.citrusframework.distribution.annotations.RemoteOnly;
 import org.citrusframework.spi.Resources;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.api.parallel.Isolated;
 
 @Isolated("JBang execution shares ~/.jbang cache and process output")
@@ -45,6 +49,20 @@ public class JBangTestEngineTest {
         TestRunConfiguration configuration = new TestRunConfiguration();
         configuration.setPackages(Collections.singletonList(Resources.fromClasspath("org/citrusframework/jbang/sample").file().getAbsolutePath()));
         runTestEngine(configuration);
+    }
+
+    @Test
+    @RemoteOnly(reason = "Starts real JBang processes in a worker workspace")
+    void testRunDottedDirectoryAndJavaPackage(@TempDir Path workDir) throws IOException {
+        Path sample = Resources.fromClasspath("org/citrusframework/jbang/sample/hello.citrus.it.yaml").file().toPath();
+        Path dottedDirectory = Files.createDirectory(workDir.resolve("sample.with.dots"));
+        Path packageDirectory = Files.createDirectories(workDir.resolve("org/citrusframework/jbang/sample"));
+        Files.copy(sample, dottedDirectory.resolve(sample.getFileName()));
+        Files.copy(sample, packageDirectory.resolve(sample.getFileName()));
+
+        TestRunConfiguration configuration = new TestRunConfiguration();
+        configuration.setPackages(List.of(dottedDirectory.toAbsolutePath().toString(), "org.citrusframework.jbang.sample"));
+        runTestEngine(configuration, workDir);
     }
 
     @Test
