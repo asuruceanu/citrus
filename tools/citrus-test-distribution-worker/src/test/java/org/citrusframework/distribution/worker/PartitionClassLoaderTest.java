@@ -21,6 +21,7 @@ import java.io.InputStream;
 import java.net.JarURLConnection;
 import java.net.URL;
 import java.net.URLConnection;
+import java.net.URLClassLoader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -29,6 +30,7 @@ import java.util.List;
 import java.util.jar.JarEntry;
 import java.util.jar.JarFile;
 import java.util.jar.JarOutputStream;
+import javax.tools.ToolProvider;
 
 import org.citrusframework.distribution.model.TestOutcomeStatus;
 import org.citrusframework.distribution.model.WorkerTestEventPayload;
@@ -132,6 +134,35 @@ class PartitionClassLoaderTest {
             assertThat(loader.loadClass(TestEngine.class.getName())).isSameAs(TestEngine.class);
             assertThat(loader.loadClass(String.class.getName())).isSameAs(String.class);
             assertThat(loader.getResource("java/lang/String.class")).isNotNull();
+        }
+    }
+
+    @Test
+    void shouldIsolateJUnitSupportWhileSharingPlatformAndJupiter() throws Exception {
+        String className = "org.junit.support.probe.SupportProbe";
+        String resource = "org/junit/support/probe/source.txt";
+        Path source = Files.writeString(tempDir.resolve("SupportProbe.java"),
+                "package org.junit.support.probe; public class SupportProbe {}");
+        Path parentPath = Files.createDirectory(tempDir.resolve("parent"));
+        Path partitionPath = Files.createDirectory(tempDir.resolve("partition"));
+        assertThat(ToolProvider.getSystemJavaCompiler().run(null, null, null,
+                "-d", parentPath.toString(), source.toString())).isZero();
+        Path partitionClass = partitionPath.resolve(className.replace('.', '/') + ".class");
+        Files.createDirectories(partitionClass.getParent());
+        Files.copy(parentPath.resolve(className.replace('.', '/') + ".class"), partitionClass);
+        Files.writeString(parentPath.resolve(resource), "parent");
+        Files.writeString(partitionPath.resolve(resource), "partition");
+
+        try (URLClassLoader parent = new URLClassLoader(new URL[] {parentPath.toUri().toURL()}, WORKER);
+             IsolatedPartitionRunner.PartitionClassLoader loader = new IsolatedPartitionRunner.PartitionClassLoader(
+                     new URL[] {partitionPath.toUri().toURL()}, parent);
+             InputStream in = loader.getResourceAsStream(resource)) {
+            assertThat(loader.loadClass(className)).isNotSameAs(parent.loadClass(className));
+            assertThat(loader.loadClass(className).getClassLoader()).isSameAs(loader);
+            assertThat(in).isNotNull();
+            assertThat(new String(in.readAllBytes(), StandardCharsets.UTF_8)).isEqualTo("partition");
+            assertThat(loader.loadClass(TestEngine.class.getName())).isSameAs(TestEngine.class);
+            assertThat(loader.loadClass(Test.class.getName())).isSameAs(Test.class);
         }
     }
 

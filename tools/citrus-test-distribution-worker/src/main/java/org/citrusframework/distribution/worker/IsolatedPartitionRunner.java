@@ -1088,7 +1088,8 @@ public final class IsolatedPartitionRunner implements PartitionRunner {
                 "META-INF/services/org.slf4j.",
                 "META-INF/services/org.apache.logging.log4j.",
                 "META-INF/org/apache/logging/log4j/",
-                "org/junit/",
+                "org/junit/platform/",
+                "org/junit/jupiter/",
                 "org/opentest4j/",
                 "org/apiguardian/",
                 "org/slf4j/",
@@ -1296,7 +1297,8 @@ public final class IsolatedPartitionRunner implements PartitionRunner {
             // JDK packages are matched exactly (isJdkPackage), not by javax./jdk./sun. prefixes: third-party javax.*
             // libraries such as wsdl4j's javax.wsdl must load from the partition with their implementation.
             return name.startsWith("java.")
-                    || name.startsWith("org.junit.")
+                    || name.startsWith("org.junit.platform.")
+                    || name.startsWith("org.junit.jupiter.")
                     || name.startsWith("org.opentest4j.")
                     || name.startsWith("org.apiguardian.")
                     || name.startsWith("org.slf4j.")
