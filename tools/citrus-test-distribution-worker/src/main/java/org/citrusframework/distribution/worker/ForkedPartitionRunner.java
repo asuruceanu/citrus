@@ -149,13 +149,13 @@ final class ForkedPartitionRunner implements PartitionRunner {
     private final Object forkStartMonitor = new Object();
     private volatile boolean stopping;
     private final WorkerFileCache sharedCache;
-    private final BrokerBlobClient sharedBlobs;
+    private final CoordinatorBlobClient sharedBlobs;
     private final long handshakeTimeoutMs;
 
     /**
      * Runs partitions against the worker's shared cache and blob client, both owned by the caller.
      */
-    ForkedPartitionRunner(DistributionWorkerConfig config, WorkerFileCache cache, BrokerBlobClient blobs) {
+    ForkedPartitionRunner(DistributionWorkerConfig config, WorkerFileCache cache, CoordinatorBlobClient blobs) {
         this(config, Objects.requireNonNull(cache, "cache"), Objects.requireNonNull(blobs, "blobs"), true);
     }
 
@@ -167,7 +167,7 @@ final class ForkedPartitionRunner implements PartitionRunner {
         this(config, null, null, false);
     }
 
-    private ForkedPartitionRunner(DistributionWorkerConfig config, WorkerFileCache cache, BrokerBlobClient blobs,
+    private ForkedPartitionRunner(DistributionWorkerConfig config, WorkerFileCache cache, CoordinatorBlobClient blobs,
                                   boolean shared) {
         this.config = Objects.requireNonNull(config, "config");
         this.sharedCache = shared ? cache : null;
@@ -195,7 +195,7 @@ final class ForkedPartitionRunner implements PartitionRunner {
             return new IsolatedPartitionRunner.PartitionExecutionResult(false,
                     e.getMessage() != null ? e.getMessage() : e.getClass().getName());
         }
-        try (cache; BrokerBlobClient blobs = new BrokerBlobClient(config, cache)) {
+        try (cache; CoordinatorBlobClient blobs = new CoordinatorBlobClient(config, cache)) {
             return execute(assignment, cancellationToken, eventSink, cache, blobs);
         }
     }
@@ -208,7 +208,7 @@ final class ForkedPartitionRunner implements PartitionRunner {
                                                                      CancellationToken cancellationToken,
                                                                      Consumer<WorkerTestEventPayload> eventSink,
                                                                      WorkerFileCache cache,
-                                                                     BrokerBlobClient blobs) {
+                                                                     CoordinatorBlobClient blobs) {
         ActiveFork fork = new ActiveFork();
         Lock startLock = JVM_FORK_START_FENCE.readLock();
         startLock.lock();

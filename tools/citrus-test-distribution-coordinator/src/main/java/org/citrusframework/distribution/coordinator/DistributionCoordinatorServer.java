@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-package org.citrusframework.distribution.broker;
+package org.citrusframework.distribution.coordinator;
 
 import java.io.IOException;
 import java.util.concurrent.TimeUnit;
@@ -25,16 +25,16 @@ import org.citrusframework.distribution.store.DistributionStore;
 import org.citrusframework.distribution.store.JdbcDistributionStore;
 
 /**
- * Embeddable and standalone lifecycle manager for the Citrus Test Distribution Broker.
+ * Embeddable and standalone lifecycle manager for the Citrus Test Distribution Coordinator.
  */
-public final class DistributionBrokerServer implements AutoCloseable {
+public final class DistributionCoordinatorServer implements AutoCloseable {
 
-    private final DistributionBrokerConfig config;
+    private final DistributionCoordinatorConfig config;
     private Vertx vertx;
     private DistributionStore store;
-    private DistributionBrokerVerticle verticle;
+    private DistributionCoordinatorVerticle verticle;
 
-    public DistributionBrokerServer(DistributionBrokerConfig config) {
+    public DistributionCoordinatorServer(DistributionCoordinatorConfig config) {
         this.config = config;
     }
 
@@ -55,16 +55,16 @@ public final class DistributionBrokerServer implements AutoCloseable {
 
         store = new JdbcDistributionStore(config.jdbcUrl(), config.jdbcUsername(), config.jdbcPassword());
         store.initialize();
-        BrokerEventStreamHub eventHub = new BrokerEventStreamHub();
-        BrokerSessionCoordinator coordinator = new BrokerSessionCoordinator(config, store, eventHub);
+        CoordinatorEventStreamHub eventHub = new CoordinatorEventStreamHub();
+        SessionCoordinator coordinator = new SessionCoordinator(config, store, eventHub);
 
         vertx = Vertx.vertx();
-        verticle = new DistributionBrokerVerticle(config, blobCache, eventHub, coordinator);
+        verticle = new DistributionCoordinatorVerticle(config, blobCache, eventHub, coordinator);
         try {
             vertx.deployVerticle(verticle).toCompletionStage().toCompletableFuture().get(30, TimeUnit.SECONDS);
         } catch (Exception e) {
             close();
-            throw new IllegalStateException("Failed to start DistributionBrokerServer", e);
+            throw new IllegalStateException("Failed to start DistributionCoordinatorServer", e);
         }
     }
 

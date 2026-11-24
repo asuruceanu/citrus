@@ -31,8 +31,8 @@ import org.aesh.AeshRuntimeRunner;
 import org.aesh.command.CommandDefinition;
 import org.aesh.command.CommandResult;
 import org.aesh.command.invocation.CommandInvocation;
-import org.citrusframework.distribution.broker.DistributionBrokerConfig;
-import org.citrusframework.distribution.broker.DistributionBrokerServer;
+import org.citrusframework.distribution.coordinator.DistributionCoordinatorConfig;
+import org.citrusframework.distribution.coordinator.DistributionCoordinatorServer;
 import org.citrusframework.distribution.config.DistributionJson;
 import org.citrusframework.distribution.config.DistributionSettings;
 import org.citrusframework.distribution.worker.DistributionWorkerConfig;
@@ -61,11 +61,11 @@ class DistCommandTest extends CommandTest {
     void shouldPrintDistHelpTree() {
         CitrusJBangMain main = createCitrusJBangMain();
         assertThat(main.execute("dist")).isZero();
-        assertThat(printer.getOutput()).contains("broker").contains("worker").contains("sessions").contains("status");
+        assertThat(printer.getOutput()).contains("coordinator").contains("worker").contains("sessions").contains("status");
 
         printer = new StringPrinter();
         main = createCitrusJBangMain();
-        assertThat(main.execute("dist", "broker")).isZero();
+        assertThat(main.execute("dist", "coordinator")).isZero();
         assertThat(printer.getOutput()).contains("start");
 
         printer = new StringPrinter();
@@ -74,25 +74,25 @@ class DistCommandTest extends CommandTest {
         assertThat(printer.getOutput()).contains("start");
 
         assertThat(main.execute("dist", "--help")).isZero();
-        assertThat(main.execute("dist", "broker", "start", "--help")).isZero();
+        assertThat(main.execute("dist", "coordinator", "start", "--help")).isZero();
         assertThat(main.execute("dist", "worker", "start", "--help")).isZero();
         assertThat(main.execute("dist", "sessions", "--help")).isZero();
         assertThat(main.execute("dist", "status", "--help")).isZero();
     }
 
     @Test
-    void shouldQueryLiveBrokerSessionsAndStatus() throws Exception {
-        DistributionBrokerConfig config = DistributionBrokerConfig.builder()
+    void shouldQueryLiveCoordinatorSessionsAndStatus() throws Exception {
+        DistributionCoordinatorConfig config = DistributionCoordinatorConfig.builder()
                 .port(0)
                 .cacheDir(tempDir.resolve("cache"))
                 .jdbcUrl("jdbc:hsqldb:mem:jbang_dist_" + System.nanoTime())
                 .build();
 
-        try (DistributionBrokerServer broker = new DistributionBrokerServer(config)) {
-            broker.start();
+        try (DistributionCoordinatorServer coordinator = new DistributionCoordinatorServer(config)) {
+            coordinator.start();
 
             HttpClient.newHttpClient().send(
-                    HttpRequest.newBuilder(URI.create(broker.baseUrl() + "/api/v1/sessions"))
+                    HttpRequest.newBuilder(URI.create(coordinator.baseUrl() + "/api/v1/sessions"))
                             .header("Content-Type", "application/json")
                             .POST(HttpRequest.BodyPublishers.ofString(DistributionJson.toJson(
                                     new CreateSessionRequest("citrus-demo", "main", "deadbeef", List.of(), 5, 1))))
@@ -100,44 +100,50 @@ class DistCommandTest extends CommandTest {
                     HttpResponse.BodyHandlers.ofString());
 
             CitrusJBangMain main = createCitrusJBangMain();
-            main.execute("dist", "sessions", "--broker-url", broker.baseUrl());
+            assertThat(main.execute("dist", "sessions", "-u", coordinator.baseUrl())).isZero();
             assertThat(printer.getOutput()).contains("citrus-demo").contains("RUNNING");
 
             printer = new StringPrinter();
             main = createCitrusJBangMain();
-            main.execute("dist", "status", "--broker-url", broker.baseUrl(), "--json");
-            assertThat(printer.getOutput()).contains("\"status\"").contains("UP");
+            assertThat(main.execute("dist", "status", "--coordinator-url", coordinator.baseUrl(), "--json")).isZero();
+            assertThat(printer.getOutput()).contains("\"status\"").contains("UP")
+                    .contains("\"coordinatorUrl\":\"" + coordinator.baseUrl() + "\"");
+
+            printer = new StringPrinter();
+            main = createCitrusJBangMain();
+            assertThat(main.execute("dist", "status", "-u", coordinator.baseUrl())).isZero();
+            assertThat(printer.getOutput()).contains("Coordinator: " + coordinator.baseUrl() + " [UP]");
         }
     }
 
     @Test
-    void shouldStartBrokerAndWorkerWithBoundedDuration() throws Exception {
-        DistributionBrokerConfig config = DistributionBrokerConfig.builder()
+    void shouldStartCoordinatorAndWorkerWithBoundedDuration() throws Exception {
+        DistributionCoordinatorConfig config = DistributionCoordinatorConfig.builder()
                 .port(0)
-                .cacheDir(tempDir.resolve("worker-broker-cache"))
+                .cacheDir(tempDir.resolve("worker-coordinator-cache"))
                 .jdbcUrl("jdbc:hsqldb:mem:jbang_worker_" + System.nanoTime())
                 .build();
 
-        try (DistributionBrokerServer broker = new DistributionBrokerServer(config)) {
-            broker.start();
+        try (DistributionCoordinatorServer coordinator = new DistributionCoordinatorServer(config)) {
+            coordinator.start();
 
             CitrusJBangMain main = createCitrusJBangMain();
-            main.execute("dist", "worker", "start",
-                    "--broker-url", broker.baseUrl(),
+            assertThat(main.execute("dist", "worker", "start",
+                    "--no-cache-cleanup", "-u", coordinator.baseUrl(),
                     "--worker-id", "jbang-worker-1",
                     "--cache-dir", tempDir.resolve("wcache").toString(),
-                    "--duration-seconds", "1");
-            assertThat(printer.getOutput()).contains("jbang-worker-1");
+                    "--duration-seconds", "1")).isZero();
+            assertThat(printer.getOutput()).contains("jbang-worker-1 connected to " + coordinator.baseUrl());
         }
 
         printer = new StringPrinter();
         CitrusJBangMain main = createCitrusJBangMain();
-        main.execute("dist", "broker", "start",
+        assertThat(main.execute("dist", "coordinator", "start",
                 "--port", "0",
-                "--jdbc-url", "jdbc:hsqldb:mem:jbang_broker_cli_" + System.nanoTime(),
-                "--cache-dir", tempDir.resolve("bcache").toString(),
-                "--duration-seconds", "1");
-        assertThat(printer.getOutput()).contains("Citrus Test Distribution Broker listening on");
+                "--jdbc-url", "jdbc:hsqldb:mem:jbang_coordinator_cli_" + System.nanoTime(),
+                "--cache-dir", tempDir.resolve("coordinator-cache").toString(),
+                "--duration-seconds", "1")).isZero();
+        assertThat(printer.getOutput()).contains("Citrus Test Distribution Coordinator listening on");
     }
 
     @Test
@@ -165,8 +171,10 @@ class DistCommandTest extends CommandTest {
                 Arguments.of(List.of("--no-cache-cleanup", "false"), List.of("--cache-cleanup=true")),
                 Arguments.of(List.of("--no-cache-cleanup", "--cache-cleanup"), List.of("--cache-cleanup=true")),
                 Arguments.of(List.of("--cache-cleanup", "--no-cache-cleanup"), List.of("--cache-cleanup=false")),
-                Arguments.of(List.of("--no-cache-cleanup", "--broker-url", "http://broker:9000"),
-                        List.of("--broker-url", "http://broker:9000", "--cache-cleanup=false")),
+                Arguments.of(List.of("--no-cache-cleanup", "--coordinator-url", "http://coordinator:9000"),
+                        List.of("--coordinator-url", "http://coordinator:9000", "--cache-cleanup=false")),
+                Arguments.of(List.of("--no-cache-cleanup", "-u", "http://coordinator:9000"),
+                        List.of("-u", "http://coordinator:9000", "--cache-cleanup=false")),
                 Arguments.of(List.of("--cache-free-space-buffer-size", "512MiB"),
                         List.of("--cache-free-space-buffer-size=512MiB")),
                 Arguments.of(List.of("--no-cache-cleanup", "--cache-cleanup=true"), List.of("--cache-cleanup=true")),
@@ -201,10 +209,10 @@ class DistCommandTest extends CommandTest {
                 Arguments.of(List.of("--cache-dir="), "--cache-dir"),
                 Arguments.of(List.of("--cache-dir=  "), "--cache-dir"),
                 Arguments.of(List.of("--cache-dir", " "), "--cache-dir"),
-                Arguments.of(List.of("--cache-dir", "--broker-url", "http://x"), "--cache-dir"),
+                Arguments.of(List.of("--cache-dir", "--coordinator-url", "http://x"), "--cache-dir"),
                 Arguments.of(List.of("--cache-free-space-buffer-size"), "--cache-free-space-buffer-size"),
                 Arguments.of(List.of("--cache-free-space-buffer-size="), "--cache-free-space-buffer-size"),
-                Arguments.of(List.of("--cache-free-space-buffer-size", "--broker-url", "http://x"),
+                Arguments.of(List.of("--cache-free-space-buffer-size", "--coordinator-url", "http://x"),
                         "--cache-free-space-buffer-size"),
                 Arguments.of(List.of("--cache-free-space-buffer-size=2GB"), "--cache-free-space-buffer-size"),
                 Arguments.of(List.of("--cache", "--help"), "Unknown cache option: --cache"));
@@ -223,7 +231,7 @@ class DistCommandTest extends CommandTest {
         return Stream.of(
                 Arguments.of(List.of("--cache"), "--cache"),
                 Arguments.of(List.of("--cache-cleanup", "flase"), "flase"),
-                Arguments.of(List.of("--cache-dir", "--broker-url", "http://x"), "--cache-dir"),
+                Arguments.of(List.of("--cache-dir", "--coordinator-url", "http://x"), "--cache-dir"),
                 Arguments.of(List.of("--cache-free-space-buffer-size="), "--cache-free-space-buffer-size"),
                 Arguments.of(List.of("--cache-dir", " "), "Missing parameter value for --cache-dir option"),
                 Arguments.of(List.of("--cache-dir="), "Missing parameter value for --cache-dir option"));
@@ -242,8 +250,8 @@ class DistCommandTest extends CommandTest {
     void shouldLeaveOtherCommandsUntouched() {
         String[] args = {"run", "--cache-foo"};
         assertThat(DistWorkerStart.normalizeWorkerStartArgs(args)).containsExactly("run", "--cache-foo");
-        String[] broker = {"dist", "broker", "start", "--cache-dir", "/tmp/b"};
-        assertThat(DistWorkerStart.normalizeWorkerStartArgs(broker)).containsExactly(broker);
+        String[] coordinator = {"dist", "coordinator", "start", "--cache-dir", "/tmp/b"};
+        assertThat(DistWorkerStart.normalizeWorkerStartArgs(coordinator)).containsExactly(coordinator);
         String[] help = {"dist", "worker", "start", "--help"};
         assertThat(DistWorkerStart.normalizeWorkerStartArgs(help)).containsExactly(help);
         String[] positional = {"other", "dist", "worker", "start", "--cache-foo"};
@@ -267,7 +275,7 @@ class DistCommandTest extends CommandTest {
     @Test
     void shouldBuildWorkerConfigFromCacheOptions() {
         DistWorkerStart command = new DistWorkerStart();
-        command.brokerUrl = "http://localhost:8765";
+        command.coordinatorUrl = "http://localhost:8765";
         command.cacheDir = tempDir.resolve("cfg-cache").toString();
         command.cacheCleanup = "false";
         command.cacheFreeSpaceBufferSize = "64MiB";
@@ -278,7 +286,7 @@ class DistCommandTest extends CommandTest {
         assertThat(config.cacheFreeSpaceBufferBytes()).isEqualTo(64L * 1024 * 1024);
 
         DistWorkerStart noCleanup = new DistWorkerStart();
-        noCleanup.brokerUrl = "http://localhost:8765";
+        noCleanup.coordinatorUrl = "http://localhost:8765";
         noCleanup.noCacheCleanup = true;
         assertThat(noCleanup.buildWorkerConfig().cacheCleanup()).isFalse();
     }
@@ -334,7 +342,7 @@ class DistCommandTest extends CommandTest {
 
     /** Normalizes a worker start command line and lets the command parser bind it to the real worker options. */
     private static DistributionWorkerConfig bindWorkerStart(List<String> leading, List<String> options) {
-        List<String> command = Stream.of(leading.stream(), Stream.of("dist", "worker", "start", "--broker-url",
+        List<String> command = Stream.of(leading.stream(), Stream.of("dist", "worker", "start", "--coordinator-url",
                 "http://localhost:1"), options.stream()).flatMap(s -> s).toList();
         String[] normalized = DistWorkerStart.normalizeWorkerStartArgs(command.toArray(String[]::new));
         int optionsStart = leading.size() + 3;
@@ -366,18 +374,18 @@ class DistCommandTest extends CommandTest {
 
     @Test
     void shouldStartWorkerWithCacheOptionsAndBoundedDuration() throws Exception {
-        DistributionBrokerConfig config = DistributionBrokerConfig.builder()
+        DistributionCoordinatorConfig config = DistributionCoordinatorConfig.builder()
                 .port(0)
-                .cacheDir(tempDir.resolve("cache-opts-broker-cache"))
+                .cacheDir(tempDir.resolve("cache-opts-coordinator-cache"))
                 .jdbcUrl("jdbc:hsqldb:mem:jbang_worker_cache_opts_" + System.nanoTime())
                 .build();
 
-        try (DistributionBrokerServer broker = new DistributionBrokerServer(config)) {
-            broker.start();
+        try (DistributionCoordinatorServer coordinator = new DistributionCoordinatorServer(config)) {
+            coordinator.start();
 
             CitrusJBangMain main = createCitrusJBangMain();
             assertThat(main.execute("dist", "worker", "start",
-                    "--broker-url", broker.baseUrl(),
+                    "--coordinator-url", coordinator.baseUrl(),
                     "--worker-id", "jbang-cache-worker",
                     "--cache-dir", tempDir.resolve("cache-opts-wcache").toString(),
                     "--no-cache-cleanup",
@@ -405,20 +413,20 @@ class DistCommandTest extends CommandTest {
 
     @Test
     void shouldReleaseWorkerCacheLockBeforeWorkerStartReturns() throws Exception {
-        DistributionBrokerConfig config = DistributionBrokerConfig.builder()
+        DistributionCoordinatorConfig config = DistributionCoordinatorConfig.builder()
                 .port(0)
-                .cacheDir(tempDir.resolve("lock-broker-cache"))
+                .cacheDir(tempDir.resolve("lock-coordinator-cache"))
                 .jdbcUrl("jdbc:hsqldb:mem:jbang_worker_lock_" + System.nanoTime())
                 .build();
         Path workerCache = tempDir.resolve("lock-wcache");
 
-        try (DistributionBrokerServer broker = new DistributionBrokerServer(config)) {
-            broker.start();
+        try (DistributionCoordinatorServer coordinator = new DistributionCoordinatorServer(config)) {
+            coordinator.start();
             for (String workerId : new String[] {"jbang-lock-worker-1", "jbang-lock-worker-2"}) {
                 printer = new StringPrinter();
                 CitrusJBangMain main = createCitrusJBangMain();
                 assertThat(main.execute("dist", "worker", "start",
-                        "--broker-url", broker.baseUrl(),
+                        "--coordinator-url", coordinator.baseUrl(),
                         "--worker-id", workerId,
                         "--cache-dir", workerCache.toString(),
                         "--duration-seconds", "1")).isZero();

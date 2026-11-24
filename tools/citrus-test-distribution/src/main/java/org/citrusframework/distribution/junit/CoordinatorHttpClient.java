@@ -39,7 +39,7 @@ import java.util.function.Predicate;
 
 import org.citrusframework.distribution.cache.ClasspathPackager;
 import org.citrusframework.distribution.config.DistributionJson;
-import org.citrusframework.distribution.model.BrokerEvent;
+import org.citrusframework.distribution.model.CoordinatorEvent;
 import org.citrusframework.distribution.model.BuildSessionResponse;
 import org.citrusframework.distribution.model.CompleteSessionRequest;
 import org.citrusframework.distribution.model.CreateSessionRequest;
@@ -53,18 +53,18 @@ import org.citrusframework.distribution.model.SubmitWorkResponse;
 import tools.jackson.core.JacksonException;
 
 /**
- * HTTP/SSE client used by the JUnit Platform coordinator and Maven extension to communicate with the broker.
+ * HTTP/SSE client used by the JUnit Platform launcher and Maven extension to communicate with the coordinator.
  */
-public class BrokerHttpClient {
+public class CoordinatorHttpClient {
 
-    private static final System.Logger LOG = System.getLogger(BrokerHttpClient.class.getName());
+    private static final System.Logger LOG = System.getLogger(CoordinatorHttpClient.class.getName());
 
     private final String baseUrl;
     private final String authToken;
     private final HttpClient httpClient;
     private final Duration optionalRequestTimeout;
 
-    public BrokerHttpClient(String baseUrl, String authToken, long connectTimeoutMs) {
+    public CoordinatorHttpClient(String baseUrl, String authToken, long connectTimeoutMs) {
         this.baseUrl = baseUrl.endsWith("/") ? baseUrl.substring(0, baseUrl.length() - 1) : baseUrl;
         this.authToken = authToken;
         this.optionalRequestTimeout = Duration.ofMillis(Math.max(500L, connectTimeoutMs));
@@ -96,9 +96,9 @@ public class BrokerHttpClient {
                 if (history != null) {
                     return Optional.of(history.durationsMs());
                 }
-                LOG.log(System.Logger.Level.DEBUG, "Historical test durations unavailable (empty broker response)");
+                LOG.log(System.Logger.Level.DEBUG, "Historical test durations unavailable (empty coordinator response)");
             } else {
-                LOG.log(System.Logger.Level.DEBUG, "Historical test durations unavailable (broker HTTP {0})", response.statusCode());
+                LOG.log(System.Logger.Level.DEBUG, "Historical test durations unavailable (coordinator HTTP {0})", response.statusCode());
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -141,7 +141,7 @@ public class BrokerHttpClient {
                 HttpResponse.BodyHandlers.ofInputStream());
         try (InputStream body = resp.body()) {
             if (resp.statusCode() != 200) {
-                throw new IOException("Broker HTTP " + resp.statusCode() + " during downloadBlob " + sha256);
+                throw new IOException("Coordinator HTTP " + resp.statusCode() + " during downloadBlob " + sha256);
             }
             long limit = ClasspathPackager.MAX_BLOB_BYTES;
             if (resp.headers().firstValueAsLong("Content-Length").orElse(0L) > limit) {
@@ -211,7 +211,7 @@ public class BrokerHttpClient {
     public long streamSessionEvents(String sessionId,
                                     long initialAfterSeq,
                                     long timeoutMs,
-                                    Predicate<BrokerEvent> shouldStop) throws IOException, InterruptedException {
+                                    Predicate<CoordinatorEvent> shouldStop) throws IOException, InterruptedException {
         long lastSeq = initialAfterSeq;
         long deadline = System.currentTimeMillis() + Math.max(2_000L, timeoutMs);
 
@@ -243,7 +243,7 @@ public class BrokerHttpClient {
                         } else if (line.isEmpty() && !dataLines.isEmpty()) {
                             String json = dataLines.toString();
                             dataLines.setLength(0);
-                            BrokerEvent event = DistributionJson.fromJson(json, BrokerEvent.class);
+                            CoordinatorEvent event = DistributionJson.fromJson(json, CoordinatorEvent.class);
                             if (event.sequence() > lastSeq) {
                                 lastSeq = event.sequence();
                             }
@@ -272,7 +272,7 @@ public class BrokerHttpClient {
         } catch (ExecutionException e) {
             throw new IOException(e.getCause());
         } catch (TimeoutException e) {
-            throw new HttpTimeoutException("Timed out waiting for broker response to " + path);
+            throw new HttpTimeoutException("Timed out waiting for coordinator response to " + path);
         } finally {
             if (!pending.isDone()) {
                 pending.cancel(true);
@@ -301,7 +301,7 @@ public class BrokerHttpClient {
 
     private static void ensureSuccess(HttpResponse<?> resp, String op) throws IOException {
         if (resp.statusCode() < 200 || resp.statusCode() >= 300) {
-            throw new IOException("Broker HTTP " + resp.statusCode() + " during " + op + ": " + resp.body());
+            throw new IOException("Coordinator HTTP " + resp.statusCode() + " during " + op + ": " + resp.body());
         }
     }
 }

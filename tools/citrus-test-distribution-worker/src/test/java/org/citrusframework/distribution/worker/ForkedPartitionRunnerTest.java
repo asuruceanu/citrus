@@ -39,8 +39,8 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
-import org.citrusframework.distribution.broker.DistributionBrokerConfig;
-import org.citrusframework.distribution.broker.DistributionBrokerServer;
+import org.citrusframework.distribution.coordinator.DistributionCoordinatorConfig;
+import org.citrusframework.distribution.coordinator.DistributionCoordinatorServer;
 import org.citrusframework.distribution.cache.BlobCacheDirectory;
 import org.citrusframework.distribution.cache.ClasspathPackager;
 import org.citrusframework.distribution.cache.WorkspacePackager;
@@ -280,7 +280,7 @@ class ForkedPartitionRunnerTest {
                             return materialized;
                         }
                     });
-            BrokerBlobClient blobs = new BrokerBlobClient(config, cache);
+            CoordinatorBlobClient blobs = new CoordinatorBlobClient(config, cache);
             ForkedPartitionRunner runner = new ForkedPartitionRunner(config, cache, blobs);
             CompletableFuture<IsolatedPartitionRunner.PartitionExecutionResult> execution =
                     CompletableFuture.supplyAsync(() -> runner.execute(pending, CancellationToken.create(), e -> { }));
@@ -354,14 +354,14 @@ class ForkedPartitionRunnerTest {
 
     @Test
     void shouldMaterializeRelativeCwdInputsRewriteBasedirAndExportDifferentialOutputs() throws Exception {
-        DistributionBrokerConfig brokerConfig = DistributionBrokerConfig.builder()
+        DistributionCoordinatorConfig coordinatorConfig = DistributionCoordinatorConfig.builder()
                 .port(0)
-                .cacheDir(tempDir.resolve("broker-cache"))
+                .cacheDir(tempDir.resolve("coordinator-cache"))
                 .jdbcUrl("jdbc:hsqldb:mem:forked_" + System.nanoTime())
                 .build();
-        try (DistributionBrokerServer broker = new DistributionBrokerServer(brokerConfig)) {
-            broker.start();
-            DistributionWorkerConfig config = workerConfig(tempDir.resolve("worker-cache"), broker.baseUrl());
+        try (DistributionCoordinatorServer coordinator = new DistributionCoordinatorServer(coordinatorConfig)) {
+            coordinator.start();
+            DistributionWorkerConfig config = workerConfig(tempDir.resolve("worker-cache"), coordinator.baseUrl());
             BlobCacheDirectory cache = new BlobCacheDirectory(config.cacheDir());
 
             Path module = Files.createDirectories(tempDir.resolve("module"));
@@ -397,7 +397,7 @@ class ForkedPartitionRunnerTest {
                     .containsExactly("target/docs/report.html");
 
             HttpResponse<Void> uploaded = HttpClient.newHttpClient().send(HttpRequest.newBuilder(URI.create(
-                    broker.baseUrl() + "/api/v1/cache/blobs/" + result.outputArtifacts().getFirst().artifact().sha256())).GET().build(),
+                    coordinator.baseUrl() + "/api/v1/cache/blobs/" + result.outputArtifacts().getFirst().artifact().sha256())).GET().build(),
                     HttpResponse.BodyHandlers.discarding());
             assertThat(uploaded.statusCode()).as("output blob uploaded to the coordinator").isEqualTo(200);
         }
@@ -454,14 +454,14 @@ class ForkedPartitionRunnerTest {
 
     @Test
     void shouldRunTestsInTheRequestedWorkingDirectoryInsideTheWorkspace() throws Exception {
-        DistributionBrokerConfig brokerConfig = DistributionBrokerConfig.builder()
+        DistributionCoordinatorConfig coordinatorConfig = DistributionCoordinatorConfig.builder()
                 .port(0)
-                .cacheDir(tempDir.resolve("broker-cache"))
+                .cacheDir(tempDir.resolve("coordinator-cache"))
                 .jdbcUrl("jdbc:hsqldb:mem:forked_wd_" + System.nanoTime())
                 .build();
-        try (DistributionBrokerServer broker = new DistributionBrokerServer(brokerConfig)) {
-            broker.start();
-            DistributionWorkerConfig config = workerConfig(tempDir.resolve("worker-cache"), broker.baseUrl());
+        try (DistributionCoordinatorServer coordinator = new DistributionCoordinatorServer(coordinatorConfig)) {
+            coordinator.start();
+            DistributionWorkerConfig config = workerConfig(tempDir.resolve("worker-cache"), coordinator.baseUrl());
             BlobCacheDirectory cache = new BlobCacheDirectory(config.cacheDir());
             PartitionAssignPayload base = assignment(cache, Map.of(), List.of(), List.of("target"),
                     unit(WorkingDirectoryFixture.class, "runInTargetDirectory"));
@@ -575,7 +575,7 @@ class ForkedPartitionRunnerTest {
                         throw new AssertionError("blobs are verified through WorkerFileCache only");
                     }
                 });
-             BrokerBlobClient blobs = new BrokerBlobClient(config, cache)) {
+             CoordinatorBlobClient blobs = new CoordinatorBlobClient(config, cache)) {
             ForkedPartitionRunner runner = new ForkedPartitionRunner(config, cache, blobs);
             IsolatedPartitionRunner.PartitionExecutionResult first = runner.execute(cold, CancellationToken.create(), e -> { });
             assertThat(first.success()).as(first.errorMessage()).isTrue();
@@ -613,7 +613,7 @@ class ForkedPartitionRunnerTest {
                         return super.isIntact(sha256);
                     }
                 });
-             BrokerBlobClient blobs = new BrokerBlobClient(config, cache)) {
+             CoordinatorBlobClient blobs = new CoordinatorBlobClient(config, cache)) {
             ForkedPartitionRunner runner = new ForkedPartitionRunner(config, cache, blobs);
             List<WorkerTestEventPayload> events = new CopyOnWriteArrayList<>();
             CompletableFuture<IsolatedPartitionRunner.PartitionExecutionResult> execution =
@@ -736,14 +736,14 @@ class ForkedPartitionRunnerTest {
 
     @Test
     void shouldRunChildShutdownHooksBeforePackagingOutputs() throws Exception {
-        DistributionBrokerConfig brokerConfig = DistributionBrokerConfig.builder()
+        DistributionCoordinatorConfig coordinatorConfig = DistributionCoordinatorConfig.builder()
                 .port(0)
-                .cacheDir(tempDir.resolve("broker-cache"))
+                .cacheDir(tempDir.resolve("coordinator-cache"))
                 .jdbcUrl("jdbc:hsqldb:mem:forked_hook_" + System.nanoTime())
                 .build();
-        try (DistributionBrokerServer broker = new DistributionBrokerServer(brokerConfig)) {
-            broker.start();
-            DistributionWorkerConfig config = workerConfig(tempDir.resolve("worker-cache"), broker.baseUrl());
+        try (DistributionCoordinatorServer coordinator = new DistributionCoordinatorServer(coordinatorConfig)) {
+            coordinator.start();
+            DistributionWorkerConfig config = workerConfig(tempDir.resolve("worker-cache"), coordinator.baseUrl());
             BlobCacheDirectory cache = new BlobCacheDirectory(config.cacheDir());
 
             IsolatedPartitionRunner.PartitionExecutionResult result = new ForkedPartitionRunner(config).execute(
@@ -821,11 +821,11 @@ class ForkedPartitionRunnerTest {
         assertThat(DistributionWorkerClient.requiresFork(auto, outputs)).isTrue();
     }
 
-    private static DistributionWorkerConfig workerConfig(Path cacheDir, String brokerUrl) {
+    private static DistributionWorkerConfig workerConfig(Path cacheDir, String coordinatorUrl) {
         return DistributionWorkerConfig.builder()
                 .workerId("forked-" + UUID.randomUUID().toString().substring(0, 6))
                 .cacheDir(cacheDir)
-                .brokerUrl(brokerUrl)
+                .coordinatorUrl(coordinatorUrl)
                 .forkJvmArgs(List.of("-Xmx256m"))
                 .build();
     }

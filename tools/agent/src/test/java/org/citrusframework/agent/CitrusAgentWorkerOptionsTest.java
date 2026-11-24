@@ -109,9 +109,43 @@ class CitrusAgentWorkerOptionsTest {
 
     @Test
     void shouldNotConsumeFollowingFlagAfterBareCacheCleanup() {
-        CitrusAgentConfiguration configuration = parse("--no-cache-cleanup", "--broker-url", "http://broker:9000");
+        CitrusAgentConfiguration configuration = parse("--no-cache-cleanup", "--coordinator-url", "http://coordinator:9000");
         assertThat(configuration.getCacheCleanup()).isFalse();
-        assertThat(configuration.getBrokerUrl()).isEqualTo("http://broker:9000");
+        assertThat(configuration.getCoordinatorUrl()).isEqualTo("http://coordinator:9000");
+    }
+
+    @Test
+    void shouldParseShortCoordinatorUrlFlagAfterBareCacheCleanup() {
+        CitrusAgentConfiguration configuration = parse("--mode", "worker", "--no-cache-cleanup",
+                "-u", "http://coordinator:9000/");
+        assertThat(configuration.getCacheCleanup()).isFalse();
+        assertThat(configuration.getCoordinatorUrl()).isEqualTo("http://coordinator:9000/");
+        assertThat(DistributionWorkerBridge.buildWorkerConfig(configuration).coordinatorUrl())
+                .isEqualTo("http://coordinator:9000");
+    }
+
+    @Test
+    @ResourceLock(Resources.SYSTEM_PROPERTIES)
+    void shouldUseCliUrlThenSystemPropertyThenAgentDefault() {
+        String key = DistributionSettings.COORDINATOR_URL_PROPERTY;
+        String previous = System.setProperty(key, "http://coordinator-prop:9100/");
+        try {
+            assertThat(DistributionWorkerBridge.buildWorkerConfig(parse("--mode", "worker")).coordinatorUrl())
+                    .isEqualTo("http://coordinator-prop:9100");
+            assertThat(DistributionWorkerBridge.buildWorkerConfig(
+                    parse("--mode", "worker", "--coordinator-url", "http://localhost:8084")).coordinatorUrl())
+                    .isEqualTo("http://localhost:8084");
+
+            System.clearProperty(key);
+            assertThat(DistributionWorkerBridge.buildWorkerConfig(parse("--mode", "worker")).coordinatorUrl())
+                    .isEqualTo("http://localhost:8084");
+        } finally {
+            if (previous == null) {
+                System.clearProperty(key);
+            } else {
+                System.setProperty(key, previous);
+            }
+        }
     }
 
     @TestFactory
@@ -133,7 +167,7 @@ class CitrusAgentWorkerOptionsTest {
         System.setProperty(DistributionSettings.WORKER_CACHE_CLEANUP_PROPERTY, "false");
         System.setProperty(DistributionSettings.WORKER_CACHE_FREE_SPACE_BUFFER_SIZE_PROPERTY, "1MiB");
         try {
-            CitrusAgentConfiguration configuration = parse("--mode", "worker", "--broker-url", "http://broker:9000");
+            CitrusAgentConfiguration configuration = parse("--mode", "worker", "--coordinator-url", "http://coordinator:9000");
             assertThat(configuration.getCacheCleanup()).isNull();
             assertThat(configuration.getCacheFreeSpaceBufferSize()).isNull();
 
@@ -151,17 +185,17 @@ class CitrusAgentWorkerOptionsTest {
     @Test
     void shouldResolveLastCacheCleanupFlagAndKeepOtherOptions() {
         CitrusAgentConfiguration configuration = parse("--mode", "worker", "--no-cache-cleanup",
-                "--broker-url", "http://broker:9000", "--cache-cleanup=true");
+                "--coordinator-url", "http://coordinator:9000", "--cache-cleanup=true");
         assertThat(configuration.getCacheCleanup()).isTrue();
         assertThat(configuration.getMode()).isEqualTo("worker");
-        assertThat(configuration.getBrokerUrl()).isEqualTo("http://broker:9000");
+        assertThat(configuration.getCoordinatorUrl()).isEqualTo("http://coordinator:9000");
     }
 
     @Test
     void shouldNotTreatValuesOfOtherOptionsAsCacheOptions() {
-        CitrusAgentConfiguration configuration = parse("--auth-token", "--cache-x", "--broker-url", "--no-cache-cleanup");
+        CitrusAgentConfiguration configuration = parse("--auth-token", "--cache-x", "--coordinator-url", "--no-cache-cleanup");
         assertThat(configuration.getAuthToken()).isEqualTo("--cache-x");
-        assertThat(configuration.getBrokerUrl()).isEqualTo("--no-cache-cleanup");
+        assertThat(configuration.getCoordinatorUrl()).isEqualTo("--no-cache-cleanup");
         assertThat(configuration.getCacheCleanup()).isNull();
     }
 
@@ -190,10 +224,10 @@ class CitrusAgentWorkerOptionsTest {
                 invalidCase("--cache-dir", "--cache-dir="),
                 invalidCase("--cache-dir", "--cache-dir=  "),
                 invalidCase("--cache-dir", "--cache-dir", " "),
-                invalidCase("--cache-dir", "--cache-dir", "--broker-url", "http://x"),
+                invalidCase("--cache-dir", "--cache-dir", "--coordinator-url", "http://x"),
                 invalidCase("--cache-free-space-buffer-size", "--cache-free-space-buffer-size"),
                 invalidCase("--cache-free-space-buffer-size", "--cache-free-space-buffer-size="),
-                invalidCase("--cache-free-space-buffer-size", "--cache-free-space-buffer-size", "--broker-url", "http://x"),
+                invalidCase("--cache-free-space-buffer-size", "--cache-free-space-buffer-size", "--coordinator-url", "http://x"),
                 invalidCase("--cache-free-space-buffer-size", "--cache-free-space-buffer-size=2GB"));
     }
 
@@ -318,7 +352,7 @@ class CitrusAgentWorkerOptionsTest {
     void shouldExitWithoutDeployingHttpWhenWorkerCacheIsLocked() throws InterruptedException {
         Path cacheDir = tempDir.resolve("shared-cache");
         DistributionWorkerConfig config = DistributionWorkerConfig.builder()
-                .brokerUrl("http://127.0.0.1:1")
+                .coordinatorUrl("http://127.0.0.1:1")
                 .cacheDir(cacheDir)
                 .cacheCleanup(false)
                 .cacheFreeSpaceBufferBytes(0)
@@ -333,11 +367,11 @@ class CitrusAgentWorkerOptionsTest {
     @ResourceLock(Resources.SYSTEM_OUT)
     void shouldReleaseWorkerCacheWhenHttpListenerCannotBind() throws Exception {
         Path cacheDir = tempDir.resolve("failed-http-cache");
-        String brokerUrl = "http://127.0.0.1:1";
+        String coordinatorUrl = "http://127.0.0.1:1";
         PrintStream originalOutput = System.out;
 
         try (ServerSocket occupiedPort = new ServerSocket(0, 1, InetAddress.getByName("0.0.0.0"))) {
-            CitrusAgentConfiguration configuration = parse("--mode", "worker", "--broker-url", brokerUrl,
+            CitrusAgentConfiguration configuration = parse("--mode", "worker", "--coordinator-url", coordinatorUrl,
                     "--port", Integer.toString(occupiedPort.getLocalPort()), "--cache-dir", cacheDir.toString());
             CitrusAgentServer server = new CitrusAgentServer(configuration);
             try {
@@ -363,7 +397,7 @@ class CitrusAgentWorkerOptionsTest {
     void shouldKeepOneWorkerAndListenerAcrossConcurrentStarts() throws Exception {
         PrintStream originalOutput = System.out;
         CitrusAgentConfiguration configuration = parse("--mode", "worker", "--port", "0", "--duration", "-1",
-                "--broker-url", "http://127.0.0.1:1", "--cache-dir", tempDir.resolve("repeat-start-cache").toString());
+                "--coordinator-url", "http://127.0.0.1:1", "--cache-dir", tempDir.resolve("repeat-start-cache").toString());
         AtomicInteger routesCreated = new AtomicInteger();
         CountDownLatch buildingRoutes = new CountDownLatch(1);
         CompletableFuture<Void> allowListen = new CompletableFuture<>();
@@ -469,7 +503,7 @@ class CitrusAgentWorkerOptionsTest {
         CountDownLatch deployed = new CountDownLatch(1);
 
         CitrusAgentServer.entrypoint(new String[] {"--mode", "worker", "--port", "0", "--duration", "1000",
-                        "--broker-url", "http://127.0.0.1:1", "--cache-dir", cacheDir.toString()},
+                        "--coordinator-url", "http://127.0.0.1:1", "--cache-dir", cacheDir.toString()},
                 List.of(router -> deployed.countDown()), System.out,
                 new PrintStream(errors, true, StandardCharsets.UTF_8), exitCodes::add);
 

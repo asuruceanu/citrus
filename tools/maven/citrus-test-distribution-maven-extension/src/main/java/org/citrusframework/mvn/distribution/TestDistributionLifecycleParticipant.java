@@ -35,7 +35,7 @@ import org.apache.maven.execution.MavenSession;
 import org.apache.maven.project.MavenProject;
 import org.citrusframework.distribution.config.DistributionJson;
 import org.citrusframework.distribution.config.DistributionSettings;
-import org.citrusframework.distribution.junit.BrokerHttpClient;
+import org.citrusframework.distribution.junit.CoordinatorHttpClient;
 import org.citrusframework.distribution.junit.DistributionLauncherInterceptor;
 import org.citrusframework.distribution.model.BuildSessionResponse;
 import org.citrusframework.distribution.model.CompleteSessionRequest;
@@ -54,7 +54,7 @@ public class TestDistributionLifecycleParticipant extends AbstractMavenLifecycle
     private static final Logger LOG = LoggerFactory.getLogger(TestDistributionLifecycleParticipant.class);
 
     private volatile String activeSessionId;
-    private volatile BrokerHttpClient activeBrokerClient;
+    private volatile CoordinatorHttpClient activeCoordinatorClient;
     private volatile Thread shutdownHook;
 
     @Override
@@ -63,8 +63,8 @@ public class TestDistributionLifecycleParticipant extends AbstractMavenLifecycle
             return;
         }
 
-        String brokerUrl = resolveProperty(session, DistributionSettings.BROKER_URL_PROPERTY,
-                DistributionSettings.getBrokerUrl());
+        String coordinatorUrl = resolveProperty(session, DistributionSettings.COORDINATOR_URL_PROPERTY,
+                DistributionSettings.getCoordinatorUrl());
         String authToken = resolveProperty(session, DistributionSettings.AUTH_TOKEN_PROPERTY,
                 DistributionSettings.getAuthToken());
         boolean fallbackLocal = Boolean.parseBoolean(resolveProperty(
@@ -104,8 +104,8 @@ public class TestDistributionLifecycleParticipant extends AbstractMavenLifecycle
         }
 
         GitDiffDetector.GitWorkspaceInfo gitInfo = GitDiffDetector.inspect(rootDir);
-        BrokerHttpClient client = new BrokerHttpClient(
-                brokerUrl, authToken, DistributionSettings.getConnectTimeoutMs());
+        CoordinatorHttpClient client = new CoordinatorHttpClient(
+                coordinatorUrl, authToken, DistributionSettings.getConnectTimeoutMs());
 
         String sessionId = null;
         try {
@@ -120,22 +120,22 @@ public class TestDistributionLifecycleParticipant extends AbstractMavenLifecycle
                     projectKey));
             sessionId = created.sessionId();
             this.activeSessionId = sessionId;
-            this.activeBrokerClient = client;
+            this.activeCoordinatorClient = client;
             registerAbortShutdownHook(sessionId, client);
-            LOG.info("Opened Citrus Test Distribution reactor session {} on broker {}", sessionId, brokerUrl);
+            LOG.info("Opened Citrus Test Distribution reactor session {} on coordinator {}", sessionId, coordinatorUrl);
         } catch (Exception e) {
             if (!fallbackLocal) {
                 throw new MavenExecutionException(
-                        "Failed to open Citrus Test Distribution session on broker " + brokerUrl, e);
+                        "Failed to open Citrus Test Distribution session on coordinator " + coordinatorUrl, e);
             }
             // Keep the interceptor active so the module launcher can enforce @RemoteOnly during fallback.
-            LOG.warn("Citrus Test Distribution broker {} unreachable ({}); module launchers will apply fallback policy",
-                    brokerUrl, e.getMessage());
+            LOG.warn("Citrus Test Distribution coordinator {} unreachable ({}); module launchers will apply fallback policy",
+                    coordinatorUrl, e.getMessage());
         }
 
         List<Path> runtimeJars = resolveInterceptorClasspathJars();
         Map<String, String> sharedProps = new LinkedHashMap<>();
-        sharedProps.put(DistributionSettings.BROKER_URL_PROPERTY, brokerUrl);
+        sharedProps.put(DistributionSettings.COORDINATOR_URL_PROPERTY, coordinatorUrl);
         if (authToken != null && !authToken.isBlank()) {
             sharedProps.put(DistributionSettings.AUTH_TOKEN_PROPERTY, authToken);
         }
@@ -188,9 +188,9 @@ public class TestDistributionLifecycleParticipant extends AbstractMavenLifecycle
     public void afterSessionEnd(MavenSession session) {
         unregisterAbortShutdownHook();
         String sessionId = this.activeSessionId;
-        BrokerHttpClient client = this.activeBrokerClient;
+        CoordinatorHttpClient client = this.activeCoordinatorClient;
         this.activeSessionId = null;
-        this.activeBrokerClient = null;
+        this.activeCoordinatorClient = null;
         if (sessionId == null || client == null) {
             return;
         }
@@ -209,11 +209,11 @@ public class TestDistributionLifecycleParticipant extends AbstractMavenLifecycle
         }
     }
 
-    private void registerAbortShutdownHook(String sessionId, BrokerHttpClient client) {
+    private void registerAbortShutdownHook(String sessionId, CoordinatorHttpClient client) {
         Thread hook = new Thread(() -> {
             if (sessionId.equals(this.activeSessionId)) {
                 this.activeSessionId = null;
-                this.activeBrokerClient = null;
+                this.activeCoordinatorClient = null;
                 try {
                     client.abortSession(sessionId, "Maven build process terminated");
                 } catch (Exception ignored) {
@@ -256,7 +256,7 @@ public class TestDistributionLifecycleParticipant extends AbstractMavenLifecycle
             "at [\\w$.<>/]+\\(.*\\)");
 
     /**
-     * Summarizes Maven build exceptions for the broker: each exception's message (or its first cause with a message),
+     * Summarizes Maven build exceptions for the coordinator: each exception's message (or its first cause with a message),
      * without ANSI color codes, blank lines, stack frames, or lines already reported, capped at {@value #MAX_FAILURE_REASON_LENGTH} chars.
      */
     static String describeBuildFailure(List<Throwable> exceptions) {

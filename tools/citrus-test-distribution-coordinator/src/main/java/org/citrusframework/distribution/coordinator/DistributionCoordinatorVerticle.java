@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-package org.citrusframework.distribution.broker;
+package org.citrusframework.distribution.coordinator;
 
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
@@ -59,29 +59,29 @@ import tools.jackson.databind.DeserializationFeature;
 import tools.jackson.databind.ObjectReader;
 
 /**
- * Vert.x 5 HTTP/REST, SSE, Static Web UI, and Worker WebSocket verticle for the Test Distribution Broker.
+ * Vert.x 5 HTTP/REST, SSE, Static Web UI, and Worker WebSocket verticle for the Test Distribution Coordinator.
  */
-public final class DistributionBrokerVerticle extends AbstractVerticle {
+public final class DistributionCoordinatorVerticle extends AbstractVerticle {
 
-    private static final Logger LOG = LoggerFactory.getLogger(DistributionBrokerVerticle.class);
+    private static final Logger LOG = LoggerFactory.getLogger(DistributionCoordinatorVerticle.class);
     private static final int MAX_HISTORY_TEST_KEYS = 10_000;
     private static final ObjectReader HISTORY_REQUEST_READER = DistributionJson.mapper()
             .readerFor(HistoricalDurationsRequest.class)
             .with(DeserializationFeature.FAIL_ON_TRAILING_TOKENS);
     private static final long MAX_BODY_BYTES = 256L * 1024L * 1024L;
 
-    private final DistributionBrokerConfig config;
+    private final DistributionCoordinatorConfig config;
     private final BlobCacheDirectory blobCache;
-    private final BrokerEventStreamHub eventHub;
-    private final BrokerSessionCoordinator coordinator;
+    private final CoordinatorEventStreamHub eventHub;
+    private final SessionCoordinator coordinator;
 
     private HttpServer httpServer;
     private long leaseTimerId = -1L;
 
-    public DistributionBrokerVerticle(DistributionBrokerConfig config,
+    public DistributionCoordinatorVerticle(DistributionCoordinatorConfig config,
                                       BlobCacheDirectory blobCache,
-                                      BrokerEventStreamHub eventHub,
-                                      BrokerSessionCoordinator coordinator) {
+                                      CoordinatorEventStreamHub eventHub,
+                                      SessionCoordinator coordinator) {
         this.config = config;
         this.blobCache = blobCache;
         this.eventHub = eventHub;
@@ -145,7 +145,7 @@ public final class DistributionBrokerVerticle extends AbstractVerticle {
                 .onComplete(startPromise);
     }
 
-    static String resolveListenHost(DistributionBrokerConfig config) {
+    static String resolveListenHost(DistributionCoordinatorConfig config) {
         if (config.port() == 0 && "0.0.0.0".equals(config.host())) {
             return "127.0.0.1";
         }

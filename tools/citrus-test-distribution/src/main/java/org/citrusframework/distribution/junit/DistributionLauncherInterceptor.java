@@ -30,7 +30,7 @@ import org.junit.platform.launcher.TestExecutionListener;
 import org.junit.platform.launcher.TestIdentifier;
 
 /**
- * JUnit Platform {@link LauncherInterceptor} wrapping coordinator {@link Launcher} instances with
+ * JUnit Platform {@link LauncherInterceptor} wrapping local {@link Launcher} instances with
  * {@link DistributedLauncher} when distribution is enabled and the launcher is outside a local execution or worker.
  */
 public class DistributionLauncherInterceptor implements LauncherInterceptor {

@@ -42,9 +42,9 @@ class DistributionPlacementFollowupTest {
     @Test
     @ResourceLock(Resources.SYSTEM_PROPERTIES)
     void independentAndEmbeddedRequestsKeepTheirPlacementOnAnExistingExecutor() throws Exception {
-        String oldBroker = System.getProperty(DistributionSettings.BROKER_URL_PROPERTY);
+        String oldCoordinator = System.getProperty(DistributionSettings.COORDINATOR_URL_PROPERTY);
         String oldFallback = System.getProperty(DistributionSettings.FALLBACK_LOCAL_PROPERTY);
-        System.setProperty(DistributionSettings.BROKER_URL_PROPERTY, "http://127.0.0.1:0");
+        System.setProperty(DistributionSettings.COORDINATOR_URL_PROPERTY, "http://127.0.0.1:0");
         System.setProperty(DistributionSettings.FALLBACK_LOCAL_PROPERTY, "false");
 
         var launcher = new DistributedLauncher(LauncherFactory.create());
@@ -77,7 +77,7 @@ class DistributionPlacementFollowupTest {
 
             assertThat(RemoteSuite.runs.get()).isOne();
         } finally {
-            restore(DistributionSettings.BROKER_URL_PROPERTY, oldBroker);
+            restore(DistributionSettings.COORDINATOR_URL_PROPERTY, oldCoordinator);
             restore(DistributionSettings.FALLBACK_LOCAL_PROPERTY, oldFallback);
         }
     }

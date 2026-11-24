@@ -10,7 +10,7 @@ Citrus Test Distribution partitions and executes JUnit Platform and Citrus integ
 * `org.citrusframework:citrus-test-distribution-ui` — Zero-Node monitoring Web UI served at `/ui/` (overview KPIs, live SVG Gantt partition waterfall, workspace/resource inspector, worker pool health, test history/flakiness, and failing test / partition crash diagnostics).
 * `org.citrusframework:citrus-test-distribution-coordinator` — Vert.x HTTP/WebSocket coordinator, Longest-Processing-Time (LPT) scheduler, SSE event hub, and JDBC persistence (`HSQLDB` file/mem or `PostgreSQL`).
 * `org.citrusframework:citrus-test-distribution-worker` — Standalone Java worker runtime with child-first `ClassLoader` or forked-JVM workspace isolation and graceful `SIGTERM` draining (`citrus-agent --mode=worker` or `citrus dist worker start`).
-* `org.citrusframework:citrus-test-distribution` — JUnit Platform `LauncherInterceptor` coordinator, `@LocalOnly` / lost-partition local fallback executor, Surefire XML writer, and `@CitrusTestFactory` declarative source splitter.
+* `org.citrusframework:citrus-test-distribution` — JUnit Platform launcher interceptor, `@LocalOnly` / lost-partition local fallback executor, Surefire XML writer, and `@CitrusTestFactory` declarative source splitter.
 * `org.citrusframework.mvn:citrus-test-distribution-maven-extension` — Opt-in Maven Core Extension (`-Dcitrus.test.distribution.enabled=true`) coordinating reactor-wide build sessions.
 
 [[tools-test-distribution-architecture]]
@@ -19,7 +19,7 @@ Citrus Test Distribution partitions and executes JUnit Platform and Citrus integ
 A distributed test run involves three components:
 
 . *Build Host (Maven Extension + JUnit `LauncherInterceptor`):* Opens a single build session on the coordinator (recording project name, Git branch, commit SHA, and changed workspace files), discovers JUnit Platform test descriptors per module, executes `@LocalOnly` tests locally, packages the test classpath and any declared external input paths into SHA-256 content-addressed blobs, uploads only missing digests, submits remote work units, streams live test and partition events over Server-Sent Events (SSE), writes standard `TEST-*.xml` Surefire/Failsafe reports, and atomically commits any declared output files back into the module.
-. *Coordinator (`DistributionBrokerServer`):* Persists sessions, partitions, worker leases, and historical test durations in JDBC (`HSQLDB` or `PostgreSQL`), schedules work units onto capability-matching workers using Longest-Processing-Time (LPT) bin packing seeded from historical execution times (handing each partition to the idle worker that has waited longest, so the whole pool is used), deduplicates classpath/workspace blobs on disk, monitors worker heartbeats, automatically requeues evicted or stalled partitions up to `maxRetries`, and serves the real-time Web UI and REST/SSE APIs.
+. *Coordinator (`DistributionCoordinatorServer`):* Persists sessions, partitions, worker leases, and historical test durations in JDBC (`HSQLDB` or `PostgreSQL`), schedules work units onto capability-matching workers using Longest-Processing-Time (LPT) bin packing seeded from historical execution times (handing each partition to the idle worker that has waited longest, so the whole pool is used), deduplicates classpath/workspace blobs on disk, monitors worker heartbeats, automatically requeues evicted or stalled partitions up to `maxRetries`, and serves the real-time Web UI and REST/SSE APIs.
 . *Workers (`DistributionWorkerClient`):* Maintain outbound WebSocket connections (`/ws/v1/worker`) to the coordinator, advertise auto-detected host capabilities (`os`, `arch`, `jdk`, `cpuCores`, `memoryMb`, `citrus.workspace.v1`) plus user tags, pull missing blobs into a local content-addressed cache, execute assigned partitions in a forked JVM (default) or, with `forkMode=AUTO`, an isolated child-first `ClassLoader` inside the worker JVM, stream per-test outcomes and captured Citrus endpoint names, and drain cleanly on `SIGTERM`.
 
 [[tools-test-distribution-maven]]
@@ -42,12 +42,12 @@ Start a coordinator and worker pool via `citrus-jbang`, then run Maven with dist
 
 [source,bash]
 ----
-citrus dist broker start --port=18080
-citrus dist worker start --broker-url=http://127.0.0.1:18080 --capabilities=docker=true
+citrus dist coordinator start --port=18080
+citrus dist worker start --coordinator-url=http://127.0.0.1:18080 --capabilities=docker=true
 
 ./mvnw verify \
   -Dcitrus.test.distribution.enabled=true \
-  -Dcitrus.test.distribution.brokerUrl=http://127.0.0.1:18080
+  -Dcitrus.test.distribution.coordinatorUrl=http://127.0.0.1:18080
 ----
 
 Normal Maven builds without `-Dcitrus.test.distribution.enabled=true` execute locally with zero coordinator traffic. In multi-module Maven reactors, the extension automatically shares one coordinator `sessionId` across all modules, reports both remote partitions and `@LocalOnly` module executions into that session, and aborts the session on the coordinator if the Maven build is interrupted (`Ctrl+C`).
@@ -63,7 +63,7 @@ TIP: Projects that do not use the Maven extension can add `org.citrusframework:c
 |Enables distributed test execution for the build or JUnit run.
 |`false`
 
-|`citrus.test.distribution.brokerUrl` / `CITRUS_DIST_BROKER_URL`
+|`citrus.test.distribution.coordinatorUrl` / `CITRUS_DIST_COORDINATOR_URL`
 |Base HTTP(S) URL of the coordinator (for example `http://127.0.0.1:18080`).
 |`http://localhost:8567`
 
@@ -80,11 +80,11 @@ TIP: Projects that do not use the Maven extension can add `org.citrusframework:c
 |`true`
 
 |`citrus.test.distribution.maxPartitionSize` / `CITRUS_DIST_MAX_PARTITION_SIZE`
-|Explicit maximum work units grouped into one `LPT` partition. Leave unset to let the broker size partitions adaptively, starting from its configured default size.
+|Explicit maximum work units grouped into one `LPT` partition. Leave unset to let the coordinator size partitions adaptively, starting from its configured default size.
 |unset
 
 |`citrus.test.distribution.minRemoteDurationMs` / `CITRUS_DIST_MIN_REMOTE_DURATION_MS`
-|Run an eligible module locally when the sum of its remote units' historical durations is strictly below this threshold in milliseconds. Every remote unit needs a duration. The broker estimates each duration from up to 10 recent runs. Set to `0` to disable the duration check.
+|Run an eligible module locally when the sum of its remote units' historical durations is strictly below this threshold in milliseconds. Every remote unit needs a duration. The coordinator estimates each duration from up to 10 recent runs. Set to `0` to disable the duration check.
 |`2000`
 
 |`citrus.test.distribution.minRemoteColdUnits` / `CITRUS_DIST_MIN_REMOTE_COLD_UNITS`
@@ -125,11 +125,11 @@ The coordinator (`citrus-test-distribution-coordinator`) runs an embedded Vert.x
 |===
 |Property / environment variable |Description |Default
 
-|`citrus.test.distribution.broker.minPartitionDurationMs` / `CITRUS_DIST_BROKER_MIN_PARTITION_DURATION_MS`
+|`citrus.test.distribution.coordinator.minPartitionDurationMs` / `CITRUS_DIST_COORDINATOR_MIN_PARTITION_DURATION_MS`
 |Target minimum estimated duration of an adaptive LPT partition in milliseconds. Set to `0` to disable the duration target.
 |`5000`
 
-|`citrus.test.distribution.broker.maxWavesPerWorker` / `CITRUS_DIST_BROKER_MAX_WAVES_PER_WORKER`
+|`citrus.test.distribution.coordinator.maxWavesPerWorker` / `CITRUS_DIST_COORDINATOR_MAX_WAVES_PER_WORKER`
 |Target maximum number of adaptive LPT partitions per eligible worker. Set to `0` to disable the wave target.
 |`2`
 |===
@@ -143,10 +143,10 @@ Adaptive sizing applies to LPT submissions that do not declare workspace outputs
 [source,bash]
 ----
 # Start coordinator and Web UI on port 8765
-citrus dist broker start --port=8765
+citrus dist coordinator start --port=8765
 
 # Start coordinator backed by PostgreSQL and Bearer token auth
-citrus dist broker start \
+citrus dist coordinator start \
   --host=0.0.0.0 \
   --port=8765 \
   --jdbc-url=jdbc:postgresql://db.internal:5432/citrus_dist \
@@ -154,13 +154,13 @@ citrus dist broker start \
   --auth-token=secret-ci-token
 
 # Check coordinator health and connected worker pool
-citrus dist status --broker-url=http://localhost:8765 --auth-token=secret-ci-token
+citrus dist status --coordinator-url=http://localhost:8765 --auth-token=secret-ci-token
 
 # List recent build sessions (table or --json)
-citrus dist sessions --broker-url=http://localhost:8765 --limit=20
+citrus dist sessions --coordinator-url=http://localhost:8765 --limit=20
 ----
 
-.`citrus dist broker start` options
+.`citrus dist coordinator start` options
 [cols="2,4,1",options="header"]
 |===
 |Option |Description |Default
@@ -179,7 +179,7 @@ citrus dist sessions --broker-url=http://localhost:8765 --limit=20
 
 |`--cache-dir`
 |Directory storing SHA-256 content-addressed classpath and workspace blobs.
-|`~/.citrus/dist-broker-cache`
+|`~/.citrus/dist-coordinator-cache`
 
 |`--auth-token`
 |Shared Bearer token protecting `/api/*` and `/ws/v1/worker`.
@@ -198,7 +198,7 @@ citrus dist sessions --broker-url=http://localhost:8765 --limit=20
 |`0`
 |===
 
-When embedding `DistributionBrokerConfig.fromSettings()`, the coordinator also reads `citrus.test.distribution.jdbcUrl` (`CITRUS_DIST_JDBC_URL`), `citrus.test.distribution.jdbcUser` (`CITRUS_DIST_JDBC_USER`, default `SA`), `citrus.test.distribution.jdbcPassword` (`CITRUS_DIST_JDBC_PASSWORD`), `citrus.test.distribution.cacheDir` (`CITRUS_DIST_CACHE_DIR`), `citrus.test.distribution.authToken` (`CITRUS_DIST_AUTH_TOKEN`).
+When embedding `DistributionCoordinatorConfig.fromSettings()`, the coordinator also reads `citrus.test.distribution.jdbcUrl` (`CITRUS_DIST_JDBC_URL`), `citrus.test.distribution.jdbcUser` (`CITRUS_DIST_JDBC_USER`, default `SA`), `citrus.test.distribution.jdbcPassword` (`CITRUS_DIST_JDBC_PASSWORD`), `citrus.test.distribution.cacheDir` (`CITRUS_DIST_CACHE_DIR`), `citrus.test.distribution.authToken` (`CITRUS_DIST_AUTH_TOKEN`).
 
 === Coordinator HTTP, SSE, and WebSocket Endpoints
 
@@ -314,7 +314,7 @@ Inspects a single build session across five session KPIs (`Passed Tests`, `Faile
 * *Execution Waterfall (`waterfall`):* Renders an interactive worker-swimlane SVG Gantt chart of all partition attempts, colored by Maven module with a legend, alongside the *Partition Breakdown* table. When a worker disconnects or stalls mid-partition, attempt `#1` remains visible as `LOST` on the original worker swimlane while attempt `#2` renders on the recovery worker swimlane. Clicking any waterfall bar or partition row opens the *Partition Detail Modal* showing state, attempt number, worker assignment, required capabilities, Failure / Eviction Reason (`errorMessage`), *Workspace & External Test Resources* (`moduleName`, `forkWorkspace` isolation mode, `workingDirectory`, materialized `inputPaths`, declared `outputPaths`, and collected `producedOutputs`), work units, and executed tests.
 * *Test Executions (`tests`):* Lists every remote and `@LocalOnly` test execution with status pills (`ALL`, `FAILED`, `FLAKY`, `PASSED`, `SKIPPED`) and search across test class, method, worker ID, or *Citrus Endpoints*. During execution on both remote workers and local fallback runs, Citrus automatically hooks `CitrusInstanceManager` / `TestActionListener` to record the deduplicated Citrus endpoint names (or endpoint URIs) exercised by each test, displaying them as inline badges and in the *Test Execution Detail Modal*.
 * *Failing Tests (`failures`):* Surfaces full stack traces with one-click `Copy Trace` buttons for every `FAILED` test execution, *and* renders partition-level crash or eviction diagnostic cards whenever a partition fails or is lost (`FAILED` or `LOST` with `errorMessage`) — ensuring forked JVM crashes, `ClassNotFoundException`, undeclared working-directory writes (`cwdCheck=FAIL`), or aborted partitions are immediately visible even when zero individual JUnit tests completed.
-* *Changed Files (`files`):* Shows the status of each tracked workspace file captured when the Maven session started. Expand a file to see its captured Git diff preview and line counts where available. The broker stores at most 8 KiB of preview output per file and 32 KiB per session. Older sessions display the recorded file paths.
+* *Changed Files (`files`):* Shows the status of each tracked workspace file captured when the Maven session started. Expand a file to see its captured Git diff preview and line counts where available. The coordinator stores at most 8 KiB of preview output per file and 32 KiB per session. Older sessions display the recorded file paths.
 
 Long lists (build sessions, partitions, test executions and test history) are paginated; a table returns to its first page when the selected session or one of its filters changes.
 
@@ -336,9 +336,9 @@ Workers can be launched either via `citrus-jbang` (`citrus dist worker start`) o
 
 [source,bash]
 ----
-# Standalone JBang worker (accepts http://, https://, ws://, or wss:// broker URLs)
+# Standalone JBang worker (accepts http://, https://, ws://, or wss:// coordinator URLs)
 citrus dist worker start \
-  --broker-url=http://127.0.0.1:8765 \
+  --coordinator-url=http://127.0.0.1:8765 \
   --worker-id=worker-k8s-01 \
   --auth-token=secret-ci-token \
   --capabilities=docker=true,kafka=true \
@@ -348,12 +348,16 @@ citrus dist worker start \
 # Citrus Agent container / JAR in worker mode
 java -jar citrus-agent.jar \
   --mode worker \
-  --broker-url http://coordinator.internal:8765 \
+  --coordinator-url http://coordinator.internal:8765 \
   --auth-token secret-ci-token \
   --capabilities docker=true,zone=eu-central-1 \
   --cache-dir /var/lib/citrus/worker-cache \
   --no-cache-cleanup
 ----
+
+Both commands accept `--coordinator-url` (`-u`). In agent worker mode, this option takes precedence over
+the `citrus.test.distribution.coordinatorUrl` system property. When neither is set, the agent connects to
+`http://localhost:8084`.
 
 Both commands accept the same local file cache options:
 

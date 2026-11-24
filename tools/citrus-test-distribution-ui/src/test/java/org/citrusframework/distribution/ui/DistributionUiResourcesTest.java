@@ -75,7 +75,7 @@ class DistributionUiResourcesTest {
                     .contains("POLL_INTERVAL_MS")
                     .contains("EventSource.CLOSED")
                     .contains("function requireApiAccess(response)", "The dashboard needs authenticated access")
-                    .doesNotContain("Broker Bearer Authentication", "commitAuthToken")
+                    .doesNotContain("commitAuthToken", "auth-token-input")
                     .contains("renderHistoryRuns", "/api/v1/tests/history/runs", "Open session")
                     .contains("forkWorkspace")
                     .contains("inputPaths")

@@ -35,14 +35,14 @@ import org.citrusframework.distribution.config.DistributionJson;
 import org.citrusframework.distribution.model.WorkerRecord;
 import org.citrusframework.jbang.cli.CitrusJBangMain;
 
-@CommandDefinition(name = "status", description = "Check broker health and connected worker pool status", generateHelp = true)
+@CommandDefinition(name = "status", description = "Check coordinator health and connected worker pool status", generateHelp = true)
 public class DistStatus extends CitrusCommand {
 
     @ParentCommand
     Dist parent;
 
-    @Option(name = "broker-url", shortName = 'b', defaultValue = "http://localhost:8765", description = "Broker base URL")
-    String brokerUrl;
+    @Option(name = "coordinator-url", shortName = 'u', defaultValue = "http://localhost:8765", description = "Coordinator base URL")
+    String coordinatorUrl;
 
     @Option(name = "auth-token", description = "Shared Bearer authentication token")
     String authToken;
@@ -69,7 +69,7 @@ public class DistStatus extends CitrusCommand {
     @Override
     public CommandResult execute(CommandInvocation invocation) {
         try {
-            String base = brokerUrl.endsWith("/") ? brokerUrl.substring(0, brokerUrl.length() - 1) : brokerUrl;
+            String base = coordinatorUrl.endsWith("/") ? coordinatorUrl.substring(0, coordinatorUrl.length() - 1) : coordinatorUrl;
             HttpClient client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build();
 
             HttpResponse<String> health = client.send(
@@ -88,7 +88,7 @@ public class DistStatus extends CitrusCommand {
 
             if (json) {
                 Map<String, Object> summary = new LinkedHashMap<>();
-                summary.put("brokerUrl", base);
+                summary.put("coordinatorUrl", base);
                 summary.put("status", health.statusCode() == 200 ? "UP" : "DOWN");
                 summary.put("workersConnected", workers.size());
                 summary.put("workers", workers);
@@ -96,14 +96,14 @@ public class DistStatus extends CitrusCommand {
                 return health.statusCode() == 200 ? CommandResult.SUCCESS : CommandResult.FAILURE;
             }
 
-            printer().println("Broker: " + base + " [" + (health.statusCode() == 200 ? "UP" : "HTTP " + health.statusCode()) + "]");
+            printer().println("Coordinator: " + base + " [" + (health.statusCode() == 200 ? "UP" : "HTTP " + health.statusCode()) + "]");
             printer().println("Connected workers: " + workers.size());
             for (WorkerRecord worker : workers) {
                 printer().println("  - " + worker.workerId() + " (" + worker.state() + ") " + worker.capabilities());
             }
             return health.statusCode() == 200 ? CommandResult.SUCCESS : CommandResult.FAILURE;
         } catch (Exception e) {
-            printer().println("Failed to reach broker at " + brokerUrl + ": " + e.getMessage());
+            printer().println("Failed to reach coordinator at " + coordinatorUrl + ": " + e.getMessage());
             return CommandResult.FAILURE;
         }
     }

@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-package org.citrusframework.distribution.broker;
+package org.citrusframework.distribution.coordinator;
 
 import java.net.URI;
 import java.net.http.HttpClient;
@@ -63,11 +63,13 @@ import org.citrusframework.distribution.model.WorkerTestEventPayload;
 import org.citrusframework.distribution.model.WorkerWsMessage;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.api.parallel.ResourceLock;
+import org.junit.jupiter.api.parallel.Resources;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-class DistributionBrokerServerTest {
+class DistributionCoordinatorServerTest {
 
     @TempDir
     Path tempDir;
@@ -77,15 +79,42 @@ class DistributionBrokerServerTest {
             .build();
 
     @Test
+    @ResourceLock(Resources.SYSTEM_PROPERTIES)
+    void shouldReadCoordinatorSettingsAndDefaultCachePath() {
+        String durationKey = "citrus.test.distribution.coordinator.minPartitionDurationMs";
+        String wavesKey = "citrus.test.distribution.coordinator.maxWavesPerWorker";
+        String previousDuration = System.setProperty(durationKey, "7250");
+        String previousWaves = System.setProperty(wavesKey, "4");
+        try {
+            DistributionCoordinatorConfig config = DistributionCoordinatorConfig.builder().build();
+            assertThat(config.cacheDir()).isEqualTo(
+                    Path.of(System.getProperty("user.home"), ".citrus", "dist-coordinator-cache"));
+            assertThat(config.minPartitionDurationMs()).isEqualTo(7_250L);
+            assertThat(config.maxWavesPerWorker()).isEqualTo(4);
+        } finally {
+            restoreProperty(durationKey, previousDuration);
+            restoreProperty(wavesKey, previousWaves);
+        }
+    }
+
+    private static void restoreProperty(String key, String previous) {
+        if (previous == null) {
+            System.clearProperty(key);
+        } else {
+            System.setProperty(key, previous);
+        }
+    }
+
+    @Test
     void shouldServeHistoricalDurationsEndpointAndValidateBounds() throws Exception {
-        DistributionBrokerConfig config = DistributionBrokerConfig.builder()
+        DistributionCoordinatorConfig config = DistributionCoordinatorConfig.builder()
                 .port(0)
                 .authToken("top-secret-token")
                 .cacheDir(tempDir.resolve("cache"))
-                .jdbcUrl("jdbc:hsqldb:mem:broker_duration_" + System.nanoTime())
+                .jdbcUrl("jdbc:hsqldb:mem:coordinator_duration_" + System.nanoTime())
                 .build();
 
-        try (DistributionBrokerServer server = new DistributionBrokerServer(config)) {
+        try (DistributionCoordinatorServer server = new DistributionCoordinatorServer(config)) {
             server.start();
             String key = "pkg.SampleTest";
             server.store().saveTestExecution(new TestExecutionRecord("test-duration", "history", "part", "worker",
@@ -122,14 +151,14 @@ class DistributionBrokerServerTest {
 
     @Test
     void shouldEnforceBearerAuthExceptHealthEndpoint() throws Exception {
-        DistributionBrokerConfig config = DistributionBrokerConfig.builder()
+        DistributionCoordinatorConfig config = DistributionCoordinatorConfig.builder()
                 .port(0)
                 .authToken("top-secret-token")
                 .cacheDir(tempDir.resolve("cache"))
-                .jdbcUrl("jdbc:hsqldb:mem:broker_auth_" + System.nanoTime())
+                .jdbcUrl("jdbc:hsqldb:mem:coordinator_auth_" + System.nanoTime())
                 .build();
 
-        try (DistributionBrokerServer server = new DistributionBrokerServer(config)) {
+        try (DistributionCoordinatorServer server = new DistributionCoordinatorServer(config)) {
             server.start();
 
             HttpResponse<String> health = httpClient.send(
@@ -163,8 +192,8 @@ class DistributionBrokerServerTest {
     void shouldRefuseAWorkerOwnedCache() throws Exception {
         Path cacheDir = tempDir.resolve("worker-owned");
         BlobCacheDirectory.recordOwnerIfAbsent(cacheDir, BlobCacheDirectory.OWNER_WORKER);
-        DistributionBrokerConfig config = DistributionBrokerConfig.builder().port(0).cacheDir(cacheDir).build();
-        try (DistributionBrokerServer server = new DistributionBrokerServer(config)) {
+        DistributionCoordinatorConfig config = DistributionCoordinatorConfig.builder().port(0).cacheDir(cacheDir).build();
+        try (DistributionCoordinatorServer server = new DistributionCoordinatorServer(config)) {
             assertThatThrownBy(server::start)
                     .isInstanceOf(IllegalStateException.class)
                     .hasMessageContainingAll(cacheDir.toString(), "owned by worker", "--cache-dir");
@@ -173,13 +202,13 @@ class DistributionBrokerServerTest {
 
     @Test
     void shouldDeduplicateAndValidateContentAddressedBlobs() throws Exception {
-        DistributionBrokerConfig config = DistributionBrokerConfig.builder()
+        DistributionCoordinatorConfig config = DistributionCoordinatorConfig.builder()
                 .port(0)
                 .cacheDir(tempDir.resolve("blob-cache"))
-                .jdbcUrl("jdbc:hsqldb:mem:broker_blobs_" + System.nanoTime())
+                .jdbcUrl("jdbc:hsqldb:mem:coordinator_blobs_" + System.nanoTime())
                 .build();
 
-        try (DistributionBrokerServer server = new DistributionBrokerServer(config)) {
+        try (DistributionCoordinatorServer server = new DistributionCoordinatorServer(config)) {
             server.start();
 
             byte[] payload = "citrus-test-jar-bytes".getBytes(StandardCharsets.UTF_8);
@@ -230,13 +259,13 @@ class DistributionBrokerServerTest {
 
     @Test
     void shouldDispatchPartitionsMatchCapabilitiesRequeueOnDisconnectAndReplaySse() throws Exception {
-        DistributionBrokerConfig config = DistributionBrokerConfig.builder()
+        DistributionCoordinatorConfig config = DistributionCoordinatorConfig.builder()
                 .port(0)
                 .cacheDir(tempDir.resolve("dispatch-cache"))
-                .jdbcUrl("jdbc:hsqldb:mem:broker_dispatch_" + System.nanoTime())
+                .jdbcUrl("jdbc:hsqldb:mem:coordinator_dispatch_" + System.nanoTime())
                 .build();
 
-        try (DistributionBrokerServer server = new DistributionBrokerServer(config)) {
+        try (DistributionCoordinatorServer server = new DistributionCoordinatorServer(config)) {
             server.start();
 
             HttpResponse<String> createdResp = postJson(
@@ -374,13 +403,13 @@ class DistributionBrokerServerTest {
 
     @Test
     void shouldRejectConflictingCapabilitiesUnderSinglePolicyWithBadRequest() throws Exception {
-        DistributionBrokerConfig config = DistributionBrokerConfig.builder()
+        DistributionCoordinatorConfig config = DistributionCoordinatorConfig.builder()
                 .port(0)
                 .cacheDir(tempDir.resolve("single-cache"))
-                .jdbcUrl("jdbc:hsqldb:mem:broker_single_" + System.nanoTime())
+                .jdbcUrl("jdbc:hsqldb:mem:coordinator_single_" + System.nanoTime())
                 .build();
 
-        try (DistributionBrokerServer server = new DistributionBrokerServer(config)) {
+        try (DistributionCoordinatorServer server = new DistributionCoordinatorServer(config)) {
             server.start();
             BuildSessionResponse session = DistributionJson.fromJson(postJson(server.baseUrl() + "/api/v1/sessions",
                     new CreateSessionRequest("citrus", "main", "abc", List.of(), 5, 1)).body(), BuildSessionResponse.class);
@@ -399,7 +428,7 @@ class DistributionBrokerServerTest {
 
     @Test
     void shouldDeduplicateWorkSubmissionAcrossCoordinatorRestart() throws Exception {
-        String jdbcUrl = "jdbc:hsqldb:file:" + tempDir.resolve("restart-db/broker");
+        String jdbcUrl = "jdbc:hsqldb:file:" + tempDir.resolve("restart-db/coordinator");
         Path sharedCache = tempDir.resolve("restart-cache");
 
         WorkUnitSpec unit = new WorkUnitSpec(
@@ -422,12 +451,12 @@ class DistributionBrokerServerTest {
         String sessionId;
         SubmitWorkResponse firstSubmit;
 
-        DistributionBrokerConfig config1 = DistributionBrokerConfig.builder()
+        DistributionCoordinatorConfig config1 = DistributionCoordinatorConfig.builder()
                 .port(0)
                 .cacheDir(sharedCache)
                 .jdbcUrl(jdbcUrl)
                 .build();
-        try (DistributionBrokerServer server1 = new DistributionBrokerServer(config1)) {
+        try (DistributionCoordinatorServer server1 = new DistributionCoordinatorServer(config1)) {
             server1.start();
 
             HttpResponse<String> createdResp = postJson(
@@ -445,12 +474,12 @@ class DistributionBrokerServerTest {
             assertThat(firstSubmit.partitionIds()).hasSize(1);
         }
 
-        DistributionBrokerConfig config2 = DistributionBrokerConfig.builder()
+        DistributionCoordinatorConfig config2 = DistributionCoordinatorConfig.builder()
                 .port(0)
                 .cacheDir(sharedCache)
                 .jdbcUrl(jdbcUrl)
                 .build();
-        try (DistributionBrokerServer server2 = new DistributionBrokerServer(config2)) {
+        try (DistributionCoordinatorServer server2 = new DistributionCoordinatorServer(config2)) {
             server2.start();
 
             HttpResponse<String> submitResp2 = postJson(
@@ -472,13 +501,13 @@ class DistributionBrokerServerTest {
 
     @Test
     void shouldSupportLocalTestsReportingHistoryFieldsAndAbortEndpointOverHttp() throws Exception {
-        DistributionBrokerConfig config = DistributionBrokerConfig.builder()
+        DistributionCoordinatorConfig config = DistributionCoordinatorConfig.builder()
                 .port(0)
                 .cacheDir(tempDir.resolve("abort-cache"))
-                .jdbcUrl("jdbc:hsqldb:mem:broker_abort_" + System.nanoTime())
+                .jdbcUrl("jdbc:hsqldb:mem:coordinator_abort_" + System.nanoTime())
                 .build();
 
-        try (DistributionBrokerServer server = new DistributionBrokerServer(config)) {
+        try (DistributionCoordinatorServer server = new DistributionCoordinatorServer(config)) {
             server.start();
 
             BuildSessionResponse session = DistributionJson.fromJson(postJson(
@@ -578,12 +607,12 @@ class DistributionBrokerServerTest {
         BlobCacheDirectory.recordOwnerIfAbsent(adopted, BlobCacheDirectory.OWNER_LAUNCHER);
 
         for (Path cacheDir : List.of(fresh, adopted)) {
-            DistributionBrokerConfig config = DistributionBrokerConfig.builder()
+            DistributionCoordinatorConfig config = DistributionCoordinatorConfig.builder()
                     .port(0)
                     .cacheDir(cacheDir)
-                    .jdbcUrl("jdbc:hsqldb:mem:broker_owner_" + System.nanoTime())
+                    .jdbcUrl("jdbc:hsqldb:mem:coordinator_owner_" + System.nanoTime())
                     .build();
-            try (DistributionBrokerServer server = new DistributionBrokerServer(config)) {
+            try (DistributionCoordinatorServer server = new DistributionCoordinatorServer(config)) {
                 server.start();
             }
         }
@@ -594,20 +623,20 @@ class DistributionBrokerServerTest {
 
     @Test
     void shouldBindLoopbackWhenEphemeralPortRequestedWithWildcardHost() {
-        DistributionBrokerConfig ephemeralWildcard = DistributionBrokerConfig.builder()
+        DistributionCoordinatorConfig ephemeralWildcard = DistributionCoordinatorConfig.builder()
             .host("0.0.0.0")
             .port(0)
             .jdbcUrl("jdbc:hsqldb:mem:ephemeral_host_test")
             .cacheDir(tempDir.resolve("ephemeral-cache"))
             .build();
-        DistributionBrokerConfig explicitPortWildcard = DistributionBrokerConfig.builder()
+        DistributionCoordinatorConfig explicitPortWildcard = DistributionCoordinatorConfig.builder()
             .host("0.0.0.0")
             .port(8765)
             .jdbcUrl("jdbc:hsqldb:mem:explicit_host_test")
             .cacheDir(tempDir.resolve("explicit-cache"))
             .build();
 
-        assertThat(DistributionBrokerVerticle.resolveListenHost(ephemeralWildcard)).isEqualTo("127.0.0.1");
-        assertThat(DistributionBrokerVerticle.resolveListenHost(explicitPortWildcard)).isEqualTo("0.0.0.0");
+        assertThat(DistributionCoordinatorVerticle.resolveListenHost(ephemeralWildcard)).isEqualTo("127.0.0.1");
+        assertThat(DistributionCoordinatorVerticle.resolveListenHost(explicitPortWildcard)).isEqualTo("0.0.0.0");
     }
 }

@@ -248,7 +248,7 @@ class JdbcDistributionStoreTest {
                     new SessionSummary(1, 1, 0, 0, 5, 4, 1_450L, 1_500L));
         }
 
-        // Reopen store from disk to verify persistence across broker restart
+        // Reopen store from disk to verify persistence across coordinator restart
         try (JdbcDistributionStore reopened = new JdbcDistributionStore(jdbcUrl, "SA", "")) {
             reopened.initialize();
 

@@ -30,20 +30,28 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class WorkerCacheCliOptionsTest {
 
-    private static final Set<String> HOST_VALUE_OPTIONS = Set.of("--broker-url", "-b", "--auth-token");
+    private static final Set<String> HOST_VALUE_OPTIONS = Set.of("--coordinator-url", "-u", "--auth-token");
 
     private static Result parse(String... args) {
         return WorkerCacheCliOptions.parse(List.of(args), HOST_VALUE_OPTIONS);
     }
 
     @Test
+    void shouldKeepShortCoordinatorUrlAfterBareCacheCleanup() {
+        Result result = WorkerCacheCliOptions.parse(
+                List.of("--no-cache-cleanup", "-u", "http://coordinator:8765"), Set.of("--coordinator-url", "-u"));
+        assertThat(result.remainingArgs()).containsExactly("-u", "http://coordinator:8765");
+        assertThat(result.cacheCleanup()).isFalse();
+    }
+
+    @Test
     void shouldReturnUnsetSettingsAndAllArgsWhenNoCacheOptionIsGiven() {
-        Result result = parse("--broker-url", "http://broker:9000", "--verbose");
+        Result result = parse("--coordinator-url", "http://coordinator:9000", "--verbose");
         assertThat(result.cacheDir()).isNull();
         assertThat(result.cacheCleanup()).isNull();
         assertThat(result.cacheFreeSpaceBufferSize()).isNull();
         assertThat(result.cacheFreeSpaceBufferBytes()).isNull();
-        assertThat(result.remainingArgs()).containsExactly("--broker-url", "http://broker:9000", "--verbose");
+        assertThat(result.remainingArgs()).containsExactly("--coordinator-url", "http://coordinator:9000", "--verbose");
         assertThat(result.canonicalArgs()).isEmpty();
     }
 
@@ -112,16 +120,16 @@ class WorkerCacheCliOptionsTest {
 
     @Test
     void shouldNotConsumeFollowingFlagAfterBareCacheCleanup() {
-        Result result = parse("--no-cache-cleanup", "--broker-url", "http://broker:9000");
+        Result result = parse("--no-cache-cleanup", "--coordinator-url", "http://coordinator:9000");
         assertThat(result.cacheCleanup()).isFalse();
-        assertThat(result.remainingArgs()).containsExactly("--broker-url", "http://broker:9000");
+        assertThat(result.remainingArgs()).containsExactly("--coordinator-url", "http://coordinator:9000");
     }
 
     @Test
     void shouldKeepRemainingArgsInOriginalOrder() {
-        Result result = parse("-v", "--cache-dir", "/tmp/c1", "--broker-url", "http://b", "--no-cache-cleanup",
+        Result result = parse("-v", "--cache-dir", "/tmp/c1", "--coordinator-url", "http://b", "--no-cache-cleanup",
                 "--help", "--cache-free-space-buffer-size=1MiB", "-x");
-        assertThat(result.remainingArgs()).containsExactly("-v", "--broker-url", "http://b", "--help", "-x");
+        assertThat(result.remainingArgs()).containsExactly("-v", "--coordinator-url", "http://b", "--help", "-x");
         assertThat(result.canonicalArgs()).containsExactly("--cache-dir=/tmp/c1", "--cache-cleanup=false",
                 "--cache-free-space-buffer-size=1MiB");
     }
@@ -130,8 +138,8 @@ class WorkerCacheCliOptionsTest {
     Stream<DynamicTest> shouldSkipValuesOfHostValueOptions() {
         return Stream.of(
                         List.of("--auth-token", "--cache-x"),
-                        List.of("--broker-url", "--cache-dir"),
-                        List.of("-b", "--no-cache-cleanup"))
+                        List.of("--coordinator-url", "--cache-dir"),
+                        List.of("-u", "--no-cache-cleanup"))
                 .map(args -> DynamicTest.dynamicTest(String.join(" ", args), () -> {
                     Result result = parse(args.toArray(String[]::new));
                     assertThat(result.remainingArgs()).containsExactlyElementsOf(args);
@@ -169,8 +177,8 @@ class WorkerCacheCliOptionsTest {
                 invalidCase("Missing parameter value for --cache-dir option", "--cache-dir="),
                 invalidCase("Missing parameter value for --cache-dir option", "--cache-dir=  "),
                 invalidCase("Missing parameter value for --cache-dir option", "--cache-dir", " "),
-                invalidCase("Missing parameter value for --cache-dir option", "--cache-dir", "--broker-url", "http://x"),
-                invalidCase("Missing parameter value for --cache-dir option", "--cache-dir", "-b", "http://x"),
+                invalidCase("Missing parameter value for --cache-dir option", "--cache-dir", "--coordinator-url", "http://x"),
+                invalidCase("Missing parameter value for --cache-dir option", "--cache-dir", "-u", "http://x"),
                 invalidCase("Missing parameter value for --cache-free-space-buffer-size option",
                         "--cache-free-space-buffer-size"),
                 invalidCase("Missing parameter value for --cache-free-space-buffer-size option",
@@ -178,7 +186,7 @@ class WorkerCacheCliOptionsTest {
                 invalidCase("Missing parameter value for --cache-free-space-buffer-size option",
                         "--cache-free-space-buffer-size", " "),
                 invalidCase("Missing parameter value for --cache-free-space-buffer-size option",
-                        "--cache-free-space-buffer-size", "--broker-url", "http://x"),
+                        "--cache-free-space-buffer-size", "--coordinator-url", "http://x"),
                 invalidCase("--cache-free-space-buffer-size", "--cache-free-space-buffer-size=2GB"),
                 invalidCase("--cache-free-space-buffer-size", "--cache-free-space-buffer-size", "1.5GiB"));
     }

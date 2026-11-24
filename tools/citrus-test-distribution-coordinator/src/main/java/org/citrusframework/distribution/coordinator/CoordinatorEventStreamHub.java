@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-package org.citrusframework.distribution.broker;
+package org.citrusframework.distribution.coordinator;
 
 import java.time.Instant;
 import java.util.ArrayList;
@@ -28,31 +28,31 @@ import java.util.concurrent.atomic.AtomicLong;
 
 import io.vertx.core.http.HttpServerResponse;
 import org.citrusframework.distribution.config.DistributionJson;
-import org.citrusframework.distribution.model.BrokerEvent;
+import org.citrusframework.distribution.model.CoordinatorEvent;
 
 /**
  * Publishes monotonically sequenced SSE events per session and globally, supporting Last-Event-ID replay.
  */
-public final class BrokerEventStreamHub {
+public final class CoordinatorEventStreamHub {
 
     private static final int MAX_GLOBAL_HISTORY = 2_000;
 
     private final AtomicLong sequenceGenerator = new AtomicLong(0);
-    private final Map<String, List<BrokerEvent>> sessionHistory = new ConcurrentHashMap<>();
+    private final Map<String, List<CoordinatorEvent>> sessionHistory = new ConcurrentHashMap<>();
     private final Set<String> terminalSessions = new CopyOnWriteArraySet<>();
-    private final List<BrokerEvent> globalHistory = new CopyOnWriteArrayList<>();
+    private final List<CoordinatorEvent> globalHistory = new CopyOnWriteArrayList<>();
     private final Map<String, Set<HttpServerResponse>> sessionSubscribers = new ConcurrentHashMap<>();
     private final Set<HttpServerResponse> globalSubscribers = new CopyOnWriteArraySet<>();
 
     /**
      * Events published so far for {@code sessionId}, oldest first.
      */
-    List<BrokerEvent> sessionEvents(String sessionId) {
+    List<CoordinatorEvent> sessionEvents(String sessionId) {
         return List.copyOf(sessionHistory.getOrDefault(sessionId, List.of()));
     }
 
-    public BrokerEvent publish(String type, String sessionId, String partitionId, String workerId, Map<String, Object> data) {
-        BrokerEvent event = new BrokerEvent(
+    public CoordinatorEvent publish(String type, String sessionId, String partitionId, String workerId, Map<String, Object> data) {
+        CoordinatorEvent event = new CoordinatorEvent(
                 sequenceGenerator.incrementAndGet(),
                 type,
                 sessionId,
@@ -93,8 +93,8 @@ public final class BrokerEventStreamHub {
 
     public void subscribeSession(String sessionId, long afterSequence, HttpServerResponse response) {
         prepareSseHeaders(response);
-        List<BrokerEvent> replay = new ArrayList<>(sessionHistory.getOrDefault(sessionId, List.of()));
-        for (BrokerEvent event : replay) {
+        List<CoordinatorEvent> replay = new ArrayList<>(sessionHistory.getOrDefault(sessionId, List.of()));
+        for (CoordinatorEvent event : replay) {
             if (event.sequence() > afterSequence) {
                 response.write(formatSse(event));
             }
@@ -111,7 +111,7 @@ public final class BrokerEventStreamHub {
 
     public void subscribeGlobal(long afterSequence, HttpServerResponse response) {
         prepareSseHeaders(response);
-        for (BrokerEvent event : globalHistory) {
+        for (CoordinatorEvent event : globalHistory) {
             if (event.sequence() > afterSequence) {
                 response.write(formatSse(event));
             }
@@ -128,7 +128,7 @@ public final class BrokerEventStreamHub {
         response.write(": connected\n\n");
     }
 
-    private String formatSse(BrokerEvent event) {
+    private String formatSse(CoordinatorEvent event) {
         return "id: " + event.sequence() + "\n"
                 + "event: " + event.type() + "\n"
                 + "data: " + DistributionJson.toJson(event) + "\n\n";

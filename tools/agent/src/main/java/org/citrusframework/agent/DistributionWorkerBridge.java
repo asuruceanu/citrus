@@ -20,6 +20,7 @@ import java.nio.file.Paths;
 import java.util.concurrent.TimeUnit;
 
 import org.citrusframework.api.agent.CitrusAgentConfiguration;
+import org.citrusframework.distribution.config.DistributionSettings;
 import org.citrusframework.distribution.worker.DistributionWorkerClient;
 import org.citrusframework.distribution.worker.DistributionWorkerConfig;
 import org.citrusframework.util.StringUtils;
@@ -31,8 +32,8 @@ final class DistributionWorkerBridge implements AutoCloseable {
 
     private final DistributionWorkerClient workerClient;
 
-    DistributionWorkerBridge(CitrusAgentConfiguration configuration) {
-        this.workerClient = new DistributionWorkerClient(buildWorkerConfig(configuration));
+    DistributionWorkerBridge(DistributionWorkerConfig configuration) {
+        this.workerClient = new DistributionWorkerClient(configuration);
     }
 
     /**
@@ -40,8 +41,10 @@ final class DistributionWorkerBridge implements AutoCloseable {
      * agent are left to the worker defaults (system property, environment variable, built-in default).
      */
     static DistributionWorkerConfig buildWorkerConfig(CitrusAgentConfiguration configuration) {
+        String fallbackUrl = DistributionSettings.getString(DistributionSettings.COORDINATOR_URL_PROPERTY, null,
+                CitrusAgentConfiguration.DEFAULT_COORDINATOR_URL);
         DistributionWorkerConfig.Builder builder = DistributionWorkerConfig.builder()
-                .brokerUrl(configuration.getBrokerUrl())
+                .coordinatorUrl(configuration.getCoordinatorUrl(fallbackUrl))
                 .authToken(configuration.getAuthToken())
                 .addCapabilitiesCsv(configuration.getCapabilities());
         if (StringUtils.hasText(configuration.getCacheDir())) {

@@ -55,9 +55,9 @@ public final class DistributionSettings {
         return projectKey != null && !projectKey.isBlank() ? "key:" + projectKey : "name:" + projectName;
     }
 
-    public static final String BROKER_URL_PROPERTY = "citrus.test.distribution.brokerUrl";
-    public static final String BROKER_URL_ENV = "CITRUS_DIST_BROKER_URL";
-    public static final String DEFAULT_BROKER_URL = "http://localhost:8567";
+    public static final String COORDINATOR_URL_PROPERTY = "citrus.test.distribution.coordinatorUrl";
+    public static final String COORDINATOR_URL_ENV = "CITRUS_DIST_COORDINATOR_URL";
+    public static final String DEFAULT_COORDINATOR_URL = "http://localhost:8567";
 
     public static final String AUTH_TOKEN_PROPERTY = "citrus.test.distribution.authToken";
     public static final String AUTH_TOKEN_ENV = "CITRUS_DIST_AUTH_TOKEN";
@@ -72,14 +72,14 @@ public final class DistributionSettings {
     public static final String MAX_PARTITION_SIZE_ENV = "CITRUS_DIST_MAX_PARTITION_SIZE";
     public static final int DEFAULT_MAX_PARTITION_SIZE = 5;
 
-    public static final String BROKER_MIN_PARTITION_DURATION_MS_PROPERTY =
-            "citrus.test.distribution.broker.minPartitionDurationMs";
-    public static final String BROKER_MIN_PARTITION_DURATION_MS_ENV = "CITRUS_DIST_BROKER_MIN_PARTITION_DURATION_MS";
-    public static final long DEFAULT_BROKER_MIN_PARTITION_DURATION_MS = 5_000L;
+    public static final String COORDINATOR_MIN_PARTITION_DURATION_MS_PROPERTY =
+            "citrus.test.distribution.coordinator.minPartitionDurationMs";
+    public static final String COORDINATOR_MIN_PARTITION_DURATION_MS_ENV = "CITRUS_DIST_COORDINATOR_MIN_PARTITION_DURATION_MS";
+    public static final long DEFAULT_COORDINATOR_MIN_PARTITION_DURATION_MS = 5_000L;
 
-    public static final String BROKER_MAX_WAVES_PER_WORKER_PROPERTY = "citrus.test.distribution.broker.maxWavesPerWorker";
-    public static final String BROKER_MAX_WAVES_PER_WORKER_ENV = "CITRUS_DIST_BROKER_MAX_WAVES_PER_WORKER";
-    public static final int DEFAULT_BROKER_MAX_WAVES_PER_WORKER = 2;
+    public static final String COORDINATOR_MAX_WAVES_PER_WORKER_PROPERTY = "citrus.test.distribution.coordinator.maxWavesPerWorker";
+    public static final String COORDINATOR_MAX_WAVES_PER_WORKER_ENV = "CITRUS_DIST_COORDINATOR_MAX_WAVES_PER_WORKER";
+    public static final int DEFAULT_COORDINATOR_MAX_WAVES_PER_WORKER = 2;
 
     public static final String MIN_REMOTE_DURATION_MS_PROPERTY = "citrus.test.distribution.minRemoteDurationMs";
     public static final String MIN_REMOTE_DURATION_MS_ENV = "CITRUS_DIST_MIN_REMOTE_DURATION_MS";
@@ -371,8 +371,8 @@ public final class DistributionSettings {
         return ROLE_WORKER.equalsIgnoreCase(System.getProperty(ROLE_PROPERTY, ""));
     }
 
-    public static String getBrokerUrl() {
-        return getString(BROKER_URL_PROPERTY, BROKER_URL_ENV, DEFAULT_BROKER_URL);
+    public static String getCoordinatorUrl() {
+        return getString(COORDINATOR_URL_PROPERTY, COORDINATOR_URL_ENV, DEFAULT_COORDINATOR_URL);
     }
 
     public static String getAuthToken() {
@@ -391,7 +391,7 @@ public final class DistributionSettings {
         return Math.max(1, getInt(MAX_PARTITION_SIZE_PROPERTY, MAX_PARTITION_SIZE_ENV, DEFAULT_MAX_PARTITION_SIZE));
     }
 
-    /** Returns an explicitly configured positive partition limit, or empty for broker-managed sizing. */
+    /** Returns an explicitly configured positive partition limit, or empty for coordinator-managed sizing. */
     public static OptionalInt findConfiguredMaxPartitionSize() {
         return findConfiguredMaxPartitionSize(System::getProperty, System::getenv);
     }
@@ -419,14 +419,14 @@ public final class DistributionSettings {
         return Math.max(0, parseInt(raw, DEFAULT_MIN_REMOTE_COLD_UNITS));
     }
 
-    public static long getBrokerMinPartitionDurationMs() {
-        return Math.max(0L, getLong(BROKER_MIN_PARTITION_DURATION_MS_PROPERTY, BROKER_MIN_PARTITION_DURATION_MS_ENV,
-                DEFAULT_BROKER_MIN_PARTITION_DURATION_MS));
+    public static long getCoordinatorMinPartitionDurationMs() {
+        return Math.max(0L, getLong(COORDINATOR_MIN_PARTITION_DURATION_MS_PROPERTY, COORDINATOR_MIN_PARTITION_DURATION_MS_ENV,
+                DEFAULT_COORDINATOR_MIN_PARTITION_DURATION_MS));
     }
 
-    public static int getBrokerMaxWavesPerWorker() {
-        return Math.max(0, getInt(BROKER_MAX_WAVES_PER_WORKER_PROPERTY, BROKER_MAX_WAVES_PER_WORKER_ENV,
-                DEFAULT_BROKER_MAX_WAVES_PER_WORKER));
+    public static int getCoordinatorMaxWavesPerWorker() {
+        return Math.max(0, getInt(COORDINATOR_MAX_WAVES_PER_WORKER_PROPERTY, COORDINATOR_MAX_WAVES_PER_WORKER_ENV,
+                DEFAULT_COORDINATOR_MAX_WAVES_PER_WORKER));
     }
 
     public static int getMaxRetries() {

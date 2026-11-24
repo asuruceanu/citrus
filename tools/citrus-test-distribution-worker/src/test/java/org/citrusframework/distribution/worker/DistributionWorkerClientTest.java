@@ -38,8 +38,8 @@ import java.util.stream.Stream;
 import io.vertx.core.Vertx;
 import io.vertx.core.buffer.Buffer;
 import io.vertx.core.http.HttpServer;
-import org.citrusframework.distribution.broker.DistributionBrokerConfig;
-import org.citrusframework.distribution.broker.DistributionBrokerServer;
+import org.citrusframework.distribution.coordinator.DistributionCoordinatorConfig;
+import org.citrusframework.distribution.coordinator.DistributionCoordinatorServer;
 import org.citrusframework.distribution.cache.BlobCacheDirectory;
 import org.citrusframework.distribution.cache.ClasspathPackager;
 import org.citrusframework.distribution.cache.WorkspacePackager;
@@ -110,20 +110,20 @@ class DistributionWorkerClientTest {
     }
 
     @Test
-    void shouldDownloadClasspathBlobExecuteJUnitTestAndStreamResultsToBroker() throws Exception {
-        DistributionBrokerConfig brokerConfig = DistributionBrokerConfig.builder()
+    void shouldDownloadClasspathBlobExecuteJUnitTestAndStreamResultsToCoordinator() throws Exception {
+        DistributionCoordinatorConfig coordinatorConfig = DistributionCoordinatorConfig.builder()
                 .port(0)
                 .authToken("worker-secret")
-                .cacheDir(tempDir.resolve("broker-cache"))
+                .cacheDir(tempDir.resolve("coordinator-cache"))
                 .jdbcUrl("jdbc:hsqldb:mem:worker_it_" + System.nanoTime())
                 .build();
 
-        try (DistributionBrokerServer broker = new DistributionBrokerServer(brokerConfig)) {
-            broker.start();
+        try (DistributionCoordinatorServer coordinator = new DistributionCoordinatorServer(coordinatorConfig)) {
+            coordinator.start();
 
             DistributionWorkerConfig workerConfig = DistributionWorkerConfig.builder()
                     .workerId("worker-1")
-                    .brokerUrl(broker.baseUrl())
+                    .coordinatorUrl(coordinator.baseUrl())
                     .authToken("worker-secret")
                     .cacheDir(tempDir.resolve("worker-cache"))
                     .forkMode(DistributionSettings.WorkerForkMode.AUTO) // exercises the shared worker JVM
@@ -134,12 +134,12 @@ class DistributionWorkerClientTest {
                 worker.start();
                 assertThat(worker.awaitRegistration(5, TimeUnit.SECONDS)).isTrue();
 
-                // Package test-classes directory as DIRECTORY_ZIP and upload to broker cache
+                // Package test-classes directory as DIRECTORY_ZIP and upload to coordinator cache
                 Path testClassesDir = Paths.get(SampleRemoteTest.class.getProtectionDomain().getCodeSource().getLocation().toURI());
                 ClasspathPackager.PackagedArtifact packaged = ClasspathPackager.packagePath(testClassesDir);
 
                 HttpResponse<String> uploadResp = httpClient.send(
-                        HttpRequest.newBuilder(URI.create(broker.baseUrl() + "/api/v1/cache/blobs/" + packaged.ref().sha256()))
+                        HttpRequest.newBuilder(URI.create(coordinator.baseUrl() + "/api/v1/cache/blobs/" + packaged.ref().sha256()))
                                 .header("Authorization", "Bearer worker-secret")
                                 .PUT(HttpRequest.BodyPublishers.ofByteArray(packaged.bytes()))
                                 .build(),
@@ -147,7 +147,7 @@ class DistributionWorkerClientTest {
                 assertThat(uploadResp.statusCode()).isEqualTo(201);
 
                 HttpResponse<String> createResp = postJson(
-                        broker.baseUrl() + "/api/v1/sessions",
+                        coordinator.baseUrl() + "/api/v1/sessions",
                         "worker-secret",
                         new CreateSessionRequest("citrus", "main", "1234567", List.of(), 4, 1));
                 BuildSessionResponse session = DistributionJson.fromJson(createResp.body(), BuildSessionResponse.class);
@@ -169,13 +169,13 @@ class DistributionWorkerClientTest {
                         0,
                         1);
                 HttpResponse<String> submitResp = postJson(
-                        broker.baseUrl() + "/api/v1/sessions/" + session.sessionId() + "/work",
+                        coordinator.baseUrl() + "/api/v1/sessions/" + session.sessionId() + "/work",
                         "worker-secret",
                         submitReq);
                 assertThat(submitResp.statusCode()).isEqualTo(200);
 
                 // Poll session detail until partition completes
-                SessionDetailResponse detail = awaitPartitionCompletion(broker.baseUrl(), "worker-secret", session.sessionId());
+                SessionDetailResponse detail = awaitPartitionCompletion(coordinator.baseUrl(), "worker-secret", session.sessionId());
                 assertThat(detail.partitions()).hasSize(1);
                 assertThat(detail.partitions().get(0).state()).isEqualTo(PartitionState.COMPLETED);
                 assertThat(detail.tests()).anySatisfy(rec -> {
@@ -184,11 +184,11 @@ class DistributionWorkerClientTest {
                 });
 
                 postJson(
-                        broker.baseUrl() + "/api/v1/sessions/" + session.sessionId() + "/complete",
+                        coordinator.baseUrl() + "/api/v1/sessions/" + session.sessionId() + "/complete",
                         "worker-secret",
                         new CompleteSessionRequest(0, 0, 0, 0L));
 
-                SessionDetailResponse finalDetail = fetchDetail(broker.baseUrl(), "worker-secret", session.sessionId());
+                SessionDetailResponse finalDetail = fetchDetail(coordinator.baseUrl(), "worker-secret", session.sessionId());
                 assertThat(finalDetail.session().status()).isEqualTo(SessionStatus.PASSED);
                 assertThat(finalDetail.session().passedTests()).isEqualTo(1);
 
@@ -199,27 +199,27 @@ class DistributionWorkerClientTest {
 
     @Test
     void shouldIsolatePartitionSystemPropertiesAcrossConcurrentWorkersInSameJvm() throws Exception {
-        DistributionBrokerConfig brokerConfig = DistributionBrokerConfig.builder()
+        DistributionCoordinatorConfig coordinatorConfig = DistributionCoordinatorConfig.builder()
                 .port(0)
                 .authToken("worker-secret")
-                .cacheDir(tempDir.resolve("broker-concurrent-cache"))
+                .cacheDir(tempDir.resolve("coordinator-concurrent-cache"))
                 .jdbcUrl("jdbc:hsqldb:mem:worker_concurrent_" + System.nanoTime())
                 .defaultMaxPartitionSize(1)
                 .build();
 
-        try (DistributionBrokerServer broker = new DistributionBrokerServer(brokerConfig)) {
-            broker.start();
+        try (DistributionCoordinatorServer coordinator = new DistributionCoordinatorServer(coordinatorConfig)) {
+            coordinator.start();
 
             DistributionWorkerConfig alphaConfig = DistributionWorkerConfig.builder()
                     .workerId("worker-alpha")
-                    .brokerUrl(broker.baseUrl())
+                    .coordinatorUrl(coordinator.baseUrl())
                     .authToken("worker-secret")
                     .cacheDir(tempDir.resolve("worker-alpha-cache"))
                     .forkMode(DistributionSettings.WorkerForkMode.AUTO) // exercises the shared worker JVM
                     .build();
             DistributionWorkerConfig betaConfig = DistributionWorkerConfig.builder()
                     .workerId("worker-beta")
-                    .brokerUrl(broker.baseUrl())
+                    .coordinatorUrl(coordinator.baseUrl())
                     .authToken("worker-secret")
                     .cacheDir(tempDir.resolve("worker-beta-cache"))
                     .forkMode(DistributionSettings.WorkerForkMode.AUTO) // exercises the shared worker JVM
@@ -236,7 +236,7 @@ class DistributionWorkerClientTest {
                 ClasspathPackager.PackagedArtifact packaged = ClasspathPackager.packagePath(testClassesDir);
 
                 HttpResponse<String> uploadResp = httpClient.send(
-                        HttpRequest.newBuilder(URI.create(broker.baseUrl() + "/api/v1/cache/blobs/" + packaged.ref().sha256()))
+                        HttpRequest.newBuilder(URI.create(coordinator.baseUrl() + "/api/v1/cache/blobs/" + packaged.ref().sha256()))
                                 .header("Authorization", "Bearer worker-secret")
                                 .PUT(HttpRequest.BodyPublishers.ofByteArray(packaged.bytes()))
                                 .build(),
@@ -244,7 +244,7 @@ class DistributionWorkerClientTest {
                 assertThat(uploadResp.statusCode()).isEqualTo(201);
 
                 HttpResponse<String> createResp = postJson(
-                        broker.baseUrl() + "/api/v1/sessions",
+                        coordinator.baseUrl() + "/api/v1/sessions",
                         "worker-secret",
                         new CreateSessionRequest("citrus", "main", "1234567", List.of(), 1, 0));
                 BuildSessionResponse session = DistributionJson.fromJson(createResp.body(), BuildSessionResponse.class);
@@ -265,7 +265,7 @@ class DistributionWorkerClientTest {
                         500L);
 
                 HttpResponse<String> submitAlpha = postJson(
-                        broker.baseUrl() + "/api/v1/sessions/" + session.sessionId() + "/work",
+                        coordinator.baseUrl() + "/api/v1/sessions/" + session.sessionId() + "/work",
                         "worker-secret",
                         new SubmitWorkRequest(
                                 "sub-alpha",
@@ -276,7 +276,7 @@ class DistributionWorkerClientTest {
                                 0,
                                 1));
                 HttpResponse<String> submitBeta = postJson(
-                        broker.baseUrl() + "/api/v1/sessions/" + session.sessionId() + "/work",
+                        coordinator.baseUrl() + "/api/v1/sessions/" + session.sessionId() + "/work",
                         "worker-secret",
                         new SubmitWorkRequest(
                                 "sub-beta",
@@ -290,7 +290,7 @@ class DistributionWorkerClientTest {
                 assertThat(submitBeta.statusCode()).isEqualTo(200);
 
                 SessionDetailResponse detail = awaitPartitionsCompletion(
-                        broker.baseUrl(), "worker-secret", session.sessionId(), 2);
+                        coordinator.baseUrl(), "worker-secret", session.sessionId(), 2);
                 assertThat(detail.partitions()).hasSize(2);
                 assertThat(detail.partitions()).allSatisfy(p ->
                         assertThat(p.state()).isEqualTo(PartitionState.COMPLETED));
@@ -339,17 +339,17 @@ class DistributionWorkerClientTest {
 
     @Test
     void shouldFailFastWhenSecondWorkerClientSharesCacheDirAndAllowReuseAfterClose() throws Exception {
-        try (DistributionBrokerServer broker = startBroker("worker_shared_cache_");
+        try (DistributionCoordinatorServer coordinator = startCoordinator("worker_shared_cache_");
              var executor = Executors.newVirtualThreadPerTaskExecutor()) {
             Path sharedCache = tempDir.resolve("shared-worker-cache");
-            ClasspathPackager.PackagedArtifact packaged = upload(broker, packageClassesOf(BlockingPartitionFixture.class));
+            ClasspathPackager.PackagedArtifact packaged = upload(coordinator, packageClassesOf(BlockingPartitionFixture.class));
             WorkUnitSpec blockedUnit = unit(BlockingPartitionFixture.class, "shouldWaitOnWorker");
 
-            try (DistributionWorkerClient worker2 = new DistributionWorkerClient(workerConfig("worker-two", broker, sharedCache).build())) {
-                try (DistributionWorkerClient worker1 = new DistributionWorkerClient(workerConfig("worker-one", broker, sharedCache).build())) {
+            try (DistributionWorkerClient worker2 = new DistributionWorkerClient(workerConfig("worker-two", coordinator, sharedCache).build())) {
+                try (DistributionWorkerClient worker1 = new DistributionWorkerClient(workerConfig("worker-one", coordinator, sharedCache).build())) {
                     worker1.start();
                     assertThat(worker1.awaitRegistration(5, TimeUnit.SECONDS)).isTrue();
-                    var partition = executor.submit(() -> runPartition(broker, List.of(packaged.ref()), blockedUnit,
+                    var partition = executor.submit(() -> runPartition(coordinator, List.of(packaged.ref()), blockedUnit,
                             List.of(), List.of()));
                     try {
                         assertThat(BlockingPartitionFixture.STARTED.await(10, TimeUnit.SECONDS)).isTrue();
@@ -369,7 +369,7 @@ class DistributionWorkerClientTest {
                 worker2.start();
                 assertThat(worker2.awaitRegistration(5, TimeUnit.SECONDS)).isTrue();
                 WorkUnitSpec warmUnit = unit(SampleRemoteTest.class, "shouldPassOnWorker");
-                assertCompleted(runPartition(broker, List.of(packaged.ref()), warmUnit, List.of(), List.of()));
+                assertCompleted(runPartition(coordinator, List.of(packaged.ref()), warmUnit, List.of(), List.of()));
                 assertThat(worker2.blobClient().downloadRequests())
                         .as("warm blob reused, no blob GET issued to the coordinator").isZero();
             }
@@ -390,7 +390,7 @@ class DistributionWorkerClientTest {
 
         Vertx vertx = Vertx.vertx();
         try {
-            HttpServer broker = vertx.createHttpServer()
+            HttpServer coordinator = vertx.createHttpServer()
                     .requestHandler(request -> request.response().setChunked(true).write(Buffer.buffer(new byte[128]))
                             .onSuccess(ignored -> bodyStarted.countDown()))
                     .webSocketHandler(socket -> socket.textMessageHandler(message -> {
@@ -401,7 +401,7 @@ class DistributionWorkerClientTest {
                     .listen(0, "127.0.0.1").toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
             Path cacheDir = tempDir.resolve("stalled-worker-cache");
             DistributionWorkerConfig config = DistributionWorkerConfig.builder()
-                    .brokerUrl("http://127.0.0.1:" + broker.actualPort())
+                    .coordinatorUrl("http://127.0.0.1:" + coordinator.actualPort())
                     .cacheDir(cacheDir)
                     .cacheCleanup(false)
                     .forkMode(DistributionSettings.WorkerForkMode.AUTO)
@@ -423,7 +423,7 @@ class DistributionWorkerClientTest {
 
     @Test
     void shouldKeepClasspathInputsAndOutputsPinnedUnderZeroFreeSpaceAndAllowCacheInsideUserDir() throws Exception {
-        try (DistributionBrokerServer broker = startBroker("worker_pinned_")) {
+        try (DistributionCoordinatorServer coordinator = startCoordinator("worker_pinned_")) {
             Path cacheDir = tempDir.resolve("pressure-cache");
             BlobCacheDirectory seededStore = new BlobCacheDirectory(cacheDir);
             List<Path> seeded = new ArrayList<>();
@@ -435,18 +435,18 @@ class DistributionWorkerClientTest {
             // Test classes (archive) and the JUnit Jupiter jars (named jars): without pins, each download would evict
             // the previously published classpath entries.
             List<ArtifactRef> classpath = new ArrayList<>();
-            classpath.add(upload(broker, packageClassesOf(DistributionWorkerClientTest.class)).ref());
-            classpath.add(upload(broker, packageClassesOf(Test.class)).ref());
-            classpath.add(upload(broker, packageClassesOf(Class.forName("org.junit.jupiter.engine.JupiterTestEngine"))).ref());
+            classpath.add(upload(coordinator, packageClassesOf(DistributionWorkerClientTest.class)).ref());
+            classpath.add(upload(coordinator, packageClassesOf(Test.class)).ref());
+            classpath.add(upload(coordinator, packageClassesOf(Class.forName("org.junit.jupiter.engine.JupiterTestEngine"))).ref());
             assertThat(classpath).extracting(ArtifactRef::kind).contains(ArtifactKind.JAR);
 
             BlobCacheDirectory hostCache = new BlobCacheDirectory(tempDir.resolve("host-cache"));
             Path module = Files.createDirectories(tempDir.resolve("module/src/test/resources")).getParent().getParent().getParent();
             Files.writeString(module.resolve("src/test/resources/greeting.txt"), "hello");
             WorkspaceFileSet input = WorkspacePackager.packageInputToCache(hostCache, module, "src/test/resources", false).orElseThrow();
-            uploadBytes(broker, input.artifact().sha256(), hostCache.readBytes(input.artifact().sha256()));
+            uploadBytes(coordinator, input.artifact().sha256(), hostCache.readBytes(input.artifact().sha256()));
 
-            DistributionWorkerConfig config = workerConfig("worker-pressure", broker, cacheDir)
+            DistributionWorkerConfig config = workerConfig("worker-pressure", coordinator, cacheDir)
                     .cacheFreeSpaceBufferBytes(Long.MAX_VALUE / 2)
                     .forkJvmArgs(List.of("-Xmx256m"))
                     .build();
@@ -455,9 +455,9 @@ class DistributionWorkerClientTest {
                 assertThat(worker.awaitRegistration(5, TimeUnit.SECONDS)).isTrue();
                 assertThat(seeded).as("unpinned blobs evicted under disk pressure").allSatisfy(p -> assertThat(p).doesNotExist());
 
-                assertCompleted(runPartition(broker, classpath, unit(SampleRemoteTest.class, "shouldPassOnWorker"),
+                assertCompleted(runPartition(coordinator, classpath, unit(SampleRemoteTest.class, "shouldPassOnWorker"),
                         List.of(), List.of()));
-                assertCompleted(runPartition(broker, classpath, unit(PinnedForkFixture.class, "readInputAndWriteOutput"),
+                assertCompleted(runPartition(coordinator, classpath, unit(PinnedForkFixture.class, "readInputAndWriteOutput"),
                         List.of(input), List.of("target/docs")));
 
                 long deadline = System.currentTimeMillis() + 10_000L;
@@ -504,7 +504,7 @@ class DistributionWorkerClientTest {
     void shouldNotHoldTheClientMonitorWhileCloseWaitsForTheCache() throws Exception {
         DistributionWorkerConfig config = DistributionWorkerConfig.builder()
                 .workerId("worker-close-latency")
-                .brokerUrl("http://127.0.0.1:9")
+                .coordinatorUrl("http://127.0.0.1:9")
                 .cacheDir(tempDir.resolve("close-latency-cache"))
                 .cacheCleanup(true)
                 .cacheFreeSpaceBufferBytes(Long.MAX_VALUE / 2)
@@ -558,21 +558,21 @@ class DistributionWorkerClientTest {
         }
     }
 
-    private DistributionBrokerServer startBroker(String dbPrefix) {
-        DistributionBrokerServer broker = new DistributionBrokerServer(DistributionBrokerConfig.builder()
+    private DistributionCoordinatorServer startCoordinator(String dbPrefix) {
+        DistributionCoordinatorServer coordinator = new DistributionCoordinatorServer(DistributionCoordinatorConfig.builder()
                 .port(0)
                 .authToken("worker-secret")
-                .cacheDir(tempDir.resolve("broker-" + dbPrefix + "cache"))
+                .cacheDir(tempDir.resolve("coordinator-" + dbPrefix + "cache"))
                 .jdbcUrl("jdbc:hsqldb:mem:" + dbPrefix + System.nanoTime())
                 .build());
-        broker.start();
-        return broker;
+        coordinator.start();
+        return coordinator;
     }
 
-    private static DistributionWorkerConfig.Builder workerConfig(String workerId, DistributionBrokerServer broker, Path cacheDir) {
+    private static DistributionWorkerConfig.Builder workerConfig(String workerId, DistributionCoordinatorServer coordinator, Path cacheDir) {
         return DistributionWorkerConfig.builder()
                 .workerId(workerId)
-                .brokerUrl(broker.baseUrl())
+                .coordinatorUrl(coordinator.baseUrl())
                 .authToken("worker-secret")
                 .cacheDir(cacheDir)
                 .cacheCleanup(true)
@@ -585,15 +585,15 @@ class DistributionWorkerClientTest {
         return ClasspathPackager.packagePath(Paths.get(anchor.getProtectionDomain().getCodeSource().getLocation().toURI()));
     }
 
-    private ClasspathPackager.PackagedArtifact upload(DistributionBrokerServer broker, ClasspathPackager.PackagedArtifact packaged)
+    private ClasspathPackager.PackagedArtifact upload(DistributionCoordinatorServer coordinator, ClasspathPackager.PackagedArtifact packaged)
             throws Exception {
-        uploadBytes(broker, packaged.ref().sha256(), packaged.bytes());
+        uploadBytes(coordinator, packaged.ref().sha256(), packaged.bytes());
         return packaged;
     }
 
-    private void uploadBytes(DistributionBrokerServer broker, String sha256, byte[] bytes) throws Exception {
+    private void uploadBytes(DistributionCoordinatorServer coordinator, String sha256, byte[] bytes) throws Exception {
         HttpResponse<String> response = httpClient.send(
-                HttpRequest.newBuilder(URI.create(broker.baseUrl() + "/api/v1/cache/blobs/" + sha256))
+                HttpRequest.newBuilder(URI.create(coordinator.baseUrl() + "/api/v1/cache/blobs/" + sha256))
                         .header("Authorization", "Bearer worker-secret")
                         .PUT(HttpRequest.BodyPublishers.ofByteArray(bytes))
                         .build(),
@@ -601,26 +601,26 @@ class DistributionWorkerClientTest {
         assertThat(response.statusCode()).isIn(200, 201);
     }
 
-    private SessionDetailResponse runPartition(DistributionBrokerServer broker, List<ArtifactRef> classpath, WorkUnitSpec unit,
+    private SessionDetailResponse runPartition(DistributionCoordinatorServer coordinator, List<ArtifactRef> classpath, WorkUnitSpec unit,
                                                List<WorkspaceFileSet> inputs, List<String> outputs) throws Exception {
-        BuildSessionResponse session = DistributionJson.fromJson(postJson(broker.baseUrl() + "/api/v1/sessions",
+        BuildSessionResponse session = DistributionJson.fromJson(postJson(coordinator.baseUrl() + "/api/v1/sessions",
                 "worker-secret", new CreateSessionRequest("citrus", "main", "1234567", List.of(), 4, 1)).body(),
                 BuildSessionResponse.class);
-        HttpResponse<String> submit = postJson(broker.baseUrl() + "/api/v1/sessions/" + session.sessionId() + "/work",
+        HttpResponse<String> submit = postJson(coordinator.baseUrl() + "/api/v1/sessions/" + session.sessionId() + "/work",
                 "worker-secret", new SubmitWorkRequest("sub-" + System.nanoTime(), "cache-module", classpath, Map.of(),
                         List.of(unit), 0, classpath.size(), inputs, outputs, !inputs.isEmpty() || !outputs.isEmpty(),
                         PartitionPolicy.LPT));
         assertThat(submit.statusCode()).isEqualTo(200);
         long deadline = System.currentTimeMillis() + 60_000L;
         while (System.currentTimeMillis() < deadline) {
-            SessionDetailResponse detail = fetchDetail(broker.baseUrl(), "worker-secret", session.sessionId());
+            SessionDetailResponse detail = fetchDetail(coordinator.baseUrl(), "worker-secret", session.sessionId());
             if (!detail.partitions().isEmpty() && detail.partitions().stream().allMatch(p ->
                     p.state() == PartitionState.COMPLETED || p.state() == PartitionState.FAILED)) {
                 return detail;
             }
             Thread.sleep(100L);
         }
-        return fetchDetail(broker.baseUrl(), "worker-secret", session.sessionId());
+        return fetchDetail(coordinator.baseUrl(), "worker-secret", session.sessionId());
     }
 
     private static void assertCompleted(SessionDetailResponse detail) {
@@ -635,15 +635,15 @@ class DistributionWorkerClientTest {
     }
 
     @Test
-    void shouldNormalizeWebSocketBrokerUrlsToHttpBaseUrl() {
+    void shouldNormalizeWebSocketCoordinatorUrlsToHttpBaseUrl() {
         assertThat(DistributionWorkerConfig.builder()
-                .brokerUrl("ws://127.0.0.1:18080/ws/v1/worker")
+                .coordinatorUrl("ws://127.0.0.1:18080/ws/v1/worker")
                 .build()
-                .brokerUrl()).isEqualTo("http://127.0.0.1:18080");
+                .coordinatorUrl()).isEqualTo("http://127.0.0.1:18080");
         assertThat(DistributionWorkerConfig.builder()
-                .brokerUrl("wss://broker.example.org/ws/v1/worker/")
+                .coordinatorUrl("wss://coordinator.example.org/ws/v1/worker/")
                 .build()
-                .brokerUrl()).isEqualTo("https://broker.example.org");
+                .coordinatorUrl()).isEqualTo("https://coordinator.example.org");
     }
 
     private SessionDetailResponse awaitPartitionsCompletion(String baseUrl, String token, String sessionId, int expectedPartitions) throws Exception {

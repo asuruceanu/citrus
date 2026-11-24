@@ -42,7 +42,7 @@ import org.citrusframework.distribution.config.DistributionSettings;
 import org.citrusframework.distribution.config.ForkedJvmOptions;
 import org.citrusframework.distribution.config.QuarkusWorkspace;
 import org.citrusframework.distribution.model.ArtifactRef;
-import org.citrusframework.distribution.model.BrokerEvent;
+import org.citrusframework.distribution.model.CoordinatorEvent;
 import org.citrusframework.distribution.model.BuildSessionResponse;
 import org.citrusframework.distribution.model.CompleteSessionRequest;
 import org.citrusframework.distribution.model.CreateSessionRequest;
@@ -154,8 +154,8 @@ public class DistributedLauncher implements Launcher {
             String sharedSessionId = System.getProperty(DistributionSettings.SESSION_ID_PROPERTY);
             if (sharedSessionId != null && !sharedSessionId.isBlank() && !onlyLocal.executions().isEmpty()) {
                 try {
-                    BrokerHttpClient sharedClient = new BrokerHttpClient(
-                            DistributionSettings.getBrokerUrl(),
+                    CoordinatorHttpClient sharedClient = new CoordinatorHttpClient(
+                            DistributionSettings.getCoordinatorUrl(),
                             DistributionSettings.getAuthToken(),
                             DistributionSettings.getConnectTimeoutMs());
                     sharedClient.reportLocalTests(
@@ -173,14 +173,14 @@ public class DistributedLauncher implements Launcher {
         WorkspaceSettings workspace = WorkspaceSettings.resolve();
         List<String> testJvmOptions = ForkedJvmOptions.capture();
 
-        String brokerUrl = DistributionSettings.getBrokerUrl();
+        String coordinatorUrl = DistributionSettings.getCoordinatorUrl();
         String authToken = DistributionSettings.getAuthToken();
         boolean fallbackLocal = DistributionSettings.isFallbackLocal();
         String externalSessionId = System.getProperty(DistributionSettings.SESSION_ID_PROPERTY);
         boolean ownsSession = externalSessionId == null || externalSessionId.isBlank();
 
-        BrokerHttpClient client = new BrokerHttpClient(
-                brokerUrl, authToken, DistributionSettings.getConnectTimeoutMs());
+        CoordinatorHttpClient client = new CoordinatorHttpClient(
+                coordinatorUrl, authToken, DistributionSettings.getConnectTimeoutMs());
 
         Path rootName = workspace.hostBaseDir().getFileName();
         String configuredProjectName = System.getProperty(DistributionSettings.PROJECT_NAME_PROPERTY);
@@ -230,10 +230,10 @@ public class DistributedLauncher implements Launcher {
         } catch (Exception e) {
             if (extracted.hasRemoteOnlyUnits() || !fallbackLocal) {
                 throw new IllegalStateException(
-                        "Citrus Test Distribution broker unreachable at " + brokerUrl
+                        "Citrus Test Distribution coordinator unreachable at " + coordinatorUrl
                                 + " and remote execution is required", e);
             }
-            LOG.log(System.Logger.Level.WARNING, "Broker {0} unreachable ({1}); falling back to local execution", brokerUrl, e.getMessage());
+            LOG.log(System.Logger.Level.WARNING, "Coordinator {0} unreachable ({1}); falling back to local execution", coordinatorUrl, e.getMessage());
             List<WorkUnitSpec> all = new ArrayList<>(extracted.localUnits());
             all.addAll(extracted.remoteUnits());
             LocalFallbackExecutor.executeLocally(delegate, all,
@@ -349,7 +349,7 @@ public class DistributedLauncher implements Launcher {
                                 sessionId,
                                 0L,
                                 DistributionSettings.getSessionTimeoutMs(),
-                                event -> handleBrokerEvent(event, replayer, reportWriter, submittedPartitions,
+                                event -> handleCoordinatorEvent(event, replayer, reportWriter, submittedPartitions,
                                         pendingPartitions, lostUnits, unitsByKey, outcomes, client));
                     }
                     if (!lostUnits.isEmpty()) {
@@ -419,7 +419,7 @@ public class DistributedLauncher implements Launcher {
     }
 
     private static boolean shouldBypassRemoteDistribution(DiscoveredWorkExtractor.ExtractedWork extracted,
-                                                          WorkspaceSettings workspace, BrokerHttpClient client,
+                                                          WorkspaceSettings workspace, CoordinatorHttpClient client,
                                                           String historyScope) {
         if (extracted.hasRemoteOnlyUnits() || workspace.forkWorkspace()
                 || extracted.remoteUnits().stream().anyMatch(unit ->
@@ -454,7 +454,7 @@ public class DistributedLauncher implements Launcher {
     }
 
     private static void completeOwnedSessionOnFailure(
-            BrokerHttpClient client,
+            CoordinatorHttpClient client,
             String sessionId,
             LocalFallbackExecutor.LocalExecutionStats localStats,
             LocalFallbackExecutor.LocalExecutionStats lostStats,
@@ -468,7 +468,7 @@ public class DistributedLauncher implements Launcher {
                     true,
                     describe(cause)));
         } catch (Exception e) {
-            LOG.log(System.Logger.Level.WARNING, "Failed to mark failed session {0} as completed on broker: {1}", sessionId, e.getMessage());
+            LOG.log(System.Logger.Level.WARNING, "Failed to mark failed session {0} as completed on coordinator: {1}", sessionId, e.getMessage());
         }
     }
 
@@ -487,7 +487,7 @@ public class DistributedLauncher implements Launcher {
      * Handles one session event. Events of partitions this launcher did not submit (sibling modules sharing a reactor
      * session) are ignored, and each partition's completion is processed once even if replayed.
      */
-    private boolean handleBrokerEvent(BrokerEvent event,
+    private boolean handleCoordinatorEvent(CoordinatorEvent event,
                                       RemoteResultReplayer replayer,
                                       SurefireReportWriter reportWriter,
                                       Set<String> submittedPartitions,
@@ -495,7 +495,7 @@ public class DistributedLauncher implements Launcher {
                                       List<WorkUnitSpec> lostUnits,
                                       Map<String, WorkUnitSpec> unitsByKey,
                                       PartitionOutcomes outcomes,
-                                      BrokerHttpClient client) {
+                                      CoordinatorHttpClient client) {
         boolean ownEvent = event.partitionId() != null && submittedPartitions.contains(event.partitionId());
         switch (event.type()) {
             case "test.event" -> {
@@ -550,7 +550,7 @@ public class DistributedLauncher implements Launcher {
     }
 
     /** Work unit keys a {@code partition.completed} event lists, or {@code null} for coordinators that do not send them. */
-    private static List<String> unitKeysOf(BrokerEvent event) {
+    private static List<String> unitKeysOf(CoordinatorEvent event) {
         Object units = event.data() != null ? event.data().get("workUnits") : null;
         if (!(units instanceof List<?> list)) {
             return null;
@@ -558,7 +558,7 @@ public class DistributedLauncher implements Launcher {
         return list.stream().map(String::valueOf).toList();
     }
 
-    private static int attemptOf(BrokerEvent event) {
+    private static int attemptOf(CoordinatorEvent event) {
         Object attempt = event.data() != null ? event.data().get("attempt") : null;
         return attempt instanceof Number n ? n.intValue() : 1;
     }
@@ -921,7 +921,7 @@ public class DistributedLauncher implements Launcher {
             this(committer, cache, new ArrayList<>());
         }
 
-        void completed(BrokerEvent event, BrokerHttpClient client) {
+        void completed(CoordinatorEvent event, CoordinatorHttpClient client) {
             Map<String, Object> data = event.data() != null ? event.data() : Map.of();
             if (!"COMPLETED".equals(String.valueOf(data.get("state")))) {
                 failures.add("Partition " + event.partitionId() + " failed: " + data.getOrDefault("errorMessage", "no details"));

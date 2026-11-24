@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-package org.citrusframework.distribution.broker;
+package org.citrusframework.distribution.coordinator;
 
 import java.nio.file.Path;
 import java.util.List;
@@ -26,7 +26,7 @@ import org.citrusframework.distribution.config.DistributionJson;
 import org.citrusframework.distribution.config.DistributionSettings;
 import org.citrusframework.distribution.model.ArtifactKind;
 import org.citrusframework.distribution.model.ArtifactRef;
-import org.citrusframework.distribution.model.BrokerEvent;
+import org.citrusframework.distribution.model.CoordinatorEvent;
 import org.citrusframework.distribution.model.BuildSessionRecord;
 import org.citrusframework.distribution.model.CompleteSessionRequest;
 import org.citrusframework.distribution.model.CreateSessionRequest;
@@ -58,7 +58,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.tuple;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-class BrokerSessionCoordinatorTest {
+class SessionCoordinatorTest {
 
     private static final long LEASE_MS = 50L;
     private static final Map<String, String> WORKSPACE_CAPS = Map.of(DistributionSettings.WORKSPACE_CAPABILITY_KEY, "true");
@@ -67,19 +67,19 @@ class BrokerSessionCoordinatorTest {
     Path tempDir;
 
     private JdbcDistributionStore store;
-    private BrokerEventStreamHub hub;
-    private BrokerSessionCoordinator coordinator;
+    private CoordinatorEventStreamHub hub;
+    private SessionCoordinator coordinator;
 
     @BeforeEach
     void setUp() {
-        DistributionBrokerConfig config = DistributionBrokerConfig.builder()
+        DistributionCoordinatorConfig config = DistributionCoordinatorConfig.builder()
                 .cacheDir(tempDir.resolve("cache"))
                 .leaseTimeoutMs(LEASE_MS)
                 .build();
         store = new JdbcDistributionStore("jdbc:hsqldb:mem:coordinator_" + System.nanoTime(), "SA", "");
         store.initialize();
-        hub = new BrokerEventStreamHub();
-        coordinator = new BrokerSessionCoordinator(config, store, hub);
+        hub = new CoordinatorEventStreamHub();
+        coordinator = new SessionCoordinator(config, store, hub);
     }
 
     @Test
@@ -107,18 +107,18 @@ class BrokerSessionCoordinatorTest {
         String sessionId;
         try (JdbcDistributionStore before = new JdbcDistributionStore(jdbcUrl, "SA", "")) {
             before.initialize();
-            BrokerSessionCoordinator running = new BrokerSessionCoordinator(
-                    DistributionBrokerConfig.builder().defaultMaxPartitionSize(10).build(),
-                    before, new BrokerEventStreamHub());
+            SessionCoordinator running = new SessionCoordinator(
+                    DistributionCoordinatorConfig.builder().defaultMaxPartitionSize(10).build(),
+                    before, new CoordinatorEventStreamHub());
             sessionId = running.createSession(
                     new CreateSessionRequest("citrus", "main", "abc", List.of(), requestedSize, 1)).sessionId();
         }
 
         try (JdbcDistributionStore after = new JdbcDistributionStore(jdbcUrl, "SA", "")) {
             after.initialize();
-            BrokerSessionCoordinator restarted = new BrokerSessionCoordinator(
-                    DistributionBrokerConfig.builder().defaultMaxPartitionSize(4).minPartitionDurationMs(5_000L).build(),
-                    after, new BrokerEventStreamHub());
+            SessionCoordinator restarted = new SessionCoordinator(
+                    DistributionCoordinatorConfig.builder().defaultMaxPartitionSize(4).minPartitionDurationMs(5_000L).build(),
+                    after, new CoordinatorEventStreamHub());
             List<WorkUnitSpec> units = IntStream.range(0, 6).mapToObj(i -> unit("pkg.RestartTest" + i)).toList();
             restarted.submitWork(sessionId, new SubmitWorkRequest("sub-after-restart", "module", List.of(), Map.of(),
                     units, 0, 0));
@@ -135,7 +135,7 @@ class BrokerSessionCoordinatorTest {
 
     @Test
     void shouldCapWavesByDistinctEligibleOnlineWorkersIncludingBusyWorkers() {
-        coordinator = new BrokerSessionCoordinator(DistributionBrokerConfig.builder()
+        coordinator = new SessionCoordinator(DistributionCoordinatorConfig.builder()
                 .defaultMaxPartitionSize(2)
                 .minPartitionDurationMs(0L)
                 .maxWavesPerWorker(2)
@@ -165,14 +165,14 @@ class BrokerSessionCoordinatorTest {
     }
 
     @Test
-    void shouldResolveAdaptiveSettingsThroughBrokerConfigBuilder() {
-        String property = DistributionBrokerConfig.MIN_PARTITION_DURATION_MS_PROPERTY;
+    void shouldResolveAdaptiveSettingsThroughCoordinatorConfigBuilder() {
+        String property = DistributionCoordinatorConfig.MIN_PARTITION_DURATION_MS_PROPERTY;
         String previous = System.getProperty(property);
         try {
             System.setProperty(property, "4500");
-            assertThat(DistributionBrokerConfig.builder().build().minPartitionDurationMs()).isEqualTo(4_500L);
-            assertThat(DistributionBrokerConfig.fromSettings().minPartitionDurationMs()).isEqualTo(4_500L);
-            DistributionBrokerConfig disabled = DistributionBrokerConfig.builder()
+            assertThat(DistributionCoordinatorConfig.builder().build().minPartitionDurationMs()).isEqualTo(4_500L);
+            assertThat(DistributionCoordinatorConfig.fromSettings().minPartitionDurationMs()).isEqualTo(4_500L);
+            DistributionCoordinatorConfig disabled = DistributionCoordinatorConfig.builder()
                     .minPartitionDurationMs(-1L).maxWavesPerWorker(-1).build();
             assertThat(disabled.minPartitionDurationMs()).isZero();
             assertThat(disabled.maxWavesPerWorker()).isZero();
@@ -246,7 +246,7 @@ class BrokerSessionCoordinatorTest {
         worker.complete(assign, assign.attempt(), List.of(docs));
 
         assertThat(partition(sessionId).state()).isEqualTo(PartitionState.COMPLETED);
-        BrokerEvent completed = lastEvent(sessionId, "partition.completed");
+        CoordinatorEvent completed = lastEvent(sessionId, "partition.completed");
         assertThat(completed.data()).containsEntry("attempt", 1).containsKey("outputArtifacts")
                 .as("lets the launcher close each class test set once all its units reported")
                 .containsEntry("workUnits", List.of("a.A"));
@@ -1041,10 +1041,10 @@ class BrokerSessionCoordinatorTest {
                         "local", sessionId, 1, "pkg.LostIT#testRecover", "pkg.LostIT", "testRecover",
                         TestOutcomeStatus.PASSED, 90L, null, null, List.of()))));
 
-        BrokerSessionCoordinator rehydrated = new BrokerSessionCoordinator(
-                DistributionBrokerConfig.builder().cacheDir(tempDir.resolve("cache-rehydrated")).leaseTimeoutMs(LEASE_MS).build(),
+        SessionCoordinator rehydrated = new SessionCoordinator(
+                DistributionCoordinatorConfig.builder().cacheDir(tempDir.resolve("cache-rehydrated")).leaseTimeoutMs(LEASE_MS).build(),
                 store,
-                new BrokerEventStreamHub());
+                new CoordinatorEventStreamHub());
         BuildSessionRecord completed = rehydrated.completeSession(
                 sessionId, new CompleteSessionRequest(2, 0, 0, 250L));
 
@@ -1079,8 +1079,8 @@ class BrokerSessionCoordinatorTest {
         return store.listPartitions(sessionId).getLast();
     }
 
-    private BrokerEvent lastEvent(String sessionId, String type) {
-        List<BrokerEvent> matching = hub.sessionEvents(sessionId).stream().filter(e -> e.type().equals(type)).toList();
+    private CoordinatorEvent lastEvent(String sessionId, String type) {
+        List<CoordinatorEvent> matching = hub.sessionEvents(sessionId).stream().filter(e -> e.type().equals(type)).toList();
         assertThat(matching).as("events of type %s", type).isNotEmpty();
         return matching.getLast();
     }

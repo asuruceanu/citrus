@@ -29,6 +29,8 @@ import org.slf4j.LoggerFactory;
 
 public class CitrusAgentConfiguration extends CitrusAppConfiguration {
 
+    public static final String DEFAULT_COORDINATOR_URL = "http://localhost:8084";
+
     /** Logger */
     private static final Logger logger = LoggerFactory.getLogger(CitrusAgentConfiguration.class);
 
@@ -41,7 +43,7 @@ public class CitrusAgentConfiguration extends CitrusAppConfiguration {
 
     private String mode = "standalone";
 
-    private String brokerUrl = "http://localhost:8084";
+    private String coordinatorUrl;
 
     private String authToken = "";
 
@@ -99,20 +101,27 @@ public class CitrusAgentConfiguration extends CitrusAppConfiguration {
         return "worker".equalsIgnoreCase(mode);
     }
 
-    public String getBrokerUrl() {
-        return brokerUrl;
+    public String getCoordinatorUrl() {
+        return getCoordinatorUrl(DEFAULT_COORDINATOR_URL);
     }
 
-    @SchemaProperty(description = "Citrus Test Distribution Broker URL when running in worker mode.", defaultValue = "http://localhost:8084")
-    public void setBrokerUrl(String brokerUrl) {
-        this.brokerUrl = brokerUrl;
+    /**
+     * Returns the explicitly configured coordinator URL, or the supplied fallback when none was configured.
+     */
+    public String getCoordinatorUrl(String fallbackUrl) {
+        return coordinatorUrl == null || coordinatorUrl.isBlank() ? fallbackUrl : coordinatorUrl;
+    }
+
+    @SchemaProperty(description = "Citrus Test Distribution Coordinator URL when running in worker mode.", defaultValue = DEFAULT_COORDINATOR_URL)
+    public void setCoordinatorUrl(String coordinatorUrl) {
+        this.coordinatorUrl = coordinatorUrl;
     }
 
     public String getAuthToken() {
         return authToken;
     }
 
-    @SchemaProperty(description = "Shared authentication token for the Citrus Test Distribution Broker.")
+    @SchemaProperty(description = "Shared authentication token for the Citrus Test Distribution Coordinator.")
     public void setAuthToken(String authToken) {
         this.authToken = authToken;
     }

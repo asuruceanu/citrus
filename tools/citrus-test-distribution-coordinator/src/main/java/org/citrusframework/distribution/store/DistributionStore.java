@@ -43,7 +43,7 @@ public interface DistributionStore extends AutoCloseable {
 
     void saveSession(BuildSessionRecord session);
 
-    /** Saves the session and its requested partition size. A non-positive size requests broker-managed sizing. */
+    /** Saves the session and its requested partition size. A non-positive size requests coordinator-managed sizing. */
     default void saveSession(BuildSessionRecord session, int requestedMaxPartitionSize) {
         saveSession(session);
     }
@@ -56,7 +56,7 @@ public interface DistributionStore extends AutoCloseable {
         return Optional.empty();
     }
 
-    /** Returns the original requested size when available, including zero for broker-managed sizing. */
+    /** Returns the original requested size when available, including zero for coordinator-managed sizing. */
     default OptionalInt findRequestedMaxPartitionSize(String sessionId) {
         return OptionalInt.empty();
     }
