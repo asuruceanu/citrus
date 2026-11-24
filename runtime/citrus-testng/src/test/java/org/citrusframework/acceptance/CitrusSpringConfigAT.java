@@ -16,6 +16,8 @@
 
 package org.citrusframework.acceptance;
 
+import java.lang.reflect.Proxy;
+
 import org.citrusframework.spring.CitrusSpringSettings;
 import org.citrusframework.base.report.HtmlReporter;
 import org.citrusframework.base.report.JUnitReporter;
@@ -125,10 +127,15 @@ public class CitrusSpringConfigAT extends TestNGCitrusSpringSupport {
         Assert.assertTrue(testSuiteListeners.getTestSuiteListeners().stream().anyMatch(loggingReporter::equals));
         Assert.assertTrue(testSuiteListeners.getTestSuiteListeners().stream().anyMatch(TestReporters.class::isInstance));
 
-        Assert.assertEquals(testActionListeners.getTestActionListeners().size(), 3);
-        Assert.assertTrue(testActionListeners.getTestActionListeners().stream().anyMatch(CustomConfig.testActionListener::equals));
-        Assert.assertTrue(testActionListeners.getTestActionListeners().stream().anyMatch(loggingReporter::equals));
-        Assert.assertTrue(testActionListeners.getTestActionListeners().stream().anyMatch(TestFlowReporter.class::isInstance));
+        // Distribution adds an endpoint collector to the runtime listeners outside Spring configuration.
+        var configuredActionListeners = testActionListeners.getTestActionListeners().stream()
+                .filter(listener -> !(Proxy.isProxyClass(listener.getClass())
+                        && "CitrusEndpointCollectorListener".equals(listener.toString())))
+                .toList();
+        Assert.assertEquals(configuredActionListeners.size(), 3);
+        Assert.assertTrue(configuredActionListeners.stream().anyMatch(CustomConfig.testActionListener::equals));
+        Assert.assertTrue(configuredActionListeners.stream().anyMatch(loggingReporter::equals));
+        Assert.assertTrue(configuredActionListeners.stream().anyMatch(TestFlowReporter.class::isInstance));
 
         Assert.assertEquals(messageListeners.getMessageListener().size(), 2);
         Assert.assertTrue(messageListeners.getMessageListener().stream().anyMatch(CustomConfig.messageListener::equals));
