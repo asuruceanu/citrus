@@ -312,8 +312,7 @@ public final class LocalFallbackExecutor {
                 }
             };
 
-            DistributionLauncherInterceptor.runLocally(
-                    () -> execute.accept(mergeListeners(additionalListeners, countingListener)));
+            DistributionLauncherInterceptor.runLocally(mergeListeners(additionalListeners, countingListener), execute);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new IllegalStateException("Interrupted while waiting for isolated tests", e);

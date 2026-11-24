@@ -16,11 +16,18 @@
 
 package org.citrusframework.distribution.junit;
 
+import java.util.HashMap;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
 
 import org.citrusframework.distribution.config.DistributionSettings;
+import org.junit.platform.engine.TestExecutionResult;
 import org.junit.platform.launcher.Launcher;
 import org.junit.platform.launcher.LauncherInterceptor;
+import org.junit.platform.launcher.TestExecutionListener;
+import org.junit.platform.launcher.TestIdentifier;
 
 /**
  * JUnit Platform {@link LauncherInterceptor} wrapping coordinator {@link Launcher} instances with
@@ -30,6 +37,7 @@ public class DistributionLauncherInterceptor implements LauncherInterceptor {
 
     private static final AtomicInteger LOCAL_EXECUTIONS = new AtomicInteger();
     private static final ThreadLocal<Boolean> LOCAL_SCOPE = new ThreadLocal<>();
+    private static final Map<Thread, Integer> LOCAL_TEST_THREADS = new ConcurrentHashMap<>();
 
     @Override
     @SuppressWarnings("unchecked")
@@ -50,7 +58,7 @@ public class DistributionLauncherInterceptor implements LauncherInterceptor {
     }
 
     static boolean isInLocalScope() {
-        return Boolean.TRUE.equals(LOCAL_SCOPE.get());
+        return Boolean.TRUE.equals(LOCAL_SCOPE.get()) || LOCAL_TEST_THREADS.containsKey(Thread.currentThread());
     }
 
     static void runLocally(Runnable run) {
@@ -66,6 +74,51 @@ public class DistributionLauncherInterceptor implements LauncherInterceptor {
         } finally {
             LOCAL_EXECUTIONS.decrementAndGet();
             LOCAL_SCOPE.remove();
+        }
+    }
+
+    static void runLocally(TestExecutionListener[] listeners, Consumer<TestExecutionListener[]> execute) {
+        try (var scope = new LocalTestScope()) {
+            TestExecutionListener[] scopedListeners = new TestExecutionListener[listeners.length + 1];
+            scopedListeners[0] = scope;
+            System.arraycopy(listeners, 0, scopedListeners, 1, listeners.length);
+            runLocally(() -> execute.accept(scopedListeners));
+        }
+    }
+
+    /** Tracks actual local JUnit execution threads, including threads supplied by its parallel executor. */
+    private static final class LocalTestScope implements TestExecutionListener, AutoCloseable {
+
+        private final Map<String, Thread> executions = new HashMap<>();
+        private boolean closed;
+
+        @Override
+        public synchronized void executionStarted(TestIdentifier identifier) {
+            if (!closed) {
+                Thread thread = Thread.currentThread();
+                if (executions.putIfAbsent(identifier.getUniqueId(), thread) == null) {
+                    LOCAL_TEST_THREADS.merge(thread, 1, Integer::sum);
+                }
+            }
+        }
+
+        @Override
+        public synchronized void executionFinished(TestIdentifier identifier, TestExecutionResult result) {
+            Thread thread = executions.remove(identifier.getUniqueId());
+            if (thread != null) {
+                release(thread);
+            }
+        }
+
+        @Override
+        public synchronized void close() {
+            closed = true;
+            executions.values().forEach(LocalTestScope::release);
+            executions.clear();
+        }
+
+        private static void release(Thread thread) {
+            LOCAL_TEST_THREADS.computeIfPresent(thread, (key, count) -> count == 1 ? null : count - 1);
         }
     }
 

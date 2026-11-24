@@ -383,7 +383,7 @@ public class DistributedLauncher implements Launcher {
 
     private void executeDelegateLocally(TestPlan testPlan, TestExecutionListener[] callListeners) {
         var listeners = combineListeners(callListeners).toArray(TestExecutionListener[]::new);
-        DistributionLauncherInterceptor.runLocally(() -> delegate.execute(testPlan, listeners));
+        DistributionLauncherInterceptor.runLocally(listeners, scoped -> delegate.execute(testPlan, scoped));
     }
 
     private static boolean shouldBypassRemoteDistribution(DiscoveredWorkExtractor.ExtractedWork extracted,

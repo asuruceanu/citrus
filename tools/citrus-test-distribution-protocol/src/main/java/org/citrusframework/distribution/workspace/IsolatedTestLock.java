@@ -29,6 +29,7 @@ import java.util.concurrent.CancellationException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.BooleanSupplier;
+import java.util.stream.Stream;
 
 import org.citrusframework.distribution.model.WorkUnitSpec;
 
@@ -55,7 +56,10 @@ public final class IsolatedTestLock implements AutoCloseable {
                                            BooleanSupplier cancelled) throws IOException, InterruptedException {
         checkCancellation(cancelled);
         if (JVM_LOCK.isHeldByCurrentThread()
-                || units.stream().map(WorkUnitSpec::className).distinct().noneMatch(name -> isIsolated(name, loader))) {
+                || units.stream()
+                        .flatMap(unit -> Stream.concat(Stream.of(unit.className()), unit.enclosingClassNames().stream()))
+                        .distinct()
+                        .noneMatch(name -> isIsolated(name, loader))) {
             return null;
         }
 

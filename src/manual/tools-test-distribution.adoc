@@ -441,10 +441,10 @@ fallback, still apply. For a worker-only verification, disable local fallback an
 (`minRemoteDurationMs` and `minRemoteColdUnits`) to zero. A test with an effective `@RemoteOnly` requirement is
 ineligible for local execution.
 
-A local test's nested launcher stays on the host when it runs on the same thread. For an embedded JUnit launcher
-running on another thread, including an existing executor thread, set the per-request configuration parameter
-`citrus.junit.jupiter.embeddedLauncher=true` on its discovery request. Citrus's Jupiter engine marks its embedded
-requests automatically. Independent launchers use normal placement rules.
+A nested launcher stays on the host when it runs on a thread executing the local test plan. When a test submits its
+embedded JUnit launch to a separate executor, set the per-request configuration parameter
+`citrus.junit.jupiter.embeddedLauncher=true` on its discovery request. Independent launches, including direct calls
+to the Citrus Jupiter engine, use normal placement rules.
 
 
 For the Citrus JBang CLI `RunTest`, resolve the runtime dependencies of `citrus-groovy`, `citrus-cucumber` and
@@ -453,7 +453,7 @@ For the Citrus JBang CLI `RunTest`, resolve the runtime dependencies of `citrus-
 For the JBang connector, use the method selectors for `JBangTestEngineTest` and run workers with Java and JBang.
 Set `CITRUS_JBANG_EXECUTABLE` on a worker to select a provisioned executable. Workers need access to the JBang app
 catalog and its dependencies or an already populated cache. Distribution serializes partitions containing Jupiter
-`@Isolated` classes that share the same JVM user home, including local distribution fallback. Use current launchers
+`@Isolated` classes or their nested tests that share the same JVM user home, including local distribution fallback. Use current launchers
 and workers so both observe the same lock.
 
 For the Maven Quarkus integration test, use upgraded workers advertising `citrus.workspace.quarkus.v1=true`.
