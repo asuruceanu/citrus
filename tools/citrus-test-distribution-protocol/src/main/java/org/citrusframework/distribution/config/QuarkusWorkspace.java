@@ -30,6 +30,7 @@ public record QuarkusWorkspace(String modelPath, Map<Integer, String> classpathD
 
     public static final String PROPERTY = "citrus.test.distribution.internal.quarkusWorkspace";
     public static final String CAPABILITY = "citrus.workspace.quarkus.v1";
+    public static final String MODEL_FORMAT_PROPERTY = "quarkus.bootstrap.application-model.serialization.format";
     public static final String MODEL_PROPERTY = "quarkus-internal-test.serialized-app-model.path";
 
     /** A location in the transferred classpath, or a path relative to the partition workspace. */

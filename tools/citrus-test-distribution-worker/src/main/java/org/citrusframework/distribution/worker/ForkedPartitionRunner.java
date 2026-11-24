@@ -64,6 +64,7 @@ import org.citrusframework.distribution.cache.BlobCacheDirectory;
 import org.citrusframework.distribution.cache.WorkspacePackager;
 import org.citrusframework.distribution.config.DistributionJson;
 import org.citrusframework.distribution.config.DistributionSettings;
+import org.citrusframework.distribution.config.ForkedJvmOptions;
 import org.citrusframework.distribution.config.QuarkusWorkspace;
 import org.citrusframework.distribution.model.ArtifactKind;
 import org.citrusframework.distribution.model.ArtifactRef;
@@ -73,6 +74,8 @@ import org.citrusframework.distribution.model.WorkspaceFileSet;
 import org.junit.platform.engine.CancellationToken;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import tools.jackson.core.type.TypeReference;
 
 /**
  * Runs a partition in a short-lived child JVM whose working directory is a private workspace.
@@ -293,8 +296,15 @@ final class ForkedPartitionRunner implements PartitionRunner {
             Map<String, String> properties = new LinkedHashMap<>(
                     IsolatedPartitionRunner.workspaceOverrides(assignment.systemProperties(), workspace));
             properties.remove(QuarkusWorkspace.PROPERTY);
+            String optionsJson = properties.remove(ForkedJvmOptions.PROPERTY);
+            List<String> testJvmOptions = optionsJson == null ? List.of()
+                    : DistributionJson.mapper().readValue(optionsJson, new TypeReference<List<String>>() {});
+            if (testJvmOptions.stream().anyMatch(option -> option == null || !ForkedJvmOptions.supported(option))) {
+                throw new IOException("Unsupported build JVM option in partition assignment");
+            }
             if (quarkusModel != null) {
                 properties.put(QuarkusWorkspace.MODEL_PROPERTY, quarkusModel.toString());
+                properties.put(QuarkusWorkspace.MODEL_FORMAT_PROPERTY, "json");
             }
             IsolatedPartitionRunner.addWorkspaceLeaseTicket(properties, fork.workspace);
             properties.put(DistributionSettings.ROLE_PROPERTY, DistributionSettings.ROLE_WORKER);
@@ -324,7 +334,7 @@ final class ForkedPartitionRunner implements PartitionRunner {
                         fork.workspace.markLaunching();
                         try {
                             fork.process = launch(argfile, request, server.getLocalPort(), workspace, workingDirectory,
-                                    fork.tmpDir);
+                                    fork.tmpDir, testJvmOptions);
                         } catch (IOException e) {
                             try {
                                 fork.workspace.markLaunchFailed();
@@ -611,14 +621,15 @@ final class ForkedPartitionRunner implements PartitionRunner {
     static final List<String> CHILD_SYSTEM_PROPERTIES = List.of(
             "-D" + DistributionSettings.ROLE_PROPERTY + "=" + DistributionSettings.ROLE_WORKER);
 
-    private Process launch(Path argfile, Path request, int port, Path workspace, Path workingDirectory, Path tmpDir)
-            throws IOException {
+    private Process launch(Path argfile, Path request, int port, Path workspace, Path workingDirectory, Path tmpDir,
+                           List<String> testJvmOptions) throws IOException {
         String java = Path.of(System.getProperty("java.home"), "bin",
                 File.separatorChar == '\\' ? "java.exe" : "java").toString();
         List<String> command = new ArrayList<>();
         command.add(java);
         command.add("@" + argfile);
         command.addAll(config.forkJvmArgs());
+        command.addAll(testJvmOptions);
         command.add("-Djava.io.tmpdir=" + tmpDir);
         command.addAll(CHILD_SYSTEM_PROPERTIES);
         command.add("-Dbasedir=" + workspace);

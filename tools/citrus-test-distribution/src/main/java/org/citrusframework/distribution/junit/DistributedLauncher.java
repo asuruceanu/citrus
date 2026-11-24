@@ -39,6 +39,7 @@ import org.citrusframework.distribution.cache.WorkspacePackager;
 import org.citrusframework.distribution.config.PathRewriter;
 import org.citrusframework.distribution.config.DistributionJson;
 import org.citrusframework.distribution.config.DistributionSettings;
+import org.citrusframework.distribution.config.ForkedJvmOptions;
 import org.citrusframework.distribution.config.QuarkusWorkspace;
 import org.citrusframework.distribution.model.ArtifactRef;
 import org.citrusframework.distribution.model.BrokerEvent;
@@ -59,6 +60,8 @@ import org.junit.platform.launcher.LauncherDiscoveryRequest;
 import org.junit.platform.launcher.LauncherExecutionRequest;
 import org.junit.platform.launcher.TestExecutionListener;
 import org.junit.platform.launcher.TestPlan;
+
+import tools.jackson.core.type.TypeReference;
 
 /**
  * Decorating JUnit Platform {@link Launcher} that partitions discovered tests across Citrus Test Distribution
@@ -168,6 +171,7 @@ public class DistributedLauncher implements Launcher {
 
         // Inputs are packaged before the coordinator is contacted, so a missing required input fails fast.
         WorkspaceSettings workspace = WorkspaceSettings.resolve();
+        List<String> testJvmOptions = ForkedJvmOptions.capture();
 
         String brokerUrl = DistributionSettings.getBrokerUrl();
         String authToken = DistributionSettings.getAuthToken();
@@ -249,18 +253,24 @@ public class DistributedLauncher implements Launcher {
                 new LocalFallbackExecutor.LocalExecutionStats(0, 0, 0, 0L);
 
         try {
-            PackagedClasspath packaged = packageCurrentClasspath(workspace.additionalClasspath());
+            Map<Path, String> mavenOutputs = mavenOutputDirectories();
+            PackagedClasspath packaged = packageCurrentClasspath(workspace.additionalClasspath(), mavenOutputs);
             Map<String, ClasspathPackager.PackagedArtifact> uploadable = new LinkedHashMap<>(packaged.byDigest());
             List<WorkspaceFileSet> inputs = new ArrayList<>(workspace.inputArtifacts());
             List<WorkUnitSpec> remoteUnits = extracted.remoteUnits();
             Map<String, String> properties = PathRewriter.rewriteHostProperties(
                     collectPropagatedProperties(), workspace.hostBaseDir());
+            if (!testJvmOptions.isEmpty()) {
+                properties.put(ForkedJvmOptions.PROPERTY, DistributionJson.toJson(testJvmOptions));
+                remoteUnits = remoteUnits.stream().map(unit -> requireCapability(unit, ForkedJvmOptions.CAPABILITY)).toList();
+            }
             if (workspace.quarkusModel() != null) {
                 QuarkusBootstrapInputs quarkus = QuarkusBootstrapInputs.prepare(workspace.quarkusModel(),
-                        workspace.hostBaseDir(), packaged.paths(), workspace::launcherCache, inputs);
+                        workspace.hostBaseDir(), workspace.hostBuildDir(), packaged.paths(), mavenOutputs.keySet(),
+                        workspace::launcherCache, inputs);
                 inputs.addAll(quarkus.inputs());
                 properties.put(QuarkusWorkspace.PROPERTY, DistributionJson.toJson(quarkus.layout()));
-                remoteUnits = remoteUnits.stream().map(QuarkusBootstrapInputs::requireCompatibleWorker).toList();
+                remoteUnits = remoteUnits.stream().map(unit -> requireCapability(unit, QuarkusWorkspace.CAPABILITY)).toList();
             }
             for (WorkspaceFileSet input : inputs) {
                 uploadable.putIfAbsent(input.artifact().sha256(), new ClasspathPackager.PackagedArtifact(
@@ -291,7 +301,7 @@ public class DistributedLauncher implements Launcher {
                     uploadedCount,
                     inputs,
                     workspace.outputPaths(),
-                    workspace.forkWorkspace(),
+                    workspace.forkWorkspace() || !testJvmOptions.isEmpty(),
                     workspace.partitionPolicy(),
                     workspace.workingDirectory()));
 
@@ -591,8 +601,27 @@ public class DistributedLauncher implements Launcher {
         return List.copyOf(paths);
     }
 
-    private static PackagedClasspath packageCurrentClasspath(List<Path> additionalWorkerClasspath) throws IOException {
-        String cp = System.getProperty("java.class.path", "");
+    private static Map<Path, String> mavenOutputDirectories() {
+        String encoded = System.getProperty(DistributionSettings.MAVEN_OUTPUT_DIRECTORIES_PROPERTY);
+        if (encoded == null) {
+            return Map.of();
+        }
+        Map<String, String> paths = DistributionJson.mapper().readValue(encoded, new TypeReference<>() {});
+        Map<Path, String> result = new LinkedHashMap<>();
+        paths.forEach((path, artifactId) -> result.put(Path.of(path).normalize(), artifactId));
+        return result;
+    }
+
+    private static WorkUnitSpec requireCapability(WorkUnitSpec unit, String capability) {
+        Map<String, String> capabilities = new LinkedHashMap<>(unit.requiredCapabilities());
+        capabilities.put(capability, "true");
+        return new WorkUnitSpec(unit.key(), unit.className(), unit.methodName(), unit.dynamicSourceName(), capabilities,
+                unit.estimatedDurationMs(), unit.enclosingClassNames());
+    }
+
+    private static PackagedClasspath packageCurrentClasspath(List<Path> additionalWorkerClasspath,
+                                                             Map<Path, String> mavenOutputs) throws IOException {
+        String cp = System.getProperty("surefire.test.class.path", System.getProperty("java.class.path", ""));
         Set<Path> classpath = new LinkedHashSet<>();
         for (String entry : cp.split(File.pathSeparator)) {
             if (!entry.isBlank()) {
@@ -607,7 +636,7 @@ public class DistributedLauncher implements Launcher {
         List<ArtifactRef> artifacts = new ArrayList<>();
         Map<String, ClasspathPackager.PackagedArtifact> byDigest = new LinkedHashMap<>();
         for (Path path : classpath) {
-            ClasspathPackager.PackagedArtifact packaged = ClasspathPackager.packagePath(path);
+            ClasspathPackager.PackagedArtifact packaged = ClasspathPackager.packagePath(path, mavenOutputs.get(path));
             artifacts.add(packaged.ref());
             byDigest.putIfAbsent(packaged.ref().sha256(), packaged);
         }

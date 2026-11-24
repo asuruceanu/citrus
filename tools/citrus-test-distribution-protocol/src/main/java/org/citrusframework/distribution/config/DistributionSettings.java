@@ -146,6 +146,9 @@ public final class DistributionSettings {
 
     public static final String BASEDIR_PROPERTY = "citrus.test.distribution.basedir";
 
+    /** Effective Maven reactor output directories keyed by absolute path, with their artifact IDs as values. */
+    public static final String MAVEN_OUTPUT_DIRECTORIES_PROPERTY = "citrus.test.distribution.internal.mavenOutputs";
+
     /** Host build output directory, supplied by the build-tool integration when available. */
     public static final String BUILD_DIRECTORY_PROPERTY = "citrus.test.distribution.buildDirectory";
 

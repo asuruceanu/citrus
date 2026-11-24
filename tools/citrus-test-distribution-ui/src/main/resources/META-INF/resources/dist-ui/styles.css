@@ -523,6 +523,58 @@ pre,
   box-shadow: 0 0 0 3px var(--citrus-orange-soft);
 }
 
+.dashboard-select {
+  position: relative;
+  display: inline-grid;
+  min-width: min(10rem, 100%);
+  max-width: 100%;
+}
+
+.dashboard-select::after {
+  content: '';
+  position: absolute;
+  inset-inline-end: 0.85rem;
+  top: 50%;
+  width: 0.42rem;
+  height: 0.42rem;
+  border: solid var(--text-muted);
+  border-width: 0 1.5px 1.5px 0;
+  transform: translateY(-70%) rotate(45deg);
+  pointer-events: none;
+}
+
+.dashboard-select select {
+  appearance: none;
+  width: 100%;
+  min-width: 0;
+  min-height: 36px;
+  padding-block: 0.35rem;
+  padding-inline: 0.75rem 2rem;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  background: var(--bg-card);
+  color: var(--text-primary);
+  box-shadow: var(--shadow-sm);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  cursor: pointer;
+}
+
+.dashboard-select select:hover { background: var(--bg-hover); }
+.dashboard-select select:focus-visible {
+  outline: 2px solid var(--citrus-orange);
+  outline-offset: 2px;
+}
+[data-theme="dark"] .dashboard-select select { color-scheme: dark; }
+.session-switcher { min-width: min(14rem, 100%); }
+
+@media (forced-colors: active) {
+  .dashboard-select select { appearance: auto; }
+  .dashboard-select::after { content: none; }
+}
+
 .pill-group {
   display: inline-flex;
   align-items: center;
@@ -1230,17 +1282,15 @@ tbody tr.clickable-row:hover {
   margin-bottom: 1rem;
 }
 .history-controls .toolbar { margin-bottom: 0; justify-content: flex-start; flex-wrap: wrap; }
-.history-controls select {
-  min-width: 10rem;
-  max-width: 100%;
-  min-height: 38px;
-  padding: 0.4rem 0.65rem;
-  border: 1px solid var(--border-strong);
-  border-radius: 0.5rem;
-  background: var(--bg-card);
-  color: var(--text-primary);
-  font: inherit;
+.history-controls .pill-group { justify-self: start; }
+.history-filter-note { margin: 0; color: var(--text-muted); font-size: 0.8125rem; }
+.history-recovery { margin-top: 0.35rem; color: var(--amber-text); font-size: 0.75rem; }
+@media (max-width: 600px) {
+  .history-controls .toolbar { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .history-controls .search-input { grid-column: 1 / -1; min-width: 0; }
+  .history-controls .dashboard-select { min-width: 0; }
 }
+
 .history-filter-count {
   margin-left: 0.25rem;
   font-variant-numeric: tabular-nums;

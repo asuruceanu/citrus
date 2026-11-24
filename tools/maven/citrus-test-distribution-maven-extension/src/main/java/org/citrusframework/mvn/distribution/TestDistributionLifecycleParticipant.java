@@ -33,6 +33,7 @@ import org.apache.maven.AbstractMavenLifecycleParticipant;
 import org.apache.maven.MavenExecutionException;
 import org.apache.maven.execution.MavenSession;
 import org.apache.maven.project.MavenProject;
+import org.citrusframework.distribution.config.DistributionJson;
 import org.citrusframework.distribution.config.DistributionSettings;
 import org.citrusframework.distribution.junit.BrokerHttpClient;
 import org.citrusframework.distribution.junit.DistributionLauncherInterceptor;
@@ -158,10 +159,28 @@ public class TestDistributionLifecycleParticipant extends AbstractMavenLifecycle
         }
 
         if (session.getProjects() != null) {
+            Map<String, String> outputDirectories = new LinkedHashMap<>();
+            List<MavenProject> reactor = session.getAllProjects() == null ? session.getProjects() : session.getAllProjects();
+            for (MavenProject project : reactor) {
+                if (project.getBuild() != null && project.getBasedir() != null) {
+                    addOutputDirectory(outputDirectories, project, project.getBuild().getOutputDirectory());
+                    addOutputDirectory(outputDirectories, project, project.getBuild().getTestOutputDirectory());
+                }
+            }
+            if (!outputDirectories.isEmpty()) {
+                sharedProps.put(DistributionSettings.MAVEN_OUTPUT_DIRECTORIES_PROPERTY, DistributionJson.toJson(outputDirectories));
+            }
             for (MavenProject project : session.getProjects()) {
                 SurefirePluginMutator.configureProject(project, sessionId, runtimeJars, sharedProps,
                         session.getUserProperties(), System::getenv);
             }
+        }
+    }
+
+    private static void addOutputDirectory(Map<String, String> directories, MavenProject project, String output) {
+        if (output != null && !output.isBlank()) {
+            Path directory = project.getBasedir().toPath().toAbsolutePath().resolve(output).normalize();
+            directories.putIfAbsent(directory.toString(), project.getArtifactId());
         }
     }
 

@@ -12,7 +12,7 @@ const POLL_INTERVAL_MS = 4000;
 // Full session detail can be several MB for large suites: reload it at most this often during live updates.
 const DETAIL_MIN_INTERVAL_MS = 2000;
 const VALID_DETAIL_TABS = new Set(['waterfall', 'tests', 'failures', 'files']);
-const INTERNAL_WORKSPACE_CAPABILITIES = new Set(['citrus.workspace.v1', 'citrus.workspace.quarkus.v1']);
+const INTERNAL_WORKSPACE_CAPABILITIES = new Set(['citrus.workspace.v1', 'citrus.workspace.quarkus.v1', 'citrus.workspace.jvm-options.v1']);
 
 function visibleCapabilities(capabilities) {
   return Object.entries(capabilities || {}).filter(([key]) => !INTERNAL_WORKSPACE_CAPABILITIES.has(key));
@@ -85,6 +85,9 @@ function buildHash() {
   if (state.view === 'session-detail' && state.selectedSessionId) {
     return `#session/${encodeURIComponent(state.selectedSessionId)}/${state.detailTab || 'waterfall'}`;
   }
+  if (state.view === 'history' && state.historyOutcome !== 'all') {
+    return `#history?outcome=${state.historyOutcome}`;
+  }
   return `#${state.view || 'overview'}`;
 }
 
@@ -120,7 +123,17 @@ function applyHashFromLocation() {
       return true;
     }
   }
-  if (['overview', 'sessions', 'session-detail', 'workers', 'history'].includes(raw)) {
+  const [view, query] = raw.split('?', 2);
+  if (view === 'history') {
+    const outcome = new URLSearchParams(query).get('outcome');
+    state.historyOutcome = ['failed', 'flaky'].includes(outcome) ? outcome : 'all';
+    state.historyProject = '';
+    state.historyQuery = '';
+    state.historyRunDetails = null;
+    state.view = 'history';
+    return true;
+  }
+  if (['overview', 'sessions', 'session-detail', 'workers'].includes(raw)) {
     state.view = raw;
     return true;
   }
@@ -138,6 +151,14 @@ function setView(view, detailTab = null) {
   if (HISTORY_VIEWS.has(view)) {
     loadHistory(true);
   }
+}
+
+function openFlakyHistory() {
+  state.historyOutcome = 'flaky';
+  state.historyProject = '';
+  state.historyQuery = '';
+  state.historyRunDetails = null;
+  setView('history');
 }
 
 function requireApiAccess(response) {
@@ -492,10 +513,15 @@ function renderSidebar() {
     state.mobileMenuOpen ? 'mobile-open' : ''
   ].filter(Boolean).join(' ');
 
-  const navItem = (id, label, iconChar, badgeVal) => html`
+  const navItem = (id, label, iconChar, badgeVal, onOpen) => html`
     <button
       class=${`nav-btn ${state.view === id ? 'active' : ''}`}
+      title=${onOpen ? 'Show tests recovered on retry' : label}
       onClick=${() => {
+        if (onOpen) {
+          onOpen();
+          return;
+        }
         if (id === 'session-detail' && !state.sessionDetail && state.sessions.length > 0) {
           loadSessionDetail(state.sessions[0].sessionId, true);
           return;
@@ -520,7 +546,8 @@ function renderSidebar() {
         ${navItem('session-detail', 'Session Waterfall', '⇶', state.sessionDetail ? state.sessionDetail.session.status : null)}
         <div class="nav-section-label" style="margin-top:10px">Infrastructure & Quality</div>
         ${navItem('workers', 'Workers Pool', '⚙', `${activeWorkers}/${state.workers.length}`)}
-        ${navItem('history', 'Test History & Flakiness', '⚡', flakyCount > 0 ? `${flakyCount} flaky` : state.history.length)}
+        ${navItem('history', 'Test History & Flakiness', '⚡',
+          flakyCount > 0 ? `${flakyCount} flaky` : state.history.length, flakyCount > 0 ? openFlakyHistory : null)}
       </div>
 
       <div class="sidebar-footer">
@@ -1156,17 +1183,14 @@ function renderSessionDetail() {
               title="Cancel active worker partitions and abort this build session"
             >✕ Abort Session</button>
           ` : null}
-          <select
-            class="search-input"
-            style="min-width:220px"
-            aria-label="Switch build session"
-            value=${session.sessionId}
-            onChange=${e => loadSessionDetail(e.target.value, false)}
-          >
-            ${state.sessions.map(s => html`
-              <option value=${s.sessionId}>${s.sessionId} (${s.status})</option>
-            `)}
-          </select>
+          <span class="dashboard-select session-switcher">
+            <select aria-label="Switch build session" data-focus-id="session-switcher"
+                value=${session.sessionId} onChange=${e => loadSessionDetail(e.target.value, false)}>
+              ${state.sessions.map(s => html`
+                <option value=${s.sessionId}>${s.sessionId} (${s.status})</option>
+              `)}
+            </select>
+          </span>
         </div>
       </div>
 
@@ -1585,14 +1609,14 @@ async function openHistoryRuns(test) {
 function renderTestHistory() {
   const q = state.historyQuery.trim().toLowerCase();
   const projects = new Map(state.history.map(h => [h.projectScope || 'name:', historyProjectLabel(h)]));
-  const inProject = state.history.filter(h => !state.historyProject
-    || (h.projectScope || 'name:') === state.historyProject);
-  const filtered = inProject.filter(h => {
-    if (state.historyOutcome === 'flaky' && !h.flakyRuns) return false;
-    if (state.historyOutcome === 'failed' && h.lastStatus !== 'FAILED') return false;
-    return !q || [h.className, h.testName, h.workUnitKey, historyProjectLabel(h)]
-      .some(value => (value || '').toLowerCase().includes(q));
-  });
+  const matching = state.history.filter(h =>
+    (!state.historyProject || (h.projectScope || 'name:') === state.historyProject)
+    && (!q || [h.className, h.testName, h.workUnitKey, historyProjectLabel(h)]
+      .some(value => (value || '').toLowerCase().includes(q))));
+  const failed = matching.filter(h => h.lastStatus === 'FAILED');
+  const flaky = matching.filter(h => h.flakyRuns > 0);
+  const filtered = state.historyOutcome === 'flaky' ? flaky
+    : state.historyOutcome === 'failed' ? failed : [...matching];
   filtered.sort((a, b) => {
     if (state.historySort === 'duration') return b.avgDurationMs - a.avgDurationMs;
     if (state.historySort === 'attempts') return b.totalRuns - a.totalRuns;
@@ -1602,9 +1626,9 @@ function renderTestHistory() {
   const historyPage = paginate('history', filtered, 25,
     `${state.historyProject}|${state.historyOutcome}|${state.historySort}|${q}`);
   const filters = [
-    ['all', 'All tests', inProject.length],
-    ['failed', 'Last attempt failed', inProject.filter(h => h.lastStatus === 'FAILED').length],
-    ['flaky', 'Recovered on retry', inProject.filter(h => h.flakyRuns > 0).length]
+    ['all', 'All tests', matching.length],
+    ['failed', 'Last attempt failed', failed.length],
+    ['flaky', 'Flaky', flaky.length]
   ];
 
   return html`
@@ -1621,28 +1645,36 @@ function renderTestHistory() {
           <input class="search-input" data-focus-id="history-search" type="search" aria-label="Search tests"
             placeholder="Search by test class or method…" value=${state.historyQuery}
             onInput=${e => { state.historyQuery = e.target.value; renderApp(); }} />
-          <select aria-label="Project" data-focus-id="history-project" value=${state.historyProject}
-              onChange=${e => { state.historyProject = e.target.value; renderApp(); }}>
-            <option value="">All projects</option>
-            ${[...projects].sort((a, b) => a[1].localeCompare(b[1])).map(([key, label]) =>
-              html`<option value=${key}>${label}</option>`)}
-          </select>
-          <select aria-label="Sort tests" data-focus-id="history-sort" value=${state.historySort}
-              onChange=${e => { state.historySort = e.target.value; renderApp(); }}>
-            <option value="attention">Failures and flaky first</option>
-            <option value="duration">Slowest first</option>
-            <option value="attempts">Most attempts first</option>
-          </select>
+          <span class="dashboard-select">
+            <select aria-label="Project" data-focus-id="history-project" value=${state.historyProject}
+                onChange=${e => { state.historyProject = e.target.value; renderApp(); }}>
+              <option value="">All projects</option>
+              ${[...projects].sort((a, b) => a[1].localeCompare(b[1])).map(([key, label]) =>
+                html`<option value=${key}>${label}</option>`)}
+            </select>
+          </span>
+          <span class="dashboard-select">
+            <select aria-label="Sort tests" data-focus-id="history-sort" value=${state.historySort}
+                onChange=${e => { state.historySort = e.target.value; renderApp(); }}>
+              <option value="attention">Failures and flaky first</option>
+              <option value="duration">Slowest first</option>
+              <option value="attempts">Most attempts first</option>
+            </select>
+          </span>
         </div>
         <div class="pill-group" aria-label="Filter by outcome">
           ${filters.map(([id, label, count]) => html`
             <button class=${`filter-pill${state.historyOutcome === id ? ' active' : ''}`}
                 aria-pressed=${String(state.historyOutcome === id)}
-                onClick=${() => { state.historyOutcome = id; renderApp(); }}>
+                data-focus-id=${`history-filter-${id}`}
+                onClick=${() => { state.historyOutcome = id; syncHash(); renderApp(); }}>
               ${label} <span class="history-filter-count">${count}</span>
             </button>
           `)}
         </div>
+        ${state.historyOutcome === 'flaky' ? html`
+          <p class="history-filter-note">Tests that passed after a worker retry. Select View runs to see the attempts by session.</p>
+        ` : null}
       </div>
 
       <div class="card">
@@ -1676,7 +1708,7 @@ function renderTestHistory() {
                         <td class="mono">${formatDuration(h.avgDurationMs)}</td>
                         <td>
                           ${statusBadge(h.lastStatus)}
-                          ${h.flakyRuns > 0 ? html`<div class="history-test-context">${h.flakyRuns} recovered</div>` : null}
+                          ${h.flakyRuns > 0 ? html`<div class="history-recovery">${h.flakyRuns} ${h.flakyRuns === 1 ? "recovery" : "recoveries"}</div>` : null}
                         </td>
                         <td><button type="button" class="btn btn-sm history-open"
                             data-focus-id=${`history-runs-${index}`} onClick=${() => openHistoryRuns(h)}>View runs →</button></td>
@@ -2007,6 +2039,7 @@ window.addEventListener('hashchange', () => {
       return;
     }
     renderApp();
+    if (state.view === 'history') loadHistory();
   }
 });
 

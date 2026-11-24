@@ -325,7 +325,9 @@ Workers that report local file cache statistics show a `Local File Cache` sectio
 
 ==== Test History and Flakiness (`#history`)
 
-Displays cross-session historical aggregates from `/api/v1/tests/history` (`Total Runs`, `Pass Rate` computed from `passedRuns / totalRuns`, `Flaky Retries`, `Avg Duration`, `Max Duration`, and `Last Status`), with search and a `⚡ Flaky Only` toggle to isolate unstable integration tests.
+Search cross-session test history by project, class, or method. The sidebar's flaky count opens the *Flaky* filter
+(`#history?outcome=flaky`), which shows tests that passed on a worker retry. Choose *View runs* to see attempts
+grouped by build session and open the session that recorded a recovery.
 
 [[tools-test-distribution-workers]]
 == Worker Pool and Citrus Agent Mode
@@ -455,9 +457,11 @@ Set `CITRUS_JBANG_EXECUTABLE` on a worker to select a provisioned executable. Wo
 catalog and its dependencies or an already populated cache. Distribution serializes partitions containing Jupiter
 `@Isolated` classes or their nested tests that share the same JVM user home, including local distribution fallback.
 
-The Quarkus test requires workers advertising `citrus.workspace.quarkus.v1=true`. The distribution launcher transfers
-the Maven-generated `quarkus/bootstrap` directory and model dependencies and remaps model paths in the forked worker
-workspace.
+Quarkus tests require workers advertising `citrus.workspace.quarkus.v1=true`. The launcher reads the model path
+supplied by Quarkus, transfers the generated model and its dependencies, and remaps their paths in the forked
+worker workspace. Quarkus versions with JSON model support can use either JSON or Java serialization on the build host.
+Custom Quarkus class output directories still need to be supported by the Quarkus test launcher, including
+`TEST_TO_MAIN_MAPPINGS` where applicable.
 
 [source,bash]
 ----
@@ -560,8 +564,14 @@ the local one — `target/` for Surefire tests in the Citrus build, the module d
 System properties forwarded to workers that contain the module path (for example `project.build.directory` or a
 configured file path) are rewritten to the workspace: the module path is replaced by the token `${citrus.dist.workspace}`
 on the host and expanded on the worker. Only whole path segments are replaced (a sibling such as `/work/app-other` stays
-untouched), including inside `file:` URIs, JDBC URLs, path lists and `@argument` files. URL-encoded or otherwise escaped
-paths are not rewritten.
+untouched), including inside `file:` URIs, JDBC URLs, path lists and `@argument` files. Windows path separators inside
+matched paths are normalized for transfer. URL-encoded paths and embedded path-list delimiters retain their original
+form.
+
+Citrus Test Distribution forwards portable module-access JVM options such as `--add-opens` and `--add-exports` and
+the `--enable-preview` switch from the build test JVM to a compatible forked worker. Configure worker-specific JVM
+options such as heap limits and agent paths with `citrus.test.distribution.worker.forkJvmArgs`. Maven reactor directory
+entries use their effective output directories and artifact IDs when available.
 
 [[tools-test-distribution-external-resources-outputs]]
 === Outputs

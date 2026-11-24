@@ -37,7 +37,7 @@ import java.util.Set;
  * Windows and case-sensitive elsewhere. URL-encoded or otherwise escaped forms (other than
  * Java-properties style doubled backslashes on Windows) are not recognized. On expansion only a
  * single separator directly after the token is normalized, so a doubled (escaped) backslash after the
- * token keeps its second backslash.
+ * token keeps its second backslash. New Windows submissions canonicalize path separators on the build host.
  */
 public final class PathRewriter {
 
@@ -62,7 +62,7 @@ public final class PathRewriter {
         }
         List<String> candidates = hostPrefixCandidates(hostBaseDir);
         props.forEach((key, value) ->
-                result.put(key, candidates.isEmpty() ? value : rewriteValue(value, candidates, WINDOWS)));
+                result.put(key, candidates.isEmpty() ? value : rewriteValue(value, candidates, WINDOWS, WINDOWS)));
         return result;
     }
 
@@ -123,6 +123,10 @@ public final class PathRewriter {
      * Replaces boundary-delimited occurrences of {@code candidates} (ordered longest first) in {@code value}.
      */
     static String rewriteValue(String value, List<String> candidates, boolean ignoreCase) {
+        return rewriteValue(value, candidates, ignoreCase, false);
+    }
+
+    static String rewriteValue(String value, List<String> candidates, boolean ignoreCase, boolean canonicalize) {
         if (value == null || value.isEmpty()) {
             return value;
         }
@@ -151,6 +155,20 @@ public final class PathRewriter {
             }
             out.append(value, copiedUpTo, i).append(DistributionSettings.WORKSPACE_TOKEN);
             i += match.length();
+            if (canonicalize && i < value.length() && (value.charAt(i) == '/' || value.charAt(i) == '\\')) {
+                // Normalize only the matched Windows path. Leave later list entries and other values untouched.
+                boolean escaped = match.contains("\\\\");
+                while (i < value.length() && ":;,\"'<>|?*".indexOf(value.charAt(i)) < 0) {
+                    char c = value.charAt(i++);
+                    if (c == '\\') {
+                        if (escaped && i < value.length() && value.charAt(i) == '\\') {
+                            i++;
+                        }
+                        c = '/';
+                    }
+                    out.append(c);
+                }
+            }
             copiedUpTo = i;
         }
         if (out == null) {

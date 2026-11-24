@@ -83,13 +83,23 @@ public final class ClasspathPackager {
     }
 
     public static PackagedArtifact packagePath(Path path) throws IOException {
+        return packagePath(path, null);
+    }
+
+    /** Packages a classpath entry using its build-provided artifact ID when known. */
+    public static PackagedArtifact packagePath(Path path, String artifactId) throws IOException {
         Path normalized = path.toAbsolutePath().normalize();
         if (Files.isDirectory(normalized)) {
             byte[] zipBytes = createDeterministicZip(normalized);
             String sha256 = sha256Hex(zipBytes);
             String name = normalized.getFileName() != null ? normalized.getFileName().toString() + ".zip" : "classes.zip";
             Path parent = normalized.getParent();
-            if (("classes.zip".equals(name) || "test-classes.zip".equals(name))
+            if (artifactId != null) {
+                String moduleArchive = artifactId + "-classes.zip";
+                if (MAVEN_OUTPUT_ARCHIVE.matcher(moduleArchive).matches()) {
+                    name = moduleArchive;
+                }
+            } else if (("classes.zip".equals(name) || "test-classes.zip".equals(name))
                     && parent != null && parent.endsWith("target") && parent.getParent() != null
                     && parent.getParent().getFileName() != null) {
                 String moduleArchive = parent.getParent().getFileName() + "-" + name;

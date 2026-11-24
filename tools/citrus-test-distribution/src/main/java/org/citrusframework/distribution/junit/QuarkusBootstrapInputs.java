@@ -18,6 +18,8 @@ package org.citrusframework.distribution.junit;
 
 import java.io.File;
 import java.io.IOException;
+import java.io.ObjectInputStream;
+import java.io.ObjectStreamClass;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -35,42 +37,38 @@ import org.citrusframework.distribution.cache.ClasspathPackager;
 import org.citrusframework.distribution.cache.WorkspacePackager;
 import org.citrusframework.distribution.config.DistributionJson;
 import org.citrusframework.distribution.config.QuarkusWorkspace;
-import org.citrusframework.distribution.model.WorkUnitSpec;
+import org.citrusframework.distribution.model.ArtifactKind;
+import org.citrusframework.distribution.model.ArtifactRef;
 import org.citrusframework.distribution.model.WorkspaceFileSet;
 import tools.jackson.databind.JsonNode;
 
 /** Packages Maven's Quarkus test model and the artifacts that its augmentation classloader needs. */
 record QuarkusBootstrapInputs(QuarkusWorkspace layout, List<WorkspaceFileSet> inputs) {
 
-    private static final Path BOOTSTRAP_DIR = Path.of("quarkus", "bootstrap");
-
     static Path findModel(Path moduleDir) {
         String configured = System.getProperty(QuarkusWorkspace.MODEL_PROPERTY);
         if (configured == null || configured.isBlank()) {
             return null;
         }
-        Path model = moduleDir.resolve(configured).normalize();
-        Path parent = model.getParent();
-        return parent != null && parent.startsWith(moduleDir) && parent.endsWith(BOOTSTRAP_DIR) ? model : null;
+        return moduleDir.resolve(configured).normalize();
     }
 
-    static QuarkusBootstrapInputs prepare(Path model, Path moduleDir, List<Path> classpath,
-                                          Supplier<BlobCacheDirectory> cache, List<WorkspaceFileSet> existingInputs)
+    static QuarkusBootstrapInputs prepare(Path model, Path moduleDir, Path buildDir, List<Path> classpath,
+                                          Set<Path> mavenOutputs, Supplier<BlobCacheDirectory> cache,
+                                          List<WorkspaceFileSet> existingInputs)
             throws IOException {
-        JsonNode json = DistributionJson.mapper().readTree(model.toFile());
+        if (!Files.isRegularFile(model) || Files.size(model) > ClasspathPackager.MAX_BLOB_BYTES) {
+            throw new IOException("Missing or oversized Quarkus application model: " + model);
+        }
+        JsonNode json = readModel(model);
         if (json == null || !json.path("app-artifact").isObject() || !json.path("dependencies").isArray()) {
             throw new IOException("Invalid Quarkus application model: " + model);
         }
 
         Map<Path, Integer> classpathIndices = new LinkedHashMap<>();
         Map<Integer, String> classpathDirectories = new LinkedHashMap<>();
-        Path buildDir = model.getParent().getParent().getParent();
         for (int index = 0; index < classpath.size(); index++) {
-            Path path = classpath.get(index);
-            classpathIndices.putIfAbsent(path, index);
-            if (path.startsWith(buildDir) && !path.equals(buildDir) && Files.isDirectory(path)) {
-                classpathDirectories.put(index, relativePath(moduleDir, path));
-            }
+            classpathIndices.putIfAbsent(classpath.get(index), index);
         }
 
         List<JsonNode> artifacts = new ArrayList<>();
@@ -80,6 +78,9 @@ record QuarkusBootstrapInputs(QuarkusWorkspace layout, List<WorkspaceFileSet> in
         Set<Path> requiredPaths = new LinkedHashSet<>();
         Map<Path, String> moduleRoots = new LinkedHashMap<>();
         moduleRoots.put(moduleDir, "");
+        if (!buildDir.startsWith(moduleDir)) {
+            moduleRoots.put(buildDir, WorkspacePackager.DEPENDENCY_STAGING_DIR + "build");
+        }
         for (JsonNode artifact : artifacts) {
             JsonNode module = artifact.path("module");
             Path root = absolutePath(module.path("module-dir").asString(""));
@@ -93,6 +94,14 @@ record QuarkusBootstrapInputs(QuarkusWorkspace layout, List<WorkspaceFileSet> in
         List<Path> roots = moduleRoots.keySet().stream()
                 .sorted(Comparator.comparingInt(Path::getNameCount).reversed()).toList();
 
+        for (int index = 0; index < classpath.size(); index++) {
+            Path path = classpath.get(index);
+            if (Files.isDirectory(path) && ((path.startsWith(buildDir) && !path.equals(buildDir))
+                    || mavenOutputs.contains(path) || requiredPaths.contains(path))) {
+                classpathDirectories.put(index, location(path, Map.of(), moduleRoots, roots).workspacePath());
+            }
+        }
+
         Map<String, QuarkusWorkspace.Location> locations = new LinkedHashMap<>();
         QuarkusWorkspace.rewriteStrings(json, value -> {
             Path path = absolutePath(value);
@@ -103,10 +112,13 @@ record QuarkusBootstrapInputs(QuarkusWorkspace layout, List<WorkspaceFileSet> in
         });
 
         List<WorkspaceFileSet> inputs = new ArrayList<>();
-        String bootstrapDir = relativePath(moduleDir, model.getParent());
-        if (!coveredByInput(bootstrapDir, existingInputs)) {
-            inputs.add(WorkspacePackager.packageInputToCache(cache.get(), moduleDir, bootstrapDir, false).orElseThrow());
-        }
+        // Stage the generated model alone so an external or relocated model does not pull in unrelated siblings.
+        String modelPath = WorkspacePackager.DEPENDENCY_STAGING_DIR + "quarkus/application-model.json";
+        byte[] modelBytes = DistributionJson.mapper().writeValueAsBytes(json);
+        String digest = ClasspathPackager.sha256Hex(modelBytes);
+        cache.get().put(digest, modelBytes);
+        inputs.add(new WorkspaceFileSet(modelPath,
+                new ArtifactRef("application-model.json", digest, ArtifactKind.REGULAR_FILE, modelBytes.length)));
         for (Path required : requiredPaths) {
             QuarkusWorkspace.Location location = location(required, classpathIndices, moduleRoots, roots);
             if (location.classpathIndex() != null || coveredByInput(location.workspacePath(), existingInputs)) {
@@ -117,14 +129,40 @@ record QuarkusBootstrapInputs(QuarkusWorkspace layout, List<WorkspaceFileSet> in
             inputs.add(new WorkspaceFileSet(location.workspacePath(), artifact.artifact()));
         }
         return new QuarkusBootstrapInputs(
-                new QuarkusWorkspace(relativePath(moduleDir, model), classpathDirectories, locations), List.copyOf(inputs));
+                new QuarkusWorkspace(modelPath, classpathDirectories, locations), List.copyOf(inputs));
     }
 
-    static WorkUnitSpec requireCompatibleWorker(WorkUnitSpec unit) {
-        Map<String, String> capabilities = new LinkedHashMap<>(unit.requiredCapabilities());
-        capabilities.put(QuarkusWorkspace.CAPABILITY, "true");
-        return new WorkUnitSpec(unit.key(), unit.className(), unit.methodName(), unit.dynamicSourceName(), capabilities,
-                unit.estimatedDurationMs(), unit.enclosingClassNames());
+    private static JsonNode readModel(Path model) throws IOException {
+        try (var stream = Files.newInputStream(model)) {
+            if (stream.read() != 0xac || stream.read() != 0xed) {
+                return DistributionJson.mapper().readTree(model.toFile());
+            }
+        }
+
+        // Quarkus can emit a Java-serialized model. Convert it using the build's Quarkus model API before transfer.
+        ClassLoader loader = Thread.currentThread().getContextClassLoader();
+        try {
+            Class<?> modelType = Class.forName("io.quarkus.bootstrap.model.ApplicationModel", false, loader);
+            Class<?> factoryType = Class.forName("io.quarkus.bootstrap.model.MappableCollectionFactory", false, loader);
+            var asMap = modelType.getMethod("asMap", factoryType);
+            Object factory = factoryType.getMethod("defaultInstance").invoke(null);
+            try (var input = new ObjectInputStream(Files.newInputStream(model)) {
+                @Override
+                protected Class<?> resolveClass(ObjectStreamClass descriptor) throws ClassNotFoundException, IOException {
+                    try {
+                        return Class.forName(descriptor.getName(), false, loader);
+                    } catch (ClassNotFoundException e) {
+                        return super.resolveClass(descriptor);
+                    }
+                }
+            }) {
+                Object applicationModel = modelType.cast(input.readObject());
+                return DistributionJson.mapper().valueToTree(asMap.invoke(applicationModel, factory));
+            }
+        } catch (ReflectiveOperationException | LinkageError | ClassCastException e) {
+            throw new IOException("Cannot convert the Quarkus Java-serialized model to JSON: " + model
+                    + ". Use a Quarkus version with JSON model support.", e);
+        }
     }
 
     private static QuarkusWorkspace.Location location(Path path, Map<Path, Integer> classpath,
