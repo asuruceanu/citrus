@@ -16,6 +16,8 @@
 
 package org.citrusframework.distribution.model;
 
+import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -37,7 +39,7 @@ public record WorkerRecord(
 ) {
 
     public WorkerRecord {
-        capabilities = capabilities == null ? Map.of() : Map.copyOf(capabilities);
+        capabilities = capabilities == null ? Map.of() : Collections.unmodifiableMap(new LinkedHashMap<>(capabilities));
         warnings = warnings == null ? List.of() : List.copyOf(warnings);
     }
 

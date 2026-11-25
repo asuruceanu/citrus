@@ -16,6 +16,8 @@
 
 package org.citrusframework.distribution.model;
 
+import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.Map;
 
 public record WorkerRegisterPayload(
@@ -29,7 +31,7 @@ public record WorkerRegisterPayload(
 ) {
 
     public WorkerRegisterPayload {
-        capabilities = capabilities == null ? Map.of() : Map.copyOf(capabilities);
+        capabilities = capabilities == null ? Map.of() : Collections.unmodifiableMap(new LinkedHashMap<>(capabilities));
     }
 
     public WorkerRegisterPayload(String workerId, String host, Map<String, String> capabilities, WorkerCacheStats cacheStats) {

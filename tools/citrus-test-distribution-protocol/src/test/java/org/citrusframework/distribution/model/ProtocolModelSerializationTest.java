@@ -25,6 +25,7 @@ import org.citrusframework.distribution.config.DistributionJson;
 import org.junit.jupiter.api.Test;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class ProtocolModelSerializationTest {
 
@@ -83,6 +84,33 @@ class ProtocolModelSerializationTest {
     }
 
     @Test
+    void shouldReadLegacyRegistrationWithNullCapabilityValues() {
+        var registration = DistributionJson.mapper().readValue(
+                """
+                {"workerId":"w1","host":"host","capabilities":{"docker":null,"os":"linux"}}
+                """, WorkerRegisterPayload.class);
+
+        assertThat(registration.capabilities()).containsEntry("docker", null).containsEntry("os", "linux");
+        assertRoundTrip(registration, WorkerRegisterPayload.class);
+        assertThatThrownBy(() -> registration.capabilities().remove("docker"))
+                .isInstanceOf(UnsupportedOperationException.class);
+    }
+
+    @Test
+    void shouldReadLegacyWorkerWithNullCapabilityValues() {
+        var worker = DistributionJson.mapper().readValue(
+                """
+                {"workerId":"w1","host":"host","capabilities":{"docker":null,"os":"linux"},"state":"IDLE",
+                 "lastHeartbeatAt":60,"registeredAt":50}
+                """, WorkerRecord.class);
+
+        assertThat(worker.capabilities()).containsEntry("docker", null).containsEntry("os", "linux");
+        assertRoundTrip(worker, WorkerRecord.class);
+        assertThatThrownBy(() -> worker.capabilities().remove("docker"))
+                .isInstanceOf(UnsupportedOperationException.class);
+    }
+
+    @Test
     void shouldRoundTripHistoricalUsageModels() {
         Map<String, String> capabilities = Map.of("docker", "true");
         var sample = new UsageSampleRecord(100L,
@@ -115,11 +143,13 @@ class ProtocolModelSerializationTest {
         var activeJobs = new ArrayList<>(List.of(new UsageSampleRecord.JobDemandBucket(capabilities, 1, 1, 0)));
         var sample = new UsageSampleRecord(100L, activeJobs, null, null);
         var registration = new WorkerRegisterPayload("w1", "host", capabilities);
+        var worker = new WorkerRecord("w1", "host", capabilities, WorkerState.IDLE, null, 60L, 50L);
         capabilities.clear();
         activeJobs.clear();
         assertThat(sample.activeJobs()).singleElement().satisfies(job ->
                 assertThat(job.requiredCapabilities()).containsExactlyEntriesOf(Map.of("docker", "true")));
         assertThat(registration.capabilities()).containsExactlyEntriesOf(Map.of("docker", "true"));
+        assertThat(worker.capabilities()).containsExactlyEntriesOf(Map.of("docker", "true"));
     }
 
     private static <T> void assertRoundTrip(T value, Class<T> type) {
