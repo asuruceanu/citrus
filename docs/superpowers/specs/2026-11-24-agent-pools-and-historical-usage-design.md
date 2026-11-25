@@ -120,7 +120,7 @@ Citrus Test Distribution currently lets any worker connect directly to the coord
 - `GET /api/v1/agent-pools/:poolId/keys` — list registration key metadata (prefix, description, timestamps, last used by, revoked timestamp; never secret/hash).
 - `POST /api/v1/agent-pools/:poolId/keys` — generate new registration key, returning `GeneratedRegistrationKey(metadata, secretKey)` once.
 - `POST /api/v1/agent-pools/:poolId/keys/:keyId/revoke` — revoke key (triggers 1h `KEY_REVOKED` warning on connected workers using it).
-- `GET /api/v1/usage?window=1h|24h|7d&filter=...` — `HistoricalUsageResponse`.
+- `GET /api/v1/usage?window=1h|24h|7d&filter=...` — `HistoricalUsageResponse` and the configured `X-Citrus-Usage-Sample-Interval-Ms` response header.
 - WebSocket `/ws/v1/worker` messages added: `worker.rejected`, `worker.renew`, `worker.renewed`.
 - SSE events added: `pool.updated` (pool creation, edits, priority or key metadata changes), `pool.deleted`, `worker.updated` (live status or warning changes), and `worker.rejected`. Events carry identifiers and refresh information without registration secrets or hashes. The worker receives the structured rejection reason before the terminal close when delivery is possible. A bare close with status `4003` indicates terminal rejection with no specific reason.
 

@@ -387,6 +387,7 @@ git commit -m "feat(test-distribution-worker): support agent pool registration, 
 ### Task 6: Web UI — Generic Sessions Subtitle, Workers Pool Parity, Agent Pools View, and Historical Usage View
 
 **Files:**
+- Modify: `tools/citrus-test-distribution-coordinator/src/main/java/org/citrusframework/distribution/coordinator/DistributionCoordinatorVerticle.java` (usage sampling interval response header)
 - Modify: `tools/citrus-test-distribution-ui/src/main/resources/META-INF/resources/dist-ui/styles.css`
 - Modify: `tools/citrus-test-distribution-ui/src/main/resources/META-INF/resources/dist-ui/app.js`
 - Test: `tools/citrus-test-distribution-ui/src/test/java/org/citrusframework/distribution/ui/DistributionUiResourcesTest.java`
@@ -400,28 +401,28 @@ git commit -m "feat(test-distribution-worker): support agent pool registration, 
   - `#pools` & `#pools/<poolId>`: priority-ordered Agent Pools table with drag-and-drop + Up/Down controls (`PUT /api/v1/agent-pools/priority`), Create/Edit Pool form with capability chips + `Save and generate registration key`, Delete confirmation (`DELETE /api/v1/agent-pools/:poolId`), and Registration Keys table with one-time copyable `secretKey` callout + `Revoke` action
   - `#usage`: capability/requirement chip filter + `1 hour` / `24 hours` / `7 days` toggle (`1h` / `24h` / `7d`), SVG `Active jobs` chart, SVG `Worker utilization` (`utilized`, `desired`, `connected`) chart, and per-pool SVG utilization charts with hover tooltips
 
-- [ ] **Step 1: Write failing UI static resource and coordinator UI serving tests**
+- [x] **Step 1: Write failing UI static resource and coordinator UI serving tests**
 
 In `DistributionUiResourcesTest.java` and `DistributionCoordinatorUiTest.java`, add assertions verifying:
 1. `app.js` contains `"Inspect distributed build sessions, artifact cache hit rates, and test outcomes."` and does **not** contain `"Inspect distributed Maven & JBang reactor runs, classpath cache hit rates, and test outcomes."`
 2. The sidebar rendered by `app.js` through `index.html` exposes navigation items for `data-view="usage"` (`Historical Usage`) and `data-view="pools"` (`Agent Pools`) and does **not** expose Connecting Builds, project groups, access control, or `minSize`/`maxSize` controls.
 3. `app.js` defines `renderAgentPools`, `renderHistoricalUsage`, `apiPut`, `apiDelete`, `/api/v1/agent-pools`, `/api/v1/agent-pools/priority`, `/api/v1/usage`, `POOL_CAPABILITY_MISMATCH`, `POOL_DELETED`, `KEY_REVOKED`, `Waiting for test execution requests`, `activeTestDisplay`, and preserves all existing `renderWorkerCacheTelemetry` and pagination assertions.
 
-- [ ] **Step 2: Run UI tests to verify they fail**
+- [x] **Step 2: Run UI tests to verify they fail**
 
 Run: `./mvnw test -Dtest=DistributionUiResourcesTest,DistributionCoordinatorUiTest -pl tools/citrus-test-distribution-ui,tools/citrus-test-distribution-coordinator -am -Dsurefire.failIfNoSpecifiedTests=false`
 Expected: FAIL with missing subtitle/views/functions in `app.js` and `index.html`.
 
-- [ ] **Step 3: Implement UI navigation, subtitle update, `Workers Pool` upgrades, `Agent Pools` view, and `Historical Usage` SVG charts**
+- [x] **Step 3: Implement UI navigation, subtitle update, `Workers Pool` upgrades, `Agent Pools` view, and `Historical Usage` SVG charts**
 
-Extend the existing sidebar and `styles.css` / `app.js` with hash routes `#pools`, `#pools/<poolId>`, and `#usage`, `apiPut`/`apiDelete` helpers, live SSE event handling (`pool.updated`, `pool.deleted`, `worker.updated`, `worker.rejected`), pool-grouped `Workers Pool` with version/live status/warnings, `Agent Pools` CRUD + drag-reorder + registration keys UI, and `Historical Usage` interactive SVG time-series charts. Preserve in-progress form inputs on live refresh, clear one-time secrets on dismissal or navigation, and discard stale usage responses when the time window or filter changes. Refresh historical usage at the sampling cadence while its view is active, with immediate fetches on navigation or filter/window changes.
+Extend the existing sidebar and `styles.css` / `app.js` with hash routes `#pools`, `#pools/<poolId>`, and `#usage`, `apiPut`/`apiDelete` helpers, live SSE event handling (`pool.updated`, `pool.deleted`, `worker.updated`, `worker.rejected`), pool-grouped `Workers Pool` with version/live status/warnings, `Agent Pools` CRUD + drag-reorder + registration keys UI, and `Historical Usage` interactive SVG time-series charts. Preserve in-progress form inputs on live refresh, clear one-time secrets on dismissal or navigation, and discard stale usage responses when the time window or filter changes. Refresh historical usage at the sampling cadence while its view is active, with immediate fetches on navigation or filter/window changes. Use the `X-Citrus-Usage-Sample-Interval-Ms` header, coalesce pool refreshes under frequent events, and retain the inspected chart timestamp during redraws.
 
-- [ ] **Step 4: Run UI tests to verify they pass**
+- [x] **Step 4: Run UI tests to verify they pass**
 
 Run: `./mvnw test -Dtest=DistributionUiResourcesTest,DistributionCoordinatorUiTest -pl tools/citrus-test-distribution-ui,tools/citrus-test-distribution-coordinator -am -Dsurefire.failIfNoSpecifiedTests=false`
 Expected: PASS (`BUILD SUCCESS`, 0 failures).
 
-- [ ] **Step 5: Commit Task 6**
+- [x] **Step 5: Commit Task 6**
 
 ```bash
 git add tools/citrus-test-distribution-ui \
