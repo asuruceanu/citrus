@@ -81,7 +81,7 @@ Citrus Test Distribution currently lets any worker connect directly to the coord
 - **Registration validation:**
   - Pooled worker (`poolId` non-blank): pool must exist (`POOL_NOT_FOUND`), `registrationKey` must belong to `poolId` and not be revoked (`INVALID_REGISTRATION_KEY` / `REVOKED_REGISTRATION_KEY`), and worker capabilities must satisfy all mandatory pool capabilities (`MISSING_POOL_CAPABILITIES`).
   - Unpooled worker (`poolId` blank): allowed when `requireAgentPool == false`; rejected with `POOL_REQUIRED` when `requireAgentPool == true`.
-  - Hourly renewal (`worker.renew`): worker re-validates `poolId` and `registrationKey` every hour; coordinator updates `last_used_at`/`last_used_by` or rejects and closes the WebSocket if revoked/deleted.
+  - Hourly renewal (`worker.renew`): the coordinator checks the credentials against the identity and key bound to the current WebSocket and rejects a revoked key immediately. A matching renewal during an existing capability-drift or pool-deletion grace period leaves the original deadline in place. Successful renewal updates the usage metadata for an active pool key. Renewal with a deleted pool acknowledges the already-connected worker through its grace deadline without updating deleted key metadata. Fresh registration always uses the current pool and capability requirements.
 - **Grace windows & eligibility:**
   - **Pool capabilities added (`POOL_CAPABILITY_MISMATCH`):** Already-connected workers in that pool missing a newly added capability stay connected up to **4 hours** (`poolDriftGraceMs = 14_400_000L`) with a warning. During grace, they finish active work and remain eligible only for jobs whose requirements satisfy **both** the pool's current capabilities and the worker's declared capabilities.
   - **Pool deleted (`POOL_DELETED`):** Already-connected workers in that pool stay connected up to **4 hours** with a warning, finish any active partition, and receive no new pool-matched partitions because the pool no longer exists.
@@ -104,7 +104,7 @@ Citrus Test Distribution currently lets any worker connect directly to the coord
     - Unpooled workers with at least those capabilities: `CapabilityMatcher.matches(filterMap, unpooled.capabilities)`
 - **Cascading `desired` calculation:**
   - Global `desired` at a sample equals total `activePartitions + pendingPartitions` across matching job buckets.
-  - Per-pool `desired` attributes each matching job bucket's demand (`activePartitions + pendingPartitions`) across compatible pools in `priorityOrder`: each compatible pool receives `min(remainingDemand, pool.connected)` (and if demand still remains after all compatible pools' connected capacity, the highest-priority compatible pool absorbs the remainder to reflect unmet demand), avoiding double-counting identical demand across multiple pools.
+  - Per-pool `desired` attributes matching demand across compatible pools in priority order using a single connected-capacity budget per pool per sample. Process demand buckets with fewer compatible pools first, breaking ties by canonical sorted requirement pairs. Consume remaining pool capacity in priority order. Attribute demand left after capacity is exhausted to the highest-priority compatible pool as unmet demand. Demand with no compatible pool remains visible in the global series.
   - Bucket aggregation takes the bucket maximum (`max`) across 15s samples in that bucket so short spikes remain visible on 24h and 7d views.
 
 ### 4. Coordinator REST & WebSocket API
@@ -120,7 +120,7 @@ Citrus Test Distribution currently lets any worker connect directly to the coord
 - `POST /api/v1/agent-pools/:poolId/keys/:keyId/revoke` — revoke key (triggers 1h `KEY_REVOKED` warning on connected workers using it).
 - `GET /api/v1/usage?window=1h|24h|7d&filter=...` — `HistoricalUsageResponse`.
 - WebSocket `/ws/v1/worker` messages added: `worker.rejected`, `worker.renew`, `worker.renewed`.
-- SSE events added: `pool.updated`, `pool.deleted`, `worker.updated`, `worker.rejected`.
+- SSE events added: `pool.updated` (pool creation, edits, priority or key metadata changes), `pool.deleted`, `worker.updated` (live status or warning changes), and `worker.rejected`. Events carry identifiers and refresh information without registration secrets or hashes. The worker receives the structured rejection reason before the terminal close when delivery is possible. A bare close with status `4003` indicates terminal rejection with no specific reason.
 
 ### 5. Web UI (`tools/citrus-test-distribution-ui`)
 

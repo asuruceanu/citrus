@@ -221,15 +221,16 @@ In `HistoricalUsageAggregatorTest.java`, add tests verifying:
 1. Window sizing: `"1h"` -> 60 x `60_000ms` buckets; `"24h"` -> 96 x `900_000ms` buckets; `"7d"` -> 84 x `7_200_000ms` buckets; unknown window throws `IllegalArgumentException`.
 2. **Review Focus #5 (cascading `desired`):** When `high-prio` (`priorityOrder=0, connected=2`) and `low-prio` (`priorityOrder=1, connected=4`) both match a job bucket with `activePartitions=2, pendingPartitions=1` (total demand `3`), global `desired == 3`, `high-prio` `desired == 2`, and `low-prio` `desired == 1`. When demand is `8`, `high-prio` absorbs the unmet remainder (`2 + (8 - 6) = 4`) and `low-prio` gets `4`, while global `desired == 8`.
 3. **Review Focus #2 (filter scoping):** Filtering by `postgres=18` excludes pools whose capabilities are `{jdk=21, os=linux}` and jobs whose requirements are `{jdk=21}`, and includes jobs/pools/unpooled buckets containing `postgres=18`.
+4. Multiple distinct job buckets compatible with A (connected 2) and B (connected 4) and each demanding two workers must yield A=2, B=2, global=4. Cover deterministic processing of buckets with different compatible pool sets and input order.
 
 In `SessionCoordinatorTest.java` (using controllable `AtomicLong` clock on `DistributionCoordinatorConfig.Builder`), add tests verifying:
 1. **Review Focus #1 (cross-pool & revoked key rejection):** Registering with a non-existent pool (`POOL_NOT_FOUND`), Pool A's key against Pool B (`INVALID_REGISTRATION_KEY`), a revoked key (`REVOKED_REGISTRATION_KEY`), or missing mandatory pool capability (`MISSING_POOL_CAPABILITIES`) sends `WORKER_REJECTED`, invokes `closer`, does not register the worker, and leaves Pool A's key `lastUsedAt` null.
 2. **Grace windows & renewal:**
    - Revoking an active key immediately adds `KEY_REVOKED` warning (`disconnectAt = now + 1h`) on connected workers using that key; sending `WORKER_RENEW` (or advancing clock `+ 1h` + `sweepExpiredLeases()`) disconnects the worker.
    - Adding mandatory capability `docker=true` to a pool marks connected workers lacking `docker` with `POOL_CAPABILITY_MISMATCH` (`disconnectAt = now + 4h`); those workers still match `{jdk=21}` jobs during grace, do NOT match `{jdk=21, docker=true}` jobs, clear the warning if `docker` is removed from the pool, and disconnect after `+ 4h`.
-   - Deleting a pool marks its connected workers with `POOL_DELETED` (`disconnectAt = now + 4h`), stops assigning new pool-matched partitions to them, lets active partitions finish, and disconnects them after `+ 4h`.
+   - Deleting a pool marks its connected workers with `POOL_DELETED` (`disconnectAt = now + 4h`), stops assigning new pool-matched partitions to them, lets active partitions finish, and disconnects them after `+ 4h`. A matching renewal during either four-hour grace period preserves the original deadline, and a revoked key still ends grace at renewal. Test a renewal just before the deadline and at the deadline.
 3. **Review Focus #2 & priority scheduling:** Between two matching pools (`prio 0` and `prio 1`) plus an unpooled worker, jobs dispatch to `prio 0` first, then `prio 1`, then unpooled; a pooled worker advertising extra `postgres=18` not configured on its pool never matches a job requiring `postgres=18`.
-4. **Live worker status:** `TEST_EVENT` with `STARTED` (`className="org.acme.OrderIT"`, `testName="shouldCreate"`) updates `WorkerRecord.activeTestDisplay()` to `"OrderIT > shouldCreate"` (falling back to full name if unqualified), and `PARTITION_COMPLETED` clears `activeTestDisplay` and updates `stateUpdatedAt`.
+4. **Live worker status:** `TEST_EVENT` with `STARTED` (`className="org.acme.OrderIT"`, `testName="shouldCreate"`) updates `WorkerRecord.activeTestDisplay()` to `"OrderIT > shouldCreate"` (falling back to full name if unqualified), and `PARTITION_COMPLETED` clears `activeTestDisplay` and updates `stateUpdatedAt`. Exercise stale/replayed events, cancellation, and disconnect so only the current attempt changes live status. At coordinator restart, preserve persisted pool and version fields while marking workers offline and clearing live execution state.
 
 - [ ] **Step 2: Run coordinator unit tests to verify they fail**
 
@@ -238,7 +239,7 @@ Expected: FAIL with compilation errors on missing `RegistrationKeyCrypto`, `Hist
 
 - [ ] **Step 3: Implement `RegistrationKeyCrypto`, `HistoricalUsageAggregator`, `DistributionCoordinatorConfig` clock/grace fields, and `SessionCoordinator` pool/key/scheduling/usage logic**
 
-Implement `RegistrationKeyCrypto` (8-char `[a-z0-9]` pool IDs; `ctrk_<8chars>_<32chars>` keys hashed with SHA-256). Implement `HistoricalUsageAggregator` with cascading priority-ordered `desired` attribution and per-bucket `max` aggregation. Extend `DistributionCoordinatorConfig` and `SessionCoordinator` to load pools from `store` on construction, enforce registration/renewal/grace rules, track `version`, `activeTestDisplay`, `stateUpdatedAt`, and `warnings` on `WorkerConnection`, schedule by pool priority using pool capabilities, and expose `sampleUsageNow()` + `queryHistoricalUsage(...)`.
+Implement `RegistrationKeyCrypto` (8-char `[a-z0-9]` pool IDs; `ctrk_<8chars>_<32chars>` keys hashed with SHA-256). Implement `HistoricalUsageAggregator` with shared connected capacity across demand buckets, priority-ordered `desired` attribution and per-bucket `max` aggregation as specified. Extend `DistributionCoordinatorConfig` and `SessionCoordinator` to load pools from `store` on construction, enforce registration/renewal/grace rules, track `version`, `activeTestDisplay`, `stateUpdatedAt`, and `warnings` on `WorkerConnection`, schedule by pool priority using pool capabilities, and expose `sampleUsageNow()` + `queryHistoricalUsage(...)`. Publish `pool.updated`, `pool.deleted`, `worker.updated`, and `worker.rejected` via the existing durable event hub, with no secret or hash in event payloads. Preserve the upstream result journal and restart behavior.
 
 - [ ] **Step 4: Run coordinator unit tests to verify they pass**
 
@@ -281,6 +282,7 @@ Add tests in `DistributionCoordinatorServerTest.java` verifying:
 1. Full HTTP lifecycle: `POST /api/v1/agent-pools` (with `generateRegistrationKey=true` returning secret once), `GET /api/v1/agent-pools`, `GET /api/v1/agent-pools/:poolId` (verifying `secretKey` and `keyHash` are absent from listed keys), `PUT /api/v1/agent-pools/:poolId`, `POST /api/v1/agent-pools/:poolId/keys`, `POST /api/v1/agent-pools/:poolId/keys/:keyId/revoke`, and `DELETE /api/v1/agent-pools/:poolId`.
 2. **Review Focus #3 (route order):** `PUT /api/v1/agent-pools/priority` with `{"poolIds": [poolB, poolA]}` returns `200` and reorders `GET /api/v1/agent-pools` without colliding with `PUT /api/v1/agent-pools/:poolId`.
 3. `GET /api/v1/usage?window=1h&filter=jdk=21` returns `200` with 60 points and matching pool series; `GET /api/v1/usage?window=bad` and `GET /api/v1/usage?window=1h&filter=a=b=c` return `400`.
+4. Verify SSE delivery of pool updates/deletions, worker warning changes and worker rejection. Verify that structured WebSocket rejection is written before close with code `4003` and neither channel leaks key material.
 
 - [ ] **Step 2: Run `DistributionCoordinatorServerTest` to verify it fails**
 
@@ -290,9 +292,9 @@ Expected: FAIL with `404` on `/api/v1/agent-pools` and `/api/v1/usage`.
 - [ ] **Step 3: Register routes, `DELETE` CORS + `PUT` body handler, WebSocket close callback, and periodic usage sampler in `DistributionCoordinatorVerticle`**
 
 In `DistributionCoordinatorVerticle.java`:
-1. Add `HttpMethod.DELETE` to `CorsHandler` and register `BodyHandler.create()` on `PUT /api/v1/*` alongside `POST /api/v1/*`.
+1. Add `HttpMethod.DELETE` to `CorsHandler` and reuse the existing size-limited PUT body handler and bearer authentication on `/api/*`.
 2. Register `PUT /api/v1/agent-pools/priority` **before** `/api/v1/agent-pools/:poolId`, plus all remaining `/api/v1/agent-pools*` and `/api/v1/usage` handlers on `executeBlocking`.
-3. Pass `() -> vertx.runOnContext(v -> ws.close((short) 4003, "Worker registration rejected or expired"))` as the 4th argument to `coordinator.registerWorker(...)`.
+3. Wire the close callback into `coordinator.registerWorker(...)`. Write the structured rejection before initiating WebSocket close `4003` and close even when the write fails.
 4. Start a periodic timer `usageTimerId = vertx.setPeriodic(config.usageSampleIntervalMs(), ...)` calling `coordinator.sampleUsageNow()` on `executeBlocking` (and trigger one initial sample on startup; cancel `usageTimerId` in `stop()`).
 
 - [ ] **Step 4: Run `DistributionCoordinatorServerTest` to verify it passes**
@@ -342,7 +344,7 @@ git commit -m "feat(test-distribution-coordinator): expose agent pool and histor
 
 1. In `DistributionWorkerConfigTest.java`: verify `poolId`, `registrationKey`, `TEST_DISTRIBUTION_AGENT_POOL`, `TEST_DISTRIBUTION_AGENT_REGISTRATION_KEY`, `TEST_DISTRIBUTION_AGENT_NAME`, `TEST_DISTRIBUTION_AGENT_CAPABILITIES`, and non-blank `version()` resolution.
 2. In `DistributionWorkerClientTest.java`:
-   - **Review Focus #1:** When server responds with `WORKER_REJECTED("INVALID_REGISTRATION_KEY", "Invalid key")` (or closes with `4003`), `awaitRegistered(2, SECONDS)` returns `false` immediately, `rejectionReason()` contains `"INVALID_REGISTRATION_KEY"`, and the client does **not** reconnect.
+   - **Review Focus #1:** A structured `WORKER_REJECTED("INVALID_REGISTRATION_KEY", "Invalid key")` makes `awaitRegistered(2, SECONDS)` return `false` promptly and preserves `"INVALID_REGISTRATION_KEY"` in `rejectionReason()`. A bare `4003` close yields a generic terminal rejection. Neither case reconnects.
    - When configured with `poolId`, `registrationKey`, and `registrationRenewalIntervalMs(150)`, the client sends `WORKER_RENEW` payloads periodically and stops if a renewal returns `WORKER_REJECTED`.
 3. In `DistCommandTest.java`: **Review Focus #4** — verify `DistWorkerStart.normalizeWorkerStartArgs(new String[]{"dist", "worker", "start", "-p", "pool1", "-k", "ctrk_1_2", "--no-cache-cleanup"})` preserves `-p pool1 -k ctrk_1_2` and normalizes `--cache-cleanup=false`.
 4. In `CitrusAgentWorkerOptionsTest.java`: **Review Focus #4** — verify `new CitrusAgentOptions().apply(new String[]{"--mode", "worker", "-p", "com.acme.tests", "--pool", "pool1", "-k", "ctrk_1_2"})` binds `packages` to `["com.acme.tests"]`, `pool` to `"pool1"`, and `registrationKey` to `"ctrk_1_2"`, and `DistributionWorkerBridge.buildWorkerConfig(...)` forwards both to `DistributionWorkerConfig`.
@@ -428,7 +430,7 @@ git commit -m "feat(test-distribution-ui): add agent pools, historical usage cha
 ### Task 7: End-to-End Integration Verification and User Manual Documentation
 
 **Files:**
-- Modify: `tools/citrus-test-distribution-coordinator/src/test/java/org/citrusframework/distribution/coordinator/DistributionCoordinatorServerTest.java`
+- Create: `tools/citrus-test-distribution-worker/src/test/java/org/citrusframework/distribution/worker/AgentPoolLifecycleIT.java`
 - Modify: `src/manual/tools-test-distribution.adoc`
 
 **Interfaces:**
@@ -437,15 +439,15 @@ git commit -m "feat(test-distribution-ui): add agent pools, historical usage cha
 
 - [ ] **Step 1: Write end-to-end pool registration, priority routing, key revocation, and historical usage test**
 
-In `DistributionCoordinatorServerTest.java`, add an end-to-end test using real `DistributionCoordinatorServer` + `DistributionWorkerClient` instances verifying:
+In the worker module, add an end-to-end test using real `DistributionCoordinatorServer` + `DistributionWorkerClient` instances verifying:
 1. Creating `high-prio` (`priorityOrder=0`, `capabilities={jdk=21, docker=true}`) and `low-prio` (`priorityOrder=1`, `capabilities={jdk=21, docker=true}`) pools with generated registration keys.
 2. Connecting a `DistributionWorkerClient` with `low-prio`'s key against `high-prio` is rejected (`INVALID_REGISTRATION_KEY`), and connecting a worker missing `docker=true` is rejected (`MISSING_POOL_CAPABILITIES`).
-3. Connecting valid workers to both pools routes a submitted partition requiring `{docker=true}` to `high-prio` first and populates `version` + `poolDisplayName` on `GET /api/v1/workers`.
+3. Connecting valid workers to both pools routes a submitted partition requiring `{docker=true}` to `high-prio` first and populates `version` + `poolDisplayName` on `GET /api/v1/workers`. Use enough concurrent demand to dispatch work to both pools, hold that work active until a usage sample observes it, and synchronize sampling and revocation assertions on observable state.
 4. Revoking `high-prio`'s key surfaces `KEY_REVOKED` warning on `GET /api/v1/workers`, disconnects the worker on its next renewal tick, and `GET /api/v1/usage?window=1h&filter=docker` returns non-zero `connected` / `utilized` / `desired` metrics for both pools.
 
 - [ ] **Step 2: Run end-to-end test and full Test Distribution test suite**
 
-Run: `./mvnw test -pl core/citrus-api,tools/citrus-test-distribution-protocol,tools/citrus-test-distribution-ui,tools/citrus-test-distribution-coordinator,tools/citrus-test-distribution-worker,tools/citrus-test-distribution,tools/maven/citrus-test-distribution-maven-extension,tools/jbang,tools/agent,tools/schema-generator`
+Run: `./mvnw verify -pl core/citrus-api,tools/citrus-test-distribution-protocol,tools/citrus-test-distribution-ui,tools/citrus-test-distribution-coordinator,tools/citrus-test-distribution-worker,tools/citrus-test-distribution,tools/maven/citrus-test-distribution-maven-extension,tools/jbang,tools/agent,tools/schema-generator -am`
 Expected: PASS (`BUILD SUCCESS`, 0 failures across all Test Distribution, JBang, Agent, and Schema Generator modules).
 
 - [ ] **Step 3: Document Agent Pools, Registration Keys, Worker CLI/Env Options, Grace Windows, and Historical Usage in `src/manual/tools-test-distribution.adoc`**
@@ -459,7 +461,7 @@ Update `src/manual/tools-test-distribution.adoc` to document:
 - [ ] **Step 4: Commit Task 7**
 
 ```bash
-git add tools/citrus-test-distribution-coordinator/src/test/java/org/citrusframework/distribution/coordinator/DistributionCoordinatorServerTest.java \
+git add tools/citrus-test-distribution-worker/src/test/java/org/citrusframework/distribution/worker/AgentPoolLifecycleIT.java \
         src/manual/tools-test-distribution.adoc
 git commit -m "docs(test-distribution): document agent pools, registration keys, and historical usage"
 ```
