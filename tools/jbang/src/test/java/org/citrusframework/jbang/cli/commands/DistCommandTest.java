@@ -154,6 +154,37 @@ class DistCommandTest extends CommandTest {
     }
 
     @Test
+    @ResourceLock(Resources.SYSTEM_PROPERTIES)
+    void shouldUseConfiguredJdbcCredentialsAndAllowAuthTokenOverride() {
+        var settings = Map.of(DistributionSettings.JDBC_USER_PROPERTY, "citrus",
+                DistributionSettings.JDBC_PASSWORD_PROPERTY, "db-password",
+                DistributionSettings.AUTH_TOKEN_PROPERTY, "shared-token");
+        var saved = new HashMap<String, String>();
+        settings.forEach((key, value) -> saved.put(key, System.setProperty(key, value)));
+        try {
+            var command = new DistCoordinatorStart();
+            command.jdbcUrl = "jdbc:postgresql://postgres:5432/citrus";
+
+            var config = command.buildCoordinatorConfig();
+            assertThat(config.jdbcUrl()).isEqualTo(command.jdbcUrl);
+            assertThat(config.jdbcUsername()).isEqualTo("citrus");
+            assertThat(config.jdbcPassword()).isEqualTo("db-password");
+            assertThat(config.authToken()).isEqualTo("shared-token");
+
+            command.authToken = "cli-token";
+            assertThat(command.buildCoordinatorConfig().authToken()).isEqualTo("cli-token");
+        } finally {
+            saved.forEach((key, value) -> {
+                if (value == null) {
+                    System.clearProperty(key);
+                } else {
+                    System.setProperty(key, value);
+                }
+            });
+        }
+    }
+
+    @Test
     void shouldListWorkerCacheOptionsInHelp() {
         CitrusJBangMain main = createCitrusJBangMain();
         assertThat(main.execute("dist", "worker", "start", "--help")).isZero();
