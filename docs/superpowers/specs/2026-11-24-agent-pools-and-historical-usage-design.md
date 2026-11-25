@@ -149,7 +149,7 @@ Citrus Test Distribution currently lets any worker connect directly to the coord
   - Coordinator strict pool flag: `citrus.test.distribution.coordinator.requireAgentPool` / `CITRUS_DIST_COORDINATOR_REQUIRE_AGENT_POOL` (property wins when set, default `false`).
 - **CLI flags:**
   - `citrus dist worker start`: `-p` / `--pool` and `-k` / `--registration-key` (added to `VALUE_OPTIONS`).
-  - `citrus-agent`: `--pool` (long option only) and `-k` / `--registration-key`, backed by `CitrusAgentConfiguration` (`pool`, `registrationKey`) and synced with `citrus-agent-configuration.json`.
+  - `citrus-agent`: `--pool` (long option only) and `-k` / `--registration-key`, backed by `CitrusAgentConfiguration` (`pool`, `registrationKey`) and synced with `citrus-agent-configuration.json`. Typed agent startup configuration accepts registration keys. Responses and startup diagnostics redact the credential, including the default-properties form. Worker credentials are resolved when the worker starts.
 
 ## Left to the Builder
 

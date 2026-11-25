@@ -325,6 +325,7 @@ git commit -m "feat(test-distribution-coordinator): expose agent pool and histor
 - Modify: `core/citrus-api/src/main/java/org/citrusframework/api/agent/CitrusAgentConfiguration.java`
 - Modify: `tools/agent/src/main/java/org/citrusframework/agent/CitrusAgentOptions.java`
 - Modify: `tools/agent/src/main/java/org/citrusframework/agent/DistributionWorkerBridge.java`
+- Modify: `tools/agent/src/main/java/org/citrusframework/agent/util/JsonSupport.java`
 - Modify: `tools/schema-generator/src/test/resources/control/citrus-agent-configuration.json`
 - Test: `tools/citrus-test-distribution-worker/src/test/java/org/citrusframework/distribution/worker/DistributionWorkerConfigTest.java`
 - Test: `tools/citrus-test-distribution-worker/src/test/java/org/citrusframework/distribution/worker/DistributionWorkerClientTest.java`
@@ -344,32 +345,32 @@ git commit -m "feat(test-distribution-coordinator): expose agent pool and histor
   - `CitrusAgentConfiguration`: `getPool()` / `setPool(String)` (`@SchemaProperty`) and `getRegistrationKey()` / `setRegistrationKey(String)` (`@SchemaProperty`), positioned in `citrus-agent-configuration.json` alphabetically (`pool` between `packages` and `port`; `registrationKey` between `port` and `reset`)
   - `CitrusAgentOptions`: `--pool` (empty short option `""`) and `-k` / `--registration-key`
 
-- [ ] **Step 1: Write failing worker config, worker client, JBang CLI, agent CLI, and schema tests**
+- [x] **Step 1: Write failing worker config, worker client, JBang CLI, agent CLI, and schema tests**
 
 1. In `DistributionWorkerConfigTest.java`: verify `poolId`, `registrationKey`, `TEST_DISTRIBUTION_AGENT_POOL`, `TEST_DISTRIBUTION_AGENT_REGISTRATION_KEY`, `TEST_DISTRIBUTION_AGENT_NAME`, `TEST_DISTRIBUTION_AGENT_CAPABILITIES`, and non-blank `version()` resolution.
 2. In `DistributionWorkerClientTest.java`:
    - **Review Focus #1:** A structured `WORKER_REJECTED("INVALID_REGISTRATION_KEY", "Invalid key")` makes `awaitRegistration(2, SECONDS)` return `false` promptly and preserves `"INVALID_REGISTRATION_KEY"` in `rejectionReason()`. A bare `4003` close yields a generic terminal rejection. Neither case reconnects.
    - When configured with `poolId`, `registrationKey`, and `registrationRenewalIntervalMs(150)`, the client sends `WORKER_RENEW` payloads periodically and stops if a renewal returns `WORKER_REJECTED`. Start renewal only after registration and cancel it when the connection ends. After ordinary socket loss, the next successfully registered socket renews again.
 3. In `DistCommandTest.java`: **Review Focus #4** — verify `DistWorkerStart.normalizeWorkerStartArgs(new String[]{"dist", "worker", "start", "-p", "pool1", "-k", "ctrk_1_2", "--no-cache-cleanup"})` preserves `-p pool1 -k ctrk_1_2` and normalizes `--cache-cleanup=false`.
-4. In `CitrusAgentWorkerOptionsTest.java`: **Review Focus #4** — verify `new CitrusAgentOptions().apply(new String[]{"--mode", "worker", "-p", "com.acme.tests", "--pool", "pool1", "-k", "ctrk_1_2"})` binds `packages` to `["com.acme.tests"]`, `pool` to `"pool1"`, and `registrationKey` to `"ctrk_1_2"`, and `DistributionWorkerBridge.buildWorkerConfig(...)` forwards both to `DistributionWorkerConfig`. A missing CLI/agent value leaves the worker’s resolved settings intact, including capabilities discovered from aliases.
+4. In `CitrusAgentWorkerOptionsTest.java`: **Review Focus #4** — verify `new CitrusAgentOptions().apply(new String[]{"--mode", "worker", "-p", "com.acme.tests", "--pool", "pool1", "-k", "ctrk_1_2"})` binds `packages` to `["com.acme.tests"]`, `pool` to `"pool1"`, and `registrationKey` to `"ctrk_1_2"`, and `DistributionWorkerBridge.buildWorkerConfig(...)` forwards both to `DistributionWorkerConfig`. A missing CLI/agent value leaves the worker’s resolved settings intact, including capabilities discovered from aliases. Verify that typed agent startup JSON accepts the registration key and agent configuration responses omit it, including when supplied as a default property.
 
-- [ ] **Step 2: Run worker, JBang, agent, and schema tests to verify they fail**
+- [x] **Step 2: Run worker, JBang, agent, and schema tests to verify they fail**
 
 Run: `./mvnw test -Dtest=DistributionWorkerConfigTest,DistributionWorkerClientTest,DistCommandTest,CitrusAgentWorkerOptionsTest,CitrusSchemaGeneratorTest -pl core/citrus-api,tools/citrus-test-distribution-worker,tools/jbang,tools/agent,tools/schema-generator -am -Dsurefire.failIfNoSpecifiedTests=false`
 Expected: FAIL with compilation errors on missing `poolId` / `registrationKey` / `rejectionReason` methods.
 
-- [ ] **Step 3: Implement worker config/client, JBang options, agent options/config/bridge, and control schema JSON**
+- [x] **Step 3: Implement worker config/client, JBang options, agent options/config/bridge, and control schema JSON**
 
 1. Extend `DistributionWorkerConfig` (resolving `version` from `Implementation-Version` or `/META-INF/maven/org.citrusframework/citrus-test-distribution-worker/pom.properties` with `"dev"` fallback) and `DistributionWorkerClient` (sending `version`, `poolId`, `registrationKey`; scheduling periodic `WORKER_RENEW` when `poolId` is non-blank; halting reconnects and releasing `registeredLatch` on `WORKER_REJECTED` or close status `4003`).
 2. Add `-p` / `--pool` and `-k` / `--registration-key` to `DistWorkerStart` (and `VALUE_OPTIONS`) and wake the command’s stop latch on terminal rejection so it exits with failure and the coordinator’s reason even without a duration limit. Keep the normal shutdown/drain path and use a small client rejection notification API.
-3. Add `pool` and `registrationKey` to `CitrusAgentConfiguration`, `CitrusAgentOptions` (`--pool` with `""` short name; `-k` / `--registration-key`), `DistributionWorkerBridge`, and `tools/schema-generator/src/test/resources/control/citrus-agent-configuration.json`.
+3. Add `pool` and `registrationKey` to `CitrusAgentConfiguration`, `CitrusAgentOptions` (`--pool` with `""` short name; `-k` / `--registration-key`), `DistributionWorkerBridge`, and `tools/schema-generator/src/test/resources/control/citrus-agent-configuration.json`. Treat the registration key as write-only when serializing the agent’s configuration. Also redact the supported worker registration key in default properties from configuration output and startup logs.
 
-- [ ] **Step 4: Run worker, JBang, agent, and schema tests to verify they pass**
+- [x] **Step 4: Run worker, JBang, agent, and schema tests to verify they pass**
 
 Run: `./mvnw test -Dtest=DistributionWorkerConfigTest,DistributionWorkerClientTest,DistCommandTest,CitrusAgentWorkerOptionsTest,CitrusSchemaGeneratorTest -pl core/citrus-api,tools/citrus-test-distribution-worker,tools/jbang,tools/agent,tools/schema-generator -am -Dsurefire.failIfNoSpecifiedTests=false`
 Expected: PASS (`BUILD SUCCESS`, 0 failures, including `CitrusSchemaGeneratorTest#verifyAgentConfigurationJson`).
 
-- [ ] **Step 5: Commit Task 5**
+- [x] **Step 5: Commit Task 5**
 
 ```bash
 git add core/citrus-api/src/main/java/org/citrusframework/api/agent/CitrusAgentConfiguration.java \
@@ -413,7 +414,7 @@ Expected: FAIL with missing subtitle/views/functions in `app.js` and `index.html
 
 - [ ] **Step 3: Implement UI navigation, subtitle update, `Workers Pool` upgrades, `Agent Pools` view, and `Historical Usage` SVG charts**
 
-Extend the existing sidebar and `styles.css` / `app.js` with hash routes `#pools`, `#pools/<poolId>`, and `#usage`, `apiPut`/`apiDelete` helpers, live SSE event handling (`pool.updated`, `pool.deleted`, `worker.updated`, `worker.rejected`), pool-grouped `Workers Pool` with version/live status/warnings, `Agent Pools` CRUD + drag-reorder + registration keys UI, and `Historical Usage` interactive SVG time-series charts. Preserve in-progress form inputs on live refresh, clear one-time secrets on dismissal or navigation, and discard stale usage responses when the time window or filter changes.
+Extend the existing sidebar and `styles.css` / `app.js` with hash routes `#pools`, `#pools/<poolId>`, and `#usage`, `apiPut`/`apiDelete` helpers, live SSE event handling (`pool.updated`, `pool.deleted`, `worker.updated`, `worker.rejected`), pool-grouped `Workers Pool` with version/live status/warnings, `Agent Pools` CRUD + drag-reorder + registration keys UI, and `Historical Usage` interactive SVG time-series charts. Preserve in-progress form inputs on live refresh, clear one-time secrets on dismissal or navigation, and discard stale usage responses when the time window or filter changes. Refresh historical usage at the sampling cadence while its view is active, with immediate fetches on navigation or filter/window changes.
 
 - [ ] **Step 4: Run UI tests to verify they pass**
 
