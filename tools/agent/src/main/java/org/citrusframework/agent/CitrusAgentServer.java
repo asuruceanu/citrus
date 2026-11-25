@@ -20,6 +20,7 @@ import java.io.PrintStream;
 import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
@@ -36,6 +37,7 @@ import org.citrusframework.CitrusSettings;
 import org.citrusframework.agent.CitrusAgentOptions.ParsedOptions;
 import org.citrusframework.agent.util.ConfigurationHelper;
 import org.citrusframework.api.agent.CitrusAgentConfiguration;
+import org.citrusframework.distribution.config.DistributionSettings;
 import org.citrusframework.distribution.worker.DistributionWorkerConfig;
 import org.citrusframework.exceptions.CitrusRuntimeException;
 import org.citrusframework.message.MessageType;
@@ -219,7 +221,7 @@ public class CitrusAgentServer implements Server {
         startRequested = true;
         ConfigurationHelper.resolveArtifacts(configuration);
         configuration.addDefaultProperty(CitrusSettings.DEFAULT_MESSAGE_TYPE_PROPERTY, MessageType.JSON.name(), false);
-        configuration.setDefaultProperties();
+        configuration.applyDefaultProperties(Set.of(DistributionSettings.WORKER_REGISTRATION_KEY_PROPERTY));
 
         // Validate worker settings and acquire its cache lock before accepting HTTP requests.
         if (configuration.isWorkerMode()) {

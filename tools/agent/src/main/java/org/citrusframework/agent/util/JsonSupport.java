@@ -17,12 +17,15 @@
 package org.citrusframework.agent.util;
 
 import java.time.Duration;
+import java.util.Map;
 import java.util.Optional;
 
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import org.citrusframework.TestSource;
 import org.citrusframework.api.agent.CitrusAgentConfiguration;
+import org.citrusframework.distribution.config.DistributionSettings;
 import org.citrusframework.exceptions.CitrusRuntimeException;
 import org.citrusframework.spi.Resource;
 import org.citrusframework.spi.Resources;
@@ -89,6 +92,9 @@ public final class JsonSupport {
     private interface WorkerCredentials {
         @JsonProperty(access = JsonProperty.Access.WRITE_ONLY)
         String getRegistrationKey();
+
+        @JsonIgnoreProperties(value = DistributionSettings.WORKER_REGISTRATION_KEY_PROPERTY, allowSetters = true)
+        Map<String, String> getDefaultProperties();
     }
 
     private static class DurationSerializer extends StdSerializer<Duration> {

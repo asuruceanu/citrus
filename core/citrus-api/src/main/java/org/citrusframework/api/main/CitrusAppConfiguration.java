@@ -16,6 +16,8 @@
 
 package org.citrusframework.api.main;
 
+import java.util.Set;
+
 import org.citrusframework.CitrusSettings;
 import org.citrusframework.api.yaml.SchemaProperty;
 
@@ -98,11 +100,12 @@ public class CitrusAppConfiguration extends TestRunConfiguration {
     }
 
     @Override
-    public void setDefaultProperties() {
-        super.setDefaultProperties();
+    public void applyDefaultProperties(Set<String> redactedNames) {
+        super.applyDefaultProperties(redactedNames);
 
-        if (getConfigClass() != null) {
-            System.setProperty(CitrusSettings.DEFAULT_CONFIG_CLASS_PROPERTY, getConfigClass());
+        String configuredClass = getConfigClass();
+        if (configuredClass != null) {
+            System.setProperty(CitrusSettings.DEFAULT_CONFIG_CLASS_PROPERTY, configuredClass);
         }
     }
 }

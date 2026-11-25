@@ -250,8 +250,14 @@ public class TestRunConfiguration {
      * Reads default properties in configuration and sets them as system properties.
      */
     public void setDefaultProperties() {
+        applyDefaultProperties(Set.of());
+    }
+
+    /** Sets the configured system properties, hiding the values of the named properties in startup logs. */
+    public void applyDefaultProperties(Set<String> redactedNames) {
         for (Map.Entry<String, String> entry : defaultProperties.entrySet()) {
-            logger.info("Setting application property {}={}", entry.getKey(), entry.getValue());
+            String displayValue = redactedNames.contains(entry.getKey()) ? "[redacted]" : entry.getValue();
+            logger.info("Setting application property {}={}", entry.getKey(), displayValue);
             System.setProperty(entry.getKey(), Optional.ofNullable(entry.getValue()).orElse(""));
         }
     }

@@ -28,6 +28,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -36,8 +37,16 @@ import java.util.stream.Stream;
 
 import io.vertx.core.Context;
 import io.vertx.core.Vertx;
+import org.apache.logging.log4j.Level;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.core.LogEvent;
+import org.apache.logging.log4j.core.Logger;
+import org.apache.logging.log4j.core.appender.AbstractAppender;
+import org.apache.logging.log4j.core.config.Property;
+import org.citrusframework.CitrusSettings;
 import org.citrusframework.agent.util.JsonSupport;
 import org.citrusframework.api.agent.CitrusAgentConfiguration;
+import org.citrusframework.api.main.TestRunConfiguration;
 import org.citrusframework.distribution.config.DistributionSettings;
 import org.citrusframework.distribution.worker.DistributionWorkerClient;
 import org.citrusframework.distribution.worker.DistributionWorkerConfig;
@@ -96,6 +105,94 @@ class CitrusAgentWorkerOptionsTest {
                 """, CitrusAgentConfiguration.class);
         assertThat(config.getRegistrationKey()).isEqualTo("test-secret");
         assertThat(JsonSupport.render(config)).contains("pool1").doesNotContain("registrationKey", "test-secret");
+    }
+
+    @Test
+    void shouldOmitOnlyRegistrationKeyFromAgentDefaultPropertiesJson() {
+        String key = DistributionSettings.WORKER_REGISTRATION_KEY_PROPERTY;
+        var config = parse("-D", key + "=property-credential,visible=retained");
+        String json = JsonSupport.render(config);
+        assertThat(json).contains("visible", "retained").doesNotContain(key, "property-credential");
+        assertThat(config.getDefaultProperties()).containsEntry(key, "property-credential");
+        assertThat(JsonSupport.read("""
+                {"defaultProperties":{"%s":"supplied"}}
+                """.formatted(key), CitrusAgentConfiguration.class).getDefaultProperties()).containsEntry(key, "supplied");
+    }
+
+    @Test
+    @ResourceLock(Resources.SYSTEM_PROPERTIES)
+    @ResourceLock(Resources.SYSTEM_OUT)
+    void shouldApplyAgentStartupPropertiesWithoutLoggingTheRegistrationCredential() {
+        String key = DistributionSettings.WORKER_REGISTRATION_KEY_PROPERTY;
+        String visibleProperty = "citrus.test.worker.visible";
+        var config = parse("--mode", "worker", "--port", "0", "--coordinator-url", "http://127.0.0.1:1",
+                "--cache-dir", tempDir.resolve("logging").toString(), "--properties",
+                key + "=property-credential," + visibleProperty + "=retained");
+        var original = new HashMap<String, String>();
+        for (String name : List.of(key, visibleProperty, CitrusSettings.DEFAULT_MESSAGE_TYPE_PROPERTY)) {
+            original.put(name, System.getProperty(name));
+        }
+
+        PrintStream out = System.out;
+        var messages = new ArrayList<String>();
+        var appender = new AbstractAppender("agent-startup-properties", null, null, true, Property.EMPTY_ARRAY) {
+            @Override
+            public void append(LogEvent event) {
+                messages.add(event.getMessage().getFormattedMessage());
+            }
+        };
+        var logger = (Logger) LogManager.getLogger(TestRunConfiguration.class);
+        var previousLevel = logger.getLevel();
+        appender.start();
+        logger.addAppender(appender);
+        logger.setLevel(Level.INFO);
+        var server = new CitrusAgentServer(config);
+        try {
+            server.start();
+            assertThat(System.getProperty(key)).isEqualTo("property-credential");
+            assertThat(messages).contains("Setting application property " + visibleProperty + "=retained")
+                    .noneMatch(message -> message.contains("property-credential"));
+        } finally {
+            server.stop();
+            System.setOut(out);
+            logger.removeAppender(appender);
+            logger.setLevel(previousLevel);
+            appender.stop();
+            original.forEach((name, value) -> {
+                if (value == null) {
+                    System.clearProperty(name);
+                } else {
+                    System.setProperty(name, value);
+                }
+            });
+        }
+    }
+
+    @Test
+    @ResourceLock(Resources.SYSTEM_PROPERTIES)
+    void shouldApplyConfigClassOnceWithEitherPropertyEntryPoint() {
+        AtomicInteger lookups = new AtomicInteger();
+        var config = new CitrusAgentConfiguration() {
+            @Override
+            public String getConfigClass() {
+                return "example.Config" + lookups.incrementAndGet();
+            }
+        };
+        String key = CitrusSettings.DEFAULT_CONFIG_CLASS_PROPERTY;
+        String original = System.getProperty(key);
+        try {
+            config.setDefaultProperties();
+            assertThat(System.getProperty(key)).isEqualTo("example.Config1");
+            config.applyDefaultProperties(Set.of(DistributionSettings.WORKER_REGISTRATION_KEY_PROPERTY));
+            assertThat(System.getProperty(key)).isEqualTo("example.Config2");
+            assertThat(lookups.get()).isEqualTo(2);
+        } finally {
+            if (original == null) {
+                System.clearProperty(key);
+            } else {
+                System.setProperty(key, original);
+            }
+        }
     }
 
     @Test
