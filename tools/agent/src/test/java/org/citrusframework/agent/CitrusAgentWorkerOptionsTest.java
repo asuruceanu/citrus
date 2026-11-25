@@ -25,7 +25,9 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -34,6 +36,7 @@ import java.util.stream.Stream;
 
 import io.vertx.core.Context;
 import io.vertx.core.Vertx;
+import org.citrusframework.agent.util.JsonSupport;
 import org.citrusframework.api.agent.CitrusAgentConfiguration;
 import org.citrusframework.distribution.config.DistributionSettings;
 import org.citrusframework.distribution.worker.DistributionWorkerClient;
@@ -59,6 +62,56 @@ class CitrusAgentWorkerOptionsTest {
 
     private static CitrusAgentConfiguration parse(String... args) {
         return new CitrusAgentOptions().apply(args);
+    }
+
+    @Test
+    @ResourceLock(Resources.SYSTEM_PROPERTIES)
+    void shouldInheritWorkerSettingsWhenPoolOptionsAreAbsent() {
+        var settings = Map.of(DistributionSettings.WORKER_POOL_PROPERTY, "inherited",
+                DistributionSettings.WORKER_REGISTRATION_KEY_PROPERTY, "inherited-key",
+                DistributionSettings.WORKER_CAPABILITIES_PROPERTY, "specialized=true");
+        var saved = new HashMap<String, String>();
+        settings.forEach((key, value) -> saved.put(key, System.setProperty(key, value)));
+        try {
+            var config = DistributionWorkerBridge.buildWorkerConfig(parse("--mode", "worker"));
+            var expected = DistributionWorkerConfig.fromSettings();
+            assertThat(config.poolId()).isEqualTo(expected.poolId());
+            assertThat(expected.registrationKey().equals(config.registrationKey())).as("inherited registration key").isTrue();
+            assertThat(config.capabilities()).containsAllEntriesOf(expected.capabilities());
+        } finally {
+            saved.forEach((key, value) -> {
+                if (value == null) {
+                    System.clearProperty(key);
+                } else {
+                    System.setProperty(key, value);
+                }
+            });
+        }
+    }
+
+    @Test
+    void shouldAcceptRegistrationKeyInConfigurationWithoutPublishingIt() {
+        var config = JsonSupport.read("""
+                {"pool":"pool1","registrationKey":"test-secret"}
+                """, CitrusAgentConfiguration.class);
+        assertThat(config.getRegistrationKey()).isEqualTo("test-secret");
+        assertThat(JsonSupport.render(config)).contains("pool1").doesNotContain("registrationKey", "test-secret");
+    }
+
+    @Test
+    void shouldKeepPackageShortOptionAndForwardPoolCredentials() {
+        var options = parse("--mode", "worker", "-p", "com.acme.tests", "--pool", "pool1", "-k", "ctrk_1_2");
+        assertThat(options.getPackages()).containsExactly("com.acme.tests");
+        assertThat(options.getPool()).isEqualTo("pool1");
+        assertThat(options.getRegistrationKey()).isEqualTo("ctrk_1_2");
+        var config = DistributionWorkerBridge.buildWorkerConfig(options);
+        assertThat(config.poolId()).isEqualTo("pool1");
+        assertThat(config.registrationKey()).isEqualTo("ctrk_1_2");
+
+        var cacheLikeValues = parse("--pool", "--no-cache-cleanup", "-k", "--cache-x");
+        assertThat(cacheLikeValues.getPool()).isEqualTo("--no-cache-cleanup");
+        assertThat(cacheLikeValues.getRegistrationKey()).isEqualTo("--cache-x");
+        assertThat(cacheLikeValues.getCacheCleanup()).isNull();
     }
 
     @TestFactory

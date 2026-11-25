@@ -19,6 +19,7 @@ package org.citrusframework.distribution.worker;
 import java.nio.file.Path;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Properties;
 
 import org.citrusframework.distribution.config.DistributionSettings;
 import org.junit.jupiter.api.AfterEach;
@@ -54,6 +55,26 @@ class DistributionWorkerConfigTest {
                 System.setProperty(key, value);
             }
         });
+    }
+
+    @Test
+    void shouldResolvePoolIdentityAndCapabilitiesFromEnvironmentAliases() {
+        var builder = new DistributionWorkerConfig.Builder(new Properties(), Map.of(
+                "TEST_DISTRIBUTION_AGENT_POOL", "pool1", "TEST_DISTRIBUTION_AGENT_REGISTRATION_KEY", "test-key",
+                "TEST_DISTRIBUTION_AGENT_NAME", "build-agent", "TEST_DISTRIBUTION_AGENT_CAPABILITIES", "docker,zone=eu"));
+        var config = builder.build();
+        assertThat(config.poolId()).isEqualTo("pool1");
+        assertThat(config.registrationKey()).isEqualTo("test-key");
+        assertThat(config.workerId()).isEqualTo("build-agent");
+        assertThat(config.capabilities()).containsEntry("docker", "true").containsEntry("zone", "eu");
+        assertThat(config.version()).isNotBlank();
+        assertThat(config.registrationRenewalIntervalMs()).isEqualTo(3_600_000L);
+
+        var override = builder.poolId("other").registrationKey("other-key").workerId("explicit").version("5.1").build();
+        assertThat(override.poolId()).isEqualTo("other");
+        assertThat(override.registrationKey()).isEqualTo("other-key");
+        assertThat(override.workerId()).isEqualTo("explicit");
+        assertThat(override.version()).isEqualTo("5.1");
     }
 
     @Test

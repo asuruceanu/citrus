@@ -28,9 +28,11 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Stream;
@@ -38,6 +40,7 @@ import java.util.stream.Stream;
 import io.vertx.core.Vertx;
 import io.vertx.core.buffer.Buffer;
 import io.vertx.core.http.HttpServer;
+import io.vertx.core.http.ServerWebSocket;
 import org.citrusframework.distribution.coordinator.DistributionCoordinatorConfig;
 import org.citrusframework.distribution.coordinator.DistributionCoordinatorServer;
 import org.citrusframework.distribution.cache.BlobCacheDirectory;
@@ -66,6 +69,7 @@ import org.junit.jupiter.api.io.TempDir;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTimeout;
 
 class DistributionWorkerClientTest {
 
@@ -106,6 +110,109 @@ class DistributionWorkerClientTest {
             assertEquals("beta", System.getProperty("custom.tenant.id"));
             Thread.sleep(250L);
             assertEquals("beta", System.getProperty("custom.tenant.id"));
+        }
+    }
+
+    @Test
+    void shouldStopPromptlyOnStructuredRejection() throws Exception {
+        assertTerminalRejection(true);
+    }
+
+    @Test
+    void shouldStopPromptlyOnBareRejectionClose() throws Exception {
+        assertTerminalRejection(false);
+    }
+
+    private void assertTerminalRejection(boolean structured) throws Exception {
+        try (var peer = new WorkerPeer(); var worker = new DistributionWorkerClient(peer.config(tempDir))) {
+            worker.start();
+            var socket = peer.nextSocket();
+            peer.nextMessage(WorkerWsMessage.WORKER_REGISTER);
+            if (structured) {
+                peer.write(socket, WorkerWsMessage.WORKER_REJECTED,
+                        Map.of("code", "INVALID_REGISTRATION_KEY", "message", "Invalid key"));
+            }
+            socket.close((short) 4003, "rejected");
+            assertTimeout(Duration.ofSeconds(1),
+                    () -> assertThat(worker.awaitRegistration(2, TimeUnit.SECONDS)).isFalse());
+            assertThat(worker.rejectionReason()).hasValueSatisfying(reason -> {
+                assertThat(reason.code()).isEqualTo(structured ? "INVALID_REGISTRATION_KEY" : "WORKER_REJECTED");
+                assertThat(reason.message()).isNotBlank();
+            });
+            assertThat(peer.sockets.poll(300, TimeUnit.MILLISECONDS)).isNull();
+        }
+    }
+
+    @Test
+    void shouldRenewOnlyAfterRegistrationOnEachConnectionAndStopOnRejection() throws Exception {
+        try (var peer = new WorkerPeer(); var worker = new DistributionWorkerClient(peer.config(tempDir))) {
+            worker.start();
+            for (int connection = 0; connection < 2; connection++) {
+                var socket = peer.nextSocket();
+                var register = peer.nextMessage(WorkerWsMessage.WORKER_REGISTER);
+                assertThat(register.payload()).containsEntry("poolId", "pool1").containsEntry("registrationKey", "test-key")
+                        .containsEntry("version", "v1");
+                assertThat(peer.messages.poll(300, TimeUnit.MILLISECONDS)).isNull();
+                peer.write(socket, WorkerWsMessage.WORKER_REGISTERED, Map.of());
+                assertThat(worker.awaitRegistration(2, TimeUnit.SECONDS)).isTrue();
+                for (int renewal = 0; renewal < 2; renewal++) {
+                    var renew = peer.nextMessage(WorkerWsMessage.WORKER_RENEW);
+                    assertThat(renew.payload()).containsEntry("workerId", "worker1").containsEntry("poolId", "pool1")
+                            .containsEntry("registrationKey", "test-key");
+                }
+                if (connection == 0) {
+                    socket.close((short) 1012, "restart");
+                } else {
+                    peer.write(socket, WorkerWsMessage.WORKER_REJECTED,
+                            Map.of("code", "INVALID_REGISTRATION_KEY", "message", "Key revoked"));
+                }
+            }
+            assertThat(peer.messages.poll(400, TimeUnit.MILLISECONDS)).isNull();
+            assertThat(peer.sockets.poll(150, TimeUnit.MILLISECONDS)).isNull();
+            assertThat(worker.rejectionReason()).hasValueSatisfying(reason -> assertThat(reason.message()).isEqualTo("Key revoked"));
+        }
+    }
+
+    private static class WorkerPeer implements AutoCloseable {
+        private final Vertx vertx = Vertx.vertx();
+        private final BlockingQueue<ServerWebSocket> sockets = new LinkedBlockingQueue<>();
+        private final BlockingQueue<WorkerWsMessage> messages = new LinkedBlockingQueue<>();
+        private final HttpServer server;
+
+        WorkerPeer() throws Exception {
+            server = vertx.createHttpServer().webSocketHandler(socket -> {
+                socket.textMessageHandler(json -> messages.add(DistributionJson.fromJson(json, WorkerWsMessage.class)));
+                sockets.add(socket);
+            }).listen(0, "127.0.0.1").toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
+        }
+
+        DistributionWorkerConfig config(Path cacheDir) {
+            return DistributionWorkerConfig.builder().workerId("worker1").poolId("pool1").registrationKey("test-key")
+                    .version("v1").registrationRenewalIntervalMs(150).reconnectDelayMs(50).cacheDir(cacheDir)
+                    .coordinatorUrl("http://127.0.0.1:" + server.actualPort()).build();
+        }
+
+        ServerWebSocket nextSocket() throws InterruptedException {
+            var socket = sockets.poll(5, TimeUnit.SECONDS);
+            assertThat(socket).isNotNull();
+            return socket;
+        }
+
+        WorkerWsMessage nextMessage(String type) throws InterruptedException {
+            var message = messages.poll(5, TimeUnit.SECONDS);
+            assertThat(message).isNotNull();
+            assertThat(message.type()).isEqualTo(type);
+            return message;
+        }
+
+        void write(ServerWebSocket socket, String type, Map<String, Object> payload) throws Exception {
+            socket.writeTextMessage(DistributionJson.toJson(new WorkerWsMessage(type, payload)))
+                    .toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
+        }
+
+        @Override
+        public void close() throws Exception {
+            vertx.close().toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
         }
     }
 

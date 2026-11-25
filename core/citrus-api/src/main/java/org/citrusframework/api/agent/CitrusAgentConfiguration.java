@@ -47,6 +47,10 @@ public class CitrusAgentConfiguration extends CitrusAppConfiguration {
 
     private String authToken = "";
 
+    private String pool;
+
+    private String registrationKey;
+
     private String capabilities = "";
 
     private String cacheDir = "";
@@ -124,6 +128,24 @@ public class CitrusAgentConfiguration extends CitrusAppConfiguration {
     @SchemaProperty(description = "Shared authentication token for the Citrus Test Distribution Coordinator.")
     public void setAuthToken(String authToken) {
         this.authToken = authToken;
+    }
+
+    public String getPool() {
+        return pool;
+    }
+
+    @SchemaProperty(description = "Agent pool ID used for worker registration.")
+    public void setPool(String pool) {
+        this.pool = pool;
+    }
+
+    public String getRegistrationKey() {
+        return registrationKey;
+    }
+
+    @SchemaProperty(description = "Registration key used to join the worker pool.")
+    public void setRegistrationKey(String registrationKey) {
+        this.registrationKey = registrationKey;
     }
 
     public String getCapabilities() {

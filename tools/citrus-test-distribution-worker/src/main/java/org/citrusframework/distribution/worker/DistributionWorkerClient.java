@@ -24,12 +24,14 @@ import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
@@ -38,10 +40,12 @@ import org.citrusframework.distribution.config.DistributionJson;
 import org.citrusframework.distribution.config.DistributionSettings;
 import org.citrusframework.distribution.model.PartitionAssignPayload;
 import org.citrusframework.distribution.model.PartitionCompletedPayload;
+import org.citrusframework.distribution.model.ResultJournal;
 import org.citrusframework.distribution.model.WorkerCacheStats;
 import org.citrusframework.distribution.model.WorkerHeartbeatPayload;
 import org.citrusframework.distribution.model.WorkerRegisterPayload;
-import org.citrusframework.distribution.model.ResultJournal;
+import org.citrusframework.distribution.model.WorkerRejectedPayload;
+import org.citrusframework.distribution.model.WorkerRenewPayload;
 import org.citrusframework.distribution.model.WorkerWsMessage;
 import org.junit.platform.engine.CancellationToken;
 import org.slf4j.Logger;
@@ -69,6 +73,10 @@ public final class DistributionWorkerClient implements AutoCloseable {
     private final AtomicBoolean closed = new AtomicBoolean(false);
     private final AtomicBoolean cacheStatsFailureActive = new AtomicBoolean();
     private final AtomicReference<WebSocket> activeWebSocket = new AtomicReference<>();
+    private final CompletableFuture<WorkerRejectedPayload> rejection = new CompletableFuture<>();
+    // Guarded by this client's monitor from the handshake through the end of the connection.
+    private WorkerWsListener connection;
+    private ScheduledFuture<?> renewal;
     private volatile ResultJournal resultOutbox;
     private final ActiveAssignmentTracker assignments = new ActiveAssignmentTracker();
     private volatile CountDownLatch registeredLatch = new CountDownLatch(1);
@@ -104,7 +112,7 @@ public final class DistributionWorkerClient implements AutoCloseable {
      *                               it, or if this client is closed
      */
     public void start() {
-        if (!running.compareAndSet(false, true)) {
+        if (rejection.isDone() || !running.compareAndSet(false, true)) {
             return;
         }
         try {
@@ -157,7 +165,16 @@ public final class DistributionWorkerClient implements AutoCloseable {
     }
 
     public boolean awaitRegistration(long timeout, TimeUnit unit) throws InterruptedException {
-        return registeredLatch.await(timeout, unit);
+        return registeredLatch.await(timeout, unit) && !rejection.isDone();
+    }
+
+    public Optional<WorkerRejectedPayload> rejectionReason() {
+        return Optional.ofNullable(rejection.getNow(null));
+    }
+
+    /** Runs the notification once when registration or renewal is rejected, including a prior rejection. */
+    public void onRejection(Runnable notification) {
+        rejection.thenRun(notification);
     }
 
     public boolean isConnected() {
@@ -183,9 +200,11 @@ public final class DistributionWorkerClient implements AutoCloseable {
     /**
      * Abruptly drops the WebSocket connection (primarily for testing disconnect failover).
      */
-    public void abortConnection() {
+    public synchronized void abortConnection() {
         assignments.cancel(null, 0);
         running.set(false);
+        connection = null;
+        cancelRenewal();
         WebSocket ws = activeWebSocket.getAndSet(null);
         if (ws != null) {
             ws.abort();
@@ -209,7 +228,12 @@ public final class DistributionWorkerClient implements AutoCloseable {
             }
             drain(10, TimeUnit.SECONDS);
             running.set(false);
-            WebSocket ws = activeWebSocket.getAndSet(null);
+            WebSocket ws;
+            synchronized (this) {
+                cancelRenewal();
+                connection = null;
+                ws = activeWebSocket.getAndSet(null);
+            }
             if (ws != null) {
                 try {
                     ws.sendClose(WebSocket.NORMAL_CLOSURE, "shutdown").get(2, TimeUnit.SECONDS);
@@ -268,34 +292,47 @@ public final class DistributionWorkerClient implements AutoCloseable {
         }
     }
 
-    private void connectInternal() {
-        if (!running.get()) {
+    private synchronized void connectInternal() {
+        if (!running.get() || draining.get() || closed.get() || rejection.isDone() || connection != null) {
             return;
         }
-        registeredLatch = new CountDownLatch(1);
-        URI wsUri = buildWsUri();
+        if (registeredLatch.getCount() == 0) {
+            registeredLatch = new CountDownLatch(1);
+        }
         WebSocket.Builder builder = httpClient.newWebSocketBuilder()
                 .connectTimeout(Duration.ofSeconds(10));
         if (config.authToken() != null && !config.authToken().isBlank()) {
             builder.header("Authorization", "Bearer " + config.authToken());
         }
 
-        builder.buildAsync(wsUri, new WorkerWsListener())
-                .whenComplete((ws, err) -> {
-                    if (err != null) {
-                        LOG.warn("Worker {} failed to connect to {}: {}", config.workerId(), wsUri, err.getMessage());
+        WorkerWsListener listener = new WorkerWsListener();
+        connection = listener;
+        builder.buildAsync(buildWsUri(), listener).whenComplete((ws, err) -> {
+            if (err != null) {
+                synchronized (this) {
+                    if (connection == listener) {
+                        connection = null;
+                        LOG.warn("Worker {} failed to connect to {}", config.workerId(), config.coordinatorUrl());
                         scheduleReconnect();
-                        return;
                     }
-                    activeWebSocket.set(ws);
-                    Map<String, String> caps = new LinkedHashMap<>(config.capabilities());
-                    caps.put("citrus-worker", "true");
-                    WorkerRegisterPayload registerPayload = new WorkerRegisterPayload(
-                            config.workerId(), config.hostName(), caps, cacheStats());
-                    @SuppressWarnings("unchecked")
-                    Map<String, Object> payloadMap = DistributionJson.convert(registerPayload, Map.class);
-                    sendMessageSafe(WorkerWsMessage.WORKER_REGISTER, payloadMap);
-                });
+                }
+            }
+        });
+    }
+
+    @SuppressWarnings("unchecked")
+    private synchronized void register(WorkerWsListener listener, WebSocket ws) {
+        if (connection != listener || closed.get() || !running.get() || rejection.isDone()) {
+            ws.abort();
+            return;
+        }
+        activeWebSocket.set(ws);
+        Map<String, String> caps = new LinkedHashMap<>(config.capabilities());
+        caps.put("citrus-worker", "true");
+        WorkerRegisterPayload register = new WorkerRegisterPayload(config.workerId(), config.hostName(),
+                config.version(), config.poolId(), config.registrationKey(), caps, cacheStats());
+        sendMessageSafe(WorkerWsMessage.WORKER_REGISTER, DistributionJson.convert(register, Map.class));
+        ws.request(1);
     }
 
     private URI buildWsUri() {
@@ -316,7 +353,7 @@ public final class DistributionWorkerClient implements AutoCloseable {
     }
 
     private void scheduleReconnect() {
-        if (!running.get() || draining.get()) {
+        if (!running.get() || draining.get() || closed.get() || rejection.isDone()) {
             return;
         }
         scheduler.schedule(this::connectInternal, config.reconnectDelayMs(), TimeUnit.MILLISECONDS);
@@ -408,19 +445,37 @@ public final class DistributionWorkerClient implements AutoCloseable {
         }
     }
 
-    private void handleWsMessage(WorkerWsMessage message) {
-        if (message == null || message.type() == null) {
+    private synchronized void handleWsMessage(WebSocket ws, WorkerWsMessage message) {
+        if (ws != activeWebSocket.get() || message == null || message.type() == null) {
             return;
         }
         switch (message.type()) {
             case WorkerWsMessage.WORKER_REGISTERED -> {
-                registeredLatch.countDown();
-                scheduler.execute(this::replayPendingResults);
+                if (!closed.get() && registeredLatch.getCount() > 0) {
+                    if (config.poolId() != null && !config.poolId().isBlank()) {
+                        long interval = config.registrationRenewalIntervalMs();
+                        renewal = scheduler.scheduleWithFixedDelay(() -> renewRegistration(ws),
+                                interval, interval, TimeUnit.MILLISECONDS);
+                    }
+                    registeredLatch.countDown();
+                    scheduler.execute(this::replayPendingResults);
+                }
+            }
+            case WorkerWsMessage.WORKER_RENEWED -> {
+                // The next renewal is already scheduled for this connection.
+            }
+            case WorkerWsMessage.WORKER_REJECTED -> {
+                WorkerRejectedPayload reason = DistributionJson.convert(message.payload(), WorkerRejectedPayload.class);
+                disconnected(ws, reason != null ? reason : genericRejection());
+                ws.abort();
             }
             case WorkerWsMessage.RESULT_ACK -> resultOutbox.acknowledge(
                     (String) message.payload().get(WorkerWsMessage.DELIVERY_ID));
             case WorkerWsMessage.PARTITION_ASSIGN -> {
                 PartitionAssignPayload assign = DistributionJson.convert(message.payload(), PartitionAssignPayload.class);
+                if (closed.get()) {
+                    return;
+                }
                 if (!assignments.canAccept()) {
                     // One live partition at a time. A cancelled run that is still winding down does not block: the
                     // new assignment queues behind it on the single-threaded executor.
@@ -481,8 +536,51 @@ public final class DistributionWorkerClient implements AutoCloseable {
         }
     }
 
+    @SuppressWarnings("unchecked")
+    private synchronized void renewRegistration(WebSocket ws) {
+        if (ws == activeWebSocket.get() && !closed.get()) {
+            WorkerRenewPayload payload = new WorkerRenewPayload(config.workerId(), config.poolId(), config.registrationKey());
+            sendMessageSafe(WorkerWsMessage.WORKER_RENEW, DistributionJson.convert(payload, Map.class));
+        }
+    }
+
+    private void cancelRenewal() {
+        if (renewal != null) {
+            renewal.cancel(false);
+            renewal = null;
+        }
+    }
+
+    private static WorkerRejectedPayload genericRejection() {
+        return new WorkerRejectedPayload("WORKER_REJECTED", "The coordinator rejected the worker registration");
+    }
+
+    private synchronized void disconnected(WebSocket ws, WorkerRejectedPayload reason) {
+        if (!activeWebSocket.compareAndSet(ws, null)) {
+            return;
+        }
+        connection = null;
+        cancelRenewal();
+        // The coordinator requeues the partition of a lost connection.
+        assignments.cancel(null, 0);
+        if (reason != null) {
+            rejection.complete(reason);
+            registeredLatch.countDown();
+        } else {
+            if (registeredLatch.getCount() == 0) {
+                registeredLatch = new CountDownLatch(1);
+            }
+            scheduleReconnect();
+        }
+    }
+
     private final class WorkerWsListener implements WebSocket.Listener {
         private final StringBuilder buffer = new StringBuilder();
+
+        @Override
+        public void onOpen(WebSocket webSocket) {
+            register(this, webSocket);
+        }
 
         @Override
         public CompletionStage<?> onText(WebSocket webSocket, CharSequence data, boolean last) {
@@ -492,9 +590,9 @@ public final class DistributionWorkerClient implements AutoCloseable {
                 buffer.setLength(0);
                 try {
                     WorkerWsMessage msg = DistributionJson.fromJson(json, WorkerWsMessage.class);
-                    handleWsMessage(msg);
+                    handleWsMessage(webSocket, msg);
                 } catch (Exception e) {
-                    LOG.warn("Invalid WebSocket message on worker {}: {}", config.workerId(), e.getMessage());
+                    LOG.warn("Invalid WebSocket message on worker {}", config.workerId());
                 }
             }
             webSocket.request(1);
@@ -503,18 +601,13 @@ public final class DistributionWorkerClient implements AutoCloseable {
 
         @Override
         public CompletionStage<?> onClose(WebSocket webSocket, int statusCode, String reason) {
-            // The coordinator requeues the partition of a lost connection; its result could never be accepted.
-            assignments.cancel(null, 0);
-            activeWebSocket.compareAndSet(webSocket, null);
-            scheduleReconnect();
+            disconnected(webSocket, statusCode == 4003 ? genericRejection() : null);
             return null;
         }
 
         @Override
         public void onError(WebSocket webSocket, Throwable error) {
-            assignments.cancel(null, 0);
-            activeWebSocket.compareAndSet(webSocket, null);
-            scheduleReconnect();
+            disconnected(webSocket, null);
         }
     }
 }

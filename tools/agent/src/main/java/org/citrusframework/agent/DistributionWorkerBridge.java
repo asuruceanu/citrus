@@ -46,6 +46,8 @@ final class DistributionWorkerBridge implements AutoCloseable {
         DistributionWorkerConfig.Builder builder = DistributionWorkerConfig.builder()
                 .coordinatorUrl(configuration.getCoordinatorUrl(fallbackUrl))
                 .authToken(configuration.getAuthToken())
+                .poolId(configuration.getPool())
+                .registrationKey(configuration.getRegistrationKey())
                 .addCapabilitiesCsv(configuration.getCapabilities());
         if (StringUtils.hasText(configuration.getCacheDir())) {
             builder.cacheDir(Paths.get(configuration.getCacheDir()));
