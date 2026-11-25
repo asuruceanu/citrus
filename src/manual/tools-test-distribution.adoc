@@ -517,7 +517,8 @@ reachable hostname. See <<agent-worker-mode>> for environment-only startup.
 |`-P`, `--port PORT` |Listening port of the agent HTTP server. Defaults to `4567`.
 |`-m`, `--mode MODE` |Use `worker` to connect to the coordinator. The default is `standalone`.
 |`-u`, `--coordinator-url URL` |Address of the coordinator to connect to.
-|`--auth-token TOKEN` |Bearer token for a coordinator that requires authentication. The agent uses `-t` for `--test`.
+|`--auth-token TOKEN` |Coordinator bearer token. Prefer exporting `CITRUS_DIST_AUTH_TOKEN` because the agent exposes
+a command-line token in its `/configuration` response. The agent uses `-t` for `--test`.
 |`--pool ID` |Pool to join. Spell out `--pool` because the agent uses `-p` for `--package`.
 |`-k`, `--registration-key KEY` |Registration key issued by that pool. The agent rejects an explicitly blank pool ID or key.
 |`-C`, `--capabilities TAGS` |Comma-separated capability tags.

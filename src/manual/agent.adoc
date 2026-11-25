@@ -403,21 +403,21 @@ The agent skips automatic tests at startup and keeps its Web UI, `/health`, `/co
 test runs available on its HTTP port (default `4567`).
 
 With the packaged `citrus-agent.jar` and its adjacent `lib/` directory, start an agent against a coordinator on
-its default port, `8765`. The following example uses a pool ID, a key issued for that pool and the coordinator's bearer token.
+its default port, `8765`. The example uses a pool ID and a key issued for that pool. If the coordinator requires
+bearer authentication, export `CITRUS_DIST_AUTH_TOKEN` before starting the agent.
 
 [source,bash]
 ----
 java -jar citrus-agent.jar --mode worker \
   -u http://localhost:8765 \
   --pool "$CITRUS_DIST_WORKER_POOL" \
-  --registration-key "$CITRUS_DIST_WORKER_REGISTRATION_KEY" \
-  --auth-token "$CITRUS_DIST_AUTH_TOKEN"
+  --registration-key "$CITRUS_DIST_WORKER_REGISTRATION_KEY"
 ----
 
 Use `-u` / `--coordinator-url` to override the coordinator address. The agent's built-in fallback is
 `http://localhost:8084`. Use `--pool` for the pool ID because `-p` selects a test package. A coordinator that
-allows unpooled workers can accept an agent without a pool ID or key. Supply the bearer token when the
-coordinator requires one.
+allows unpooled workers can accept an agent without a pool ID or key. The agent also accepts `--auth-token TOKEN`,
+but passing the token on the command line exposes it in the agent's `/configuration` response.
 
 For a container deployment, set `CITRUS_AGENT_MODE=worker` and `CITRUS_DIST_COORDINATOR_URL` in the
 container environment. Supply pool credentials and the bearer token through the corresponding environment
