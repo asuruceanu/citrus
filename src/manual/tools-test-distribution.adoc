@@ -9,7 +9,7 @@ Citrus Test Distribution partitions and executes JUnit Platform and Citrus integ
 * `org.citrusframework:citrus-test-distribution-protocol` — Shared WebSocket/REST protocol DTOs, SHA-256 content-addressed blob cache, Citrus endpoint telemetry collector, capability matcher, and `@LocalOnly` / `@RemoteOnly` / `@AgentRequirement` annotations.
 * `org.citrusframework:citrus-test-distribution-ui` — Zero-Node monitoring Web UI served at `/ui/` (overview KPIs, live SVG Gantt partition waterfall, workspace/resource inspector, worker pool health, test history/flakiness, and failing test / partition crash diagnostics).
 * `org.citrusframework:citrus-test-distribution-coordinator` — Vert.x HTTP/WebSocket coordinator, Longest-Processing-Time (LPT) scheduler, SSE event hub, and JDBC persistence (file-backed `HSQLDB` or `PostgreSQL`).
-* `org.citrusframework:citrus-test-distribution-worker` — Standalone Java worker runtime with child-first `ClassLoader` or forked-JVM workspace isolation and graceful `SIGTERM` draining (`citrus-agent --mode=worker` or `citrus dist worker start`).
+* `org.citrusframework:citrus-test-distribution-worker` — Standalone Java worker runtime with child-first `ClassLoader` or forked-JVM workspace isolation and graceful `SIGTERM` draining (`citrus-agent --mode worker` or `citrus dist worker start`).
 * `org.citrusframework:citrus-test-distribution` — JUnit Platform launcher interceptor, `@LocalOnly` / lost-partition local fallback executor, Surefire XML writer, and `@CitrusTestFactory` declarative source splitter.
 * `org.citrusframework.mvn:citrus-test-distribution-maven-extension` — Opt-in Maven Core Extension (`-Dcitrus.test.distribution.enabled=true`) coordinating reactor-wide build sessions.
 
@@ -453,91 +453,174 @@ Search cross-session test history by project, class, or method. The sidebar's fl
 grouped by build session and open the session that recorded a recovery.
 
 [[tools-test-distribution-workers]]
-== Worker Pool and Citrus Agent Mode
+== Test Distribution Workers
 
-Workers can be launched either via `citrus-jbang` (`citrus dist worker start`) or through the containerized `citrus-agent` server in `worker` mode:
+A worker connects to a coordinator over an outbound WebSocket, downloads the files it needs, executes one test
+partition at a time and streams results back. Both runtimes use the same worker client. Choose
+`citrus dist worker start` for a dedicated worker in a CI job or container. Choose Citrus Agent in worker mode
+when you also need its HTTP service, Web UI or on-demand test runs.
 
+=== Start a worker
+
+Start the coordinator separately with `citrus dist coordinator start`. It listens on port `8765` by default.
+For a pooled worker, create an <<tools-test-distribution-agent-pools,agent pool>> and supply its ID and registration
+key. The examples read those values from the environment. If your coordinator accepts unpooled workers, you can
+omit both settings. A coordinator with bearer authentication also requires `CITRUS_DIST_AUTH_TOKEN` or `--auth-token`.
+
+.Dedicated JBang worker
 [source,bash]
 ----
-# Standalone JBang worker (accepts http://, https://, ws://, or wss:// coordinator URLs)
 citrus dist worker start \
-  --coordinator-url=http://127.0.0.1:8765 \
-  --worker-id=worker-k8s-01 \
-  --auth-token=secret-ci-token \
-  --capabilities=docker=true,kafka=true \
-  --cache-dir=/var/lib/citrus/worker-cache \
-  --cache-free-space-buffer-size=4GiB
-
-# Citrus Agent container / JAR in worker mode
-java -jar citrus-agent.jar \
-  --mode worker \
-  --coordinator-url http://coordinator.internal:8765 \
-  --auth-token secret-ci-token \
-  --capabilities docker=true,zone=eu-central-1 \
-  --cache-dir /var/lib/citrus/worker-cache \
-  --no-cache-cleanup
+  --coordinator-url=http://localhost:8765 \
+  --pool="$CITRUS_DIST_WORKER_POOL" \
+  --registration-key="$CITRUS_DIST_WORKER_REGISTRATION_KEY"
 ----
 
-Both commands accept `--coordinator-url` (`-u`). In agent worker mode, this option takes precedence over
-the `citrus.test.distribution.coordinatorUrl` system property. When neither is set, the agent connects to
-`http://localhost:8084`.
-
-To join an <<tools-test-distribution-agent-pools,agent pool>>, configure its ID and a registration key belonging to it.
-Upgrade the coordinator before enabling pooled workers. A pooled worker stops if the coordinator cannot confirm its pool ID.
-The JBang worker accepts `--pool` / `-p` and `--registration-key` / `-k`. In Citrus Agent worker mode, use
-`--pool` and `--registration-key` / `-k`. The agent's `-p` selects a test package.
-
-[cols="1,2,3",options="header"]
-|===
-|Setting |System property |Environment variable and alias
-|Pool ID |`citrus.test.distribution.worker.pool`
-|`CITRUS_DIST_WORKER_POOL` / `TEST_DISTRIBUTION_AGENT_POOL`
-|Registration key |`citrus.test.distribution.worker.registrationKey`
-|`CITRUS_DIST_WORKER_REGISTRATION_KEY` / `TEST_DISTRIBUTION_AGENT_REGISTRATION_KEY`
-|===
-
-An explicit worker option or typed agent setting takes precedence. Otherwise the worker checks the
-`CITRUS_DIST_WORKER_*` variable first, then the `TEST_DISTRIBUTION_AGENT_*` alias, then the JVM system property,
-skipping blank values. Citrus Agent rejects an explicitly blank `--pool` or `--registration-key` argument.
-The following command takes its registration key from the environment.
-
+.Citrus Agent with its packaged JAR and adjacent lib/ directory
 [source,bash]
 ----
-citrus dist worker start --coordinator-url=http://localhost:8765 --pool="$CITRUS_DIST_WORKER_POOL" --capabilities=docker
+java -jar citrus-agent.jar --mode worker \
+  -u http://localhost:8765 \
+  --pool "$CITRUS_DIST_WORKER_POOL" \
+  --registration-key "$CITRUS_DIST_WORKER_REGISTRATION_KEY"
 ----
 
-Both commands accept the same local file cache options:
+The JBang worker defaults to `http://localhost:8765`. Citrus Agent defaults to `http://localhost:8084`.
+To point the agent at a coordinator on port `8765`, set `-u` / `--coordinator-url`,
+`citrus.test.distribution.coordinatorUrl` or `CITRUS_DIST_COORDINATOR_URL`. In a container, use the coordinator's
+reachable hostname. See <<agent-worker-mode>> for environment-only startup.
 
-* `--cache-dir DIR` — Directory of the worker's local file cache (default `${user.home}/.citrus-test-distribution-agent/file-cache`).
-* `--[no-]cache-cleanup[=true|false]` — Enables (default) or disables automatic eviction of cached files. Both commands also accept a space-separated Boolean, such as `--cache-cleanup false`. Without a value, `--no-cache-cleanup` disables cleanup. When the flag is given several times, the last one wins.
-* `--cache-free-space-buffer-size SIZE` — Free disk space the worker keeps available on the cache drive when cleanup is enabled (default `2GiB`; `KiB`, `MiB` and `GiB` suffixes in any letter case, or plain bytes).
+=== Command-line options
 
-Both commands validate the cache flags when invoked with `--help` or `-h`.
+.Options for citrus dist worker start
+[cols="2,3",options="header"]
+|===
+|Option |Purpose
 
-The worker keeps every classpath jar and declared input it downloads from the coordinator in this cache and reuses it
-across partitions, sessions and worker restarts, so a warm worker only downloads what changed. Cached files are
-verified before reuse, and a corrupted file is removed and downloaded again. The worker fails the partition if a blob
-download goes 60 seconds without receiving data and removes the partial download. With cleanup enabled, the worker evicts the
-least recently used files when the usable space on the cache drive falls below the buffer: when it starts, before each
-download and after each partition. Files used by the running partition are never evicted. If evicting everything else
-still does not free enough space, the worker logs a warning and continues; the partition fails only when the disk
-actually runs full. With cleanup disabled, the cache grows without limit. If the usable space on the cache drive is
-already below `--cache-free-space-buffer-size`, the worker evicts every cached file not in use each time it starts and
-after each partition, so the cache effectively runs cold; on small disks, lower the buffer.
+|`-u`, `--coordinator-url URL` |Coordinator address. Both runtimes accept HTTP, HTTPS, WS and WSS URLs.
+|`-w`, `--worker-id ID` |Unique worker ID. The default is stable for a given hostname and cache directory.
+|`--auth-token TOKEN` |Bearer token for a coordinator that requires authentication.
+|`-p`, `--pool ID` |Pool to join.
+|`-k`, `--registration-key KEY` |Registration key issued by that pool.
+|`-C`, `--capabilities TAGS` |Comma-separated capability tags, such as `zone=east,large-fixtures`.
+|`--cache-dir DIR` |Worker's local file cache directory.
+|`--[no-]cache-cleanup[=true\|false]` |Enable or disable automatic cache eviction. Enabled by default.
+|`--cache-free-space-buffer-size SIZE` |Amount of disk space cleanup tries to keep free. Defaults to `2GiB`.
+|`--duration-seconds N` |Run for the given number of seconds, then drain. The default, `0`, runs until stopped.
+|===
 
-IMPORTANT: Sharing a local file cache directory between several workers is not supported. A worker locks its cache
-directory exclusively (lock file `<cacheDir>/.lock`) and refuses to start when another worker holds that lock. When running
-more than one worker on the same host, give each worker its own `--cache-dir`, or run each worker in its own container.
-The cache directory must be on a local filesystem that supports file locks. A worker also refuses a cache directory
-marked as belonging to the coordinator or host launcher.
+.Options for Citrus Agent in worker mode
+[cols="2,3",options="header"]
+|===
+|Option |Purpose
 
-NOTE: Upgrading from an earlier version: the default worker cache directory moved from `.citrus-dist/cache/worker`
-below the worker's working directory to `${user.home}/.citrus-test-distribution-agent/file-cache`, which is shared by
-every worker of the same user account and locked by the first one. Old `.citrus-dist/cache/worker` directories are no
-longer used and can be deleted safely. Hosts that run several worker daemons under the same account must now give each
-daemon its own `--cache-dir`; otherwise every daemon after the first fails to start on the cache lock.
+|`-P`, `--port PORT` |Listening port of the agent HTTP server. Defaults to `4567`.
+|`-m`, `--mode MODE` |Use `worker` to connect to the coordinator. The default is `standalone`.
+|`-u`, `--coordinator-url URL` |Address of the coordinator to connect to.
+|`--auth-token TOKEN` |Coordinator bearer token. The agent uses it for worker authentication and omits it from
+`/configuration`. The agent uses `-t` for `--test`.
+|`--pool ID` |Pool to join. Spell out `--pool` because the agent uses `-p` for `--package`.
+|`-k`, `--registration-key KEY` |Registration key issued by that pool. The agent rejects an explicitly blank pool ID or key.
+|`-C`, `--capabilities TAGS` |Comma-separated capability tags.
+|`--cache-dir DIR` |Worker's local file cache directory.
+|`--[no-]cache-cleanup[=true\|false]` |Enable or disable automatic cache eviction. Enabled by default.
+|`--cache-free-space-buffer-size SIZE` |Amount of disk space cleanup tries to keep free. Defaults to `2GiB`.
+|===
 
-Every worker automatically advertises host capabilities (`os`, `arch`, `jdk`, `cpuCores`, `memoryMb`, and `citrus.workspace.v1=true`) merged with any custom `--capabilities` `key=value` pairs. On `SIGTERM` or shutdown, the worker sends `worker.draining` so the coordinator stops assigning new partitions while allowing any in-flight partition to finish within its drain timeout before closing the WebSocket.
+=== Environment variables and JVM system properties
+
+Explicit worker options override inherited settings. Both runtimes use the following lookup order.
+
+* For coordinator URL, bearer token and cache settings, the worker checks the JVM system property, then the
+  `CITRUS_DIST_*` environment variable, then uses the runtime default. Cache settings also accept the existing
+  `TEST_DISTRIBUTION_AGENT_*` aliases listed under <<tools-test-distribution-external-resources-worker>>
+  after the Citrus environment variable.
+* For pool ID, registration key, worker ID and capabilities, the worker checks the `CITRUS_DIST_WORKER_*`
+  environment variable before the `citrus.test.distribution.worker.*` JVM system property, then uses the runtime
+  default. Existing environment aliases are checked after the Citrus variable and before the system property.
+  The pool and registration key aliases are `TEST_DISTRIBUTION_AGENT_POOL` and `TEST_DISTRIBUTION_AGENT_REGISTRATION_KEY`.
+* Citrus Agent reads `citrus.agent.mode`, or `CITRUS_AGENT_MODE` if the JVM property is unset. A blank or unset
+  inherited mode selects `standalone`. The agent validates this setting before reading CLI options, so an unsupported
+  value stops startup. Use `--mode` to override a valid inherited mode.
+
+[cols="3,3,2",options="header"]
+|===
+|Environment variable |JVM system property |Default
+
+|`CITRUS_DIST_COORDINATOR_URL` |`citrus.test.distribution.coordinatorUrl`
+|JBang `http://localhost:8765` +
+Agent `http://localhost:8084`
+|`CITRUS_DIST_AUTH_TOKEN` |`citrus.test.distribution.authToken` |Empty
+|`CITRUS_DIST_WORKER_POOL` |`citrus.test.distribution.worker.pool` |Unpooled
+|`CITRUS_DIST_WORKER_REGISTRATION_KEY` |`citrus.test.distribution.worker.registrationKey` |Empty
+|`CITRUS_DIST_WORKER_ID` |`citrus.test.distribution.worker.id` |Generated from hostname and cache path
+|`CITRUS_DIST_WORKER_CAPABILITIES` |`citrus.test.distribution.worker.capabilities` |Detected capabilities
+|`CITRUS_DIST_WORKER_CACHE_DIR` |`citrus.test.distribution.worker.cacheDir` |`${user.home}/.citrus-test-distribution-agent/file-cache`
+|`CITRUS_DIST_WORKER_CACHE_CLEANUP` |`citrus.test.distribution.worker.cacheCleanup` |`true`
+|`CITRUS_DIST_WORKER_CACHE_FREE_SPACE_BUFFER_SIZE` |`citrus.test.distribution.worker.cacheFreeSpaceBufferSize` |`2GiB`
+|`CITRUS_AGENT_MODE` |`citrus.agent.mode` |`standalone` (also accepts `worker`)
+|===
+
+=== Worker capabilities
+
+The worker detects `os`, `arch`, `jdk` (Java feature version), `cpuCores` (available processors) and `memoryMb`
+(maximum JVM heap in MiB). It advertises workspace support by default with `citrus.workspace.v1`,
+`citrus.workspace.quarkus.v1`, `citrus.workspace.jvm-options.v1` and `citrus.workspace.jvm-layout.v1`, each set to `true`.
+
+Use `CITRUS_DIST_WORKER_CAPABILITIES` or its system property to add or override tags. A bare tag means `true`.
+The worker merges `-C` / `--capabilities` entries over the inherited tags. For example, with
+`CITRUS_DIST_WORKER_CAPABILITIES=zone=east,large-fixtures`, passing `-C zone=west` advertises `zone=west`
+and `large-fixtures=true`. The runtime always reports its actual `jdk` and sets the protocol marker `citrus-worker=true`.
+
+=== Local file cache
+
+The worker keeps downloaded classpath JARs and declared inputs across partitions, sessions and restarts. Set
+`--cache-dir` to choose a directory. The default is `${user.home}/.citrus-test-distribution-agent/file-cache`.
+The worker verifies files before reuse, removes corrupt files and downloads them again. A download that receives
+no data for 60 seconds fails the partition and removes the partial file.
+
+With cleanup enabled, the worker checks free space at startup, before each download and after each partition.
+When space falls below `--cache-free-space-buffer-size`, it evicts the least recently used files first and preserves
+files in use by the running partition. Specify the buffer in bytes or whole `KiB`, `MiB` or `GiB` (case-insensitive).
+If eviction cannot restore the buffer, the worker warns and continues. A full disk can fail the partition.
+On small disks, lower the buffer to avoid repeatedly emptying the cache.
+
+Use `--no-cache-cleanup` or `--cache-cleanup false` to let the cache grow without automatic eviction. Both runtimes
+accept a space-separated boolean or an equals sign. If a cleanup flag is repeated, the last value wins.
+Both runtimes validate cache flags even with `--help` or `-h`.
+
+Each worker holds an exclusive `<cacheDir>/.lock` on a local filesystem that supports file locking. Give every worker
+on a host its own cache directory. A worker refuses a directory locked by another worker or marked for use by a
+coordinator or build host.
+
+NOTE: Older versions used `.citrus-dist/cache/worker` under the working directory. After upgrading, you can delete
+the unused old directory. Workers running under the same account now share the default path, so set a distinct
+`--cache-dir` for each.
+
+=== Registration and shutdown
+
+Upgrade the coordinator before enabling pooled workers. A pooled worker requires the coordinator to confirm its
+pool ID before it accepts work. Once confirmed, it renews its registration hourly using its startup key.
+See <<tools-test-distribution-agent-pools>> for key rotation and grace periods.
+
+[cols="2,3",options="header"]
+|===
+|Registration rejection |What to check
+
+|`POOL_REQUIRED`, `POOL_NOT_FOUND` |Supply the ID of an existing pool.
+|`INVALID_REGISTRATION_KEY`, `REVOKED_REGISTRATION_KEY` |Use an active key issued for that pool.
+|`MISSING_POOL_CAPABILITIES` |Compare the worker's advertised tags with the pool's mandatory capabilities.
+|`INVALID_WORKER_METADATA` |Use at most 128 characters for the worker ID and 255 for the hostname.
+|`ALREADY_REGISTERED` |The same connection attempted to register twice.
+|`POOL_NOT_CONFIRMED` |The worker could not confirm its configured pool. Check the coordinator version and pool ID.
+|`WORKER_REJECTED` |The worker received a rejection without a specific reason. Check the coordinator logs.
+|===
+
+On registration rejection, the JBang worker reports the reason and exits with a nonzero status. Citrus Agent
+logs one warning and keeps its HTTP service running. Check the coordinator's worker list to verify registration.
+On `SIGTERM`, the worker signals `worker.draining` so the coordinator stops assigning it new partitions.
+The JBang worker gives an active partition up to 30 seconds to finish. Citrus Agent allows up to 15 seconds.
+The worker then closes the connection and releases the cache lock.
 
 [[tools-test-distribution-annotations]]
 == Placement Annotations
@@ -755,6 +838,10 @@ caches of the build host and the coordinator. Workers keep their own local file 
 [cols="2,4,1",options="header"]
 |===
 |Property / environment variable |Meaning |Default
+|`citrus.test.distribution.coordinatorUrl` / `CITRUS_DIST_COORDINATOR_URL`
+|Coordinator address used by the worker.
+|JBang `http://localhost:8765` +
+Agent `http://localhost:8084`
 |`citrus.test.distribution.worker.forkMode` / `CITRUS_DIST_WORKER_FORK_MODE`
 |`ALWAYS` runs every partition in a fresh JVM, so containers, system properties, static state and threads left behind
 by one partition cannot affect the next. `AUTO` runs partitions in the shared worker JVM (faster, less isolated) and forks

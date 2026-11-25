@@ -18,6 +18,7 @@ package org.citrusframework.api.agent;
 
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
@@ -37,6 +38,11 @@ public final class CitrusAgentSettings {
     private static final String AGENT_NAME_PROPERTY = AGENT_PROPERTY_PREFIX + "name";
     private static final String AGENT_NAME_ENV = AGENT_ENV_PREFIX + "NAME";
     private static final String AGENT_NAME_DEFAULT = "citrus-agent";
+
+    @CitrusConfigProperty(description = "Execution mode for the agent (standalone or worker).", defaultValue = "standalone")
+    private static final String MODE_PROPERTY = AGENT_PROPERTY_PREFIX + "mode";
+    private static final String MODE_ENV = AGENT_ENV_PREFIX + "MODE";
+    private static final String MODE_DEFAULT = "standalone";
 
     @CitrusConfigProperty(description = "Test engine to use for running tests.", defaultValue = "junit-jupiter")
     private static final String TEST_ENGINE_PROPERTY = AGENT_PROPERTY_PREFIX + "test.engine";
@@ -135,6 +141,22 @@ public final class CitrusAgentSettings {
      */
     public static String getAgentName() {
         return CitrusSettings.getPropertyEnvOrDefault(AGENT_NAME_PROPERTY, AGENT_NAME_ENV, AGENT_NAME_DEFAULT);
+    }
+
+    public static String getMode() {
+        String mode = CitrusSettings.getPropertyEnvOrDefault(MODE_PROPERTY, MODE_ENV, MODE_DEFAULT);
+        String source = System.getProperty(MODE_PROPERTY) != null ? MODE_PROPERTY : MODE_ENV;
+        return parseMode(mode, source);
+    }
+
+    public static String parseMode(String raw, String source) {
+        String mode = raw == null ? "" : raw.strip();
+        return switch (mode.toLowerCase(Locale.ROOT)) {
+            case "", "standalone" -> MODE_DEFAULT;
+            case "worker" -> "worker";
+            default -> throw new IllegalArgumentException("Unsupported agent mode '" + mode + "' for " + source
+                    + " - expected 'standalone' or 'worker'");
+        };
     }
 
     public static String getTestEngine() {

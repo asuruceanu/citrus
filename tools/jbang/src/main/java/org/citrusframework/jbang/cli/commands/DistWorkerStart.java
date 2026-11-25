@@ -38,6 +38,8 @@ import org.citrusframework.jbang.cli.CitrusJBangMain;
 @CommandDefinition(name = "start", description = "Start a Citrus Test Distribution worker connected to a coordinator")
 public class DistWorkerStart extends CitrusCommand {
 
+    static final String DEFAULT_COORDINATOR_URL = "http://localhost:8765";
+
     private static final List<String> COMMAND_WORDS = List.of("dist", "worker", "start");
 
     /** Options of this command that take a separate value token, which is never parsed as a cache option. */
@@ -54,7 +56,7 @@ public class DistWorkerStart extends CitrusCommand {
     @Option(name = "help", shortName = 'h', hasValue = false, description = "Display this help and exit")
     boolean helpRequested;
 
-    @Option(name = "coordinator-url", shortName = 'u', defaultValue = "http://localhost:8765", description = "Coordinator base URL")
+    @Option(name = "coordinator-url", shortName = 'u', description = "Coordinator base URL (default: " + DEFAULT_COORDINATOR_URL + ")")
     String coordinatorUrl;
 
     @Option(name = "worker-id", shortName = 'w', description = "Unique worker identifier")
@@ -171,8 +173,10 @@ public class DistWorkerStart extends CitrusCommand {
     }
 
     DistributionWorkerConfig buildWorkerConfig() {
+        String effectiveUrl = coordinatorUrl != null && !coordinatorUrl.isBlank()
+                ? coordinatorUrl : DistributionSettings.resolveCoordinatorUrl(DEFAULT_COORDINATOR_URL);
         DistributionWorkerConfig.Builder builder = DistributionWorkerConfig.builder()
-                .coordinatorUrl(coordinatorUrl)
+                .coordinatorUrl(effectiveUrl)
                 .poolId(pool)
                 .registrationKey(registrationKey)
                 .addCapabilitiesCsv(capabilities);

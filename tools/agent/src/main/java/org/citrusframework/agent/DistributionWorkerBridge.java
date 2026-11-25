@@ -18,6 +18,7 @@ package org.citrusframework.agent;
 
 import java.nio.file.Paths;
 import java.util.concurrent.TimeUnit;
+import java.util.function.UnaryOperator;
 
 import org.citrusframework.api.agent.CitrusAgentConfiguration;
 import org.citrusframework.distribution.config.DistributionSettings;
@@ -47,14 +48,20 @@ final class DistributionWorkerBridge implements AutoCloseable {
      * agent are left to the worker defaults (system property, environment variable, built-in default).
      */
     static DistributionWorkerConfig buildWorkerConfig(CitrusAgentConfiguration configuration) {
-        String fallbackUrl = DistributionSettings.getString(DistributionSettings.COORDINATOR_URL_PROPERTY, null,
+        return buildWorkerConfig(configuration, System::getenv);
+    }
+
+    static DistributionWorkerConfig buildWorkerConfig(CitrusAgentConfiguration configuration, UnaryOperator<String> env) {
+        String fallbackUrl = DistributionSettings.resolveCoordinatorUrl(System::getProperty, env,
                 CitrusAgentConfiguration.DEFAULT_COORDINATOR_URL);
         DistributionWorkerConfig.Builder builder = DistributionWorkerConfig.builder()
                 .coordinatorUrl(configuration.getCoordinatorUrl(fallbackUrl))
-                .authToken(configuration.getAuthToken())
                 .poolId(configuration.getPool())
                 .registrationKey(configuration.getRegistrationKey())
                 .addCapabilitiesCsv(configuration.getCapabilities());
+        if (StringUtils.hasText(configuration.getAuthToken())) {
+            builder.authToken(configuration.getAuthToken());
+        }
         if (StringUtils.hasText(configuration.getCacheDir())) {
             builder.cacheDir(Paths.get(configuration.getCacheDir()));
         }

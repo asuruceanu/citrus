@@ -14,7 +14,7 @@ The agent application exposes a REST service API for clients to inject tests and
 As a web application the agent exposes several REST endpoints.
 Http clients are able to trigger test runs and inspect the remote test results.
 
-At service startup the agent will automatically run all tests that can be found according to certain criteria.
+In standalone mode, the agent automatically runs matching tests at startup by default.
 The agent performs a test scan looking for available tests on multiple sources applying multiple search criteria:
 
 * name pattern: Tests that should be executed must match one of the given class name patterns (e.g. `.*IT`)
@@ -36,7 +36,11 @@ The agent REST API provides these operations:
 
 | /health
 | GET
-| Provides general agent service status as a Json object (UP: true/false)
+| Returns the agent service status as JSON, `{"status":"UP"}`.
+
+| /configuration
+| GET
+| Returns the current agent configuration and omits the worker bearer token and pool registration key.
 
 | /run
 | GET
@@ -80,6 +84,9 @@ The Citrus agent application supports the following settings.
 |===
 |System properties |Description
 
+| citrus.agent.mode
+| Execution mode, either `standalone` (default) or `worker`. See <<agent-worker-mode>>.
+
 | citrus.agent.name
 | The name of this agent instance. Default value is `citrus-agent`.
 
@@ -96,7 +103,7 @@ The Citrus agent application supports the following settings.
 | Should use system exit to mark test failure (e.g. system exit = -1). Default is `false`.
 
 | citrus.agent.skip.tests
-| Test execution should bee skipped at server startup. Default is `false` which means that all tests found are automatically run as part of the server startup procedure.
+| Set to `true` to skip startup tests in standalone mode. The default is `false`. Worker mode always skips startup tests.
 
 | citrus.agent.includes
 | List of test name patterns to include in test runs. The server searches for tests matching these patterns when running all available tests. Default patterns are `["^.*IT$", "^.*ITCase$", "^IT.*$"]`
@@ -124,6 +131,9 @@ Same properties are settable via environment variables.
 |===
 |Environment variable |Description
 
+| CITRUS_AGENT_MODE
+| Execution mode, either `standalone` (default) or `worker`. See <<agent-worker-mode>>.
+
 | CITRUS_AGENT_NAME
 | The name of this agent instance. Default value is `citrus-agent`.
 
@@ -140,7 +150,7 @@ Same properties are settable via environment variables.
 | Should use system exit to mark test failure (e.g. system exit = -1). Default is `false`.
 
 | CITRUS_AGENT_SKIP_TESTS
-| Test execution should bee skipped at server startup. Default is `false` which means that all tests found are automatically run as part of the server startup procedure.
+| Set to `true` to skip startup tests in standalone mode. The default is `false`. Worker mode always skips startup tests.
 
 | CITRUS_AGENT_INCLUDES
 | List of test name patterns to include in test runs. The server searches for tests matching these patterns when running all available tests. Default patterns are `["^.*IT$", "^.*ITCase$", "^IT.*$"]`
@@ -384,3 +394,46 @@ It verifies the test results and makes the local Maven build fail in case of tes
 It automatically removes the Citrus agent service deployment and its related resources from the Kubernetes cluster.
 
 When the local Maven build is successful you can be sure that all tests have run successful on the agent.
+
+[[agent-worker-mode]]
+== Test Distribution Worker Mode
+
+Start Citrus Agent with `--mode worker` to execute partitions assigned by a Test Distribution coordinator.
+The agent skips automatic tests at startup and keeps its Web UI, `/health`, `/configuration` and on-demand
+test runs available on its HTTP port (default `4567`).
+
+With the packaged `citrus-agent.jar` and its adjacent `lib/` directory, start an agent against a coordinator on
+its default port, `8765`. The example uses a pool ID and a key issued for that pool. If the coordinator requires
+bearer authentication, export `CITRUS_DIST_AUTH_TOKEN` before starting the agent.
+
+[source,bash]
+----
+java -jar citrus-agent.jar --mode worker \
+  -u http://localhost:8765 \
+  --pool "$CITRUS_DIST_WORKER_POOL" \
+  --registration-key "$CITRUS_DIST_WORKER_REGISTRATION_KEY"
+----
+
+Use `-u` / `--coordinator-url` to override the coordinator address. The agent's built-in fallback is
+`http://localhost:8084`. Use `--pool` for the pool ID because `-p` selects a test package. A coordinator that
+allows unpooled workers can accept an agent without a pool ID or key. Use `--auth-token TOKEN` to supply the
+coordinator bearer token on the command line. The agent uses it to authenticate the worker and omits it from
+`/configuration`.
+
+For a container deployment, set `CITRUS_AGENT_MODE=worker` and `CITRUS_DIST_COORDINATOR_URL` in the
+container environment. Supply pool credentials and the bearer token through the corresponding environment
+variables if required. The agent also reads these settings when started from the JAR.
+
+[source,bash]
+----
+CITRUS_AGENT_MODE=worker \
+CITRUS_DIST_COORDINATOR_URL=http://coordinator:8765 \
+java -jar citrus-agent.jar
+----
+
+The agent reads the `citrus.agent.mode` JVM system property, or `CITRUS_AGENT_MODE` if the property is unset.
+Values are case-insensitive and the agent ignores surrounding whitespace. A blank or unset inherited mode selects
+`standalone`. An unsupported value in the selected setting stops startup with exit status 1 before the agent reads
+the command line. Use `-m` / `--mode` to override a valid inherited mode. An unsupported CLI mode also exits with status 1.
+
+See <<tools-test-distribution-workers>> for both worker runtimes, capability tags, cache settings and registration failures.

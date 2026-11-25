@@ -6,17 +6,17 @@
 
 ## Intent and Why
 
-Citrus Test Distribution currently lets any worker connect directly to the coordinator and matches build requirements directly against individual workers' advertised capabilities. As shared worker fleets grow, operators need controlled grouping, capability governance, credential rotation, pool prioritization, fleet health warnings, and historical capacity visibility modeled on Develocity Test Distribution Administration — tailored to Citrus without enterprise bloat (no access control/RBAC, no project groups, no autoscaler sizing, and no duplicate Connecting Builds view since `Build Sessions Explorer` already covers live sessions).
+Citrus Test Distribution currently lets any worker connect directly to the coordinator and matches build requirements directly against individual workers' advertised capabilities. As shared worker fleets grow, operators need controlled grouping, capability governance, credential rotation, pool prioritization, fleet health warnings, and historical capacity visibility, tailored to Citrus without enterprise bloat (no access control/RBAC, no project groups, no autoscaler sizing, and no duplicate Connecting Builds view since `Build Sessions Explorer` already covers live sessions).
 
 ## Goals, Non-Goals, and Anti-Goals
 
 - **Goals:**
   - **Agent Pools (full lifecycle & registration):** Create, edit, prioritize (drag-and-drop + move controls), and delete agent pools with generated short unique IDs, mandatory capability sets (`key=value` and bare `key` tokens), and multiple pool-scoped registration keys (`Generate`, prefix/metadata tracking, `Last used at`, `Last used by`, `Revoke`).
-  - **Develocity-parity registration, grace windows, and scheduling:**
+  - **Registration, grace windows, and scheduling:**
     - Reject connecting workers missing mandatory pool capabilities, referencing a non-existent pool, or presenting an invalid, wrong-pool, or revoked registration key.
     - Keep already-connected workers online with explicit warning indicators for up to **4 hours** after pool deletion (`POOL_DELETED`) or mandatory capability additions (`POOL_CAPABILITY_MISMATCH`), and up to **1 hour** (or next hourly registration renewal) after registration key revocation (`KEY_REVOKED`), then forcibly disconnect them.
     - Match build requirements against pool capabilities (ignoring extra capabilities declared only on pooled workers), schedule higher-priority pools before lower-priority pools, and support hybrid mode where unpooled workers remain backward-compatible fallback capacity unless `citrus.test.distribution.coordinator.requireAgentPool=true`.
-  - **Workers Pool parity with Develocity Agents:** Enhance the existing `Workers Pool` view (without adding a separate `Agents` tab) with top fleet summary counts (`N workers, B busy, I idle`), grouping by Agent Pool, worker `Version`, live `Last status update` (`Executing <ClassName> > <testName>` when busy; `Idle for <duration> · Waiting for test execution requests` when idle), and grace-window warning badges, while preserving local file cache telemetry.
+  - **Workers Pool telemetry and grouping:** Enhance the existing `Workers Pool` view (without adding a separate `Agents` tab) with top fleet summary counts (`N workers, B busy, I idle`), grouping by Agent Pool, worker `Version`, live `Last status update` (`Executing <ClassName> > <testName>` when busy; `Idle for <duration> · Waiting for test execution requests` when idle), and grace-window warning badges, while preserving local file cache telemetry.
   - **Historical Usage (`1 hour` / `24 hours` / `7 days`):** Persist periodic coordinator usage snapshots and render `Active jobs`, `Worker utilization` (`utilized`, `desired`, `connected`), and per-pool utilization time-series charts with capability/requirement chip filtering.
   - **Generic `Build Sessions Explorer` subtitle:** Replace `"Inspect distributed Maven & JBang reactor runs, classpath cache hit rates, and test outcomes."` with `"Inspect distributed build sessions, artifact cache hit rates, and test outcomes."`
 - **Non-Goals:**
@@ -42,7 +42,7 @@ Citrus Test Distribution currently lets any worker connect directly to the coord
 1. **Approach A — Hybrid Pool Model + Periodic 15s JDBC Usage Samples (Selected):**
    - Agent pools, SHA-256 hashed registration keys, and compact 15-second usage sample buckets are persisted in `JdbcDistributionStore`.
    - Workers with `--pool` + `--registration-key` join a pool, renew hourly, and follow pool priority + capability rules; workers without `--pool` continue working in an `Unpooled Workers` fallback group unless `requireAgentPool=true` is enabled on the coordinator.
-   - Chosen because it delivers full Develocity Agent Pool & Historical Usage semantics while keeping existing zero-config local/CI setups and tests working out of the box.
+   - Chosen because it delivers the full Agent Pool & Historical Usage semantics while keeping existing zero-config local/CI setups and tests working out of the box.
 2. **Approach B — Auto-Seeded `default` Pool + Query-Time Usage Reconstruction:**
    - Reconstructs utilization curves from partition start/end timestamps instead of sampling. Rejected because historical `connected` and `desired` worker counts cannot be reconstructed accurately from partition rows alone, especially under capability filters and offline transitions.
 3. **Approach C — Strict Pool-Only Enforcement:**
@@ -145,7 +145,7 @@ Citrus Test Distribution currently lets any worker connect directly to the coord
 - **System properties & environment variables:**
   - Pool ID: `citrus.test.distribution.worker.pool`, `CITRUS_DIST_WORKER_POOL`, `TEST_DISTRIBUTION_AGENT_POOL`.
   - Registration key: `citrus.test.distribution.worker.registrationKey`, `CITRUS_DIST_WORKER_REGISTRATION_KEY`, `TEST_DISTRIBUTION_AGENT_REGISTRATION_KEY`.
-  - Develocity env aliases also honored for worker name (`TEST_DISTRIBUTION_AGENT_NAME`) and capabilities (`TEST_DISTRIBUTION_AGENT_CAPABILITIES`).
+  - Additional env aliases are honored for worker name (`TEST_DISTRIBUTION_AGENT_NAME`) and capabilities (`TEST_DISTRIBUTION_AGENT_CAPABILITIES`).
   - Coordinator strict pool flag: `citrus.test.distribution.coordinator.requireAgentPool` / `CITRUS_DIST_COORDINATOR_REQUIRE_AGENT_POOL` (property wins when set, default `false`).
 - **CLI flags:**
   - `citrus dist worker start`: `-p` / `--pool` and `-k` / `--registration-key` (added to `VALUE_OPTIONS`).

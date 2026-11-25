@@ -281,6 +281,24 @@ class DistCommandTest extends CommandTest {
 
     @Test
     @ResourceLock(Resources.SYSTEM_PROPERTIES)
+    void shouldResolveWorkerCoordinatorUrlFromPropertyWhenCliUrlAbsent() {
+        String property = DistributionSettings.COORDINATOR_URL_PROPERTY;
+        String previous = System.setProperty(property, "http://worker-prop:9200/");
+        try {
+            assertThat(bindWorkerStart(List.of(), List.of()).coordinatorUrl()).isEqualTo("http://worker-prop:9200");
+            assertThat(bindWorkerStart(List.of(), List.of("-u", "http://worker-cli:9201")).coordinatorUrl())
+                    .isEqualTo("http://worker-cli:9201");
+        } finally {
+            if (previous == null) {
+                System.clearProperty(property);
+            } else {
+                System.setProperty(property, previous);
+            }
+        }
+    }
+
+    @Test
+    @ResourceLock(Resources.SYSTEM_PROPERTIES)
     void shouldInheritWorkerSettingsWhenPoolOptionsAreAbsent() {
         var settings = Map.of(DistributionSettings.WORKER_POOL_PROPERTY, "inherited",
                 DistributionSettings.WORKER_REGISTRATION_KEY_PROPERTY, "inherited-key",
@@ -433,8 +451,8 @@ class DistCommandTest extends CommandTest {
 
     /** Normalizes a worker start command line and lets the command parser bind it to the real worker options. */
     private static DistributionWorkerConfig bindWorkerStart(List<String> leading, List<String> options) {
-        List<String> command = Stream.of(leading.stream(), Stream.of("dist", "worker", "start", "--coordinator-url",
-                "http://localhost:1"), options.stream()).flatMap(s -> s).toList();
+        List<String> command = Stream.of(leading.stream(), Stream.of("dist", "worker", "start"), options.stream())
+                .flatMap(s -> s).toList();
         String[] normalized = DistWorkerStart.normalizeWorkerStartArgs(command.toArray(String[]::new));
         int optionsStart = leading.size() + 3;
         assertThat(Arrays.asList(normalized).subList(0, optionsStart)).containsExactlyElementsOf(

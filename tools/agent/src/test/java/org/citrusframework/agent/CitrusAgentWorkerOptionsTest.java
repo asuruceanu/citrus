@@ -20,6 +20,10 @@ import java.io.ByteArrayOutputStream;
 import java.io.PrintStream;
 import java.net.InetAddress;
 import java.net.ServerSocket;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -32,6 +36,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.UnaryOperator;
 import java.util.stream.Stream;
 
 import io.vertx.core.Context;
@@ -50,6 +55,7 @@ import org.citrusframework.distribution.config.DistributionSettings;
 import org.citrusframework.distribution.worker.DistributionWorkerClient;
 import org.citrusframework.distribution.worker.DistributionWorkerConfig;
 import org.citrusframework.exceptions.CitrusRuntimeException;
+import org.citrusframework.util.SocketUtils;
 import org.junit.jupiter.api.DynamicTest;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestFactory;
@@ -70,6 +76,76 @@ class CitrusAgentWorkerOptionsTest {
 
     private static CitrusAgentConfiguration parse(String... args) {
         return new CitrusAgentOptions().apply(args);
+    }
+
+    @Test
+    void shouldRejectInvalidCliModeAtStartup() {
+        assertInvalidModeAtStartup(new String[] {"--mode", "bogus"}, "-m/--mode");
+    }
+
+    @Test
+    @ResourceLock(Resources.SYSTEM_PROPERTIES)
+    void shouldRejectInvalidModePropertyAtStartup() {
+        String key = "citrus.agent.mode";
+        String previous = System.setProperty(key, "bogus");
+        try {
+            assertInvalidModeAtStartup(new String[0], key);
+        } finally {
+            restoreProperty(key, previous);
+        }
+    }
+
+    private static void assertInvalidModeAtStartup(String[] args, String source) {
+        var errors = new ByteArrayOutputStream();
+        try (var err = new PrintStream(errors, true, StandardCharsets.UTF_8)) {
+            assertThat(CitrusAgentServer.parseOptions(args, err)).isEmpty();
+            errors.reset();
+            List<Integer> exitCodes = new ArrayList<>();
+            CitrusAgentServer.entrypoint(args, List.of(), System.out, err, exitCodes::add);
+            assertThat(exitCodes).containsExactly(1);
+            assertThat(errors.toString(StandardCharsets.UTF_8)).hasLineCount(1)
+                    .contains("Invalid Citrus agent options:", "'bogus'", source);
+        }
+    }
+
+    @Test
+    @ResourceLock(Resources.SYSTEM_PROPERTIES)
+    void shouldOverrideInheritedModeWithCliMode() {
+        String key = "citrus.agent.mode";
+        String previous = System.setProperty(key, "standalone");
+        try {
+            assertThat(CitrusAgentServer.parseOptions(new String[] {"-m", " WORKER "}, System.err))
+                    .hasValueSatisfying(options -> assertThat(options.configuration().getMode()).isEqualTo("worker"));
+        } finally {
+            restoreProperty(key, previous);
+        }
+    }
+
+    @Test
+    @ResourceLock(Resources.SYSTEM_PROPERTIES)
+    void shouldPreserveInheritedAuthTokenWhenCliTokenAbsent() {
+        String key = DistributionSettings.AUTH_TOKEN_PROPERTY;
+        String previous = System.setProperty(key, "inherited-token");
+        try {
+            assertThat(DistributionWorkerBridge.buildWorkerConfig(parse("--mode", "worker")).authToken())
+                    .isEqualTo("inherited-token");
+            assertThat(DistributionWorkerBridge.buildWorkerConfig(
+                    parse("--mode", "worker", "--auth-token", "   ")).authToken())
+                    .isEqualTo("inherited-token");
+            assertThat(DistributionWorkerBridge.buildWorkerConfig(
+                    parse("--mode", "worker", "--auth-token", "cli-token")).authToken())
+                    .isEqualTo("cli-token");
+        } finally {
+            restoreProperty(key, previous);
+        }
+    }
+
+    private static void restoreProperty(String key, String previous) {
+        if (previous == null) {
+            System.clearProperty(key);
+        } else {
+            System.setProperty(key, previous);
+        }
     }
 
     @Test
@@ -98,12 +174,48 @@ class CitrusAgentWorkerOptionsTest {
     }
 
     @Test
-    void shouldAcceptRegistrationKeyInConfigurationWithoutPublishingIt() {
+    void shouldAcceptWorkerCredentialsInConfigurationWithoutPublishingThem() {
         var config = JsonSupport.read("""
-                {"pool":"pool1","registrationKey":"test-secret"}
+                {"pool":"pool1","registrationKey":"test-secret","authToken":"test-bearer-token"}
                 """, CitrusAgentConfiguration.class);
         assertThat(config.getRegistrationKey()).isEqualTo("test-secret");
-        assertThat(JsonSupport.render(config)).contains("pool1").doesNotContain("registrationKey", "test-secret");
+        assertThat(config.getAuthToken()).isEqualTo("test-bearer-token");
+        assertThat(JsonSupport.render(config)).contains("pool1")
+                .doesNotContain("registrationKey", "test-secret", "authToken", "test-bearer-token");
+    }
+
+    @Test
+    @ResourceLock(Resources.SYSTEM_OUT)
+    void shouldAuthenticateWithCliTokenWithoutExposingItInHttpConfiguration() throws Exception {
+        var peer = Vertx.vertx();
+        PrintStream originalOutput = System.out;
+        String token = "test-cli-bearer-token";
+        var authorization = new CompletableFuture<String>();
+        try (var http = HttpClient.newHttpClient()) {
+            var endpoint = peer.createHttpServer()
+                    .webSocketHandler(socket -> authorization.complete(socket.headers().get("Authorization")))
+                    .listen(0, "127.0.0.1").toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
+            int agentPort = SocketUtils.findAvailableTcpPort(1024, 32767);
+            var server = new CitrusAgentServer(parse("--mode", "worker", "--port", Integer.toString(agentPort),
+                    "--duration", "-1", "--coordinator-url", "http://127.0.0.1:" + endpoint.actualPort(),
+                    "--auth-token", token, "--cache-dir", tempDir.resolve("auth-token-cache").toString()));
+            try {
+                server.start();
+                assertThat(authorization.get(5, TimeUnit.SECONDS)).isEqualTo("Bearer " + token);
+
+                var request = HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + agentPort + "/configuration"))
+                        .timeout(Duration.ofSeconds(5)).build();
+                var response = http.send(request, HttpResponse.BodyHandlers.ofString());
+                assertThat(response.statusCode()).isEqualTo(200);
+                assertThat(response.body()).contains("\"mode\"").doesNotContain("authToken", token);
+            } finally {
+                server.stop();
+                server.completed.get(5, TimeUnit.SECONDS);
+            }
+        } finally {
+            System.setOut(originalOutput);
+            peer.close().toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
+        }
     }
 
     @Test
@@ -330,25 +442,26 @@ class CitrusAgentWorkerOptionsTest {
 
     @Test
     @ResourceLock(Resources.SYSTEM_PROPERTIES)
-    void shouldUseCliUrlThenSystemPropertyThenAgentDefault() {
+    void shouldResolveAgentCoordinatorUrlFromEnvironmentWhenCliUrlAbsent() {
         String key = DistributionSettings.COORDINATOR_URL_PROPERTY;
+        UnaryOperator<String> env = name -> DistributionSettings.COORDINATOR_URL_ENV.equals(name)
+                ? "http://coordinator-env:9100" : null;
         String previous = System.setProperty(key, "http://coordinator-prop:9100/");
         try {
-            assertThat(DistributionWorkerBridge.buildWorkerConfig(parse("--mode", "worker")).coordinatorUrl())
+            var worker = parse("--mode", "worker");
+            assertThat(DistributionWorkerBridge.buildWorkerConfig(worker, env).coordinatorUrl())
                     .isEqualTo("http://coordinator-prop:9100");
             assertThat(DistributionWorkerBridge.buildWorkerConfig(
-                    parse("--mode", "worker", "--coordinator-url", "http://localhost:8084")).coordinatorUrl())
+                    parse("--mode", "worker", "--coordinator-url", "http://localhost:8084"), env).coordinatorUrl())
                     .isEqualTo("http://localhost:8084");
 
             System.clearProperty(key);
-            assertThat(DistributionWorkerBridge.buildWorkerConfig(parse("--mode", "worker")).coordinatorUrl())
+            assertThat(DistributionWorkerBridge.buildWorkerConfig(worker, env).coordinatorUrl())
+                    .isEqualTo("http://coordinator-env:9100");
+            assertThat(DistributionWorkerBridge.buildWorkerConfig(worker, name -> null).coordinatorUrl())
                     .isEqualTo("http://localhost:8084");
         } finally {
-            if (previous == null) {
-                System.clearProperty(key);
-            } else {
-                System.setProperty(key, previous);
-            }
+            restoreProperty(key, previous);
         }
     }
 
@@ -529,7 +642,9 @@ class CitrusAgentWorkerOptionsTest {
                     new PrintStream(errors, true, StandardCharsets.UTF_8), exitCodes::add);
 
             assertThat(output.toString(StandardCharsets.UTF_8)).contains("Citrus application option usage:",
-                    "--cache-dir", "--cache-cleanup", "--no-cache-cleanup", "--cache-free-space-buffer-size");
+                    "-t or --test", "--auth-token", "--cache-dir", "--cache-cleanup", "--no-cache-cleanup",
+                    "--cache-free-space-buffer-size")
+                    .doesNotContain("-t or --auth-token");
             assertThat(errors.toString(StandardCharsets.UTF_8)).isEmpty();
             assertThat(exitCodes).isEmpty();
             assertThat(cacheDir).doesNotExist();

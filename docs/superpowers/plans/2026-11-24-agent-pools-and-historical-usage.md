@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add Develocity-modeled Agent Pools (CRUD, priority ordering, registration keys, 1h/4h grace windows), Workers Pool parity (pool grouping, version, live executing test/idle status, warnings), Historical Usage (`1h`/`24h`/`7d` charts with capability/requirement filtering), and a generic Build Sessions Explorer subtitle to Citrus Test Distribution.
+**Goal:** Add Agent Pools (CRUD, priority ordering, registration keys, 1h/4h grace windows), Workers Pool parity (pool grouping, version, live executing test/idle status, warnings), Historical Usage (`1h`/`24h`/`7d` charts with capability/requirement filtering), and a generic Build Sessions Explorer subtitle to Citrus Test Distribution.
 
 **Architecture:** Extend `citrus-test-distribution-protocol` with pool, registration-key, warning, renewal, and usage-sample records plus bare-capability support. Persist pools, SHA-256 hashed keys, worker pool/warning metadata, and 15-second usage snapshots in `JdbcDistributionStore` (HSQLDB & PostgreSQL), enforce pool priority + capability matching + grace windows in `SessionCoordinator`, expose `/api/v1/agent-pools*` and `/api/v1/usage` in `DistributionCoordinatorVerticle`, wire `--pool` and `--registration-key` + hourly renewal through `DistributionWorkerClient`, `citrus-jbang`, and `citrus-agent`, and render the zero-Node ESM UI in `dist-ui`.
 
@@ -76,9 +76,9 @@
   - `AgentRequirement#value()` default `"true"`
   - `CapabilityMatcher.validateCapabilities(Map<String, String> capabilities)` and `DistributionSettings.parseStrictCapabilitiesCsv(String csv)` validating `[A-Za-z0-9._-]+` tokens and at most one `=` per entry
   - `DistributionSettings`:
-    - `WORKER_POOL_PROPERTY = "citrus.test.distribution.worker.pool"`, `WORKER_POOL_ENV = "CITRUS_DIST_WORKER_POOL"`, `DEVELOCITY_AGENT_POOL_ENV = "TEST_DISTRIBUTION_AGENT_POOL"`
-    - `WORKER_REGISTRATION_KEY_PROPERTY = "citrus.test.distribution.worker.registrationKey"`, `WORKER_REGISTRATION_KEY_ENV = "CITRUS_DIST_WORKER_REGISTRATION_KEY"`, `DEVELOCITY_AGENT_REGISTRATION_KEY_ENV = "TEST_DISTRIBUTION_AGENT_REGISTRATION_KEY"`
-    - `DEVELOCITY_AGENT_NAME_ENV = "TEST_DISTRIBUTION_AGENT_NAME"`, `DEVELOCITY_AGENT_CAPABILITIES_ENV = "TEST_DISTRIBUTION_AGENT_CAPABILITIES"`
+    - `WORKER_POOL_PROPERTY = "citrus.test.distribution.worker.pool"`, `WORKER_POOL_ENV = "CITRUS_DIST_WORKER_POOL"`, env alias `"TEST_DISTRIBUTION_AGENT_POOL"`
+    - `WORKER_REGISTRATION_KEY_PROPERTY = "citrus.test.distribution.worker.registrationKey"`, `WORKER_REGISTRATION_KEY_ENV = "CITRUS_DIST_WORKER_REGISTRATION_KEY"`, env alias `"TEST_DISTRIBUTION_AGENT_REGISTRATION_KEY"`
+    - env aliases `"TEST_DISTRIBUTION_AGENT_NAME"` and `"TEST_DISTRIBUTION_AGENT_CAPABILITIES"` for worker name and capabilities
     - `COORDINATOR_REQUIRE_AGENT_POOL_PROPERTY = "citrus.test.distribution.coordinator.requireAgentPool"`, `COORDINATOR_REQUIRE_AGENT_POOL_ENV = "CITRUS_DIST_COORDINATOR_REQUIRE_AGENT_POOL"`, `isCoordinatorRequireAgentPool()`
     - `resolveWorkerPool(Properties, Map<String, String>)`, `resolveWorkerRegistrationKey(Properties, Map<String, String>)`, `resolveWorkerId(Properties, Map<String, String>)`, `resolveWorkerCapabilitiesCsv(Properties, Map<String, String>)`
 

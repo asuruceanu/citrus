@@ -210,6 +210,7 @@ public class CitrusAgentConfiguration extends CitrusAppConfiguration {
 
         configuration.setPort(CitrusAgentSettings.getServerPort());
 
+        configuration.setMode(CitrusAgentSettings.getMode());
         configuration.setEngine(CitrusAgentSettings.getTestEngine());
         configuration.setIncludes(CitrusAgentSettings.getIncludes());
         configuration.setWorkDir(CitrusAgentSettings.getWorkDir());
