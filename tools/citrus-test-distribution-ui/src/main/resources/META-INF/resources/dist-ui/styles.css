@@ -870,6 +870,57 @@ tbody tr.clickable-row:hover {
   padding: 8px;
 }
 
+.waterfall-gap-heading {
+  fill: var(--text-muted);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.waterfall-gap-band {
+  fill: var(--text-muted);
+  fill-opacity: 0.07;
+}
+
+.waterfall-gap-edges {
+  fill: none;
+  stroke: var(--text-muted);
+  stroke-opacity: 0.55;
+  stroke-dasharray: 2 3;
+  pointer-events: none;
+}
+
+.waterfall-gap-chip {
+  fill: var(--bg-card);
+  stroke: var(--border-strong);
+}
+
+.waterfall-gap-duration {
+  fill: var(--text-secondary);
+  font-size: 10px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;
+}
+
+.waterfall-build-gap:hover .waterfall-gap-band {
+  fill-opacity: 0.14;
+}
+
+.waterfall-expanded {
+  position: fixed;
+  inset: 12px;
+  z-index: 70;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  box-shadow: 0 0 0 100vmax rgba(15, 23, 42, 0.6);
+}
+
+.waterfall-expanded .card-body {
+  min-height: 0;
+  overflow: auto;
+}
+
 .waterfall-bar {
   cursor: pointer;
   transition: opacity 0.14s ease;
