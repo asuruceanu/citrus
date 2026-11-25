@@ -23,6 +23,7 @@ import java.util.Optional;
 import java.util.OptionalInt;
 import java.util.function.Consumer;
 
+import org.citrusframework.distribution.model.AgentPoolRecord;
 import org.citrusframework.distribution.model.BuildSessionRecord;
 import org.citrusframework.distribution.model.CoordinatorEvent;
 import org.citrusframework.distribution.model.PartitionRecord;
@@ -34,6 +35,7 @@ import org.citrusframework.distribution.model.TestExecutionRecord;
 import org.citrusframework.distribution.model.WorkspaceChange;
 import org.citrusframework.distribution.model.TestHistoryRun;
 import org.citrusframework.distribution.model.TestHistorySummary;
+import org.citrusframework.distribution.model.UsageSampleRecord;
 import org.citrusframework.distribution.model.WorkerRecord;
 
 /**
@@ -92,6 +94,37 @@ public interface DistributionStore extends AutoCloseable {
     List<WorkspaceChange> findWorkspaceChanges(String sessionId);
 
     List<String> findChangedFiles(String sessionId);
+
+    void upsertAgentPool(AgentPoolRecord pool);
+
+    /** Creates the pool together with its optional initial key. */
+    void insertAgentPool(AgentPoolRecord pool, StoredRegistrationKey initialKey);
+
+    Optional<AgentPoolRecord> findAgentPool(String poolId);
+
+    List<AgentPoolRecord> listAgentPools();
+
+    /** Deletes the pool and all of its registration keys. */
+    boolean deleteAgentPool(String poolId);
+
+    /** Assigns zero-based priorities to a permutation of the current pool IDs. */
+    void updateAgentPoolPriorities(List<String> orderedPoolIds, long updatedAt);
+
+    void insertRegistrationKey(StoredRegistrationKey key);
+
+    List<StoredRegistrationKey> listRegistrationKeys(String poolId);
+
+    Optional<StoredRegistrationKey> findRegistrationKey(String keyId);
+
+    /** Returns whether the pool owns the key, preserving its first revocation time. */
+    boolean revokeRegistrationKey(String poolId, String keyId, long revokedAt);
+
+    void touchRegistrationKeyUsage(String keyId, long usedAt, String workerId);
+
+    /** Stores the sample and discards samples strictly older than the cutoff in one transaction. */
+    void recordUsageSample(UsageSampleRecord sample, long pruneBeforeTimestamp);
+
+    List<UsageSampleRecord> listUsageSamples(long fromTimestamp, long toTimestamp);
 
     void upsertWorker(WorkerRecord worker);
 

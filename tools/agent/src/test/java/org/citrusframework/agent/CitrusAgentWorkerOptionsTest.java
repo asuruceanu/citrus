@@ -25,7 +25,9 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -34,7 +36,16 @@ import java.util.stream.Stream;
 
 import io.vertx.core.Context;
 import io.vertx.core.Vertx;
+import org.apache.logging.log4j.Level;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.core.LogEvent;
+import org.apache.logging.log4j.core.Logger;
+import org.apache.logging.log4j.core.appender.AbstractAppender;
+import org.apache.logging.log4j.core.config.Property;
+import org.citrusframework.CitrusSettings;
+import org.citrusframework.agent.util.JsonSupport;
 import org.citrusframework.api.agent.CitrusAgentConfiguration;
+import org.citrusframework.api.main.TestRunConfiguration;
 import org.citrusframework.distribution.config.DistributionSettings;
 import org.citrusframework.distribution.worker.DistributionWorkerClient;
 import org.citrusframework.distribution.worker.DistributionWorkerConfig;
@@ -59,6 +70,199 @@ class CitrusAgentWorkerOptionsTest {
 
     private static CitrusAgentConfiguration parse(String... args) {
         return new CitrusAgentOptions().apply(args);
+    }
+
+    @Test
+    @ResourceLock(Resources.SYSTEM_PROPERTIES)
+    void shouldInheritWorkerSettingsWhenPoolOptionsAreAbsent() {
+        var settings = Map.of(DistributionSettings.WORKER_POOL_PROPERTY, "inherited",
+                DistributionSettings.WORKER_REGISTRATION_KEY_PROPERTY, "inherited-key",
+                DistributionSettings.WORKER_CAPABILITIES_PROPERTY, "specialized=true");
+        var saved = new HashMap<String, String>();
+        settings.forEach((key, value) -> saved.put(key, System.setProperty(key, value)));
+        try {
+            var config = DistributionWorkerBridge.buildWorkerConfig(parse("--mode", "worker"));
+            var expected = DistributionWorkerConfig.fromSettings();
+            assertThat(config.poolId()).isEqualTo(expected.poolId());
+            assertThat(expected.registrationKey().equals(config.registrationKey())).as("inherited registration key").isTrue();
+            assertThat(config.capabilities()).containsAllEntriesOf(expected.capabilities());
+        } finally {
+            saved.forEach((key, value) -> {
+                if (value == null) {
+                    System.clearProperty(key);
+                } else {
+                    System.setProperty(key, value);
+                }
+            });
+        }
+    }
+
+    @Test
+    void shouldAcceptRegistrationKeyInConfigurationWithoutPublishingIt() {
+        var config = JsonSupport.read("""
+                {"pool":"pool1","registrationKey":"test-secret"}
+                """, CitrusAgentConfiguration.class);
+        assertThat(config.getRegistrationKey()).isEqualTo("test-secret");
+        assertThat(JsonSupport.render(config)).contains("pool1").doesNotContain("registrationKey", "test-secret");
+    }
+
+    @Test
+    void shouldOmitOnlyRegistrationKeyFromAgentDefaultPropertiesJson() {
+        String key = DistributionSettings.WORKER_REGISTRATION_KEY_PROPERTY;
+        var config = parse("-D", key + "=property-credential,visible=retained");
+        String json = JsonSupport.render(config);
+        assertThat(json).contains("visible", "retained").doesNotContain(key, "property-credential");
+        assertThat(config.getDefaultProperties()).containsEntry(key, "property-credential");
+        assertThat(JsonSupport.read("""
+                {"defaultProperties":{"%s":"supplied"}}
+                """.formatted(key), CitrusAgentConfiguration.class).getDefaultProperties()).containsEntry(key, "supplied");
+    }
+
+    @Test
+    @ResourceLock(Resources.SYSTEM_PROPERTIES)
+    @ResourceLock(Resources.SYSTEM_OUT)
+    void shouldApplyAgentStartupPropertiesWithoutLoggingTheRegistrationCredential() {
+        String key = DistributionSettings.WORKER_REGISTRATION_KEY_PROPERTY;
+        String visibleProperty = "citrus.test.worker.visible";
+        var calls = new AtomicInteger();
+        var config = new CitrusAgentConfiguration() {
+            @Override
+            public void setDefaultProperties() {
+                calls.incrementAndGet();
+                super.setDefaultProperties();
+            }
+        };
+        new CitrusAgentOptions().apply(config, new String[] {"--mode", "worker", "--port", "0",
+                "--coordinator-url", "http://127.0.0.1:1", "--cache-dir", tempDir.resolve("logging").toString(),
+                "--properties", key + "=property-credential," + visibleProperty + "=retained"});
+        var original = new HashMap<String, String>();
+        for (String name : List.of(key, visibleProperty, CitrusSettings.DEFAULT_MESSAGE_TYPE_PROPERTY)) {
+            original.put(name, System.getProperty(name));
+        }
+
+        PrintStream out = System.out;
+        var messages = new ArrayList<String>();
+        var appender = new AbstractAppender("agent-startup-properties", null, null, true, Property.EMPTY_ARRAY) {
+            @Override
+            public void append(LogEvent event) {
+                messages.add(event.getMessage().getFormattedMessage());
+            }
+        };
+        var logger = (Logger) LogManager.getLogger(TestRunConfiguration.class);
+        var previousLevel = logger.getLevel();
+        appender.start();
+        logger.addAppender(appender);
+        logger.setLevel(Level.INFO);
+        var server = new CitrusAgentServer(config);
+        try {
+            server.start();
+            assertThat(calls.get()).as("supplied configuration startup hook").isEqualTo(1);
+            assertThat(System.getProperty(key)).isEqualTo("property-credential");
+            assertThat(messages).contains("Setting application property " + visibleProperty + "=retained")
+                    .noneMatch(message -> message.contains("property-credential"));
+        } finally {
+            server.stop();
+            System.setOut(out);
+            logger.removeAppender(appender);
+            logger.setLevel(previousLevel);
+            appender.stop();
+            original.forEach((name, value) -> {
+                if (value == null) {
+                    System.clearProperty(name);
+                } else {
+                    System.setProperty(name, value);
+                }
+            });
+        }
+    }
+
+    @Test
+    @ResourceLock(Resources.SYSTEM_PROPERTIES)
+    void shouldApplyConfigClassOnceWithAndWithoutPropertyRedaction() {
+        AtomicInteger lookups = new AtomicInteger();
+        var config = new CitrusAgentConfiguration() {
+            @Override
+            public String getConfigClass() {
+                return "example.Config" + lookups.incrementAndGet();
+            }
+        };
+        String key = CitrusSettings.DEFAULT_CONFIG_CLASS_PROPERTY;
+        String original = System.getProperty(key);
+        try {
+            config.setDefaultProperties();
+            assertThat(System.getProperty(key)).isEqualTo("example.Config1");
+            config.redactDefaultPropertyInLogs(DistributionSettings.WORKER_REGISTRATION_KEY_PROPERTY);
+            config.setDefaultProperties();
+            assertThat(System.getProperty(key)).isEqualTo("example.Config2");
+            assertThat(lookups.get()).isEqualTo(2);
+        } finally {
+            if (original == null) {
+                System.clearProperty(key);
+            } else {
+                System.setProperty(key, original);
+            }
+        }
+    }
+
+    @Test
+    @ResourceLock(Resources.SYSTEM_OUT)
+    void logsOneSanitizedWorkerRejectionWhileKeepingTheStandaloneAgentRunning() throws Exception {
+        var peer = Vertx.vertx();
+        var messages = new java.util.concurrent.LinkedBlockingQueue<String>();
+        var appender = new AbstractAppender("agent-worker-rejection", null, null, true, Property.EMPTY_ARRAY) {
+            @Override
+            public void append(LogEvent event) {
+                messages.add(event.getMessage().getFormattedMessage());
+            }
+        };
+        var logger = (Logger) LogManager.getLogger(DistributionWorkerBridge.class);
+        var previousLevel = logger.getLevel();
+        var originalOutput = System.out;
+        appender.start();
+        logger.addAppender(appender);
+        logger.setLevel(Level.WARN);
+        try {
+            var endpoint = peer.createHttpServer().webSocketHandler(socket -> socket.textMessageHandler(message ->
+                    socket.writeTextMessage("""
+                            {"type":"worker.rejected","payload":{"code":"INVALID_REGISTRATION_KEY",
+                            "message":"Invalid worker-key and bearer-secret"}}
+                            """))).listen(0, "127.0.0.1").toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
+            var server = new CitrusAgentServer(parse("--mode", "worker", "--port", "0", "--duration", "-1",
+                    "--coordinator-url", "http://127.0.0.1:" + endpoint.actualPort(), "--pool", "pool1",
+                    "--registration-key", "worker-key", "--auth-token", "bearer-secret",
+                    "--cache-dir", tempDir.resolve("rejection").toString()));
+            try {
+                server.start();
+                assertThat(messages.poll(3, TimeUnit.SECONDS)).contains("INVALID_REGISTRATION_KEY")
+                        .doesNotContain("worker-key", "bearer-secret");
+                assertThat(server.isRunning()).isTrue();
+            } finally {
+                server.stop();
+            }
+            assertThat(messages).isEmpty();
+        } finally {
+            logger.removeAppender(appender);
+            logger.setLevel(previousLevel);
+            appender.stop();
+            System.setOut(originalOutput);
+            peer.close().toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    void shouldKeepPackageShortOptionAndForwardPoolCredentials() {
+        var options = parse("--mode", "worker", "-p", "com.acme.tests", "--pool", "pool1", "-k", "ctrk_1_2");
+        assertThat(options.getPackages()).containsExactly("com.acme.tests");
+        assertThat(options.getPool()).isEqualTo("pool1");
+        assertThat(options.getRegistrationKey()).isEqualTo("ctrk_1_2");
+        var config = DistributionWorkerBridge.buildWorkerConfig(options);
+        assertThat(config.poolId()).isEqualTo("pool1");
+        assertThat(config.registrationKey()).isEqualTo("ctrk_1_2");
+
+        var cacheLikeValues = parse("--pool", "--no-cache-cleanup", "-k", "--cache-x");
+        assertThat(cacheLikeValues.getPool()).isEqualTo("--no-cache-cleanup");
+        assertThat(cacheLikeValues.getRegistrationKey()).isEqualTo("--cache-x");
+        assertThat(cacheLikeValues.getCacheCleanup()).isNull();
     }
 
     @TestFactory

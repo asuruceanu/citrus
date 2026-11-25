@@ -33,11 +33,13 @@ class DistributionUiResourcesTest {
         try (InputStream index = cl.getResourceAsStream("META-INF/resources/dist-ui/index.html");
              InputStream styles = cl.getResourceAsStream("META-INF/resources/dist-ui/styles.css");
              InputStream app = cl.getResourceAsStream("META-INF/resources/dist-ui/app.js");
+             InputStream chart = cl.getResourceAsStream("META-INF/resources/dist-ui/usage-chart.js");
              InputStream htm = cl.getResourceAsStream("META-INF/resources/dist-ui/vendor/htm-mini.js")) {
 
             assertThat(index).isNotNull();
             assertThat(styles).isNotNull();
             assertThat(app).isNotNull();
+            assertThat(chart).isNotNull();
             assertThat(htm).isNotNull();
 
             String stylesText = new String(styles.readAllBytes(), StandardCharsets.UTF_8);
@@ -51,6 +53,17 @@ class DistributionUiResourcesTest {
 
             String appText = new String(app.readAllBytes(), StandardCharsets.UTF_8);
             assertThat(appText)
+                    .contains("Inspect distributed build sessions, artifact cache hit rates, and test outcomes.")
+                    .doesNotContain("Inspect distributed Maven & JBang reactor runs, classpath cache hit rates, and test outcomes.")
+                    .contains("data-view=${id}", "navItem('usage', 'Historical Usage'", "navItem('pools', 'Agent Pools'")
+                    .doesNotContainIgnoringCase("Connecting Builds")
+                    .doesNotContainIgnoringCase("project groups")
+                    .doesNotContainIgnoringCase("access control")
+                    .doesNotContain("minSize", "maxSize")
+                    .contains("renderAgentPools", "renderHistoricalUsage", "apiPut", "apiDelete")
+                    .contains("/api/v1/agent-pools", "/api/v1/agent-pools/priority", "/api/v1/usage")
+                    .contains("POOL_CAPABILITY_MISMATCH", "POOL_DELETED", "KEY_REVOKED")
+                    .contains("Waiting for test execution requests", "activeTestDisplay")
                     .contains("renderWorkerCacheTelemetry")
                     .contains("lowDiskSpace")
                     .contains("freeSpaceBufferBytes")

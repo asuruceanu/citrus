@@ -24,6 +24,9 @@ public record WorkerWsMessage(
 ) {
     public static final String WORKER_REGISTER = "worker.register";
     public static final String WORKER_REGISTERED = "worker.registered";
+    public static final String WORKER_REJECTED = "worker.rejected";
+    public static final String WORKER_RENEW = "worker.renew";
+    public static final String WORKER_RENEWED = "worker.renewed";
     public static final String WORKER_HEARTBEAT = "worker.heartbeat";
     public static final String WORKER_DRAINING = "worker.draining";
     public static final String PARTITION_ASSIGN = "partition.assign";

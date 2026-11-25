@@ -21,12 +21,16 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Stream;
 
+import io.vertx.core.Vertx;
 import org.aesh.AeshRuntimeRunner;
 import org.aesh.command.CommandDefinition;
 import org.aesh.command.CommandResult;
@@ -36,6 +40,7 @@ import org.citrusframework.distribution.coordinator.DistributionCoordinatorServe
 import org.citrusframework.distribution.config.DistributionJson;
 import org.citrusframework.distribution.config.DistributionSettings;
 import org.citrusframework.distribution.worker.DistributionWorkerConfig;
+import org.citrusframework.distribution.model.WorkerWsMessage;
 import org.citrusframework.distribution.model.CreateSessionRequest;
 import org.citrusframework.jbang.cli.CitrusJBangMain;
 import org.citrusframework.jbang.cli.StringPrinter;
@@ -44,12 +49,14 @@ import org.junit.jupiter.api.condition.DisabledOnOs;
 import org.junit.jupiter.api.condition.OS;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.api.parallel.ResourceLock;
+import org.junit.jupiter.api.parallel.Resources;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 
 @ResourceLock("citrus-jbang-run")
 class DistCommandTest extends CommandTest {
@@ -270,6 +277,90 @@ class DistCommandTest extends CommandTest {
         assertThatThrownBy(() -> DistWorkerStart.normalizeWorkerStartArgs(invalid))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessage("Unknown cache option: --cache-foo");
+    }
+
+    @Test
+    @ResourceLock(Resources.SYSTEM_PROPERTIES)
+    void shouldInheritWorkerSettingsWhenPoolOptionsAreAbsent() {
+        var settings = Map.of(DistributionSettings.WORKER_POOL_PROPERTY, "inherited",
+                DistributionSettings.WORKER_REGISTRATION_KEY_PROPERTY, "inherited-key",
+                DistributionSettings.WORKER_CAPABILITIES_PROPERTY, "specialized=true");
+        var saved = new HashMap<String, String>();
+        settings.forEach((key, value) -> saved.put(key, System.setProperty(key, value)));
+        try {
+            var config = bindWorkerStart(List.of(), List.of());
+            var expected = DistributionWorkerConfig.fromSettings();
+            assertThat(config.poolId()).isEqualTo(expected.poolId());
+            assertThat(expected.registrationKey().equals(config.registrationKey())).as("inherited registration key").isTrue();
+            assertThat(config.capabilities()).containsAllEntriesOf(expected.capabilities());
+        } finally {
+            saved.forEach((key, value) -> {
+                if (value == null) {
+                    System.clearProperty(key);
+                } else {
+                    System.setProperty(key, value);
+                }
+            });
+        }
+    }
+
+    @Test
+    void shouldBindPoolCredentialsAndPreserveCacheFlags() {
+        String[] args = {"dist", "worker", "start", "-p", "pool1", "-k", "ctrk_1_2", "--no-cache-cleanup"};
+        assertThat(DistWorkerStart.normalizeWorkerStartArgs(args)).containsExactly(
+                "dist", "worker", "start", "-p", "pool1", "-k", "ctrk_1_2", "--cache-cleanup=false");
+        assertThat(DistWorkerStart.normalizeWorkerStartArgs(new String[] {"dist", "worker", "start",
+                "--pool", "--cache-dir", "--registration-key", "--cache-x"})).containsExactly(
+                "dist", "worker", "start", "--pool", "--cache-dir", "--registration-key", "--cache-x");
+        var config = bindWorkerStart(List.of(), Arrays.asList(args).subList(3, args.length));
+        assertThat(config.poolId()).isEqualTo("pool1");
+        assertThat(config.registrationKey()).isEqualTo("ctrk_1_2");
+        assertThat(config.cacheCleanup()).isFalse();
+    }
+
+    @Test
+    void shouldExitIndefiniteWorkerCommandOnRegistrationRejection() throws Exception {
+        var config = DistributionCoordinatorConfig.builder().port(0).requireAgentPool(true)
+                .cacheDir(tempDir.resolve("coordinator"))
+                .jdbcUrl("jdbc:hsqldb:file:" + tempDir.resolve("jbang-reject") + ";shutdown=true").build();
+        try (var coordinator = new DistributionCoordinatorServer(config)) {
+            coordinator.start();
+            var main = createCitrusJBangMain(1);
+            assertTimeoutPreemptively(Duration.ofSeconds(5), () ->
+                    assertThat(main.execute("dist", "worker", "start", "-u", coordinator.baseUrl(),
+                            "-p", "missing-pool", "-k", "test-key",
+                            "--cache-dir", tempDir.resolve("worker").toString())).isEqualTo(1));
+            assertThat(printer.getOutput()).contains("POOL_NOT_FOUND").doesNotContain("test-key");
+        }
+    }
+
+    @Test
+    void shouldExitIndefiniteWorkerCommandOnRenewalRejection() throws Exception {
+        var vertx = Vertx.vertx();
+        try {
+            var server = vertx.createHttpServer().webSocketHandler(socket -> socket.textMessageHandler(json -> {
+                String type = DistributionJson.fromJson(json, WorkerWsMessage.class).type();
+                if (WorkerWsMessage.WORKER_REGISTER.equals(type)) {
+                    socket.writeTextMessage(DistributionJson.toJson(new WorkerWsMessage(WorkerWsMessage.WORKER_REGISTERED, Map.of("poolId", "pool1"))));
+                } else if (WorkerWsMessage.WORKER_RENEW.equals(type)) {
+                    socket.writeTextMessage(DistributionJson.toJson(new WorkerWsMessage(WorkerWsMessage.WORKER_REJECTED,
+                            Map.of("code", "INVALID_REGISTRATION_KEY", "message", "Key revoked: test-secret"))));
+                }
+            })).listen(0, "127.0.0.1").toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
+            var command = new DistWorkerStart(createCitrusJBangMain()) {
+                @Override
+                DistributionWorkerConfig buildWorkerConfig() {
+                    return DistributionWorkerConfig.builder().coordinatorUrl("http://127.0.0.1:" + server.actualPort())
+                            .poolId("pool1").registrationKey("test-secret").registrationRenewalIntervalMs(100)
+                            .cacheDir(tempDir.resolve("worker")).build();
+                }
+            };
+            assertTimeoutPreemptively(Duration.ofSeconds(5),
+                    () -> assertThat(command.execute(null)).isEqualTo(CommandResult.FAILURE));
+            assertThat(printer.getOutput()).contains("INVALID_REGISTRATION_KEY", "Key revoked").doesNotContain("test-secret");
+        } finally {
+            vertx.close().toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
+        }
     }
 
     @Test

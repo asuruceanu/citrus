@@ -31,5 +31,5 @@ import java.lang.annotation.Target;
 @Repeatable(AgentRequirements.class)
 public @interface AgentRequirement {
     String key();
-    String value();
+    String value() default "true";
 }

@@ -23,6 +23,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.Callable;
 
 import io.vertx.core.AbstractVerticle;
 import io.vertx.core.Future;
@@ -56,7 +57,11 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import tools.jackson.core.JacksonException;
 import tools.jackson.databind.DeserializationFeature;
+import tools.jackson.databind.MapperFeature;
 import tools.jackson.databind.ObjectReader;
+import tools.jackson.databind.cfg.CoercionAction;
+import tools.jackson.databind.cfg.CoercionInputShape;
+import tools.jackson.databind.type.LogicalType;
 
 /**
  * Vert.x 5 HTTP/REST, SSE, Static Web UI, and Worker WebSocket verticle for the Test Distribution Coordinator.
@@ -64,10 +69,18 @@ import tools.jackson.databind.ObjectReader;
 public final class DistributionCoordinatorVerticle extends AbstractVerticle {
 
     private static final Logger LOG = LoggerFactory.getLogger(DistributionCoordinatorVerticle.class);
+    private static final String USAGE_INTERVAL_HEADER = "X-Citrus-Usage-Sample-Interval-Ms";
     private static final int MAX_HISTORY_TEST_KEYS = 10_000;
     private static final ObjectReader HISTORY_REQUEST_READER = DistributionJson.mapper()
             .readerFor(HistoricalDurationsRequest.class)
             .with(DeserializationFeature.FAIL_ON_TRAILING_TOKENS);
+    private static final ObjectReader POOL_REQUEST_READER = DistributionJson.mapper().rebuild()
+            .disable(MapperFeature.ALLOW_COERCION_OF_SCALARS)
+            .withCoercionConfig(LogicalType.Textual, coercion -> coercion
+                    .setCoercion(CoercionInputShape.Integer, CoercionAction.Fail)
+                    .setCoercion(CoercionInputShape.Float, CoercionAction.Fail)
+                    .setCoercion(CoercionInputShape.Boolean, CoercionAction.Fail))
+            .build().reader().with(DeserializationFeature.FAIL_ON_TRAILING_TOKENS);
     private static final long MAX_BODY_BYTES = 256L * 1024L * 1024L;
 
     private final DistributionCoordinatorConfig config;
@@ -77,6 +90,9 @@ public final class DistributionCoordinatorVerticle extends AbstractVerticle {
 
     private HttpServer httpServer;
     private long leaseTimerId = -1L;
+    private long usageTimerId = -1L;
+    private Future<Void> leaseSweep = Future.succeededFuture();
+    private Future<Void> usageSample = Future.succeededFuture();
 
     public DistributionCoordinatorVerticle(DistributionCoordinatorConfig config,
                                       BlobCacheDirectory blobCache,
@@ -100,9 +116,11 @@ public final class DistributionCoordinatorVerticle extends AbstractVerticle {
                 .allowedMethod(HttpMethod.GET)
                 .allowedMethod(HttpMethod.POST)
                 .allowedMethod(HttpMethod.PUT)
+                .allowedMethod(HttpMethod.DELETE)
                 .allowedHeader("Authorization")
                 .allowedHeader("Content-Type")
-                .allowedHeader("Last-Event-ID"));
+                .allowedHeader("Last-Event-ID")
+                .exposedHeader(USAGE_INTERVAL_HEADER));
 
         router.get("/health").handler(ctx -> writeJson(ctx, 200, Map.of("status", "UP")));
         router.get("/").handler(ctx -> ctx.redirect("/ui/index.html"));
@@ -131,18 +149,41 @@ public final class DistributionCoordinatorVerticle extends AbstractVerticle {
         router.put("/api/v1/cache/blobs/:sha256").handler(this::handlePutBlob);
         router.get("/api/v1/cache/blobs/:sha256").handler(this::handleGetBlob);
 
+        registerAgentPoolRoutes(router);
+        router.get("/api/v1/usage").handler(ctx -> {
+            ctx.response().putHeader(USAGE_INTERVAL_HEADER, Long.toString(config.usageSampleIntervalMs()));
+            respond(ctx, 200, () ->
+                    coordinator.queryHistoricalUsage(ctx.request().getParam("window"), ctx.request().getParam("filter")));
+        });
         router.get("/api/v1/workers").handler(ctx -> writeJson(ctx, 200, coordinator.listWorkers()));
         router.get("/api/v1/tests/history").handler(this::handleTestHistory);
         router.get("/api/v1/tests/history/runs").handler(this::handleTestHistoryRuns);
         router.post("/api/v1/history/durations").handler(this::handleHistoricalDurations);
 
-        leaseTimerId = vertx.setPeriodic(5_000L, id -> coordinator.sweepExpiredLeases());
-
-        httpServer = vertx.createHttpServer();
-        httpServer.requestHandler(router)
-                .listen(config.port(), resolveListenHost(config))
+        httpServer = vertx.createHttpServer().requestHandler(router);
+        sampleUsage().onComplete(initial -> httpServer.listen(config.port(), resolveListenHost(config))
+                .onSuccess(server -> {
+                    leaseTimerId = vertx.setPeriodic(5_000L, id -> leaseSweep =
+                            runMaintenance(leaseSweep, coordinator::sweepExpiredLeases, "Lease sweep"));
+                    usageTimerId = vertx.setPeriodic(config.usageSampleIntervalMs(), id -> sampleUsage());
+                })
                 .<Void>mapEmpty()
-                .onComplete(startPromise);
+                .onComplete(startPromise));
+    }
+
+    private Future<Void> sampleUsage() {
+        usageSample = runMaintenance(usageSample, coordinator::sampleUsageNow, "Usage sample");
+        return usageSample;
+    }
+
+    private Future<Void> runMaintenance(Future<Void> previous, Runnable work, String name) {
+        if (!previous.isComplete()) {
+            return previous;
+        }
+        return vertx.<Void>executeBlocking(() -> {
+            work.run();
+            return null;
+        }, false).onFailure(err -> LOG.warn("{} failed", name, err));
     }
 
     static String resolveListenHost(DistributionCoordinatorConfig config) {
@@ -157,8 +198,11 @@ public final class DistributionCoordinatorVerticle extends AbstractVerticle {
         if (leaseTimerId != -1L) {
             vertx.cancelTimer(leaseTimerId);
         }
+        if (usageTimerId != -1L) {
+            vertx.cancelTimer(usageTimerId);
+        }
         if (httpServer != null) {
-            httpServer.close().onComplete(stopPromise);
+            Future.join(leaseSweep, usageSample).onComplete(done -> httpServer.close().onComplete(stopPromise));
         } else {
             stopPromise.complete();
         }
@@ -191,6 +235,79 @@ public final class DistributionCoordinatorVerticle extends AbstractVerticle {
         return MessageDigest.isEqual(
                 expected.getBytes(StandardCharsets.UTF_8),
                 candidate.getBytes(StandardCharsets.UTF_8));
+    }
+
+    private record PoolRequest(String displayName, Map<String, String> capabilities, Boolean generateRegistrationKey,
+                               String keyDescription) {
+    }
+
+    private record PoolPriorityRequest(List<String> poolIds) {
+    }
+
+    private record KeyRequest(String description) {
+    }
+
+    private void registerAgentPoolRoutes(Router router) {
+        String pools = "/api/v1/agent-pools";
+        String pool = pools + "/:poolId";
+        router.get(pools).handler(ctx -> respond(ctx, 200, coordinator::listAgentPools));
+        router.post(pools).handler(ctx -> {
+            ctx.response().putHeader("Cache-Control", "no-store");
+            respond(ctx, 201, () -> {
+                var request = readPoolRequest(ctx, PoolRequest.class);
+                return coordinator.createAgentPool(request.displayName(), request.capabilities(),
+                        Boolean.TRUE.equals(request.generateRegistrationKey()), request.keyDescription());
+            });
+        });
+        router.put(pools + "/priority").handler(ctx -> respond(ctx, 200, () ->
+                coordinator.reorderAgentPools(readPoolRequest(ctx, PoolPriorityRequest.class).poolIds())));
+        router.get(pool).handler(ctx -> respond(ctx, 200, () ->
+                coordinator.getAgentPoolDetail(ctx.pathParam("poolId")).orElse(null)));
+        router.put(pool).handler(ctx -> respond(ctx, 200, () -> {
+            var request = readPoolRequest(ctx, PoolRequest.class);
+            return coordinator.updateAgentPool(ctx.pathParam("poolId"), request.displayName(), request.capabilities())
+                    .orElse(null);
+        }));
+        router.delete(pool).handler(ctx -> respond(ctx, 200, () -> {
+            String poolId = ctx.pathParam("poolId");
+            return coordinator.deleteAgentPool(poolId) ? Map.of("deleted", true, "poolId", poolId) : null;
+        }));
+        router.get(pool + "/keys").handler(ctx -> respond(ctx, 200, () ->
+                coordinator.listRegistrationKeys(ctx.pathParam("poolId")).orElse(null)));
+        router.post(pool + "/keys").handler(ctx -> {
+            ctx.response().putHeader("Cache-Control", "no-store");
+            respond(ctx, 201, () -> {
+                String description = ctx.body().length() > 0 ? readPoolRequest(ctx, KeyRequest.class).description() : null;
+                return coordinator.generateRegistrationKey(ctx.pathParam("poolId"), description).orElse(null);
+            });
+        });
+        router.post(pool + "/keys/:keyId/revoke").handler(ctx -> respond(ctx, 200, () ->
+                coordinator.revokeRegistrationKey(ctx.pathParam("poolId"), ctx.pathParam("keyId")).orElse(null)));
+    }
+
+    private <T> T readPoolRequest(RoutingContext ctx, Class<T> type) {
+        String body = ctx.body().asString();
+        if (body != null && !body.isBlank()) {
+            try {
+                T request = POOL_REQUEST_READER.forType(type).readValue(body);
+                if (request != null) {
+                    return request;
+                }
+            } catch (JacksonException e) {
+                throw new IllegalArgumentException("Invalid agent pool request", e);
+            }
+        }
+        throw new IllegalArgumentException("Missing agent pool request");
+    }
+
+    private void respond(RoutingContext ctx, int statusCode, Callable<?> action) {
+        vertx.executeBlocking(action).onSuccess(result -> {
+            if (result == null) {
+                writeJson(ctx, 404, Map.of("error", "Agent pool or registration key not found"));
+            } else {
+                writeJson(ctx, statusCode, result);
+            }
+        }).onFailure(err -> writeError(ctx, err));
     }
 
     private void handleCreateSession(RoutingContext ctx) {
@@ -379,12 +496,17 @@ public final class DistributionCoordinatorVerticle extends AbstractVerticle {
         Future<ServerWebSocket> wsFuture = ctx.request().toWebSocket();
         wsFuture.onSuccess(ws -> {
             String connectionId = UUID.randomUUID().toString();
+            var transport = new WorkerSocket(ws);
             ws.textMessageHandler(text -> vertx.executeBlocking(() -> {
                 WorkerWsMessage msg = DistributionJson.fromJson(text, WorkerWsMessage.class);
                 if (WorkerWsMessage.WORKER_REGISTER.equals(msg.type())) {
                     WorkerRegisterPayload reg = DistributionJson.convert(msg.payload(), WorkerRegisterPayload.class);
-                    coordinator.registerWorker(connectionId, reg, outbound ->
-                            ws.writeTextMessage(DistributionJson.toJson(outbound)));
+                    // An expiry sweep can reject this socket while another registration frame is queued.
+                    synchronized (coordinator) {
+                        if (!transport.closing) {
+                            coordinator.registerWorker(connectionId, reg, transport::send, transport::closeRejected);
+                        }
+                    }
                 } else {
                     coordinator.handleWorkerMessage(connectionId, msg);
                 }
@@ -397,6 +519,29 @@ public final class DistributionCoordinatorVerticle extends AbstractVerticle {
             }));
             ws.exceptionHandler(err -> LOG.debug("Worker WebSocket error ({}): {}", connectionId, err.getMessage()));
         }).onFailure(err -> LOG.warn("Failed to upgrade worker WebSocket", err));
+    }
+
+    private static final class WorkerSocket {
+        private final ServerWebSocket socket;
+        // The coordinator serializes calls to send and closeRejected, including from maintenance sweeps.
+        private Future<Void> rejectionWrite = Future.succeededFuture();
+        private boolean closing;
+
+        private WorkerSocket(ServerWebSocket socket) {
+            this.socket = socket;
+        }
+
+        private void send(WorkerWsMessage outbound) {
+            var written = socket.writeTextMessage(DistributionJson.toJson(outbound));
+            if (WorkerWsMessage.WORKER_REJECTED.equals(outbound.type())) {
+                rejectionWrite = written;
+            }
+        }
+
+        private void closeRejected() {
+            closing = true;
+            rejectionWrite.onComplete(written -> socket.close((short) 4003, "Worker rejected"));
+        }
     }
 
     private long resolveAfterSequence(RoutingContext ctx) {

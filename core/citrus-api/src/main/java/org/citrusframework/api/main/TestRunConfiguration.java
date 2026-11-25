@@ -53,6 +53,7 @@ public class TestRunConfiguration {
 
     /** Default properties set as system properties */
     private Map<String, String> defaultProperties = new LinkedHashMap<>();
+    private final Set<String> redactedDefaultPropertyNames = new HashSet<>();
 
     /** Optional test jar artifact holding tests */
     private File testJar;
@@ -246,12 +247,18 @@ public class TestRunConfiguration {
         this.dependencies.addAll(dependencies);
     }
 
+    /** Hides this property's value in startup logs when this configuration applies its system properties. */
+    public void redactDefaultPropertyInLogs(String name) {
+        redactedDefaultPropertyNames.add(name);
+    }
+
     /**
      * Reads default properties in configuration and sets them as system properties.
      */
     public void setDefaultProperties() {
         for (Map.Entry<String, String> entry : defaultProperties.entrySet()) {
-            logger.info("Setting application property {}={}", entry.getKey(), entry.getValue());
+            String displayValue = redactedDefaultPropertyNames.contains(entry.getKey()) ? "[redacted]" : entry.getValue();
+            logger.info("Setting application property {}={}", entry.getKey(), displayValue);
             System.setProperty(entry.getKey(), Optional.ofNullable(entry.getValue()).orElse(""));
         }
     }

@@ -17,6 +17,8 @@
 package org.citrusframework.distribution.coordinator;
 
 import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.EnumMap;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -32,15 +34,20 @@ import java.util.function.Consumer;
 import org.citrusframework.distribution.TestExecutionIdentity;
 import org.citrusframework.distribution.config.DistributionJson;
 import org.citrusframework.distribution.config.DistributionSettings;
+import org.citrusframework.distribution.model.AgentPoolRecord;
+import org.citrusframework.distribution.model.AgentPoolSummary;
 import org.citrusframework.distribution.model.ArtifactRef;
 import org.citrusframework.distribution.model.BuildSessionRecord;
 import org.citrusframework.distribution.model.BuildSessionResponse;
 import org.citrusframework.distribution.model.CompleteSessionRequest;
 import org.citrusframework.distribution.model.CreateSessionRequest;
+import org.citrusframework.distribution.model.GeneratedRegistrationKey;
+import org.citrusframework.distribution.model.HistoricalUsageResponse;
 import org.citrusframework.distribution.model.PartitionAssignPayload;
 import org.citrusframework.distribution.model.PartitionCompletedPayload;
 import org.citrusframework.distribution.model.PartitionRecord;
 import org.citrusframework.distribution.model.PartitionState;
+import org.citrusframework.distribution.model.RegistrationKeyRecord;
 import org.citrusframework.distribution.model.ReportLocalTestsRequest;
 import org.citrusframework.distribution.model.SessionDetailResponse;
 import org.citrusframework.distribution.model.SessionStatus;
@@ -48,23 +55,28 @@ import org.citrusframework.distribution.model.SessionSummary;
 import org.citrusframework.distribution.model.SubmitWorkRequest;
 import org.citrusframework.distribution.model.SubmitWorkResponse;
 import org.citrusframework.distribution.model.TestExecutionRecord;
-import org.citrusframework.distribution.model.WorkspaceChange;
 import org.citrusframework.distribution.model.TestHistoryRun;
 import org.citrusframework.distribution.model.TestHistorySummary;
 import org.citrusframework.distribution.model.TestOutcomeStatus;
+import org.citrusframework.distribution.model.UsageSampleRecord;
 import org.citrusframework.distribution.model.WorkUnitSpec;
-import org.citrusframework.distribution.model.WorkerHeartbeatPayload;
 import org.citrusframework.distribution.model.WorkerCacheStats;
+import org.citrusframework.distribution.model.WorkerHeartbeatPayload;
 import org.citrusframework.distribution.model.WorkerRecord;
 import org.citrusframework.distribution.model.WorkerRegisterPayload;
+import org.citrusframework.distribution.model.WorkerRenewPayload;
 import org.citrusframework.distribution.model.WorkerState;
 import org.citrusframework.distribution.model.WorkerTestEventPayload;
+import org.citrusframework.distribution.model.WorkerWarning;
+import org.citrusframework.distribution.model.WorkerWarningCode;
 import org.citrusframework.distribution.model.WorkerWsMessage;
+import org.citrusframework.distribution.model.WorkspaceChange;
 import org.citrusframework.distribution.model.WorkspaceFileSet;
 import org.citrusframework.distribution.scheduler.CapabilityMatcher;
 import org.citrusframework.distribution.scheduler.LptPartitionScheduler;
-import org.citrusframework.distribution.store.DistributionStore;
 import org.citrusframework.distribution.store.DistributionStore.RecoverableWork;
+import org.citrusframework.distribution.store.DistributionStore;
+import org.citrusframework.distribution.store.StoredRegistrationKey;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -77,32 +89,39 @@ public final class SessionCoordinator {
 
     private final DistributionCoordinatorConfig config;
     private final DistributionStore store;
+    private final AgentPoolRegistry pools;
     private final CoordinatorEventStreamHub eventHub;
     private final LptPartitionScheduler scheduler = new LptPartitionScheduler();
 
     private final Map<String, SessionRuntime> sessions = new ConcurrentHashMap<>();
     private final Map<String, PartitionRuntime> partitions = new ConcurrentHashMap<>();
     private final Map<String, WorkerConnection> workers = new ConcurrentHashMap<>();
+    private final Map<String, List<WorkerConnection>> connectionsByWorker = new HashMap<>();
     private long assignmentSequence;
 
     public SessionCoordinator(DistributionCoordinatorConfig config, DistributionStore store, CoordinatorEventStreamHub eventHub) {
         this.config = config;
         this.store = store;
         this.eventHub = eventHub;
+        this.pools = new AgentPoolRegistry(store);
     }
 
     synchronized void restorePendingWork() {
         for (WorkerRecord worker : store.listWorkers()) {
-            if (worker.state() != WorkerState.OFFLINE) {
-                store.upsertWorker(new WorkerRecord(worker.workerId(), worker.host(), worker.capabilities(), WorkerState.OFFLINE,
-                        null, worker.lastHeartbeatAt(), worker.registeredAt(), worker.cacheStats()));
+            if (worker.state() != WorkerState.OFFLINE || worker.activePartitionId() != null
+                    || worker.activeTestDisplay() != null || !worker.warnings().isEmpty()) {
+                resetPersistedWorker(worker, WorkerState.OFFLINE);
             }
         }
+        Map<String, Set<String>> previousWorkers = new HashMap<>();
         Map<String, Map<String, PartitionRecord>> latest = new HashMap<>();
         for (RecoverableWork work : store.listRecoverableWork()) {
             Map<String, PartitionRecord> records = latest.computeIfAbsent(work.sessionId(), sessionId -> {
                 Map<String, PartitionRecord> byId = new HashMap<>();
                 for (PartitionRecord record : store.listPartitions(sessionId)) {
+                    if (record.state() == PartitionState.LOST && record.workerId() != null) {
+                        previousWorkers.computeIfAbsent(record.partitionId(), id -> new HashSet<>()).add(record.workerId());
+                    }
                     byId.merge(record.partitionId(), record, (a, b) -> a.attempt() > b.attempt() ? a : b);
                 }
                 return byId;
@@ -116,6 +135,7 @@ public final class SessionCoordinator {
                 PartitionRuntime runtime = new PartitionRuntime(record, work.request(), work.maxRetries());
                 runtime.retriesUsed = Math.max(0, record.attempt() - 1);
                 runtime.lastAssignedWorkerId = record.workerId();
+                runtime.earlierAttemptWorkerIds.addAll(previousWorkers.getOrDefault(partitionId, Set.of()));
                 partitions.put(partitionId, runtime);
                 if (record.state() != PartitionState.PENDING) {
                     restoreInFlightTests(runtime);
@@ -144,7 +164,7 @@ public final class SessionCoordinator {
 
     public synchronized BuildSessionResponse createSession(CreateSessionRequest request) {
         String sessionId = "sess-" + UUID.randomUUID().toString().substring(0, 12);
-        long now = System.currentTimeMillis();
+        long now = now();
         int maxPartSize = request.maxPartitionSize() > 0 ? request.maxPartitionSize() : config.defaultMaxPartitionSize();
         int maxRetries = request.maxRetries() >= 0 ? request.maxRetries() : config.defaultMaxRetries();
 
@@ -310,7 +330,7 @@ public final class SessionCoordinator {
                     evt.errorMessage(),
                     evt.stackTrace(),
                     evt.endpoints() != null ? evt.endpoints() : List.of(),
-                    System.currentTimeMillis(),
+                    now(),
                     evt.uniqueId()
             );
 
@@ -342,7 +362,7 @@ public final class SessionCoordinator {
             return session.record;
         }
         String abortReason = (reason != null && !reason.isBlank()) ? reason : "Session aborted";
-        long now = System.currentTimeMillis();
+        long now = now();
 
         Set<String> abortedPartitionIds = new HashSet<>();
         for (PartitionRuntime pr : partitions.values()) {
@@ -417,16 +437,7 @@ public final class SessionCoordinator {
                         && wr.activePartitionId() != null
                         && abortedPartitionIds.contains(wr.activePartitionId())
                         && !liveWorkerIds.contains(wr.workerId())) {
-                    store.upsertWorker(new WorkerRecord(
-                            wr.workerId(),
-                            wr.host(),
-                            wr.capabilities(),
-                            WorkerState.IDLE,
-                            null,
-                            wr.lastHeartbeatAt(),
-                            wr.registeredAt(),
-                            wr.cacheStats()
-                    ));
+                    resetPersistedWorker(wr, WorkerState.IDLE);
                 }
             }
         }
@@ -456,7 +467,7 @@ public final class SessionCoordinator {
             return session.record;
         }
 
-        long finishedAt = System.currentTimeMillis();
+        long finishedAt = now();
         SessionSummary summary = computeSessionSummary(session, request, finishedAt);
 
         Map<String, PartitionRecord> latestPartitions = new LinkedHashMap<>();
@@ -567,28 +578,323 @@ public final class SessionCoordinator {
         return store.findHistoricalDurationsMs(keys, recentLimit, historyScope);
     }
 
-    public synchronized void registerWorker(String connectionId, WorkerRegisterPayload payload, Consumer<WorkerWsMessage> sender) {
+    public synchronized UsageSampleRecord sampleUsageNow() {
+        var snapshot = new UsageSampleBuilder(pools.ordered());
+        for (var connections : connectionsByWorker.values()) {
+            WorkerConnection worker = displayedWorker(connections);
+            snapshot.addWorker(worker.pool, worker.capabilities, worker.utilized());
+        }
+        for (PartitionRuntime partition : partitions.values()) {
+            snapshot.addPartition(partition.record);
+        }
+        long now = now();
+        var sample = snapshot.build(now);
+        store.recordUsageSample(sample, now - config.usageRetentionMs());
+        return sample;
+    }
+
+    public HistoricalUsageResponse queryHistoricalUsage(String window, String filterCsv) {
+        String selected = window == null ? "1h" : window;
+        long now = now();
+        long from = HistoricalUsageAggregator.window(selected).from(now);
+        var filter = DistributionSettings.parseStrictCapabilitiesCsv(filterCsv);
+        List<AgentPoolRecord> current;
+        synchronized (this) {
+            current = pools.ordered();
+        }
+        return HistoricalUsageAggregator.aggregate(selected, now, filter, store.listUsageSamples(from, now), current);
+    }
+
+    public record CreatedAgentPool(AgentPoolSummary pool, GeneratedRegistrationKey generatedKey) {
+    }
+
+    public record AgentPoolDetail(AgentPoolSummary pool, List<RegistrationKeyRecord> registrationKeys) {
+    }
+
+    public synchronized List<AgentPoolSummary> listAgentPools() {
+        return pools.ordered().stream().map(this::summarize).toList();
+    }
+
+    public synchronized Optional<AgentPoolDetail> getAgentPoolDetail(String poolId) {
+        return Optional.ofNullable(pools.get(poolId)).map(pool -> {
+            var keys = keyMetadata(poolId);
+            return new AgentPoolDetail(summarize(pool, keys), keys);
+        });
+    }
+
+    private AgentPoolSummary summarize(AgentPoolRecord pool) {
+        return summarize(pool, keyMetadata(pool.poolId()));
+    }
+
+    private AgentPoolSummary summarize(AgentPoolRecord pool, List<RegistrationKeyRecord> keys) {
+        int connected = 0;
+        int busy = 0;
+        int idle = 0;
+        for (var connections : connectionsByWorker.values()) {
+            WorkerConnection worker = displayedWorker(connections);
+            if (worker.inPool(pool.poolId())) {
+                connected++;
+                if (worker.utilized()) {
+                    busy++;
+                }
+                if (worker.state == WorkerState.IDLE) {
+                    idle++;
+                }
+            }
+        }
+        int activeKeys = (int) keys.stream().filter(k -> k.revokedAt() == null).count();
+        return new AgentPoolSummary(pool.poolId(), pool.displayName(), pool.capabilities(), pool.priorityOrder(),
+                connected, busy, idle, activeKeys, pool.createdAt(), pool.updatedAt());
+    }
+
+    public synchronized CreatedAgentPool createAgentPool(String displayName, Map<String, String> capabilities,
+                                                         boolean generateKey, String keyDescription) {
+        long now = now();
+        AgentPoolRecord pool = pools.newPool(displayName, capabilities, now);
+        var key = generateKey ? AgentPoolRegistry.issueKey(pool.poolId(), keyDescription, now) : null;
+        pools.insert(pool, key);
+        poolUpdated(pool.poolId());
+        return new CreatedAgentPool(summarize(pool), key == null ? null : key.generated());
+    }
+
+    public synchronized Optional<AgentPoolSummary> updateAgentPool(String poolId, String displayName,
+                                                                    Map<String, String> capabilities) {
+        AgentPoolRecord previous = pools.get(poolId);
+        if (previous == null) {
+            return Optional.empty();
+        }
+        long now = now();
+        AgentPoolRecord updated = pools.update(previous, displayName, capabilities, now);
+        var affected = workersInPool(poolId);
+        for (WorkerConnection conn : affected) {
+            if (conn.expiredWarning(now) == null) {
+                conn.pool = updated;
+                if (CapabilityMatcher.matches(updated.capabilities(), conn.capabilities)) {
+                    conn.warnings.remove(WorkerWarningCode.POOL_CAPABILITY_MISMATCH);
+                } else {
+                    conn.warn(WorkerWarningCode.POOL_CAPABILITY_MISMATCH, "Worker no longer meets pool capabilities",
+                            now, config.poolDriftGraceMs());
+                }
+            }
+        }
+        for (WorkerConnection conn : affected) {
+            if (!expireWarning(conn, now)) {
+                tryPersistWorker(conn);
+            }
+        }
+        poolUpdated(poolId);
+        dispatchPendingPartitions();
+        return Optional.of(summarize(updated));
+    }
+
+    public synchronized boolean deleteAgentPool(String poolId) {
+        if (!pools.delete(poolId)) {
+            return false;
+        }
+        long now = now();
+        var affected = workersInPool(poolId);
+        affected.forEach(conn -> conn.warn(WorkerWarningCode.POOL_DELETED, "Agent pool was deleted",
+                now, config.poolDriftGraceMs()));
+        affected.forEach(this::tryPersistWorker);
+        eventHub.publish("pool.deleted", null, null, null, Map.of("poolId", poolId));
+        return true;
+    }
+
+    public synchronized List<AgentPoolSummary> reorderAgentPools(List<String> orderedPoolIds) {
+        pools.reorder(orderedPoolIds, now());
+        for (WorkerConnection conn : workers.values()) {
+            if (conn.pool != null && pools.get(conn.pool.poolId()) != null) {
+                conn.pool = pools.get(conn.pool.poolId());
+            }
+        }
+        orderedPoolIds.forEach(this::poolUpdated);
+        dispatchPendingPartitions();
+        return listAgentPools();
+    }
+
+    private void poolUpdated(String poolId) {
+        eventHub.publish("pool.updated", null, null, null, Map.of("poolId", poolId));
+    }
+
+    public synchronized Optional<GeneratedRegistrationKey> generateRegistrationKey(String poolId, String description) {
+        if (pools.get(poolId) == null) {
+            return Optional.empty();
+        }
+        var key = AgentPoolRegistry.issueKey(poolId, description, now());
+        store.insertRegistrationKey(key.stored());
+        poolUpdated(poolId);
+        return Optional.of(key.generated());
+    }
+
+    private List<RegistrationKeyRecord> keyMetadata(String poolId) {
+        return store.listRegistrationKeys(poolId).stream().map(StoredRegistrationKey::metadata).toList();
+    }
+
+    public synchronized Optional<List<RegistrationKeyRecord>> listRegistrationKeys(String poolId) {
+        return Optional.ofNullable(pools.get(poolId)).map(p -> keyMetadata(p.poolId()));
+    }
+
+    public synchronized Optional<RegistrationKeyRecord> revokeRegistrationKey(String poolId, String keyId) {
+        if (!store.revokeRegistrationKey(poolId, keyId, now())) {
+            return Optional.empty();
+        }
+        var key = store.findRegistrationKey(keyId).orElseThrow().metadata();
+        var affected = workersInPool(poolId).stream().filter(conn -> conn.key.metadata().keyId().equals(keyId)).toList();
+        affected.forEach(conn -> conn.warn(WorkerWarningCode.KEY_REVOKED, "Registration key was revoked",
+                key.revokedAt(), config.keyRevocationGraceMs()));
+        affected.forEach(this::tryPersistWorker);
+        poolUpdated(poolId);
+        return Optional.of(key);
+    }
+
+    private List<WorkerConnection> workersInPool(String poolId) {
+        return workers.values().stream().filter(conn -> conn.inPool(poolId)).toList();
+    }
+
+    private long now() {
+        return config.clock().getAsLong();
+    }
+
+    public void registerWorker(String connectionId, WorkerRegisterPayload payload, Consumer<WorkerWsMessage> sender) {
+        registerWorker(connectionId, payload, sender, () -> { });
+    }
+
+    public synchronized void registerWorker(String connectionId, WorkerRegisterPayload payload,
+                                            Consumer<WorkerWsMessage> sender, Runnable closer) {
         String workerId = payload.workerId() != null && !payload.workerId().isBlank()
                 ? payload.workerId()
                 : "worker-" + connectionId.substring(0, Math.min(8, connectionId.length()));
-        Map<String, String> caps = payload.capabilities() != null ? Map.copyOf(payload.capabilities()) : Map.of();
-        WorkerConnection conn = new WorkerConnection(
-                connectionId,
-                workerId,
-                payload.host() != null ? payload.host() : "unknown",
-                caps,
-                sender
-        );
-        conn.cacheStats = payload.cacheStats();
+        if (workers.containsKey(connectionId)) {
+            terminate(workers.get(connectionId), RegistrationFailure.ALREADY_REGISTERED);
+            return;
+        }
+        if (workerId.length() > 128 || (payload.host() != null && payload.host().length() > 255)) {
+            reject(workerId, sender, closer, RegistrationFailure.INVALID_WORKER_METADATA);
+            return;
+        }
+        String poolId = payload.poolId();
+        AgentPoolRecord pool = null;
+        StoredRegistrationKey key = null;
+        RegistrationFailure failure = null;
+        if (poolId == null || poolId.isBlank()) {
+            if (config.requireAgentPool()) {
+                failure = RegistrationFailure.POOL_REQUIRED;
+            }
+        } else if ((pool = pools.get(poolId)) == null) {
+            failure = RegistrationFailure.POOL_NOT_FOUND;
+        } else {
+            key = store.listRegistrationKeys(poolId).stream()
+                    .filter(k -> RegistrationKeyCrypto.verifySecret(payload.registrationKey(), k.keyHash()))
+                    .findFirst().orElse(null);
+            if (key == null) {
+                failure = RegistrationFailure.INVALID_REGISTRATION_KEY;
+            } else if (key.metadata().revokedAt() != null) {
+                failure = RegistrationFailure.REVOKED_REGISTRATION_KEY;
+            } else if (!CapabilityMatcher.matches(pool.capabilities(), payload.capabilities())) {
+                failure = RegistrationFailure.MISSING_POOL_CAPABILITIES;
+            }
+        }
+        if (failure != null) {
+            reject(workerId, sender, closer, failure);
+            return;
+        }
+        var conn = new WorkerConnection(connectionId, workerId, payload, pool, key, now(), sender, closer);
         workers.put(connectionId, conn);
-        persistWorker(conn);
-
-        sender.accept(new WorkerWsMessage(WorkerWsMessage.WORKER_REGISTERED, Map.of("workerId", workerId)));
-        eventHub.publish("worker.registered", null, null, workerId, Map.of(
-                "host", conn.host,
-                "capabilities", caps));
-
+        connectionsByWorker.computeIfAbsent(workerId, id -> new ArrayList<>()).add(conn);
+        try {
+            persistWorker(conn);
+            if (key != null) {
+                store.touchRegistrationKeyUsage(key.metadata().keyId(), conn.connectedAt, workerId);
+                poolUpdated(poolId);
+            }
+        } catch (RuntimeException e) {
+            handleWorkerDisconnect(connectionId);
+            throw e;
+        }
+        Map<String, Object> acknowledgement = pool == null ? Map.of("workerId", workerId)
+                : Map.of("workerId", workerId, "poolId", pool.poolId());
+        sender.accept(new WorkerWsMessage(WorkerWsMessage.WORKER_REGISTERED, acknowledgement));
+        eventHub.publish("worker.registered", null, null, workerId, Map.of("host", conn.host,
+                "capabilities", conn.capabilities));
         dispatchPendingPartitions();
+    }
+
+    private void renew(WorkerConnection conn, WorkerRenewPayload renewal) {
+        boolean identityMatches = renewal != null && conn.workerId.equals(renewal.workerId())
+                && Objects.equals(conn.poolId(), renewal.poolId());
+        if (!identityMatches || !conn.matchesRenewalKey(renewal.registrationKey())) {
+            terminate(conn, RegistrationFailure.INVALID_REGISTRATION_KEY);
+            return;
+        }
+        if (conn.warnings.containsKey(WorkerWarningCode.KEY_REVOKED)) {
+            terminate(conn, RegistrationFailure.REVOKED_REGISTRATION_KEY);
+            return;
+        }
+        if (conn.key != null && !conn.warnings.containsKey(WorkerWarningCode.POOL_DELETED)) {
+            var current = store.findRegistrationKey(conn.key.metadata().keyId());
+            if (current.isEmpty() || !current.get().metadata().poolId().equals(conn.poolId())) {
+                terminate(conn, RegistrationFailure.INVALID_REGISTRATION_KEY);
+                return;
+            }
+            if (current.get().metadata().revokedAt() != null) {
+                terminate(conn, RegistrationFailure.REVOKED_REGISTRATION_KEY);
+                return;
+            }
+            store.touchRegistrationKeyUsage(conn.key.metadata().keyId(), now(), conn.workerId);
+            poolUpdated(conn.poolId());
+        }
+        conn.sender.accept(new WorkerWsMessage(WorkerWsMessage.WORKER_RENEWED, Map.of("workerId", conn.workerId)));
+    }
+
+    private enum RegistrationFailure {
+        POOL_REQUIRED("An agent pool is required"),
+        POOL_NOT_FOUND("Agent pool does not exist"),
+        INVALID_REGISTRATION_KEY("Invalid registration credentials"),
+        REVOKED_REGISTRATION_KEY("Registration key was revoked"),
+        MISSING_POOL_CAPABILITIES("Worker does not meet mandatory pool capabilities"),
+        INVALID_WORKER_METADATA("Worker identity or host exceeds the supported length"),
+        ALREADY_REGISTERED("Connection is already registered");
+
+        private final String message;
+
+        RegistrationFailure(String message) {
+            this.message = message;
+        }
+    }
+
+    private void reject(String workerId, Consumer<WorkerWsMessage> sender, Runnable closer, RegistrationFailure failure) {
+        Map<String, Object> data = Map.of("code", failure.name(), "message", failure.message);
+        try {
+            sender.accept(new WorkerWsMessage(WorkerWsMessage.WORKER_REJECTED, data));
+        } finally {
+            try {
+                closer.run();
+            } finally {
+                eventHub.publish("worker.rejected", null, null, workerId, data);
+            }
+        }
+    }
+
+    private void terminate(WorkerConnection conn, RegistrationFailure failure) {
+        try {
+            reject(conn.workerId, conn.sender, conn.closer, failure);
+        } finally {
+            handleWorkerDisconnect(conn.connectionId);
+        }
+    }
+
+    private boolean expireWarning(WorkerConnection conn, long now) {
+        WorkerWarning warning = conn.expiredWarning(now);
+        if (warning == null) {
+            return false;
+        }
+        var failure = switch (warning.code()) {
+            case KEY_REVOKED -> RegistrationFailure.REVOKED_REGISTRATION_KEY;
+            case POOL_DELETED -> RegistrationFailure.POOL_NOT_FOUND;
+            case POOL_CAPABILITY_MISMATCH -> RegistrationFailure.MISSING_POOL_CAPABILITIES;
+        };
+        terminate(conn, failure);
+        return true;
     }
 
     public synchronized void handleWorkerMessage(String connectionId, WorkerWsMessage message) {
@@ -596,7 +902,10 @@ public final class SessionCoordinator {
         if (conn == null) {
             return;
         }
-        long receivedAt = System.currentTimeMillis();
+        long receivedAt = now();
+        if (expireWarning(conn, receivedAt)) {
+            return;
+        }
         boolean wasSilent = conn.lastHeartbeatAt < receivedAt - config.leaseTimeoutMs();
         boolean wasCancelling = conn.cancelledPartitionId != null;
         conn.lastHeartbeatAt = receivedAt;
@@ -612,6 +921,7 @@ public final class SessionCoordinator {
 
     private void processWorkerMessage(WorkerConnection conn, WorkerWsMessage message) {
         switch (message.type()) {
+            case WorkerWsMessage.WORKER_RENEW -> renew(conn, DistributionJson.convert(message.payload(), WorkerRenewPayload.class));
             case WorkerWsMessage.WORKER_HEARTBEAT -> {
                 WorkerHeartbeatPayload hb = DistributionJson.convert(message.payload(), WorkerHeartbeatPayload.class);
                 if (hb != null && hb.cacheStats() != null) {
@@ -624,10 +934,10 @@ public final class SessionCoordinator {
                 if (hb != null && hb.activePartitionId() != null) {
                     PartitionRuntime pr = partitions.get(hb.activePartitionId());
                     if (isActiveOn(pr, conn)) {
-                        pr.lastProgressAt = System.currentTimeMillis();
+                        pr.lastProgressAt = now();
                     }
                 }
-                persistWorker(conn);
+                tryPersistWorker(conn);
             }
             case WorkerWsMessage.WORKER_DRAINING -> {
                 conn.state = WorkerState.DRAINING;
@@ -638,12 +948,11 @@ public final class SessionCoordinator {
                 String partitionId = stringField(message.payload(), "partitionId");
                 PartitionRuntime pr = partitionId != null ? partitions.get(partitionId) : null;
                 int startedAttempt = intField(message.payload(), "attempt");
-                if (!isActiveOn(pr, conn) || pr.record.state() != PartitionState.ASSIGNED
-                        || (startedAttempt > 0 && startedAttempt != pr.record.attempt())) {
+                if (!acceptsAttempt(pr, conn, startedAttempt) || pr.record.state() != PartitionState.ASSIGNED) {
                     LOG.warn("Discarding {} for partition {} from worker {} (connection {}): not the active assignment",
                             message.type(), partitionId, conn.workerId, conn.connectionId);
                 } else {
-                    long now = System.currentTimeMillis();
+                    long now = now();
                     pr.lastProgressAt = now;
                     pr.record = pr.buildRecord(
                             conn.workerId,
@@ -693,7 +1002,7 @@ public final class SessionCoordinator {
             return;
         }
         if (live) {
-            runtime.lastProgressAt = System.currentTimeMillis();
+            runtime.lastProgressAt = now();
         }
         boolean running = live || store.findSession(record.sessionId()).map(s -> s.status() == SessionStatus.RUNNING).orElse(false);
         SessionRuntime session = running ? getOrRehydrateSession(record.sessionId()) : null;
@@ -713,20 +1022,41 @@ public final class SessionCoordinator {
             result = new TestExecutionRecord(deliveryId == null ? UUID.randomUUID().toString() : deliveryId,
                     record.sessionId(), record.partitionId(), conn.workerId, evt.workUnitKey(), evt.className(),
                     evt.testName(), evt.status(), evt.durationMs(), record.attempt(), flaky, evt.errorMessage(),
-                    evt.stackTrace(), evt.endpoints() == null ? List.of() : evt.endpoints(), System.currentTimeMillis(), evt.uniqueId());
+                    evt.stackTrace(), evt.endpoints() == null ? List.of() : evt.endpoints(), now(), evt.uniqueId());
         }
         @SuppressWarnings("unchecked")
         Map<String, Object> data = DistributionJson.convert(evt, Map.class);
         data.put("sessionId", record.sessionId());
         data.put("partitionId", record.partitionId());
         eventHub.publish("test.event", record.sessionId(), record.partitionId(), conn.workerId, data, deliveryId, result, List.of());
+        // Replay only acknowledges the journal entry. Apply both in-memory changes before either status write can fail.
+        if (live) {
+            if (evt.status() == TestOutcomeStatus.STARTED) {
+                conn.activeTests.putLast(testKey, testDisplay(evt));
+            } else {
+                conn.activeTests.remove(testKey);
+            }
+        }
         if (result != null && session != null) {
             session.recordExecution(result);
             refreshRunningSessionSummary(session);
         }
+        if (live) {
+            persistWorker(conn);
+        }
         if (deliveryId != null) {
             acknowledgeResult(conn, deliveryId);
         }
+    }
+
+    private static String testDisplay(WorkerTestEventPayload event) {
+        String className = event.className();
+        if (className == null || className.isBlank()) {
+            return event.testName();
+        }
+        String simpleName = className.substring(className.lastIndexOf('.') + 1);
+        return event.testName() == null || event.testName().isBlank()
+                ? simpleName : simpleName + " > " + event.testName();
     }
 
     private void handleCompletion(WorkerConnection conn, Map<String, Object> payload) {
@@ -745,7 +1075,8 @@ public final class SessionCoordinator {
             }
         }
         boolean accepted = acceptsAttempt(partitions.get(done.partitionId()), conn, done.attempt());
-        if (done.partitionId() != null && done.partitionId().equals(conn.cancelledPartitionId)) {
+        if (done.partitionId() != null && done.partitionId().equals(conn.cancelledPartitionId)
+                && (done.attempt() == conn.cancelledAttempt || (done.attempt() == 0 && conn.allowLegacyCancelAck))) {
             confirmCancellation(conn);
         }
         if (accepted) {
@@ -777,12 +1108,20 @@ public final class SessionCoordinator {
         if (conn == null) {
             return;
         }
+        var remaining = connectionsByWorker.get(conn.workerId);
+        remaining.remove(conn);
+        if (remaining.isEmpty()) {
+            connectionsByWorker.remove(conn.workerId);
+        }
         conn.state = WorkerState.OFFLINE;
+        conn.warnings.clear();
         String inFlightPartitionId = conn.activePartitionId;
         conn.activePartitionId = null;
-        persistWorker(conn);
+        tryPersistWorker(conn);
 
-        eventHub.publish("worker.offline", null, inFlightPartitionId, conn.workerId, Map.of());
+        if (remaining.isEmpty()) {
+            eventHub.publish("worker.offline", null, inFlightPartitionId, conn.workerId, Map.of());
+        }
 
         if (inFlightPartitionId != null) {
             PartitionRuntime pr = partitions.get(inFlightPartitionId);
@@ -794,7 +1133,11 @@ public final class SessionCoordinator {
     }
 
     public synchronized void sweepExpiredLeases() {
-        long cutoff = System.currentTimeMillis() - config.leaseTimeoutMs();
+        long now = now();
+        for (WorkerConnection conn : List.copyOf(workers.values())) {
+            expireWarning(conn, now);
+        }
+        long cutoff = now - config.leaseTimeoutMs();
         for (PartitionRuntime pr : partitions.values()) {
             if ((pr.record.state() == PartitionState.ASSIGNED || pr.record.state() == PartitionState.RUNNING)
                     && pr.lastProgressAt < cutoff) {
@@ -812,7 +1155,7 @@ public final class SessionCoordinator {
             pr.activeConnectionId = null;
             pr.inFlightTestKeys.clear();
             PartitionState endState = done.success() ? PartitionState.COMPLETED : PartitionState.FAILED;
-            long now = System.currentTimeMillis();
+            long now = now();
             long started = pr.record.startedAt() > 0L ? pr.record.startedAt() : now;
             List<String> producedOutputs = done.outputArtifacts().stream()
                     .map(WorkspaceFileSet::relativePath)
@@ -858,7 +1201,7 @@ public final class SessionCoordinator {
             session.failedOrInterruptedTests.addAll(interrupted);
         }
         pr.inFlightTestKeys.clear();
-        long now = System.currentTimeMillis();
+        long now = now();
         long startedAt = pr.record.startedAt() > 0L ? pr.record.startedAt() : now;
         if (pr.retriesUsed < pr.maxRetries) {
             PartitionRecord evictedAttempt = pr.buildRecord(
@@ -923,7 +1266,7 @@ public final class SessionCoordinator {
             }
             pr.lastAssignedWorkerId = matchingWorker.workerId;
             int nextAttempt = pr.retriesUsed + 1;
-            long now = System.currentTimeMillis();
+            long now = now();
             pr.lastProgressAt = now;
             pr.record = pr.buildRecord(
                     matchingWorker.workerId,
@@ -943,7 +1286,7 @@ public final class SessionCoordinator {
             matchingWorker.lastAssignedAt = ++assignmentSequence;
             matchingWorker.activePartitionId = pr.record.partitionId();
             pr.activeConnectionId = matchingWorker.connectionId;
-            persistWorker(matchingWorker);
+            tryPersistWorker(matchingWorker);
 
             PartitionAssignPayload assignPayload = new PartitionAssignPayload(
                     pr.record.partitionId(),
@@ -1011,6 +1354,8 @@ public final class SessionCoordinator {
             stalled.activePartitionId = null;
         }
         stalled.cancelledPartitionId = pr.record.partitionId();
+        stalled.cancelledAttempt = pr.record.attempt();
+        stalled.allowLegacyCancelAck = !pr.earlierAttemptWorkerIds.contains(stalled.workerId);
         persistWorker(stalled);
     }
 
@@ -1036,62 +1381,96 @@ public final class SessionCoordinator {
                 capabilities, unit.estimatedDurationMs(), unit.enclosingClassNames());
     }
 
-    private int countEligibleOnlineWorkers(Map<String, String> requiredCapabilities) {
-        long aliveSince = System.currentTimeMillis() - config.leaseTimeoutMs();
-        return (int) workers.values().stream()
-                .filter(conn -> conn.state == WorkerState.IDLE || conn.state == WorkerState.BUSY)
-                .filter(conn -> conn.cancelledPartitionId == null && conn.lastHeartbeatAt >= aliveSince)
-                .filter(conn -> CapabilityMatcher.matches(requiredCapabilities, conn.capabilities))
-                .map(conn -> conn.workerId)
-                .distinct()
-                .count();
+    private boolean eligible(WorkerConnection conn, Map<String, String> requirements, long now) {
+        AgentPoolRecord current = conn.pool == null ? null : pools.get(conn.poolId());
+        return (conn.state == WorkerState.IDLE || conn.state == WorkerState.BUSY)
+                && conn.cancelledPartitionId == null
+                && !conn.warnings.containsKey(WorkerWarningCode.POOL_DELETED)
+                && conn.lastHeartbeatAt >= now - config.leaseTimeoutMs()
+                && conn.expiredWarning(now) == null
+                && (conn.pool == null || (current != null && CapabilityMatcher.matches(requirements, current.capabilities())))
+                && CapabilityMatcher.matches(requirements, conn.capabilities);
     }
 
-    /**
-     * An idle worker that is not finishing a cancelled attempt, has been heard from within the lease timeout, and
-     * satisfies {@code requiredCapabilities}. Workers outside {@code preferAvoiding} (those that ran earlier attempts
-     * of the partition) are chosen first.
-     */
-    private WorkerConnection findIdleMatchingWorker(Map<String, String> requiredCapabilities, Set<String> preferAvoiding) {
-        long aliveSince = System.currentTimeMillis() - config.leaseTimeoutMs();
-        // Least recently assigned first, so partitions spread over the pool instead of always hitting the worker that
-        // happens to come first; a worker an earlier attempt ran on is only a fallback.
-        WorkerConnection best = null;
-        WorkerConnection fallback = null;
-        for (WorkerConnection conn : workers.values()) {
-            if (conn.state == WorkerState.IDLE && conn.activePartitionId == null && conn.cancelledPartitionId == null
-                    && conn.lastHeartbeatAt >= aliveSince
-                    && CapabilityMatcher.matches(requiredCapabilities, conn.capabilities)) {
-                if (!preferAvoiding.contains(conn.workerId)) {
-                    if (best == null || assignedEarlier(conn, best)) {
-                        best = conn;
-                    }
-                } else if (fallback == null || assignedEarlier(conn, fallback)) {
-                    fallback = conn;
-                }
+    private int countEligibleOnlineWorkers(Map<String, String> requirements) {
+        long now = now();
+        return (int) workers.values().stream().filter(conn -> eligible(conn, requirements, now))
+                .map(conn -> conn.workerId).distinct().count();
+    }
+
+    private WorkerConnection findIdleMatchingWorker(Map<String, String> requirements, Set<String> preferAvoiding) {
+        long now = now();
+        return workers.values().stream()
+                .filter(conn -> conn.state == WorkerState.IDLE && conn.activePartitionId == null)
+                .filter(conn -> eligible(conn, requirements, now))
+                .min(Comparator.comparingInt((WorkerConnection conn) -> conn.pool == null
+                                ? Integer.MAX_VALUE : conn.pool.priorityOrder())
+                        .thenComparing(conn -> preferAvoiding.contains(conn.workerId))
+                        .thenComparingLong(conn -> conn.lastAssignedAt)
+                        .thenComparing(conn -> conn.workerId)
+                        .thenComparing(conn -> conn.connectionId))
+                .orElse(null);
+    }
+
+    /** A reconnected idle socket must not hide another socket still executing under this worker ID. */
+    private static WorkerConnection displayedWorker(List<WorkerConnection> connections) {
+        for (WorkerConnection conn : connections.reversed()) {
+            if (conn.activePartitionId != null) {
+                return conn;
             }
         }
-        return best != null ? best : fallback;
+        return connections.getLast();
     }
 
-    private static boolean assignedEarlier(WorkerConnection a, WorkerConnection b) {
-        if (a.lastAssignedAt != b.lastAssignedAt) {
-            return a.lastAssignedAt < b.lastAssignedAt;
+    /** A worker status projection must not interrupt an assignment or a committed pool transition. */
+    private void tryPersistWorker(WorkerConnection conn) {
+        try {
+            persistWorker(conn);
+        } catch (RuntimeException e) {
+            LOG.warn("Could not persist status for worker {}", conn.workerId, e);
         }
-        return a.workerId.compareTo(b.workerId) < 0;
     }
 
     private void persistWorker(WorkerConnection conn) {
-        store.upsertWorker(new WorkerRecord(
-                conn.workerId,
-                conn.host,
-                conn.capabilities,
-                conn.state,
-                conn.activePartitionId,
-                conn.lastHeartbeatAt,
-                conn.connectedAt,
-                conn.cacheStats
-        ));
+        if (conn.activePartitionId == null) {
+            conn.activeTests.clear();
+        }
+        String display = conn.activeTests.isEmpty() ? null : conn.activeTests.lastEntry().getValue();
+        WorkerRecord old = conn.lastPersisted;
+        boolean stateChanged = old == null || old.state() != conn.state
+                || !Objects.equals(old.activePartitionId(), conn.activePartitionId)
+                || !Objects.equals(old.activeTestDisplay(), display);
+        if (stateChanged) {
+            conn.stateUpdatedAt = now();
+        }
+        var row = new WorkerRecord(conn.workerId, conn.host, conn.version, conn.poolId(),
+                conn.pool == null ? null : conn.pool.displayName(), conn.capabilities, conn.state, conn.activePartitionId,
+                display, conn.stateUpdatedAt, conn.lastHeartbeatAt, conn.connectedAt, conn.cacheStats,
+                List.copyOf(conn.warnings.values()));
+        var connections = connectionsByWorker.get(conn.workerId);
+        WorkerConnection displayed = connections == null ? conn : displayedWorker(connections);
+        WorkerRecord visible = displayed == conn ? row : displayed.lastPersisted;
+        store.upsertWorker(visible);
+        conn.lastPersisted = row;
+        if (conn.updatePending || stateChanged || !Objects.equals(old.poolDisplayName(), row.poolDisplayName())
+                || !old.warnings().equals(row.warnings()) || !Objects.equals(old.cacheStats(), row.cacheStats())) {
+            try {
+                eventHub.publish("worker.updated", null, visible.activePartitionId(), visible.workerId(),
+                        Map.of("state", visible.state().name()));
+                conn.updatePending = false;
+            } catch (RuntimeException e) {
+                // The row already committed. Retry the notification with the latest visible status on the next heartbeat.
+                conn.updatePending = true;
+                LOG.warn("Could not publish status update for worker {}", conn.workerId, e);
+            }
+        }
+    }
+
+    private void resetPersistedWorker(WorkerRecord worker, WorkerState state) {
+        store.upsertWorker(new WorkerRecord(worker.workerId(), worker.host(), worker.version(), worker.poolId(),
+                worker.poolDisplayName(), worker.capabilities(), state, null, null, now(), worker.lastHeartbeatAt(),
+                worker.registeredAt(), worker.cacheStats(), List.of()));
+        eventHub.publish("worker.updated", null, null, worker.workerId(), Map.of("state", state.name()));
     }
 
     private void refreshRunningSessionSummary(SessionRuntime session) {
@@ -1318,7 +1697,7 @@ public final class SessionCoordinator {
         private final String workingDirectory;
         private final int maxRetries;
         private int retriesUsed;
-        private long lastProgressAt = System.currentTimeMillis();
+        private long lastProgressAt;
         /** Connection of the worker currently holding this partition; {@code null} while not assigned. */
         private String activeConnectionId;
         /** Tests currently started on this attempt, reconstructed from events on restart. */
@@ -1374,29 +1753,72 @@ public final class SessionCoordinator {
         private final String connectionId;
         private final String workerId;
         private final String host;
+        private final String version;
         private final Map<String, String> capabilities;
         private final Consumer<WorkerWsMessage> sender;
-        private final long connectedAt = System.currentTimeMillis();
-        private long lastHeartbeatAt = System.currentTimeMillis();
+        private final Runnable closer;
+        private final long connectedAt;
+        private final StoredRegistrationKey key;
+        private final Map<WorkerWarningCode, WorkerWarning> warnings = new EnumMap<>(WorkerWarningCode.class);
+        private final LinkedHashMap<String, String> activeTests = new LinkedHashMap<>();
+        /** Last configured pool snapshot, retained during deletion grace. */
+        private AgentPoolRecord pool;
+        private long lastHeartbeatAt;
+        private long stateUpdatedAt;
+        private WorkerRecord lastPersisted;
+        private boolean updatePending;
         private WorkerState state = WorkerState.IDLE;
         /** Sequence number of this worker's latest assignment (0 = never), for least-recently-used dispatch. */
         private long lastAssignedAt;
         private String activePartitionId;
-        /** Latest local file cache telemetry reported by the worker; null for workers that report none. */
-        private volatile WorkerCacheStats cacheStats;
+        private WorkerCacheStats cacheStats;
         /** Partition whose expired attempt this worker was told to cancel and has not yet confirmed ending. */
         private String cancelledPartitionId;
+        private int cancelledAttempt;
+        private boolean allowLegacyCancelAck;
 
-        private WorkerConnection(String connectionId,
-                                 String workerId,
-                                 String host,
-                                 Map<String, String> capabilities,
-                                 Consumer<WorkerWsMessage> sender) {
+        private WorkerConnection(String connectionId, String workerId, WorkerRegisterPayload payload,
+                                 AgentPoolRecord pool, StoredRegistrationKey key, long now,
+                                 Consumer<WorkerWsMessage> sender, Runnable closer) {
             this.connectionId = connectionId;
             this.workerId = workerId;
-            this.host = host;
-            this.capabilities = capabilities;
+            this.host = payload.host() == null ? "unknown" : payload.host();
+            this.version = payload.version();
+            this.capabilities = payload.capabilities();
+            this.cacheStats = payload.cacheStats();
+            this.pool = pool;
+            this.key = key;
+            this.connectedAt = now;
+            this.lastHeartbeatAt = now;
             this.sender = sender;
+            this.closer = closer;
+        }
+
+        private String poolId() {
+            return pool == null ? null : pool.poolId();
+        }
+
+        private boolean matchesRenewalKey(String candidate) {
+            if (key == null) {
+                return candidate == null || candidate.isBlank();
+            }
+            return RegistrationKeyCrypto.verifySecret(candidate, key.keyHash());
+        }
+
+        private boolean inPool(String id) {
+            return pool != null && pool.poolId().equals(id) && !warnings.containsKey(WorkerWarningCode.POOL_DELETED);
+        }
+
+        private WorkerWarning expiredWarning(long now) {
+            return warnings.values().stream().filter(warning -> now >= warning.disconnectAt()).findFirst().orElse(null);
+        }
+
+        private boolean utilized() {
+            return state == WorkerState.BUSY || activePartitionId != null;
+        }
+
+        private void warn(WorkerWarningCode code, String message, long detectedAt, long graceMs) {
+            warnings.computeIfAbsent(code, k -> new WorkerWarning(code, message, detectedAt, detectedAt + graceMs));
         }
     }
 }

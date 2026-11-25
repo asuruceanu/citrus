@@ -16,18 +16,38 @@
 
 package org.citrusframework.distribution.model;
 
+import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 
 public record WorkerRecord(
         String workerId,
         String host,
+        String version,
+        String poolId,
+        String poolDisplayName,
         Map<String, String> capabilities,
         WorkerState state,
         String activePartitionId,
+        String activeTestDisplay,
+        long stateUpdatedAt,
         long lastHeartbeatAt,
         long registeredAt,
-        WorkerCacheStats cacheStats
+        WorkerCacheStats cacheStats,
+        List<WorkerWarning> warnings
 ) {
+
+    public WorkerRecord {
+        capabilities = capabilities == null ? Map.of() : Collections.unmodifiableMap(new LinkedHashMap<>(capabilities));
+        warnings = warnings == null ? List.of() : List.copyOf(warnings);
+    }
+
+    public WorkerRecord(String workerId, String host, Map<String, String> capabilities, WorkerState state,
+                        String activePartitionId, long lastHeartbeatAt, long registeredAt, WorkerCacheStats cacheStats) {
+        this(workerId, host, null, null, null, capabilities, state, activePartitionId, null, 0L, lastHeartbeatAt,
+                registeredAt, cacheStats, List.of());
+    }
 
     public WorkerRecord(String workerId, String host, Map<String, String> capabilities, WorkerState state,
                         String activePartitionId, long lastHeartbeatAt, long registeredAt) {

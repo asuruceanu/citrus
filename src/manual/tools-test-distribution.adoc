@@ -19,7 +19,7 @@ Citrus Test Distribution partitions and executes JUnit Platform and Citrus integ
 A distributed test run involves three components:
 
 . *Build Host (Maven Extension + JUnit `LauncherInterceptor`):* Opens a single build session on the coordinator (recording project name, Git branch, commit SHA, and changed workspace files), discovers JUnit Platform test descriptors per module, executes `@LocalOnly` tests locally, packages the test classpath and any declared external input paths into SHA-256 content-addressed blobs, uploads only missing digests, submits remote work units, streams live test and partition events over Server-Sent Events (SSE), writes standard `TEST-*.xml` Surefire/Failsafe reports, and atomically commits any declared output files back into the module.
-. *Coordinator (`DistributionCoordinatorServer`):* Persists sessions, partitions, worker leases, and historical test durations in JDBC (`HSQLDB` or `PostgreSQL`), schedules work units onto capability-matching workers using Longest-Processing-Time (LPT) bin packing seeded from historical execution times (handing each partition to the idle worker that has waited longest, so the whole pool is used), deduplicates classpath/workspace blobs on disk, monitors worker heartbeats, automatically requeues evicted or stalled partitions up to `maxRetries`, and serves the real-time Web UI and REST/SSE APIs.
+. *Coordinator (`DistributionCoordinatorServer`):* Persists sessions, partitions, worker leases, and historical test durations in JDBC (`HSQLDB` or `PostgreSQL`), schedules work units onto capability-matching workers using Longest-Processing-Time (LPT) bin packing seeded from historical execution times (choosing an eligible idle worker by pool priority and then favoring workers least recently assigned), deduplicates classpath/workspace blobs on disk, monitors worker heartbeats, automatically requeues evicted or stalled partitions up to `maxRetries`, and serves the real-time Web UI and REST/SSE APIs.
 . *Workers (`DistributionWorkerClient`):* Maintain outbound WebSocket connections (`/ws/v1/worker`) to the coordinator, advertise auto-detected host capabilities (`os`, `arch`, `jdk`, `cpuCores`, `memoryMb`, `citrus.workspace.v1`) plus user tags, pull missing blobs into a local content-addressed cache, execute assigned partitions in a forked JVM (default) or, with `forkMode=AUTO`, an isolated child-first `ClassLoader` inside the worker JVM, stream per-test outcomes and captured Citrus endpoint names, and drain cleanly on `SIGTERM`.
 
 [[tools-test-distribution-maven]]
@@ -136,6 +136,10 @@ The coordinator (`citrus-test-distribution-coordinator`) runs an embedded Vert.x
 |`citrus.test.distribution.coordinator.maxWavesPerWorker` / `CITRUS_DIST_COORDINATOR_MAX_WAVES_PER_WORKER`
 |Target maximum number of adaptive LPT partitions per eligible worker. Set to `0` to disable the wave target.
 |`2`
+
+|`citrus.test.distribution.coordinator.requireAgentPool` / `CITRUS_DIST_COORDINATOR_REQUIRE_AGENT_POOL`
+|Require every new worker registration to include a pool ID and valid key. Enable this after migrating unpooled workers.
+|`false`
 |===
 
 Adaptive sizing applies to LPT submissions that do not declare workspace outputs and leave `maxPartitionSize` unset.
@@ -298,7 +302,32 @@ When `--auth-token` is configured, all `/api/*` and `/ws/v1/worker` endpoints re
 
 |`/api/v1/workers`
 |`GET`
-|Lists registered workers with state (`IDLE`, `BUSY`, `DRAINING`, `OFFLINE`), host, heartbeat timestamp, active partition, and capability tags.
+|Lists registered workers with state (`IDLE`, `BUSY`, `DRAINING`, `OFFLINE`), host, heartbeat timestamp, active partition, capability tags, version, pool ID, pool display name, and pool warnings.
+
+|`/api/v1/agent-pools`
+|`GET` / `POST`
+|List pools in priority order or create a pool. Set `generateRegistrationKey` to `true` to receive its first key.
+
+|`/api/v1/agent-pools/:poolId`
+|`GET` / `PUT` / `DELETE`
+|Read the pool and its key metadata, replace its display name and capability map, or delete it.
+
+|`/api/v1/agent-pools/priority`
+|`PUT`
+|Submit `{"poolIds":["first-id","second-id"]}` with every current pool ID exactly once, highest priority first.
+
+|`/api/v1/agent-pools/:poolId/keys`
+|`GET` / `POST`
+|List key metadata or generate a key with an optional `description`. Only the creation response contains `secretKey`.
+
+|`/api/v1/agent-pools/:poolId/keys/:keyId/revoke`
+|`POST`
+|Revoke one key. Workers can still use other active keys for this pool.
+
+|`/api/v1/usage?window=1h&filter=docker`
+|`GET`
+|Read fleet and per-pool usage. The optional `window` accepts `1h` (default), `24h`, or `7d`.
+The optional `filter` accepts comma-separated capabilities.
 
 |`/api/v1/tests/history?limit=100`
 |`GET`
@@ -319,7 +348,7 @@ The UI is a zero-Node ES module single-page application built with lightweight `
 === Real-Time Transport, Deep Links, and Authentication
 
 * *Live SSE with Automatic Polling Fallback:* On load, the UI opens an `EventSource` stream against `/api/v1/events/stream` (`Live SSE` badge in the top bar) and coalesces burst events so rapid `test.event` updates refresh views smoothly without flooding the browser. If SSE disconnects or is blocked by a reverse proxy, the UI switches to a 4-second background HTTP polling loop (`Polling` badge), ticks elapsed clocks for `RUNNING` sessions locally, and automatically reconnects `EventSource` once the coordinator becomes reachable again.
-* *URL Hash Routing:* Views and session sub-tabs synchronize with the URL hash (`#overview`, `#sessions`, `#session/<sessionId>/<tab>`, `#workers`, `#history`), preserving navigation state across browser reloads and shareable links.
+* *URL Hash Routing:* Views and session sub-tabs synchronize with the URL hash (`#overview`, `#sessions`, `#session/<sessionId>/<tab>`, `#workers`, `#pools`, `#usage`, `#history`), preserving navigation state across browser reloads and shareable links.
 * *Authenticated Dashboard Access:* To serve the dashboard on a coordinator with bearer authentication enabled, use a trusted reverse proxy that supplies the bearer header for the dashboard’s API and SSE requests.
 * *Theme Toggle:* The sun/moon toggle switches between dark and light themes.
 
@@ -351,8 +380,71 @@ Long lists (build sessions, partitions, test executions and test history) are pa
 
 ==== Workers Pool (`#workers`)
 
-Displays cards for every worker in the cluster, filterable by state (`ALL`, `IDLE`, `BUSY`, `DRAINING`, `OFFLINE`) and searchable by worker ID, host name, or capability key/value (such as `docker=true`, `os=linux`, `citrus.workspace.v1=true`), along with last heartbeat age and active partition ID.
-Workers that report local file cache statistics show a `Local File Cache` section with the cleanup policy (`AUTO LRU` or `NO CLEANUP`), the number and size of cached blobs, usable disk space against the configured free space buffer, and the number of evicted blobs. A `LOW DISK` badge, and the `LOW_DISK` filter, mark workers whose usable disk space is below their buffer.
+Workers appear in tables grouped by pool, with a separate group for unpooled workers. Each row shows the worker ID,
+host, version, capabilities, state, last heartbeat, and current test or partition. Search by ID, host, or capability
+and select *Warning* to see workers with a pool or key warning and the time until their disconnect deadline.
+Workers that report local file cache statistics show the cleanup policy, cached blob count and size, usable disk space,
+and eviction count. The *Low Disk* filter selects workers whose usable disk space is below their configured buffer.
+
+[[tools-test-distribution-agent-pools]]
+==== Agent Pools (`#pools`)
+
+Create a pool with a display name and the capabilities every member must advertise. The coordinator assigns a unique,
+stable pool ID. Copy that ID into the worker configuration. For example, a pool with `docker` and `jdk=21` admits
+Java 21 workers advertising `docker=true`. A bare capability means `true`. In a REST request, supply string values,
+for example `{"displayName":"Container workers","capabilities":{"docker":"true","jdk":"21"},"generateRegistrationKey":true}`.
+
+For a partition to run on a pooled worker, both the pool's declared capabilities and the worker's advertised capabilities
+must satisfy every partition requirement. Declare built-in capabilities on the pool when jobs require them. For example,
+include `citrus.workspace.v1=true` for jobs that declare workspace inputs or outputs. Workers may advertise extra
+capabilities. Capability values match without regard to case. Numeric `cpuCores` and `memoryMb` requirements are minimums.
+
+Drag a pool or use *Up* and *Down* to change the order. The coordinator checks the highest-priority pool first
+(`priorityOrder=0`). If its matching workers are busy or unavailable, an idle matching worker from the next pool can take
+the partition immediately. Configured pools take priority over eligible unpooled workers.
+
+===== Registration keys and grace windows
+
+Generate a registration key on creation or under *Manage* → *Registration Keys*. Copy the full `ctrk_...` value into
+the worker's secret configuration while it is displayed. The coordinator stores its hash. Subsequent reads and dashboard
+visits show the key prefix, description, last use, and revocation status. Citrus Agent omits the secret from its
+configuration responses and masks the registration-key property in configuration logs. The pool key authenticates
+registration and renewal. A coordinator configured with bearer authentication also requires its auth token.
+
+A pool can have multiple active keys. To rotate, generate a replacement, update the affected workers' configuration,
+and restart them with the new key. Confirm successful registration and the new key's *Last used* details before
+revoking the old key. Workers use their startup credential for every renewal.
+
+[cols="2,4",options="header"]
+|===
+|Workers Pool warning |What happens
+|`KEY_REVOKED`
+|New registrations with that key fail immediately. Connected workers using it disconnect on their next renewal
+(normally hourly) or at the one-hour deadline, whichever comes first.
+|`POOL_CAPABILITY_MISMATCH`
+|After a pool edit, connected workers that no longer satisfy all mandatory capabilities have four hours to comply.
+They can still receive work matching both sets of capabilities during the grace window. Restart with the required
+capabilities or correct the pool definition before the deadline.
+|`POOL_DELETED`
+|The coordinator immediately stops assigning new partitions from the deleted pool. Connected workers have a four-hour
+grace window for existing work. Reconfigure and restart them with another pool and its key.
+|===
+
+==== Historical Usage (`#usage`)
+
+Choose *1 hour*, *24 hours*, or *7 days* to see active jobs, fleet utilization, and utilization for each pool.
+The REST response also reports active partitions in the fleet series. *Connected* counts online workers, *Utilized* counts workers handling work, and *Desired* counts active and
+pending partitions. Per-pool desired demand fills compatible pools by priority up to their connected capacity.
+Excess demand goes to the highest-priority compatible pool. Deleted pools retain connected and utilized counts while
+their workers remain connected during grace and receive no new desired demand.
+
+Filter by capability or requirement, for example `docker,jdk=21`. The filter applies to job requirements, pool
+capabilities, and capabilities advertised by unpooled workers. All filter terms must match. Each chart bucket shows
+the peak of each metric in that interval. Use the pointer or arrow keys to inspect it.
+
+The coordinator samples every 15 seconds and retains seven days by default. Embedded coordinators can change these
+defaults with `DistributionCoordinatorConfig.Builder.usageSampleIntervalMs` and `usageRetentionMs`.
+The dashboard uses the interval from the usage response header `X-Citrus-Usage-Sample-Interval-Ms` to refresh the charts.
 
 ==== Test History and Flakiness (`#history`)
 
@@ -389,6 +481,30 @@ java -jar citrus-agent.jar \
 Both commands accept `--coordinator-url` (`-u`). In agent worker mode, this option takes precedence over
 the `citrus.test.distribution.coordinatorUrl` system property. When neither is set, the agent connects to
 `http://localhost:8084`.
+
+To join an <<tools-test-distribution-agent-pools,agent pool>>, configure its ID and a registration key belonging to it.
+Upgrade the coordinator before enabling pooled workers. A pooled worker stops if the coordinator cannot confirm its pool ID.
+The JBang worker accepts `--pool` / `-p` and `--registration-key` / `-k`. In Citrus Agent worker mode, use
+`--pool` and `--registration-key` / `-k`. The agent's `-p` selects a test package.
+
+[cols="1,2,3",options="header"]
+|===
+|Setting |System property |Environment variable and alias
+|Pool ID |`citrus.test.distribution.worker.pool`
+|`CITRUS_DIST_WORKER_POOL` / `TEST_DISTRIBUTION_AGENT_POOL`
+|Registration key |`citrus.test.distribution.worker.registrationKey`
+|`CITRUS_DIST_WORKER_REGISTRATION_KEY` / `TEST_DISTRIBUTION_AGENT_REGISTRATION_KEY`
+|===
+
+An explicit worker option or typed agent setting takes precedence. Otherwise the worker checks the
+`CITRUS_DIST_WORKER_*` variable first, then the `TEST_DISTRIBUTION_AGENT_*` alias, then the JVM system property,
+skipping blank values. Citrus Agent rejects an explicitly blank `--pool` or `--registration-key` argument.
+The following command takes its registration key from the environment.
+
+[source,bash]
+----
+citrus dist worker start --coordinator-url=http://localhost:8765 --pool="$CITRUS_DIST_WORKER_POOL" --capabilities=docker
+----
 
 Both commands accept the same local file cache options:
 

@@ -101,8 +101,9 @@ public class CitrusAppConfiguration extends TestRunConfiguration {
     public void setDefaultProperties() {
         super.setDefaultProperties();
 
-        if (getConfigClass() != null) {
-            System.setProperty(CitrusSettings.DEFAULT_CONFIG_CLASS_PROPERTY, getConfigClass());
+        String configuredClass = getConfigClass();
+        if (configuredClass != null) {
+            System.setProperty(CitrusSettings.DEFAULT_CONFIG_CLASS_PROPERTY, configuredClass);
         }
     }
 }

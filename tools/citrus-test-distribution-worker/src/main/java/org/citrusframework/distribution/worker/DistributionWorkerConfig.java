@@ -16,6 +16,8 @@
 
 package org.citrusframework.distribution.worker;
 
+import java.io.IOException;
+import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -24,6 +26,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Properties;
 import java.util.UUID;
 
 import org.citrusframework.distribution.config.DistributionSettings;
@@ -37,10 +40,16 @@ import org.citrusframework.distribution.config.DistributionSettings.WorkerForkMo
  */
 public final class DistributionWorkerConfig {
 
+    private static final String DEFAULT_VERSION = resolveVersion();
+
     private final String workerId;
     private final String hostName;
     private final String coordinatorUrl;
     private final String authToken;
+    private final String poolId;
+    private final String registrationKey;
+    private final String version;
+    private final long registrationRenewalIntervalMs;
     private final Path cacheDir;
     private final boolean cacheCleanup;
     private final long cacheFreeSpaceBufferBytes;
@@ -56,6 +65,10 @@ public final class DistributionWorkerConfig {
         this.hostName = builder.hostName;
         this.coordinatorUrl = builder.coordinatorUrl;
         this.authToken = builder.authToken;
+        this.poolId = builder.poolId;
+        this.registrationKey = builder.registrationKey;
+        this.version = builder.version;
+        this.registrationRenewalIntervalMs = builder.registrationRenewalIntervalMs;
         // Cache settings fall back to system property / environment / default only when not set explicitly, so an
         // invalid lower-tier value cannot break a configuration whose explicit option overrides it.
         this.cacheDir = builder.cacheDir != null ? builder.cacheDir : DistributionSettings.getWorkerCacheDir();
@@ -81,8 +94,29 @@ public final class DistributionWorkerConfig {
         this.cwdCheckMode = builder.cwdCheckMode;
     }
 
+    private static String resolveVersion() {
+        String implementationVersion = DistributionWorkerConfig.class.getPackage().getImplementationVersion();
+        if (implementationVersion != null && !implementationVersion.isBlank()) {
+            return implementationVersion;
+        }
+        try (InputStream resource = DistributionWorkerConfig.class.getResourceAsStream(
+                "/META-INF/maven/org.citrusframework/citrus-test-distribution-worker/pom.properties")) {
+            if (resource != null) {
+                Properties properties = new Properties();
+                properties.load(resource);
+                String mavenVersion = properties.getProperty("version");
+                if (mavenVersion != null && !mavenVersion.isBlank()) {
+                    return mavenVersion;
+                }
+            }
+        } catch (IOException ignored) {
+            // Development builds may have no readable Maven metadata.
+        }
+        return "dev";
+    }
+
     public static Builder builder() {
-        return new Builder();
+        return new Builder(System.getProperties(), System.getenv());
     }
 
     public static DistributionWorkerConfig fromSettings() {
@@ -103,6 +137,22 @@ public final class DistributionWorkerConfig {
 
     public String authToken() {
         return authToken;
+    }
+
+    public String poolId() {
+        return poolId;
+    }
+
+    public String registrationKey() {
+        return registrationKey;
+    }
+
+    public String version() {
+        return version;
+    }
+
+    public long registrationRenewalIntervalMs() {
+        return registrationRenewalIntervalMs;
     }
 
     public Path cacheDir() {
@@ -166,11 +216,15 @@ public final class DistributionWorkerConfig {
         private String hostName = resolveHostName();
         private String coordinatorUrl = normalizeCoordinatorBaseUrl(DistributionSettings.getCoordinatorUrl());
         private String authToken = DistributionSettings.getAuthToken();
+        private String poolId;
+        private String registrationKey;
+        private String version = DEFAULT_VERSION;
+        private long registrationRenewalIntervalMs = Duration.ofHours(1).toMillis();
         /** Explicit cache settings; {@code null} means "resolve from settings in {@link #build()}". */
         private Path cacheDir;
         private Boolean cacheCleanup;
         private Long cacheFreeSpaceBufferBytes;
-        private Map<String, String> capabilities = new LinkedHashMap<>(DistributionSettings.detectHostCapabilities(null));
+        private Map<String, String> capabilities;
         private long heartbeatIntervalMs = 5_000L;
         private long reconnectDelayMs = 1_000L;
         private Duration blobReadIdleTimeout = Duration.ofSeconds(60);
@@ -181,7 +235,41 @@ public final class DistributionWorkerConfig {
         private WorkerCwdCheckMode cwdCheckMode = DistributionSettings.parseWorkerCwdCheckMode(DistributionSettings.getString(
                 DistributionSettings.WORKER_CWD_CHECK_PROPERTY, DistributionSettings.WORKER_CWD_CHECK_ENV, null));
 
-        private Builder() {
+        Builder(Properties properties, Map<String, String> environment) {
+            workerId = DistributionSettings.resolveWorkerId(properties, environment);
+            poolId = DistributionSettings.resolveWorkerPool(properties, environment);
+            registrationKey = DistributionSettings.resolveWorkerRegistrationKey(properties, environment);
+            capabilities = DistributionSettings.detectHostCapabilities(
+                    DistributionSettings.resolveWorkerCapabilitiesCsv(properties, environment));
+        }
+
+        public Builder poolId(String poolId) {
+            if (poolId != null && !poolId.isBlank()) {
+                this.poolId = poolId;
+            }
+            return this;
+        }
+
+        public Builder registrationKey(String registrationKey) {
+            if (registrationKey != null && !registrationKey.isBlank()) {
+                this.registrationKey = registrationKey;
+            }
+            return this;
+        }
+
+        public Builder version(String version) {
+            if (version != null && !version.isBlank()) {
+                this.version = version;
+            }
+            return this;
+        }
+
+        public Builder registrationRenewalIntervalMs(long intervalMs) {
+            if (intervalMs <= 0) {
+                throw new IllegalArgumentException("Registration renewal interval must be positive");
+            }
+            registrationRenewalIntervalMs = intervalMs;
+            return this;
         }
 
         public Builder workerId(String workerId) {

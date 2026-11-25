@@ -42,7 +42,7 @@ public class DistWorkerStart extends CitrusCommand {
 
     /** Options of this command that take a separate value token, which is never parsed as a cache option. */
     private static final Set<String> VALUE_OPTIONS = Set.of("--coordinator-url", "-u", "--worker-id", "-w",
-            "--auth-token", "--capabilities", "-C", "--duration-seconds");
+            "--auth-token", "--pool", "-p", "--registration-key", "-k", "--capabilities", "-C", "--duration-seconds");
 
     /** Drain timeout plus slack for closing the worker client after a shutdown request. */
     private static final long SHUTDOWN_TIMEOUT_MILLIS = TimeUnit.SECONDS.toMillis(60);
@@ -62,6 +62,12 @@ public class DistWorkerStart extends CitrusCommand {
 
     @Option(name = "auth-token", description = "Shared Bearer authentication token")
     String authToken;
+
+    @Option(name = "pool", shortName = 'p', description = "Agent pool ID used for worker registration")
+    String pool;
+
+    @Option(name = "registration-key", shortName = 'k', description = "Registration key used to join the worker pool")
+    String registrationKey;
 
     @Option(name = "capabilities", shortName = 'C', description = "Comma-separated capability tags (e.g. docker=true,gpu=true)")
     String capabilities;
@@ -167,7 +173,9 @@ public class DistWorkerStart extends CitrusCommand {
     DistributionWorkerConfig buildWorkerConfig() {
         DistributionWorkerConfig.Builder builder = DistributionWorkerConfig.builder()
                 .coordinatorUrl(coordinatorUrl)
-                .capabilities(DistributionSettings.detectHostCapabilities(capabilities));
+                .poolId(pool)
+                .registrationKey(registrationKey)
+                .addCapabilitiesCsv(capabilities);
         if (workerId != null && !workerId.isBlank()) {
             builder.workerId(workerId);
         }
@@ -211,12 +219,21 @@ public class DistWorkerStart extends CitrusCommand {
         Runtime.getRuntime().addShutdownHook(hook);
 
         try (DistributionWorkerClient client = new DistributionWorkerClient(config)) {
+            client.onRejection(stopLatch::countDown);
             client.start();
             printer().println("Citrus Test Distribution Worker " + config.workerId() + " connected to " + config.coordinatorUrl());
             if (durationSeconds > 0) {
                 stopLatch.await(durationSeconds, TimeUnit.SECONDS);
             } else {
                 stopLatch.await();
+            }
+            var rejection = client.rejectionReason();
+            if (rejection.isPresent()) {
+                var reason = rejection.get();
+                String message = "Worker registration rejected (" + reason.code() + "): " + reason.message();
+                String key = config.registrationKey();
+                printer().println(key == null || key.isEmpty() ? message : message.replace(key, "[redacted]"));
+                return CommandResult.FAILURE;
             }
             client.drain(30, TimeUnit.SECONDS);
             return CommandResult.SUCCESS;

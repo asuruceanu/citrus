@@ -27,6 +27,7 @@ import java.sql.Types;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -40,10 +41,12 @@ import java.util.function.Consumer;
 import org.apache.commons.dbcp2.BasicDataSource;
 import org.citrusframework.distribution.TestExecutionIdentity;
 import org.citrusframework.distribution.config.DistributionJson;
+import org.citrusframework.distribution.model.AgentPoolRecord;
 import org.citrusframework.distribution.model.BuildSessionRecord;
 import org.citrusframework.distribution.model.CoordinatorEvent;
 import org.citrusframework.distribution.model.PartitionRecord;
 import org.citrusframework.distribution.model.PartitionState;
+import org.citrusframework.distribution.model.RegistrationKeyRecord;
 import org.citrusframework.distribution.model.SessionStatus;
 import org.citrusframework.distribution.model.SessionSummary;
 import org.citrusframework.distribution.model.SubmitWorkRequest;
@@ -53,10 +56,12 @@ import org.citrusframework.distribution.model.WorkspaceChange;
 import org.citrusframework.distribution.model.TestHistoryRun;
 import org.citrusframework.distribution.model.TestHistorySummary;
 import org.citrusframework.distribution.model.TestOutcomeStatus;
+import org.citrusframework.distribution.model.UsageSampleRecord;
 import org.citrusframework.distribution.model.WorkUnitSpec;
 import org.citrusframework.distribution.model.WorkerCacheStats;
 import org.citrusframework.distribution.model.WorkerRecord;
 import org.citrusframework.distribution.model.WorkerState;
+import org.citrusframework.distribution.model.WorkerWarning;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import tools.jackson.core.JacksonException;
@@ -73,6 +78,11 @@ public class JdbcDistributionStore implements DistributionStore {
     private static final TypeReference<Map<String, String>> STRING_MAP_TYPE = new TypeReference<>() {};
     private static final TypeReference<List<WorkUnitSpec>> WORK_UNITS_TYPE = new TypeReference<>() {};
     private static final TypeReference<List<String>> STRING_LIST_TYPE = new TypeReference<>() {};
+    private static final TypeReference<List<WorkerWarning>> WORKER_WARNINGS_TYPE = new TypeReference<>() {};
+
+    private static final String POOL_COLUMNS = "display_name, capabilities_json, priority_order, created_at, updated_at, pool_id";
+    private static final String REGISTRATION_KEY_COLUMNS = "key_id, pool_id, key_prefix, description, created_at, "
+            + "last_used_at, last_used_by, revoked_at, key_hash";
 
     private static final int HISTORY_PAGE_SIZE = 32;
     private static final int LEGACY_HISTORY_ROW = 0;
@@ -152,12 +162,32 @@ public class JdbcDistributionStore implements DistributionStore {
                 "CREATE TABLE IF NOT EXISTS dist_workers (" +
                         "worker_id VARCHAR(128) PRIMARY KEY, " +
                         "host VARCHAR(255), " +
-                        "capabilities_json VARCHAR(4096), " +
+                        "capabilities_json " + longText + ", " +
                         "state VARCHAR(32), " +
                         "active_partition_id VARCHAR(64), " +
                         "last_heartbeat_at BIGINT, " +
                         "registered_at BIGINT, " +
-                        "cache_stats_json VARCHAR(2048))",
+                        "cache_stats_json VARCHAR(2048), " +
+                        "version VARCHAR(64), " +
+                        "pool_id VARCHAR(64), " +
+                        "pool_display_name VARCHAR(255), " +
+                        "active_test_display VARCHAR(512), " +
+                        "state_updated_at BIGINT, " +
+                        "warnings_json " + longText + ")",
+                "CREATE TABLE IF NOT EXISTS dist_agent_pools (" +
+                        "pool_id VARCHAR(64) PRIMARY KEY, " +
+                        "display_name VARCHAR(255) NOT NULL, " +
+                        "capabilities_json " + longText + " NOT NULL, " +
+                        "priority_order INT NOT NULL, " +
+                        "created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL)",
+                "CREATE TABLE IF NOT EXISTS dist_registration_keys (" +
+                        "key_id VARCHAR(64) PRIMARY KEY, " +
+                        "pool_id VARCHAR(64) NOT NULL REFERENCES dist_agent_pools(pool_id) ON DELETE CASCADE, " +
+                        "key_prefix VARCHAR(32) NOT NULL, key_hash VARCHAR(128) NOT NULL, " +
+                        "description VARCHAR(512), created_at BIGINT NOT NULL, " +
+                        "last_used_at BIGINT, last_used_by VARCHAR(255), revoked_at BIGINT)",
+                "CREATE TABLE IF NOT EXISTS dist_usage_samples (" +
+                        "sampled_at BIGINT PRIMARY KEY, payload_json " + longText + " NOT NULL)",
                 "CREATE TABLE IF NOT EXISTS dist_partitions (" +
                         "partition_id VARCHAR(64) NOT NULL, " +
                         "session_id VARCHAR(64), " +
@@ -218,6 +248,7 @@ public class JdbcDistributionStore implements DistributionStore {
                 stmt.execute("SET FILES WRITE DELAY FALSE");
             }
             stmt.execute("CREATE INDEX IF NOT EXISTS idx_dist_events_session ON dist_events (session_id, sequence_id)");
+            stmt.execute("CREATE INDEX IF NOT EXISTS idx_dist_reg_keys_pool ON dist_registration_keys (pool_id)");
             stmt.execute("CREATE INDEX IF NOT EXISTS idx_dist_tests_session ON dist_test_executions (session_id)");
             stmt.execute("CREATE INDEX IF NOT EXISTS idx_dist_tests_unit ON dist_test_executions (work_unit_key)");
             stmt.execute("CREATE INDEX IF NOT EXISTS idx_dist_parts_session ON dist_partitions (session_id)");
@@ -230,6 +261,7 @@ public class JdbcDistributionStore implements DistributionStore {
     private static void ensureColumns(Connection conn, Statement stmt, String longText) throws SQLException {
         Map<String, java.util.Set<String>> existing = new java.util.HashMap<>();
         String partitionsTable = null;
+        boolean widenWorkerCapabilities = false;
         try (ResultSet rs = conn.getMetaData().getColumns(conn.getCatalog(), conn.getSchema(), null, null)) {
             while (rs.next()) {
                 String table = rs.getString("TABLE_NAME");
@@ -237,11 +269,17 @@ public class JdbcDistributionStore implements DistributionStore {
                 if (table != null && col != null) {
                     existing.computeIfAbsent(table.toLowerCase(Locale.ROOT), k -> new java.util.HashSet<>())
                             .add(col.toLowerCase(Locale.ROOT));
+                    if ("dist_workers".equalsIgnoreCase(table) && "capabilities_json".equalsIgnoreCase(col)) {
+                        widenWorkerCapabilities = !longText.equalsIgnoreCase(rs.getString("TYPE_NAME"));
+                    }
                     if ("dist_partitions".equalsIgnoreCase(table)) {
                         partitionsTable = table;
                     }
                 }
             }
+        }
+        if (widenWorkerCapabilities) {
+            stmt.execute("ALTER TABLE dist_workers ALTER COLUMN capabilities_json SET DATA TYPE " + longText);
         }
         Map<String, Map<String, String>> additions = new LinkedHashMap<>();
         Map<String, String> partitionColumns = new LinkedHashMap<>();
@@ -254,7 +292,9 @@ public class JdbcDistributionStore implements DistributionStore {
         partitionColumns.put("error_message", "VARCHAR(4096)");
         additions.put("dist_partitions", partitionColumns);
         additions.put("dist_session_changes", Map.of("change_json", longText));
-        additions.put("dist_workers", Map.of("cache_stats_json", "VARCHAR(2048)"));
+        additions.put("dist_workers", Map.of("cache_stats_json", "VARCHAR(2048)", "version", "VARCHAR(64)",
+                "pool_id", "VARCHAR(64)", "pool_display_name", "VARCHAR(255)", "active_test_display", "VARCHAR(512)",
+                "state_updated_at", "BIGINT", "warnings_json", longText));
         additions.put("dist_sessions", Map.of("failure_reason", "VARCHAR(4096)",
                 "requested_max_partition_size", "INT", "history_scope", "VARCHAR(1024)", "max_retries", "INT"));
         additions.put("dist_events", Map.of("delivery_id", "VARCHAR(64)"));
@@ -625,47 +665,331 @@ public class JdbcDistributionStore implements DistributionStore {
     }
 
     @Override
-    public synchronized void upsertWorker(WorkerRecord w) {
-        String capsJson = truncate(DistributionJson.toJson(w.capabilities() != null ? w.capabilities() : Map.of()), 4096);
-        String updateSql = "UPDATE dist_workers SET host=?, capabilities_json=?, state=?, active_partition_id=?, " +
-                "last_heartbeat_at=?, registered_at=?, cache_stats_json=? WHERE worker_id=?";
-        String insertSql = "INSERT INTO dist_workers (worker_id, host, capabilities_json, state, active_partition_id, " +
-                "last_heartbeat_at, registered_at, cache_stats_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
-        String cacheJson = w.cacheStats() != null ? DistributionJson.toJson(w.cacheStats()) : null;
+    public synchronized void upsertAgentPool(AgentPoolRecord pool) {
+        String update = "UPDATE dist_agent_pools SET display_name=?, capabilities_json=?, priority_order=?, "
+                + "created_at=?, updated_at=? WHERE pool_id=?";
         try (Connection conn = dataSource.getConnection()) {
-            try (PreparedStatement ps = conn.prepareStatement(updateSql)) {
-                ps.setString(1, w.host());
-                ps.setString(2, capsJson);
-                ps.setString(3, w.state().name());
-                ps.setString(4, w.activePartitionId());
-                ps.setLong(5, w.lastHeartbeatAt());
-                ps.setLong(6, w.registeredAt());
-                ps.setString(7, cacheJson);
-                ps.setString(8, w.workerId());
-                if (ps.executeUpdate() > 0) {
-                    return;
+            if (writePool(conn, update, pool) == 0) {
+                insertPool(conn, pool);
+            }
+        } catch (SQLException e) {
+            throw new IllegalStateException("Failed to save agent pool " + pool.poolId(), e);
+        }
+    }
+
+    @Override
+    public synchronized void insertAgentPool(AgentPoolRecord pool, StoredRegistrationKey initialKey) {
+        if (initialKey != null && !pool.poolId().equals(initialKey.metadata().poolId())) {
+            throw new IllegalArgumentException("Initial registration key belongs to a different pool");
+        }
+        inTransaction("create agent pool " + pool.poolId(), conn -> {
+            insertPool(conn, pool);
+            if (initialKey != null) {
+                insertRegistrationKey(conn, initialKey);
+            }
+        });
+    }
+
+    private static void insertPool(Connection conn, AgentPoolRecord pool) throws SQLException {
+        writePool(conn, "INSERT INTO dist_agent_pools (" + POOL_COLUMNS + ") VALUES (?, ?, ?, ?, ?, ?)", pool);
+    }
+
+    private static int writePool(Connection conn, String sql, AgentPoolRecord pool) throws SQLException {
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, pool.displayName());
+            ps.setString(2, DistributionJson.toJson(pool.capabilities()));
+            ps.setInt(3, pool.priorityOrder());
+            ps.setLong(4, pool.createdAt());
+            ps.setLong(5, pool.updatedAt());
+            ps.setString(6, pool.poolId());
+            return ps.executeUpdate();
+        }
+    }
+
+    @Override
+    public Optional<AgentPoolRecord> findAgentPool(String poolId) {
+        String sql = "SELECT " + POOL_COLUMNS + " FROM dist_agent_pools WHERE pool_id=?";
+        try (Connection conn = dataSource.getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, poolId);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? Optional.of(mapPool(rs)) : Optional.empty();
+            }
+        } catch (SQLException e) {
+            throw new IllegalStateException("Failed to find agent pool " + poolId, e);
+        }
+    }
+
+    @Override
+    public List<AgentPoolRecord> listAgentPools() {
+        String sql = "SELECT " + POOL_COLUMNS + " FROM dist_agent_pools ORDER BY priority_order, created_at, pool_id";
+        try (Connection conn = dataSource.getConnection(); PreparedStatement ps = conn.prepareStatement(sql);
+             ResultSet rs = ps.executeQuery()) {
+            List<AgentPoolRecord> pools = new ArrayList<>();
+            while (rs.next()) {
+                pools.add(mapPool(rs));
+            }
+            return pools;
+        } catch (SQLException e) {
+            throw new IllegalStateException("Failed to list agent pools", e);
+        }
+    }
+
+    private static AgentPoolRecord mapPool(ResultSet rs) throws SQLException {
+        return new AgentPoolRecord(rs.getString("pool_id"), rs.getString("display_name"),
+                DistributionJson.fromJson(rs.getString("capabilities_json"), STRING_MAP_TYPE),
+                rs.getInt("priority_order"), rs.getLong("created_at"), rs.getLong("updated_at"));
+    }
+
+    @Override
+    public synchronized boolean deleteAgentPool(String poolId) {
+        // The foreign key cascades to every owned registration key in the same transaction.
+        String sql = "DELETE FROM dist_agent_pools WHERE pool_id=?";
+        try (Connection conn = dataSource.getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, poolId);
+            return ps.executeUpdate() == 1;
+        } catch (SQLException e) {
+            throw new IllegalStateException("Failed to delete agent pool " + poolId, e);
+        }
+    }
+
+    @Override
+    public synchronized void updateAgentPoolPriorities(List<String> orderedPoolIds, long updatedAt) {
+        if (new HashSet<>(orderedPoolIds).size() != orderedPoolIds.size()) {
+            throw new IllegalArgumentException("Duplicate pool IDs in priority order");
+        }
+        inTransaction("update agent pool priorities", conn -> {
+            try (Statement stmt = conn.createStatement();
+                 ResultSet count = stmt.executeQuery("SELECT COUNT(*) FROM dist_agent_pools")) {
+                count.next();
+                if (orderedPoolIds.size() != count.getLong(1)) {
+                    throw new IllegalArgumentException("Priority order must include every agent pool");
                 }
             }
-            try (PreparedStatement ps = conn.prepareStatement(insertSql)) {
-                ps.setString(1, w.workerId());
-                ps.setString(2, w.host());
-                ps.setString(3, capsJson);
-                ps.setString(4, w.state().name());
-                ps.setString(5, w.activePartitionId());
-                ps.setLong(6, w.lastHeartbeatAt());
-                ps.setLong(7, w.registeredAt());
-                ps.setString(8, cacheJson);
+            String sql = "UPDATE dist_agent_pools SET priority_order=?, updated_at=? WHERE pool_id=?";
+            try (PreparedStatement ps = conn.prepareStatement(sql)) {
+                for (int i = 0; i < orderedPoolIds.size(); i++) {
+                    String id = orderedPoolIds.get(i);
+                    ps.setInt(1, i);
+                    ps.setLong(2, updatedAt);
+                    ps.setString(3, id);
+                    if (ps.executeUpdate() != 1) {
+                        throw new IllegalArgumentException("Unknown agent pool " + id);
+                    }
+                }
+            }
+        });
+    }
+
+    @Override
+    public void insertRegistrationKey(StoredRegistrationKey key) {
+        try (Connection conn = dataSource.getConnection()) {
+            insertRegistrationKey(conn, key);
+        } catch (SQLException e) {
+            throw new IllegalStateException("Failed to insert registration key " + key.metadata().keyId(), e);
+        }
+    }
+
+    private static void insertRegistrationKey(Connection conn, StoredRegistrationKey key) throws SQLException {
+        String sql = "INSERT INTO dist_registration_keys (" + REGISTRATION_KEY_COLUMNS
+                + ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)";
+        RegistrationKeyRecord metadata = key.metadata();
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, metadata.keyId());
+            ps.setString(2, metadata.poolId());
+            ps.setString(3, metadata.keyPrefix());
+            ps.setString(4, metadata.description());
+            ps.setLong(5, metadata.createdAt());
+            ps.setObject(6, metadata.lastUsedAt(), Types.BIGINT);
+            ps.setString(7, metadata.lastUsedBy());
+            ps.setObject(8, metadata.revokedAt(), Types.BIGINT);
+            ps.setString(9, key.keyHash());
+            ps.executeUpdate();
+        }
+    }
+
+    @Override
+    public List<StoredRegistrationKey> listRegistrationKeys(String poolId) {
+        String sql = "SELECT " + REGISTRATION_KEY_COLUMNS
+                + " FROM dist_registration_keys WHERE pool_id=? ORDER BY created_at, key_id";
+        try (Connection conn = dataSource.getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, poolId);
+            try (ResultSet rs = ps.executeQuery()) {
+                List<StoredRegistrationKey> keys = new ArrayList<>();
+                while (rs.next()) {
+                    keys.add(mapRegistrationKey(rs));
+                }
+                return keys;
+            }
+        } catch (SQLException e) {
+            throw new IllegalStateException("Failed to list registration keys for pool " + poolId, e);
+        }
+    }
+
+    @Override
+    public Optional<StoredRegistrationKey> findRegistrationKey(String keyId) {
+        String sql = "SELECT " + REGISTRATION_KEY_COLUMNS + " FROM dist_registration_keys WHERE key_id=?";
+        try (Connection conn = dataSource.getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, keyId);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? Optional.of(mapRegistrationKey(rs)) : Optional.empty();
+            }
+        } catch (SQLException e) {
+            throw new IllegalStateException("Failed to find registration key " + keyId, e);
+        }
+    }
+
+    private static StoredRegistrationKey mapRegistrationKey(ResultSet rs) throws SQLException {
+        var metadata = new RegistrationKeyRecord(rs.getString("key_id"), rs.getString("pool_id"),
+                rs.getString("key_prefix"), rs.getString("description"), rs.getLong("created_at"),
+                rs.getObject("last_used_at", Long.class), rs.getString("last_used_by"),
+                rs.getObject("revoked_at", Long.class));
+        return new StoredRegistrationKey(metadata, rs.getString("key_hash"));
+    }
+
+    @Override
+    public boolean revokeRegistrationKey(String poolId, String keyId, long revokedAt) {
+        String sql = "UPDATE dist_registration_keys SET revoked_at=COALESCE(revoked_at, ?) WHERE pool_id=? AND key_id=?";
+        try (Connection conn = dataSource.getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setLong(1, revokedAt);
+            ps.setString(2, poolId);
+            ps.setString(3, keyId);
+            return ps.executeUpdate() == 1;
+        } catch (SQLException e) {
+            throw new IllegalStateException("Failed to revoke registration key " + keyId, e);
+        }
+    }
+
+    @Override
+    public void touchRegistrationKeyUsage(String keyId, long usedAt, String workerId) {
+        String sql = "UPDATE dist_registration_keys SET last_used_at=?, last_used_by=? WHERE key_id=? "
+                + "AND revoked_at IS NULL AND (last_used_at IS NULL OR last_used_at <= ?)";
+        try (Connection conn = dataSource.getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setLong(1, usedAt);
+            ps.setString(2, workerId);
+            ps.setString(3, keyId);
+            ps.setLong(4, usedAt);
+            ps.executeUpdate();
+        } catch (SQLException e) {
+            throw new IllegalStateException("Failed to update usage for registration key " + keyId, e);
+        }
+    }
+
+    @Override
+    public synchronized void recordUsageSample(UsageSampleRecord sample, long pruneBeforeTimestamp) {
+        String json = DistributionJson.toJson(sample);
+        inTransaction("record usage sample", conn -> {
+            try (PreparedStatement ps = conn.prepareStatement("UPDATE dist_usage_samples SET payload_json=? WHERE sampled_at=?")) {
+                ps.setString(1, json);
+                ps.setLong(2, sample.sampledAt());
+                if (ps.executeUpdate() == 0) {
+                    try (PreparedStatement insert = conn.prepareStatement(
+                            "INSERT INTO dist_usage_samples (payload_json, sampled_at) VALUES (?, ?)")) {
+                        insert.setString(1, json);
+                        insert.setLong(2, sample.sampledAt());
+                        insert.executeUpdate();
+                    }
+                }
+            }
+            try (PreparedStatement ps = conn.prepareStatement("DELETE FROM dist_usage_samples WHERE sampled_at < ?")) {
+                ps.setLong(1, pruneBeforeTimestamp);
                 ps.executeUpdate();
+            }
+        });
+    }
+
+    @Override
+    public List<UsageSampleRecord> listUsageSamples(long fromTimestamp, long toTimestamp) {
+        String sql = "SELECT payload_json FROM dist_usage_samples WHERE sampled_at BETWEEN ? AND ? ORDER BY sampled_at";
+        try (Connection conn = dataSource.getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setLong(1, fromTimestamp);
+            ps.setLong(2, toTimestamp);
+            try (ResultSet rs = ps.executeQuery()) {
+                List<UsageSampleRecord> samples = new ArrayList<>();
+                while (rs.next()) {
+                    samples.add(DistributionJson.fromJson(rs.getString("payload_json"), UsageSampleRecord.class));
+                }
+                return samples;
+            }
+        } catch (SQLException e) {
+            throw new IllegalStateException("Failed to list usage samples", e);
+        }
+    }
+
+    @FunctionalInterface
+    private interface SqlTransaction {
+        void execute(Connection conn) throws SQLException;
+    }
+
+    private void inTransaction(String operation, SqlTransaction action) {
+        try (Connection conn = dataSource.getConnection()) {
+            conn.setAutoCommit(false);
+            try {
+                action.execute(conn);
+                conn.commit();
+            } catch (SQLException | RuntimeException e) {
+                try {
+                    conn.rollback();
+                } catch (SQLException rollbackFailure) {
+                    e.addSuppressed(rollbackFailure);
+                }
+                throw e;
+            }
+        } catch (SQLException e) {
+            throw new IllegalStateException("Failed to " + operation, e);
+        }
+    }
+
+    @Override
+    public synchronized void upsertWorker(WorkerRecord w) {
+        String update = "UPDATE dist_workers SET host=?, capabilities_json=?, state=?, active_partition_id=?, "
+                + "last_heartbeat_at=?, registered_at=?, cache_stats_json=?, version=?, pool_id=?, pool_display_name=?, "
+                + "active_test_display=?, state_updated_at=?, warnings_json=? WHERE worker_id=?";
+        String insert = "INSERT INTO dist_workers (host, capabilities_json, state, active_partition_id, "
+                + "last_heartbeat_at, registered_at, cache_stats_json, version, pool_id, pool_display_name, "
+                + "active_test_display, state_updated_at, warnings_json, worker_id) "
+                + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+        try (Connection conn = dataSource.getConnection()) {
+            if (writeWorker(conn, update, w) == 0) {
+                writeWorker(conn, insert, w);
             }
         } catch (SQLException e) {
             throw new IllegalStateException("Failed to upsert worker " + w.workerId(), e);
         }
     }
 
+    private static int writeWorker(Connection conn, String sql, WorkerRecord worker) throws SQLException {
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, worker.host());
+            ps.setString(2, DistributionJson.toJson(worker.capabilities()));
+            ps.setString(3, worker.state().name());
+            ps.setString(4, worker.activePartitionId());
+            ps.setLong(5, worker.lastHeartbeatAt());
+            ps.setLong(6, worker.registeredAt());
+            ps.setString(7, worker.cacheStats() == null ? null : DistributionJson.toJson(worker.cacheStats()));
+            ps.setString(8, truncateWorkerText(worker.version(), 64));
+            ps.setString(9, worker.poolId());
+            ps.setString(10, worker.poolDisplayName());
+            ps.setString(11, truncateWorkerText(worker.activeTestDisplay(), 512));
+            ps.setLong(12, worker.stateUpdatedAt());
+            ps.setString(13, DistributionJson.toJson(worker.warnings()));
+            ps.setString(14, worker.workerId());
+            return ps.executeUpdate();
+        }
+    }
+
+    private static String truncateWorkerText(String text, int limit) {
+        if (text != null && text.length() > limit
+                && Character.isSurrogatePair(text.charAt(limit - 1), text.charAt(limit))) {
+            return text.substring(0, limit - 1);
+        }
+        return truncate(text, limit);
+    }
+
     @Override
     public List<WorkerRecord> listWorkers() {
         String sql = "SELECT worker_id, host, capabilities_json, state, active_partition_id, " +
-                "last_heartbeat_at, registered_at, cache_stats_json FROM dist_workers ORDER BY registered_at ASC";
+                "last_heartbeat_at, registered_at, cache_stats_json, version, pool_id, pool_display_name, " +
+                "active_test_display, state_updated_at, warnings_json FROM dist_workers ORDER BY registered_at ASC";
         List<WorkerRecord> workers = new ArrayList<>();
         try (Connection conn = dataSource.getConnection();
              PreparedStatement ps = conn.prepareStatement(sql);
@@ -677,12 +1001,18 @@ public class JdbcDistributionStore implements DistributionStore {
                 workers.add(new WorkerRecord(
                         workerId,
                         rs.getString("host"),
+                        rs.getString("version"),
+                        rs.getString("pool_id"),
+                        rs.getString("pool_display_name"),
                         caps,
                         WorkerState.valueOf(rs.getString("state")),
                         rs.getString("active_partition_id"),
+                        rs.getString("active_test_display"),
+                        rs.getLong("state_updated_at"),
                         rs.getLong("last_heartbeat_at"),
                         rs.getLong("registered_at"),
-                        cacheStats
+                        cacheStats,
+                        readWorkerWarnings(rs.getString("warnings_json"), workerId)
                 ));
             }
             return workers;
@@ -703,6 +1033,21 @@ public class JdbcDistributionStore implements DistributionStore {
             }
         }
         return Map.of();
+    }
+
+    private static List<WorkerWarning> readWorkerWarnings(String json, String workerId) {
+        if (json != null && !json.isBlank()) {
+            try {
+                List<WorkerWarning> warnings = DistributionJson.fromJson(json, WORKER_WARNINGS_TYPE);
+                if (warnings != null && warnings.stream().allMatch(w -> w != null && w.code() != null)) {
+                    return warnings;
+                }
+            } catch (JacksonException e) {
+                // A malformed telemetry field must not hide other workers.
+            }
+            LOG.warn("Ignoring malformed warnings JSON for worker {}", workerId);
+        }
+        return List.of();
     }
 
     private static WorkerCacheStats readWorkerCacheStats(String json, String workerId) {

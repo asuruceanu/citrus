@@ -6,9 +6,14 @@
  */
 
 import { html } from './vendor/htm-mini.js';
+import { renderUsageChart } from './usage-chart.js';
 
 const STORAGE_THEME_KEY = 'citrus.dist.theme';
 const POLL_INTERVAL_MS = 4000;
+const AGENT_POOLS_API = '/api/v1/agent-pools';
+const USAGE_INTERVAL_HEADER = 'X-Citrus-Usage-Sample-Interval-Ms';
+const DEFAULT_USAGE_REFRESH_INTERVAL_MS = 15_000;
+const MAX_TIMEOUT_MS = 2 ** 31 - 1;
 // Full session detail can be several MB for large suites: reload it at most this often during live updates.
 const DETAIL_MIN_INTERVAL_MS = 2000;
 const VALID_DETAIL_TABS = new Set(['waterfall', 'tests', 'failures', 'files']);
@@ -19,7 +24,7 @@ function visibleCapabilities(capabilities) {
 }
 
 const state = {
-  view: 'overview', // 'overview' | 'sessions' | 'session-detail' | 'workers' | 'history'
+  view: 'overview', // 'overview' | 'sessions' | 'session-detail' | 'workers' | 'history' | 'pools' | 'usage'
   detailTab: 'waterfall', // 'waterfall' | 'tests' | 'failures' | 'files'
   sidebarCollapsed: false,
   mobileMenuOpen: false,
@@ -31,8 +36,25 @@ const state = {
   sessions: [],
   selectedSessionId: null,
   sessionDetail: null,
+  sessionDetailError: null,
   workers: [],
   history: [],
+  pools: null,
+  poolListError: '',
+  selectedPoolId: null,
+  poolDetail: null,
+  poolDetailError: '',
+  poolDraft: null,
+  poolKeyDescription: '',
+  poolMutationError: '',
+  poolMutationInFlight: false,
+  poolSecret: null,
+  draggedPoolId: null,
+  usageWindow: '1h',
+  usageFilter: { chips: {}, input: '', error: '' },
+  usage: null,
+  usageError: '',
+  usageSelections: new Map(),
 
   // Filters
   sessionQuery: '',
@@ -65,9 +87,18 @@ let refreshInFlight = false;
 let refreshPending = false;
 let lastDetailLoadAt = 0;
 let detailTimer = null;
-// Increases with every session detail request; a response that is no longer the latest is discarded.
+// A new request or leaving the detail view invalidates earlier responses.
 let detailRequestSeq = 0;
+let detailRequestInFlight = null;
 let workerRequestSeq = 0;
+let poolDataRevision = 0;
+let poolRefreshInFlight = false;
+let poolRefreshPending = false;
+let poolViewSeq = 0;
+let poolRefreshTimer = null;
+let usageRefreshTimer = null;
+let usageRequest = null;
+let usageRefreshIntervalMs = DEFAULT_USAGE_REFRESH_INTERVAL_MS;
 let workerPollInFlight = false;
 let pollTimer = null;
 let suppressHashChange = false;
@@ -88,6 +119,9 @@ function buildHash() {
   }
   if (state.view === 'history' && state.historyOutcome !== 'all') {
     return `#history?outcome=${state.historyOutcome}`;
+  }
+  if (state.view === 'pools' && state.selectedPoolId) {
+    return `#pools/${encodeURIComponent(state.selectedPoolId)}`;
   }
   return `#${state.view || 'overview'}`;
 }
@@ -120,7 +154,7 @@ function applyHashFromLocation() {
     if (sid) {
       state.selectedSessionId = sid;
       state.detailTab = tab;
-      state.view = 'session-detail';
+      changeView('session-detail');
       return true;
     }
   }
@@ -131,24 +165,57 @@ function applyHashFromLocation() {
     state.historyProject = '';
     state.historyQuery = '';
     state.historyRunDetails = null;
-    state.view = 'history';
+    changeView('history');
     return true;
   }
-  if (['overview', 'sessions', 'session-detail', 'workers'].includes(raw)) {
-    state.view = raw;
+  if (raw.startsWith('pools/')) {
+    changeView('pools', safeDecodeSegment(raw.slice('pools/'.length)));
+    return true;
+  }
+  if (['overview', 'sessions', 'session-detail', 'workers', 'pools', 'usage'].includes(raw)) {
+    changeView(raw);
     return true;
   }
   return false;
 }
 
-function setView(view, detailTab = null) {
-  state.waterfallExpanded = false;
+function changeView(view, poolId = null) {
+  if (view === state.view && poolId === state.selectedPoolId) return;
+  if (state.view === 'usage') stopUsageRefresh();
+  if (state.view === 'session-detail') {
+    detailRequestSeq++;
+    detailRequestInFlight = null;
+    clearTimeout(detailTimer);
+    detailTimer = null;
+  }
+  if (state.view === 'pools' || view === 'pools') {
+    poolViewSeq++;
+    state.selectedPoolId = poolId;
+    state.poolDetail = null;
+    state.poolDetailError = '';
+    state.poolDraft = null;
+    state.poolKeyDescription = '';
+    state.poolMutationError = '';
+    state.poolSecret = null;
+    state.draggedPoolId = null;
+  }
   state.view = view;
+}
+
+function refreshCurrentView() {
+  loadPools();
+  if (state.view === 'usage') loadUsage(true);
+}
+
+function setView(view, detailTab = null, poolId = null) {
+  state.waterfallExpanded = false;
+  changeView(view, poolId);
   if (detailTab && VALID_DETAIL_TABS.has(detailTab)) {
     state.detailTab = detailTab;
   }
   state.mobileMenuOpen = false;
   syncHash();
+  refreshCurrentView();
   renderApp();
   if (HISTORY_VIEWS.has(view)) {
     loadHistory(true);
@@ -166,30 +233,46 @@ function openFlakyHistory() {
 function requireApiAccess(response) {
   if (response.status !== 401) return;
   state.authError = 'The dashboard needs authenticated access to the coordinator API.';
+  state.poolSecret = null;
   renderApp();
   throw new Error('Unauthorized');
 }
 
-async function apiGet(path) {
-  const res = await fetch(path, { headers: { 'Accept': 'application/json' } });
+async function apiGetResponse(path, signal) {
+  const res = await fetch(path, { headers: { 'Accept': 'application/json' }, signal });
+  signal?.throwIfAborted();
   requireApiAccess(res);
   if (!res.ok) {
-    throw new Error(`HTTP ${res.status}`);
+    throw Object.assign(new Error(`HTTP ${res.status}`), { status: res.status });
+  }
+  return res;
+}
+
+async function apiGet(path, signal) {
+  return (await apiGetResponse(path, signal)).json();
+}
+
+async function apiWrite(method, path, body) {
+  const headers = { 'Accept': 'application/json' };
+  if (body !== undefined) headers['Content-Type'] = 'application/json';
+  const res = await fetch(path, { method, headers, body: JSON.stringify(body), cache: 'no-store' });
+  requireApiAccess(res);
+  if (!res.ok) {
+    throw Object.assign(new Error(`HTTP ${res.status}`), { status: res.status });
   }
   return res.json();
 }
 
-async function apiPost(path, body = {}) {
-  const res = await fetch(path, {
-    method: 'POST',
-    headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' },
-    body: JSON.stringify(body)
-  });
-  requireApiAccess(res);
-  if (!res.ok) {
-    throw new Error(`HTTP ${res.status}`);
-  }
-  return res.json();
+function apiPost(path, body = {}) {
+  return apiWrite('POST', path, body);
+}
+
+function apiPut(path, body) {
+  return apiWrite('PUT', path, body);
+}
+
+function apiDelete(path) {
+  return apiWrite('DELETE', path);
 }
 
 function scheduleRefresh(delayMs = 140) {
@@ -297,7 +380,6 @@ async function refreshAll() {
         await loadSessionDetail(state.selectedSessionId, false);
       }
     }
-    syncHash();
     renderApp();
   } catch (err) {
     if (err.message !== 'Unauthorized') {
@@ -313,15 +395,27 @@ async function refreshAll() {
 }
 
 async function loadSessionDetail(sessionId, switchView = true) {
+  if (switchView) {
+    state.selectedSessionId = sessionId;
+    changeView('session-detail');
+    state.mobileMenuOpen = false;
+    syncHash();
+    renderApp();
+  }
+  const selectionAtStart = state.selectedSessionId;
+  const hashAtStart = location.hash;
+  if (detailRequestInFlight?.sessionId === sessionId && detailRequestInFlight.isCurrent()) return;
+  const requestSeq = ++detailRequestSeq;
+  const isCurrent = () => requestSeq === detailRequestSeq && location.hash === hashAtStart
+    && state.view === 'session-detail' && state.selectedSessionId === selectionAtStart;
+  detailRequestInFlight = { sessionId, isCurrent };
   try {
-    const requestSeq = ++detailRequestSeq;
     const detail = await apiGet(`/api/v1/sessions/${encodeURIComponent(sessionId)}`);
-    if (requestSeq !== detailRequestSeq) {
-      return; // a newer request (e.g. the user switched sessions) superseded this one
-    }
+    if (!isCurrent()) return;
     lastDetailLoadAt = Date.now();
     state.selectedSessionId = sessionId;
     state.sessionDetail = detail;
+    state.sessionDetailError = null;
 
     if (state.selectedPartition && Array.isArray(detail.partitions)) {
       const exact = detail.partitions.find(
@@ -335,14 +429,17 @@ async function loadSessionDetail(sessionId, switchView = true) {
       state.selectedTestExecution = detail.tests.find(t => t.id === state.selectedTestExecution.id) || null;
     }
 
-    if (switchView) {
-      state.view = 'session-detail';
-      state.mobileMenuOpen = false;
-    }
     syncHash();
     renderApp();
   } catch (err) {
+    if (!isCurrent() || err.message === 'Unauthorized') return;
+    if (sessionId === state.selectedSessionId && state.sessionDetail?.session?.sessionId !== sessionId) {
+      state.sessionDetailError = { sessionId, message: `Could not load build session (${err.message}).` };
+      renderApp();
+    }
     console.warn('Failed to load session detail:', err.message);
+  } finally {
+    if (requestSeq === detailRequestSeq) detailRequestInFlight = null;
   }
 }
 
@@ -354,6 +451,7 @@ function ensurePollingLoop() {
         connectSse();
       }
       refreshAll();
+      if (showsPoolData()) schedulePoolRefresh();
     } else if (shouldPollWorkers()) {
       // Heartbeats update worker telemetry without publishing a lifecycle event.
       pollWorkers();
@@ -374,6 +472,7 @@ function connectSse() {
   eventSource = new EventSource('/api/v1/events/stream');
   eventSource.onopen = () => {
     state.sseConnected = true;
+    if (showsPoolData()) schedulePoolRefresh();
     renderApp();
     if (shouldPollWorkers()) {
       pollWorkers();
@@ -387,11 +486,18 @@ function connectSse() {
     'session.created', 'session.completed', 'session.aborted', 'work.submitted',
     'partition.assigned', 'partition.started', 'partition.requeued',
     'partition.completed', 'partition.lost', 'test.event',
-    'worker.registered', 'worker.draining', 'worker.offline', 'worker.disconnected'
+    'worker.registered', 'worker.draining', 'worker.offline', 'worker.disconnected',
+    'worker.updated', 'worker.rejected'
   ];
   for (const evt of eventTypes) {
     eventSource.addEventListener(evt, () => {
       scheduleRefresh();
+      if (state.view === 'pools' && evt.startsWith('worker.')) schedulePoolRefresh();
+    });
+  }
+  for (const evt of ['pool.updated', 'pool.deleted']) {
+    eventSource.addEventListener(evt, () => {
+      if (showsPoolData()) schedulePoolRefresh();
     });
   }
 }
@@ -517,6 +623,8 @@ function renderSidebar() {
 
   const navItem = (id, label, iconChar, badgeVal, onOpen) => html`
     <button
+      data-view=${id}
+      aria-current=${state.view === id ? 'page' : undefined}
       class=${`nav-btn ${state.view === id ? 'active' : ''}`}
       title=${onOpen ? 'Show tests recovered on retry' : label}
       onClick=${() => {
@@ -524,9 +632,12 @@ function renderSidebar() {
           onOpen();
           return;
         }
-        if (id === 'session-detail' && !state.sessionDetail && state.sessions.length > 0) {
-          loadSessionDetail(state.sessions[0].sessionId, true);
-          return;
+        if (id === 'session-detail') {
+          const sessionId = state.selectedSessionId || state.sessions[0]?.sessionId;
+          if (sessionId && state.sessionDetail?.session?.sessionId !== sessionId) {
+            loadSessionDetail(sessionId);
+            return;
+          }
         }
         setView(id);
       }}
@@ -546,8 +657,10 @@ function renderSidebar() {
         ${navItem('overview', 'Overview', '◈', null)}
         ${navItem('sessions', 'Build Sessions', '▤', state.sessions.length)}
         ${navItem('session-detail', 'Session Waterfall', '⇶', state.sessionDetail ? state.sessionDetail.session.status : null)}
+        ${navItem('usage', 'Historical Usage', '◴', null)}
         <div class="nav-section-label" style="margin-top:10px">Infrastructure & Quality</div>
         ${navItem('workers', 'Workers Pool', '⚙', `${activeWorkers}/${state.workers.length}`)}
+        ${navItem('pools', 'Agent Pools', '▦', null)}
         ${navItem('history', 'Test History & Flakiness', '⚡',
           flakyCount > 0 ? `${flakyCount} flaky` : state.history.length, flakyCount > 0 ? openFlakyHistory : null)}
       </div>
@@ -755,7 +868,7 @@ function renderSessionsExplorer() {
       <div class="page-header">
         <div>
           <h1 class="page-title">Build Sessions Explorer</h1>
-          <p class="page-subtitle">Inspect distributed Maven & JBang reactor runs, classpath cache hit rates, and test outcomes.</p>
+          <p class="page-subtitle">Inspect distributed build sessions, artifact cache hit rates, and test outcomes.</p>
         </div>
       </div>
 
@@ -1180,12 +1293,12 @@ function renderWorkspaceChanges(sessionId, changes) {
 }
 
 function renderSessionDetail() {
-  if (!state.sessionDetail || !state.sessionDetail.session) {
-    return html`
-      <div class="card">
-        <div class="empty-state">Select a build session from Overview or Build Sessions to inspect its waterfall timeline.</div>
-      </div>
-    `;
+  if (!state.sessionDetail?.session || state.sessionDetail.session.sessionId !== state.selectedSessionId) {
+    const sessionId = state.selectedSessionId;
+    const message = sessionId
+      ? (state.sessionDetailError?.sessionId === sessionId ? state.sessionDetailError.message : 'Loading build session…')
+      : 'Select a build session from Overview or Build Sessions to inspect its waterfall timeline.';
+    return html`<div class="card"><div class="empty-state" role="status">${message}</div></div>`;
   }
 
   const { session, changedFiles = [], workspaceChanges, partitions = [], tests = [] } = state.sessionDetail;
@@ -1569,12 +1682,97 @@ function renderWorkerCacheTelemetry(w) {
   `;
 }
 
+function warningList(worker) {
+  return worker.state === 'OFFLINE' ? [] : (worker.warnings || []);
+}
+
+function compactElapsed(ms) {
+  const seconds = Math.max(0, Math.floor(ms / 1000));
+  if (seconds >= 86400) return `${Math.floor(seconds / 86400)}d ${Math.floor(seconds % 86400 / 3600)}h`;
+  if (seconds >= 3600) return `${Math.floor(seconds / 3600)}h ${Math.floor(seconds % 3600 / 60)}m`;
+  if (seconds >= 60) return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+  return `${seconds}s`;
+}
+
+function renderWorkerStatus(worker, now) {
+  const statusSince = worker.stateUpdatedAt || worker.lastHeartbeatAt || now;
+  if (worker.state === 'IDLE') {
+    return `Idle for ${compactElapsed(now - statusSince)} · Waiting for test execution requests`;
+  }
+  if (worker.state === 'BUSY' || worker.activePartitionId || worker.activeTestDisplay) {
+    return `Executing ${worker.activeTestDisplay || worker.activePartitionId || 'tests'}`;
+  }
+  return formatAgo(statusSince);
+}
+
+const WORKER_WARNINGS = {
+  POOL_CAPABILITY_MISMATCH: 'Worker no longer meets pool capabilities',
+  POOL_DELETED: 'Agent pool was deleted',
+  KEY_REVOKED: 'Registration key was revoked'
+};
+
+function renderWorkerWarning(warning, now) {
+  const remaining = warning.disconnectAt - now;
+  const deadline = warning.disconnectAt > 0
+    ? (remaining > 0 ? `Disconnects in ${compactElapsed(remaining)}` : 'Disconnect pending')
+    : null;
+  return html`
+    <div class="alert-banner alert-banner-amber worker-warning">
+      <strong>${warning.message || WORKER_WARNINGS[warning.code] || warning.code}</strong>
+      <span class="mono">${warning.code}</span>
+      ${deadline ? html`<span>${deadline}</span>` : null}
+    </div>
+  `;
+}
+
+function renderWorkerGroup(label, workers, now, deleted = false) {
+  const page = paginate(`workers-${workers[0].poolId || 'unpooled'}`, workers, 25,
+    `${state.workerStateFilter}|${state.workerQuery.trim().toLowerCase()}`);
+  return html`
+    <section class="card">
+      <div class="card-header">
+        <h2 class="card-title">${label} ${deleted ? html`<span class="badge badge-offline">Deleted</span>` : null}</h2>
+        <span class="muted">${workers.length} ${workers.length === 1 ? 'worker' : 'workers'}</span>
+      </div>
+      <div class="table-wrap">
+        <table class="workers-table">
+          <thead><tr>
+            <th scope="col">Worker</th><th scope="col">Hostname</th><th scope="col">Version</th>
+            <th scope="col">State</th><th scope="col">Capabilities</th><th scope="col">Last status update</th>
+            <th scope="col">Local File Cache</th>
+          </tr></thead>
+          <tbody>
+            ${page.items.map(w => html`
+              <tr>
+                <td class="mono">${w.workerId}</td>
+                <td class="mono">${w.host || '—'}</td>
+                <td class="mono">${w.version || '—'}</td>
+                <td>${statusBadge(w.state)}</td>
+                <td>${visibleCapabilities(w.capabilities).map(([k, v]) => html`<span class="tag mono">${k}=${v}</span>`)}</td>
+                <td>
+                  <div>${renderWorkerStatus(w, now)}</div>
+                  <small class="muted">Last heartbeat ${formatAgo(w.lastHeartbeatAt)}</small>
+                  ${warningList(w).map(warning => renderWorkerWarning(warning, now))}
+                </td>
+                <td>${renderWorkerCacheTelemetry(w)}</td>
+              </tr>
+            `)}
+          </tbody>
+        </table>
+      </div>
+      ${page.controls}
+    </section>
+  `;
+}
+
 function renderWorkersPool() {
-  const states = ['ALL', 'IDLE', 'BUSY', 'DRAINING', 'OFFLINE', 'LOW_DISK'];
+  const states = ['ALL', 'IDLE', 'BUSY', 'WARNING', 'DRAINING', 'OFFLINE', 'LOW_DISK'];
   const q = state.workerQuery.trim().toLowerCase();
   const filtered = state.workers.filter(w => {
     if (state.workerStateFilter === 'LOW_DISK') {
       if (!isLowDisk(w)) return false;
+    } else if (state.workerStateFilter === 'WARNING') {
+      if (!warningList(w).length) return false;
     } else if (state.workerStateFilter !== 'ALL' && w.state !== state.workerStateFilter) return false;
     if (!q) return true;
     const capStr = Object.entries(w.capabilities || {}).map(([k, v]) => `${k}=${v}`).join(' ').toLowerCase();
@@ -1582,13 +1780,29 @@ function renderWorkersPool() {
       || (w.host || '').toLowerCase().includes(q)
       || capStr.includes(q);
   });
+  const busy = state.workers.filter(w => w.state === 'BUSY').length;
+  const idle = state.workers.filter(w => w.state === 'IDLE').length;
+  const now = Date.now();
+  const workersByPool = new Map();
+  for (const worker of filtered) {
+    const poolId = worker.poolId || null;
+    if (!workersByPool.has(poolId)) workersByPool.set(poolId, []);
+    workersByPool.get(poolId).push(worker);
+  }
+  const fromConfigured = (state.pools || []).flatMap(pool => {
+    const workers = workersByPool.get(pool.poolId);
+    workersByPool.delete(pool.poolId);
+    return workers ? [renderWorkerGroup(pool.displayName, workers, now)] : [];
+  });
+  const unpooled = workersByPool.get(null);
+  workersByPool.delete(null);
 
   return html`
     <div>
       <div class="page-header">
         <div>
           <h1 class="page-title">Workers Pool</h1>
-          <p class="page-subtitle">Connected Citrus remote worker agents, host capability tags, and active partition assignments.</p>
+          <p class="page-subtitle">${state.workers.length} workers, ${busy} busy, ${idle} idle</p>
         </div>
       </div>
 
@@ -1596,51 +1810,576 @@ function renderWorkersPool() {
         <input
           class="search-input"
           data-focus-id="workers-search"
+          aria-label="Filter workers by worker ID, host, or capability"
           type="search"
           placeholder="Filter by worker ID, host, or capability (e.g. gpu, docker, macos)…"
           value=${state.workerQuery}
           onInput=${e => { state.workerQuery = e.target.value; renderApp(); }}
         />
-        <div class="pill-group">
+        <div class="pill-group" aria-label="Worker state filters">
           ${states.map(st => html`
             <button
               class=${`filter-pill ${state.workerStateFilter === st ? 'active' : ''}`}
+              aria-pressed=${String(state.workerStateFilter === st)}
               onClick=${() => { state.workerStateFilter = st; renderApp(); }}
             >${st === 'LOW_DISK' ? 'LOW DISK' : st}</button>
           `)}
         </div>
       </div>
 
-      ${filtered.length === 0
-        ? html`<div class="card"><div class="empty-state">No workers match the current filter.</div></div>`
-        : html`
-          <div class="workers-grid">
-            ${filtered.map(w => html`
-              <div class="worker-card">
-                <div class="worker-card-header">
-                  <div>
-                    <div class="mono" style="font-size:15px;font-weight:700">${w.workerId}</div>
-                    <div class="mono" style="font-size:12px;color:var(--text-muted)">${w.host}</div>
-                  </div>
-                  ${statusBadge(w.state)}
-                </div>
+      ${filtered.length === 0 ? html`<div class="card"><div class="empty-state">No workers match the current filter.</div></div>` : null}
+      ${fromConfigured}
+      ${[...workersByPool].map(([poolId, workers]) => renderWorkerGroup(
+        workers[0].poolDisplayName || poolId, workers, now,
+        workers.some(w => warningList(w).some(warning => warning.code === 'POOL_DELETED'))))}
+      ${unpooled ? renderWorkerGroup('Unpooled Workers', unpooled, now) : null}
+    </div>
+  `;
+}
 
-                <div style="font-size:12.5px;color:var(--text-secondary)">
-                  Last heartbeat: <strong>${formatAgo(w.lastHeartbeatAt)}</strong>
-                  ${w.activePartitionId ? html` · Active: <span class="mono" style="color:var(--citrus-orange-deep);font-weight:700">${w.activePartitionId}</span>` : null}
-                </div>
+function poolPath(poolId) {
+  return `${AGENT_POOLS_API}/${encodeURIComponent(poolId)}`;
+}
 
-                <div>
-                  ${visibleCapabilities(w.capabilities).map(([k, v]) => html`
-                    <span class="tag mono">${k}=${v}</span>
-                  `)}
-                </div>
+function newPoolDraft(pool) {
+  return {
+    displayName: pool?.displayName || '',
+    edited: false,
+    capabilities: { chips: { ...pool?.capabilities }, input: '', error: '' }
+  };
+}
 
-                ${renderWorkerCacheTelemetry(w)}
-              </div>
-            `)}
-          </div>
-        `}
+function isCurrentPoolVisit(visit) {
+  return visit === poolViewSeq && state.view === 'pools' && location.hash === buildHash();
+}
+
+function showsPoolData() {
+  return state.view === 'pools' || state.view === 'workers';
+}
+
+async function loadPools() {
+  if (!showsPoolData()) return;
+  if (poolRefreshInFlight) {
+    poolRefreshPending = true;
+    return;
+  }
+  poolRefreshInFlight = true;
+  poolRefreshPending = false;
+  const revision = poolDataRevision;
+  const visit = poolViewSeq;
+  const poolId = state.selectedPoolId;
+  const isCurrent = () => revision === poolDataRevision && !state.poolMutationInFlight;
+  const isCurrentDetail = () => isCurrent() && isCurrentPoolVisit(visit);
+  try {
+    const list = apiGet(AGENT_POOLS_API).then(pools => {
+      if (!isCurrent()) return;
+      state.pools = pools;
+      state.poolListError = '';
+    }).catch(err => {
+      if (isCurrent() && err.message !== 'Unauthorized') {
+        state.poolListError = `Could not load agent pools (${err.message}).`;
+      }
+    });
+    const detail = poolId ? apiGet(poolPath(poolId)).then(result => {
+      if (!isCurrentDetail()) return;
+      state.poolDetail = result;
+      state.poolDetailError = '';
+      // Live updates must leave the user's unsaved changes alone.
+      if (!state.poolDraft?.edited) state.poolDraft = newPoolDraft(result.pool);
+    }).catch(err => {
+      if (!isCurrentDetail() || err.message === 'Unauthorized') return;
+      if (err.status === 404) {
+        state.poolDetail = null;
+        state.poolSecret = null;
+        state.poolDetailError = 'This agent pool is no longer available.';
+      } else {
+        state.poolDetailError = `Could not refresh agent pool (${err.message}).`;
+      }
+    }) : null;
+    await Promise.all([list, detail]);
+    if (showsPoolData()) renderApp();
+  } finally {
+    poolRefreshInFlight = false;
+    if (poolRefreshPending && showsPoolData()) loadPools();
+  }
+}
+
+function schedulePoolRefresh() {
+  if (poolRefreshTimer) return;
+  poolRefreshTimer = setTimeout(() => {
+    poolRefreshTimer = null;
+    loadPools();
+  }, 140);
+}
+
+function commitCapabilityChips(editor) {
+  if (!editor.input.trim()) {
+    editor.input = '';
+    editor.error = '';
+    return true;
+  }
+  const entries = [];
+  for (const entry of editor.input.split(',')) {
+    const [key, value = 'true', extra] = entry.split('=').map(part => part.trim());
+    const token = /^[A-Za-z0-9._-]+$/;
+    if (extra !== undefined || !token.test(key) || !token.test(value)) {
+      editor.error = 'Enter a key or key=value using letters, numbers, periods, underscores, or hyphens.';
+      return false;
+    }
+    entries.push([key, value]);
+  }
+  editor.chips = { ...editor.chips, ...Object.fromEntries(entries) };
+  editor.input = '';
+  editor.error = '';
+  return true;
+}
+
+function renderCapabilityEditor({ label, id, editor, disabled, onChange, onInput }) {
+  const add = () => {
+    if (commitCapabilityChips(editor)) onChange?.();
+    renderApp();
+  };
+  return html`
+    <div class="capability-editor">
+      <label class="dashboard-label" for=${id}>${label}</label>
+      <div class="dashboard-actions">
+        <input class="search-input" id=${id} data-focus-id=${id} type="text" autocomplete="off"
+          placeholder="e.g. docker, jdk=21" value=${editor.input} disabled=${disabled}
+          aria-invalid=${editor.error ? 'true' : undefined}
+          aria-describedby=${editor.error ? `${id}-error` : undefined}
+          onInput=${e => { editor.input = e.target.value; onInput?.(); }}
+          onKeyDown=${e => { if (e.key === 'Enter') { e.preventDefault(); add(); } }} />
+        <button class="btn btn-sm" type="button" disabled=${disabled} onClick=${add}>Add</button>
+      </div>
+      <div class="dashboard-actions">
+        ${Object.entries(editor.chips).map(([key, value]) => html`
+          <span class="tag mono">
+            ${key}=${value}
+            <button type="button" class="chip-remove" disabled=${disabled}
+              aria-label=${`Remove ${key}=${value}`}
+              onClick=${() => { delete editor.chips[key]; onChange?.(); renderApp(); }}>×</button>
+          </span>
+        `)}
+      </div>
+      ${editor.error ? html`<p class="form-error" id=${`${id}-error`} role="alert">${editor.error}</p>` : null}
+    </div>
+  `;
+}
+
+async function runPoolMutation(action, operation) {
+  if (state.poolMutationInFlight) return;
+  const visit = poolViewSeq;
+  const isCurrent = () => isCurrentPoolVisit(visit) && !state.authError;
+  state.poolMutationInFlight = true;
+  state.poolMutationError = '';
+  renderApp();
+  try {
+    await operation(isCurrent);
+  } catch (err) {
+    if (isCurrent()) state.poolMutationError = `Could not ${action} (${err.message}).`;
+  } finally {
+    state.poolMutationInFlight = false;
+    // Reload after the write, including partial saves. Any GET started before it finished is stale.
+    poolDataRevision++;
+    if (showsPoolData()) {
+      renderApp();
+      loadPools();
+    }
+  }
+}
+
+function revealPoolSecret(poolId, generated) {
+  if (state.selectedPoolId === poolId && generated?.secretKey) {
+    state.poolSecret = { poolId, keyId: generated.metadata.keyId, value: generated.secretKey };
+  }
+}
+
+function saveAgentPool(e) {
+  e.preventDefault();
+  const draft = state.poolDraft;
+  const poolId = state.selectedPoolId;
+  const generate = e.submitter?.value === 'generate';
+  const displayName = draft.displayName.trim();
+  if (!displayName || !commitCapabilityChips(draft.capabilities)) {
+    state.poolMutationError = displayName ? '' : 'Enter a display name.';
+    renderApp();
+    return;
+  }
+  const request = { displayName, capabilities: draft.capabilities.chips };
+  runPoolMutation('save agent pool', async isCurrent => {
+    if (!poolId) {
+      const created = await apiPost(AGENT_POOLS_API, { ...request, generateRegistrationKey: generate });
+      if (isCurrent()) {
+        setView('pools', null, created.pool.poolId);
+        revealPoolSecret(created.pool.poolId, created.generatedKey);
+      }
+      return;
+    }
+    const updated = await apiPut(poolPath(poolId), request);
+    if (isCurrent()) state.poolDraft = newPoolDraft(updated);
+    if (generate) {
+      try {
+        const key = await apiPost(`${poolPath(poolId)}/keys`);
+        if (isCurrent()) revealPoolSecret(poolId, key);
+      } catch (err) {
+        if (isCurrent()) state.poolMutationError = `Pool saved. Could not generate registration key (${err.message}).`;
+      }
+    }
+  });
+}
+
+function deleteAgentPool(pool) {
+  if (!window.confirm(`Delete "${pool.displayName}"? Connected workers will receive a warning and be disconnected after the grace period.`)) return;
+  runPoolMutation('delete agent pool', async isCurrent => {
+    await apiDelete(poolPath(pool.poolId));
+    if (isCurrent() && state.selectedPoolId) setView('pools');
+  });
+}
+
+function moveAgentPool(poolId, destination) {
+  const ids = state.pools.map(pool => pool.poolId);
+  const from = ids.indexOf(poolId);
+  if (from < 0 || from === destination || destination < 0 || destination >= ids.length) return;
+  ids.splice(from, 1);
+  ids.splice(destination, 0, poolId);
+  runPoolMutation('save pool priority', async isCurrent => {
+    const pools = await apiPut('/api/v1/agent-pools/priority', { poolIds: ids });
+    if (!isCurrent()) return;
+    state.pools = pools;
+  });
+}
+
+function startPoolDrag(e, poolId) {
+  if (state.poolMutationInFlight) {
+    e.preventDefault();
+    return;
+  }
+  state.draggedPoolId = poolId;
+  e.dataTransfer.setData('text/plain', poolId);
+  e.dataTransfer.effectAllowed = 'move';
+}
+
+function dropOnPool(e, targetId) {
+  if (!state.draggedPoolId) return;
+  e.preventDefault();
+  const sourceId = state.draggedPoolId;
+  state.draggedPoolId = null;
+  const index = state.pools.findIndex(pool => pool.poolId === targetId);
+  moveAgentPool(sourceId, index);
+  renderApp();
+}
+
+async function copyDashboardText(value, element) {
+  try {
+    await navigator.clipboard.writeText(value);
+    showToast('Copied to clipboard');
+  } catch {
+    // The Clipboard API may be unavailable when the coordinator is served over plain HTTP.
+    if (element instanceof HTMLInputElement) {
+      element.focus();
+      element.select();
+    } else {
+      const range = document.createRange();
+      range.selectNodeContents(element);
+      window.getSelection()?.removeAllRanges();
+      window.getSelection()?.addRange(range);
+    }
+  }
+}
+
+function renderAgentPoolTable() {
+  const pools = state.pools;
+  const busy = state.poolMutationInFlight;
+  if (!pools) {
+    return state.poolListError ? null : html`<div class="card"><div class="empty-state" role="status">Loading agent pools…</div></div>`;
+  }
+  if (pools.length === 0) {
+    return html`<div class="card"><div class="empty-state">No agent pools configured.</div></div>`;
+  }
+  return html`
+    <div class="card table-wrap">
+      <table class="agent-pool-table" aria-label="Agent pools in priority order">
+        <thead><tr>
+          <th scope="col">Priority</th><th scope="col">Display name</th><th scope="col">ID</th>
+          <th scope="col">Workers</th><th scope="col">Capabilities</th><th scope="col">Registration keys</th>
+          <th scope="col">Actions</th>
+        </tr></thead>
+        <tbody>${pools.map((pool, i) => {
+          const caps = Object.entries(pool.capabilities || {});
+          return html`
+            <tr onDragOver=${e => {
+              if (state.draggedPoolId) { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; }
+            }} onDragEnter=${e => {
+              if (state.draggedPoolId !== null) e.currentTarget.classList.add('pool-drop-target');
+            }} onDragLeave=${e => {
+              if (!e.currentTarget.contains(e.relatedTarget)) e.currentTarget.classList.remove('pool-drop-target');
+            }} onDrop=${e => dropOnPool(e, pool.poolId)}>
+              <td>
+                <div class="dashboard-actions">
+                  <span class="pool-drag-handle" draggable="true" aria-hidden="true" title="Drag to reorder"
+                    onDragStart=${e => startPoolDrag(e, pool.poolId)}
+                    onDragEnd=${() => { state.draggedPoolId = null; renderApp(); }}>⠿</span>
+                  <span class="mono">${i + 1}</span>
+                  <button class="btn btn-sm" aria-label=${`Move ${pool.displayName} up`}
+                    aria-disabled=${String(busy || i === 0)} data-focus-id=${`pool-up-${pool.poolId}`}
+                    onClick=${() => moveAgentPool(pool.poolId, i - 1)}>Up</button>
+                  <button class="btn btn-sm" aria-label=${`Move ${pool.displayName} down`}
+                    aria-disabled=${String(busy || i === pools.length - 1)} data-focus-id=${`pool-down-${pool.poolId}`}
+                    onClick=${() => moveAgentPool(pool.poolId, i + 1)}>Down</button>
+                </div>
+              </td>
+              <td><strong>${pool.displayName}</strong></td>
+              <td>
+                <div class="dashboard-actions pool-id">
+                  <code class="mono">${pool.poolId}</code>
+                  <button class="btn btn-sm" aria-label=${`Copy ID for ${pool.displayName}`}
+                    onClick=${e => copyDashboardText(pool.poolId, e.currentTarget.previousElementSibling)}>Copy ID</button>
+                </div>
+              </td>
+              <td>${pool.connectedWorkers} connected<br/><small class="muted">${pool.busyWorkers} busy · ${pool.idleWorkers} idle</small></td>
+              <td>${caps.slice(0, 3).map(([key, value]) => html`<span class="tag mono">${key}=${value}</span>`)}
+                ${caps.length > 3 ? html`<span class="muted">+ ${caps.length - 3} more</span>` : null}
+                ${caps.length === 0 ? '—' : null}
+              </td>
+              <td>${pool.activeKeyCount} active</td>
+              <td><div class="dashboard-actions">
+                <button class="btn btn-sm" onClick=${() => setView('pools', null, pool.poolId)}>Manage</button>
+                <button class="btn btn-sm btn-danger" disabled=${busy} onClick=${() => deleteAgentPool(pool)}>Delete</button>
+              </div></td>
+            </tr>
+          `;
+        })}</tbody>
+      </table>
+    </div>
+  `;
+}
+
+function renderAgentPoolForm() {
+  const busy = state.poolMutationInFlight;
+  const draft = state.poolDraft;
+  const pool = state.poolDetail?.pool;
+  return html`
+    <section class="card">
+      <div class="card-header">
+        <h2 class="card-title">${pool ? 'Edit Pool' : 'Create Pool'}</h2>
+        ${pool ? html`<code class="mono pool-id">${pool.poolId}</code>` : null}
+      </div>
+      <form class="card-body dashboard-form" onSubmit=${saveAgentPool}>
+        <label class="dashboard-label">Display name
+          <input class="search-input" data-focus-id="pool-name" type="text" required
+            value=${draft.displayName} disabled=${busy}
+            onInput=${e => { draft.displayName = e.target.value; draft.edited = true; }} />
+        </label>
+        ${renderCapabilityEditor({
+          label: 'Mandatory capabilities', id: 'pool-capabilities', editor: draft.capabilities, disabled: busy,
+          onInput: () => { draft.edited = true; }, onChange: () => { draft.edited = true; }
+        })}
+        <div class="dashboard-actions">
+          <button class="btn btn-primary" type="submit" disabled=${busy}>Save</button>
+          <button class="btn" type="submit" value="generate" disabled=${busy}>Save and generate registration key</button>
+          ${pool
+            ? html`<button class="btn btn-danger" type="button" disabled=${busy} onClick=${() => deleteAgentPool(pool)}>Delete</button>`
+            : html`<button class="btn" type="button" disabled=${busy}
+                onClick=${() => { state.poolDraft = null; state.poolMutationError = ''; renderApp(); }}>Cancel</button>`}
+        </div>
+      </form>
+    </section>
+  `;
+}
+
+function generatePoolKey(e, poolId) {
+  e.preventDefault();
+  const description = state.poolKeyDescription.trim();
+  runPoolMutation('generate registration key', async isCurrent => {
+    const generated = await apiPost(`${poolPath(poolId)}/keys`, { description });
+    if (isCurrent()) {
+      state.poolKeyDescription = '';
+      revealPoolSecret(poolId, generated);
+    }
+  });
+}
+
+function revokePoolKey(poolId, keyId) {
+  runPoolMutation('revoke registration key', async isCurrent => {
+    await apiPost(`${poolPath(poolId)}/keys/${encodeURIComponent(keyId)}/revoke`);
+    if (isCurrent() && state.poolSecret?.keyId === keyId) state.poolSecret = null;
+  });
+}
+
+function renderPoolSecret(poolId) {
+  const secret = state.poolSecret;
+  if (secret?.poolId !== poolId) return null;
+  return html`
+    <div class="alert-banner alert-banner-amber" role="status">
+      <strong>Registration key generated</strong>
+      <p>Copy this registration key now. It is shown once.</p>
+      <div class="dashboard-actions">
+        <input class="search-input secret-key mono" type="text" readonly autocomplete="off" spellcheck="false"
+          aria-label="One-time registration key" data-focus-id="pool-secret" value=${secret.value} />
+        <button class="btn" onClick=${e => copyDashboardText(secret.value, e.currentTarget.previousElementSibling)}>Copy key</button>
+        <button class="btn" onClick=${() => { state.poolSecret = null; renderApp(); }}>Dismiss</button>
+      </div>
+    </div>
+  `;
+}
+
+function formatDateTime(epochMs) {
+  return epochMs ? new Date(epochMs).toLocaleString() : '—';
+}
+
+function renderRegistrationKeys() {
+  const { pool, registrationKeys } = state.poolDetail;
+  const { poolId } = pool;
+  const busy = state.poolMutationInFlight;
+  const keyPage = paginate('pool-keys', registrationKeys, 25, poolId);
+  return html`
+    <section class="card">
+      <div class="card-header"><h2 class="card-title">Registration Keys</h2></div>
+      <form class="card-body dashboard-actions" onSubmit=${e => generatePoolKey(e, poolId)}>
+        <label class="dashboard-label">Key description (optional)
+          <input class="search-input" type="text" value=${state.poolKeyDescription} data-focus-id="pool-key-description"
+            disabled=${busy} onInput=${e => { state.poolKeyDescription = e.target.value; }} />
+        </label>
+        <button class="btn" type="submit" disabled=${busy}>Generate key</button>
+      </form>
+      ${registrationKeys.length ? html`
+        <div class="table-wrap">
+          <table>
+            <thead><tr>
+              <th scope="col">Prefix</th><th scope="col">Description</th><th scope="col">Created</th>
+              <th scope="col">Last used</th><th scope="col">Last used by</th><th scope="col">Status</th><th scope="col">Actions</th>
+            </tr></thead>
+            <tbody>${keyPage.items.map(key => html`
+              <tr>
+                <td class="mono">${key.keyPrefix}</td>
+                <td>${key.description || '—'}</td>
+                <td>${formatDateTime(key.createdAt)}</td>
+                <td>${formatDateTime(key.lastUsedAt)}</td>
+                <td class="mono">${key.lastUsedBy || '—'}</td>
+                <td>${key.revokedAt ? html`<span class="badge badge-offline">Revoked</span> ${formatDateTime(key.revokedAt)}`
+                  : html`<span class="badge badge-idle">Active</span>`}</td>
+                <td>${key.revokedAt ? '—' : html`
+                  <button class="btn btn-sm btn-danger" disabled=${busy}
+                    onClick=${() => revokePoolKey(poolId, key.keyId)}>Revoke</button>`}</td>
+              </tr>
+            `)}</tbody>
+          </table>
+        </div>
+        ${keyPage.controls}
+      ` : html`<div class="empty-state">No registration keys.</div>`}
+    </section>
+  `;
+}
+
+function renderAgentPools() {
+  const poolId = state.selectedPoolId;
+  const pool = state.poolDetail?.pool;
+  const error = state.poolMutationError || (poolId ? state.poolDetailError : state.poolListError);
+  return html`
+    <div>
+      <div class="page-header">
+        <div>
+          <h1 class="page-title">${pool ? pool.displayName : 'Agent Pools'}</h1>
+          ${pool ? html`<p class="page-subtitle">${pool.connectedWorkers} connected · ${pool.busyWorkers} busy · ${pool.idleWorkers} idle</p>` : null}
+        </div>
+        ${poolId ? html`<button class="btn" onClick=${() => setView('pools')}>All Agent Pools</button>` : html`
+          <button class="btn btn-primary" disabled=${state.poolDraft !== null || state.poolMutationInFlight}
+            onClick=${() => { state.poolDraft = newPoolDraft(); state.poolMutationError = ''; renderApp(); }}>Create Pool</button>`}
+      </div>
+      ${error ? html`<div class="alert-banner alert-banner-rose" role="alert">${error}</div>` : null}
+      ${poolId ? renderPoolSecret(poolId) : null}
+      ${state.poolDraft && (!poolId || pool) ? renderAgentPoolForm() : null}
+      ${pool ? renderRegistrationKeys() : (!poolId ? renderAgentPoolTable() : (!state.poolDetailError
+        ? html`<div class="card"><div class="empty-state" role="status">Loading agent pool…</div></div>` : null))}
+    </div>
+  `;
+}
+
+function stopUsageRefresh() {
+  clearTimeout(usageRefreshTimer);
+  usageRefreshTimer = null;
+  usageRequest?.abort();
+  usageRequest = null;
+}
+
+async function loadUsage(reset = false) {
+  if (reset) {
+    stopUsageRefresh();
+    state.usage = null;
+    state.usageError = '';
+    state.usageSelections.clear();
+  }
+  if (state.view !== 'usage' || usageRequest) return;
+  const request = new AbortController();
+  usageRequest = request;
+  const params = new URLSearchParams({ window: state.usageWindow });
+  const filters = Object.entries(state.usageFilter.chips).map(([key, value]) => `${key}=${value}`);
+  if (filters.length) params.set('filter', filters.join(','));
+  try {
+    const response = await apiGetResponse(`/api/v1/usage?${params}`, request.signal);
+    const usage = await response.json();
+    if (usageRequest !== request) return;
+    const intervalHeader = response.headers.get(USAGE_INTERVAL_HEADER);
+    const configuredInterval = intervalHeader && /^\d+$/.test(intervalHeader) ? Number(intervalHeader) : 0;
+    usageRefreshIntervalMs = Number.isFinite(configuredInterval) && configuredInterval > 0
+      ? Math.min(configuredInterval, MAX_TIMEOUT_MS) : DEFAULT_USAGE_REFRESH_INTERVAL_MS;
+    state.usage = usage;
+    state.usageError = '';
+  } catch (err) {
+    if (usageRequest !== request) return;
+    if (err.message !== 'Unauthorized') state.usageError = `Could not load historical usage (${err.message}).`;
+  } finally {
+    if (usageRequest === request) {
+      usageRequest = null;
+      usageRefreshTimer = setTimeout(() => loadUsage(), usageRefreshIntervalMs);
+      renderApp();
+    }
+  }
+}
+
+const USAGE_WINDOWS = [['1h', '1 hour'], ['24h', '24 hours'], ['7d', '7 days']];
+const ACTIVE_JOBS_METRICS = [{ key: 'activeJobs', label: 'Active jobs', color: 'var(--blue-text)' }];
+const UTILIZATION_METRICS = [
+  { key: 'utilized', label: 'Utilized', color: 'var(--emerald-text)' },
+  { key: 'desired', label: 'Desired', color: 'var(--amber-text)', dash: '8 5' },
+  { key: 'connected', label: 'Connected', color: 'var(--blue-text)', dash: '2 4' }
+];
+
+function renderHistoricalUsage() {
+  const usage = state.usage;
+  // A blur or pointer event from a replaced chart can only update its old selection map.
+  const selections = state.usageSelections = new Map(state.usageSelections);
+  return html`
+    <div>
+      <div class="page-header"><h1 class="page-title">Historical Usage</h1></div>
+      <section class="card card-body usage-controls">
+        ${renderCapabilityEditor({
+          label: 'Filter by capability or requirement', id: 'usage-filter', editor: state.usageFilter,
+          onChange: () => loadUsage(true)
+        })}
+        <div class="pill-group" aria-label="Usage time window">
+          ${USAGE_WINDOWS.map(([value, label]) => html`
+            <button class=${`filter-pill ${state.usageWindow === value ? 'active' : ''}`}
+              aria-pressed=${String(state.usageWindow === value)} data-focus-id=${`usage-${value}`}
+              onClick=${() => {
+                if (value === state.usageWindow) return;
+                state.usageWindow = value;
+                loadUsage(true);
+                renderApp();
+              }}>${label}</button>
+          `)}
+        </div>
+      </section>
+      ${state.usageError ? html`<div class="alert-banner alert-banner-rose" role="alert">${state.usageError}</div>` : null}
+      ${usage ? html`
+        <p id="usage-instructions" class="usage-instructions muted">Hover over a chart or use the arrow keys to inspect a time bucket.</p>
+        ${renderUsageChart('usage-jobs', 'Active jobs', usage.series, ACTIVE_JOBS_METRICS, state.usageWindow, selections)}
+        ${renderUsageChart('usage-workers', 'Worker utilization', usage.series, UTILIZATION_METRICS, state.usageWindow, selections)}
+        <h2 class="usage-section-heading">Agent pool utilization</h2>
+        ${usage.pools.length ? usage.pools.map(pool => renderUsageChart(
+          `usage-pool-${pool.poolId}`, pool.displayName, pool.points, UTILIZATION_METRICS, state.usageWindow, selections))
+          : html`<div class="card"><div class="empty-state">No agent pools match this filter.</div></div>`}
+      ` : (!state.usageError ? html`<div class="card"><div class="empty-state" role="status">Loading historical usage…</div></div>` : null)}
     </div>
   `;
 }
@@ -2047,6 +2786,8 @@ function renderMainView() {
     case 'sessions': return renderSessionsExplorer();
     case 'session-detail': return renderSessionDetail();
     case 'workers': return renderWorkersPool();
+    case 'pools': return renderAgentPools();
+    case 'usage': return renderHistoricalUsage();
     case 'history': return renderTestHistory();
     default: return renderOverview();
   }
@@ -2054,7 +2795,7 @@ function renderMainView() {
 
 export function renderApp() {
   const root = document.getElementById('app');
-  if (!root) return;
+  if (!root || state.draggedPoolId) return;
 
   // Preserve focused input and cursor position across DOM replacement
   const active = document.activeElement;
@@ -2080,7 +2821,7 @@ export function renderApp() {
   root.replaceChildren(tree);
 
   if (focusId) {
-    const nextInput = root.querySelector(`[data-focus-id="${focusId}"]`);
+    const nextInput = root.querySelector(`[data-focus-id="${CSS.escape(focusId)}"]`);
     if (nextInput) {
       nextInput.focus();
       if (selStart !== null && typeof nextInput.setSelectionRange === 'function') {
@@ -2097,16 +2838,23 @@ export function renderApp() {
 window.addEventListener('hashchange', () => {
   if (suppressHashChange) return;
   const prevSid = state.selectedSessionId;
-  if (applyHashFromLocation()) {
-    state.waterfallExpanded = false;
-    if (state.view === 'session-detail'
-        && state.selectedSessionId
-        && (state.selectedSessionId !== prevSid || state.sessionDetail?.session?.sessionId !== state.selectedSessionId)) {
-      loadSessionDetail(state.selectedSessionId, false);
-      return;
-    }
+  if (!applyHashFromLocation()) changeView('overview');
+  state.waterfallExpanded = false;
+  refreshCurrentView();
+  renderApp();
+  if (state.view === 'session-detail'
+      && state.selectedSessionId
+      && (state.selectedSessionId !== prevSid || state.sessionDetail?.session?.sessionId !== state.selectedSessionId)) {
+    loadSessionDetail(state.selectedSessionId, false);
+  }
+  if (state.view === 'history') loadHistory();
+});
+
+window.addEventListener('pagehide', () => {
+  poolViewSeq++;
+  if (state.poolSecret) {
+    state.poolSecret = null;
     renderApp();
-    if (state.view === 'history') loadHistory();
   }
 });
 
@@ -2131,6 +2879,7 @@ window.addEventListener('keydown', e => {
 });
 
 applyHashFromLocation();
+refreshCurrentView();
 renderApp();
 ensurePollingLoop();
 connectSse();

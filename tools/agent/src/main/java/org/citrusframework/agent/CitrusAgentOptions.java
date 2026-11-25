@@ -77,6 +77,26 @@ public class CitrusAgentOptions extends CitrusAppOptions<CitrusAgentConfiguratio
             }
         });
 
+        options.add(new CliOption<>("", "pool", "Agent pool ID used for worker registration") {
+            @Override
+            protected void doProcess(CitrusAgentConfiguration configuration, String arg, String value, LinkedList<String> remainingArgs) {
+                if (!StringUtils.hasText(value)) {
+                    throw new CitrusRuntimeException("Missing parameter value for --pool option");
+                }
+                configuration.setPool(value);
+            }
+        });
+
+        options.add(new CliOption<>("k", "registration-key", "Registration key used to join the worker pool") {
+            @Override
+            protected void doProcess(CitrusAgentConfiguration configuration, String arg, String value, LinkedList<String> remainingArgs) {
+                if (!StringUtils.hasText(value)) {
+                    throw new CitrusRuntimeException("Missing parameter value for -k/--registration-key option");
+                }
+                configuration.setRegistrationKey(value);
+            }
+        });
+
         options.add(new CliOption<>("C", "capabilities", "Comma-separated worker capabilities (key=value)") {
             @Override
             protected void doProcess(CitrusAgentConfiguration configuration, String arg, String value, LinkedList<String> remainingArgs) {

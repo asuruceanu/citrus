@@ -20,15 +20,16 @@ import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.IntStream;
 
 import org.citrusframework.distribution.config.DistributionJson;
 import org.citrusframework.distribution.config.DistributionSettings;
 import org.citrusframework.distribution.model.ArtifactKind;
 import org.citrusframework.distribution.model.ArtifactRef;
-import org.citrusframework.distribution.model.CoordinatorEvent;
 import org.citrusframework.distribution.model.BuildSessionRecord;
 import org.citrusframework.distribution.model.CompleteSessionRequest;
+import org.citrusframework.distribution.model.CoordinatorEvent;
 import org.citrusframework.distribution.model.CreateSessionRequest;
 import org.citrusframework.distribution.model.PartitionAssignPayload;
 import org.citrusframework.distribution.model.PartitionCompletedPayload;
@@ -37,6 +38,7 @@ import org.citrusframework.distribution.model.PartitionRecord;
 import org.citrusframework.distribution.model.PartitionState;
 import org.citrusframework.distribution.model.ReportLocalTestsRequest;
 import org.citrusframework.distribution.model.SessionStatus;
+import org.citrusframework.distribution.model.SessionSummary;
 import org.citrusframework.distribution.model.SubmitWorkRequest;
 import org.citrusframework.distribution.model.TestExecutionRecord;
 import org.citrusframework.distribution.model.TestOutcomeStatus;
@@ -47,6 +49,7 @@ import org.citrusframework.distribution.model.WorkerRecord;
 import org.citrusframework.distribution.model.WorkerRegisterPayload;
 import org.citrusframework.distribution.model.WorkerState;
 import org.citrusframework.distribution.model.WorkerTestEventPayload;
+import org.citrusframework.distribution.model.WorkerWarningCode;
 import org.citrusframework.distribution.model.WorkerWsMessage;
 import org.citrusframework.distribution.model.WorkspaceFileSet;
 import org.citrusframework.distribution.store.JdbcDistributionStore;
@@ -1031,8 +1034,8 @@ class SessionCoordinatorTest {
                 SessionStatus.RUNNING, now - 5_000L, 0L,
                 1, 0, 0, 0, 1, 1, 0L, 0L));
         store.upsertWorker(new WorkerRecord(
-                "worker-cache-orphan", "host-1", Map.of(),
-                WorkerState.BUSY, "part-cache-run", now, now - 10_000L, stats));
+                "worker-cache-orphan", "host-1", "v1", "pool", "Original pool", Map.of(),
+                WorkerState.BUSY, "part-cache-run", "Old > test", now, now, now - 10_000L, stats, List.of()));
         store.savePartition(new PartitionRecord(
                 "part-cache-run", "sess-cache-abort", "worker-cache-orphan",
                 PartitionState.RUNNING, 1, 2_000L, now - 3_000L, 0L,
@@ -1043,6 +1046,10 @@ class SessionCoordinatorTest {
         assertThat(store.listWorkers()).singleElement().satisfies(w -> {
             assertThat(w.state()).isEqualTo(WorkerState.IDLE);
             assertThat(w.cacheStats()).isEqualTo(stats);
+            assertThat(w.version()).isEqualTo("v1");
+            assertThat(w.poolId()).isEqualTo("pool");
+            assertThat(w.poolDisplayName()).isEqualTo("Original pool");
+            assertThat(w.activeTestDisplay()).isNull();
         });
     }
 
@@ -1125,6 +1132,640 @@ class SessionCoordinatorTest {
         assertThat(completed.totalTests()).isEqualTo(2);
     }
 
+    private static final Map<String, String> JDK = Map.of("jdk", "21");
+    private static final Map<String, String> DOCKER = Map.of("jdk", "21", "docker", "true");
+
+    private AtomicLong useControlledClock(boolean requirePool) {
+        AtomicLong clock = new AtomicLong(10_000_000L);
+        coordinator = new SessionCoordinator(DistributionCoordinatorConfig.builder().clock(clock::get)
+                .requireAgentPool(requirePool).leaseTimeoutMs(100_000_000L).build(), store, hub);
+        return clock;
+    }
+
+    private Worker join(String name, String poolId, String secret, Map<String, String> caps) {
+        Worker worker = new Worker(name);
+        coordinator.registerWorker(name, new WorkerRegisterPayload(name, "host", "5.0", poolId, secret, caps, null),
+                worker.received::add, () -> worker.closed = true);
+        return worker;
+    }
+
+    private WorkerRecord row(String id) {
+        return store.listWorkers().stream().filter(w -> id.equals(w.workerId())).findFirst().orElseThrow();
+    }
+
+    private void renew(Worker worker, String pool, String key) {
+        worker.send(WorkerWsMessage.WORKER_RENEW, Map.of("workerId", worker.connectionId, "poolId", pool, "registrationKey", key));
+    }
+
+    private void assertRejected(Worker worker, String code) {
+        assertThat(worker.messagesOfType(WorkerWsMessage.WORKER_REJECTED)).singleElement()
+                .satisfies(m -> assertThat(m.payload()).containsEntry("code", code));
+        assertThat(worker.closed).isTrue();
+    }
+
+    private void demand(String session, String id, Map<String, String> caps) {
+        submit(session, id, List.of(), List.of(), false, new WorkUnitSpec(id, id, null, null, caps, 100L));
+    }
+
+    @Test
+    void rejectsUnusableRegistrationWithoutChangingKeyUsage() {
+        useControlledClock(true);
+        var a = coordinator.createAgentPool("A", JDK, true, "first");
+        var b = coordinator.createAgentPool("B", JDK, false, null);
+        String id = a.pool().poolId();
+        String secret = a.generatedKey().secretKey();
+        assertThat(id).matches("[a-z0-9]{8}");
+        assertThat(secret).matches("ctrk_[a-z0-9]{8}_[a-z0-9]{32}");
+        assertRejected(join("none", null, null, JDK), "POOL_REQUIRED");
+        assertRejected(join("missing", "unknown", secret, JDK), "POOL_NOT_FOUND");
+        assertRejected(join("wrong", b.pool().poolId(), secret, JDK), "INVALID_REGISTRATION_KEY");
+        assertRejected(join("no-cap", id, secret, Map.of()), "MISSING_POOL_CAPABILITIES");
+        assertRejected(join("x".repeat(129), id, secret, JDK), "INVALID_WORKER_METADATA");
+        coordinator.revokeRegistrationKey(id, a.generatedKey().metadata().keyId());
+        assertRejected(join("revoked", id, secret, JDK), "REVOKED_REGISTRATION_KEY");
+        assertThat(store.listWorkers()).isEmpty();
+        assertThat(coordinator.listRegistrationKeys(id).orElseThrow()).singleElement()
+                .satisfies(key -> assertThat(key.lastUsedAt()).isNull());
+        var events = new java.util.ArrayList<CoordinatorEvent>();
+        store.replayEvents(null, 0, 2000, events::add);
+        assertThat(events).extracting(CoordinatorEvent::type).contains("pool.updated", "worker.rejected");
+        assertThat(DistributionJson.toJson(events)).doesNotContain(secret, store.listRegistrationKeys(id).getFirst().keyHash());
+    }
+
+    @Test
+    void sendsWorkerRejectionAndClosesWhenEventPersistenceFails() {
+        var database = "jdbc:hsqldb:mem:rejection_failure_" + System.nanoTime();
+        try (var failing = new JdbcDistributionStore(database, "SA", "") {
+            @Override
+            public long appendEvent(CoordinatorEvent event, String deliveryId, TestExecutionRecord result,
+                                    List<PartitionRecord> partitions) {
+                if ("worker.rejected".equals(event.type())) {
+                    throw new IllegalStateException("Simulated rejection event write failure");
+                }
+                return super.appendEvent(event, deliveryId, result, partitions);
+            }
+        }) {
+            failing.initialize();
+            var config = DistributionCoordinatorConfig.builder().requireAgentPool(true).build();
+            var rejecting = new SessionCoordinator(config, failing, new CoordinatorEventStreamHub(failing));
+            var worker = new Worker("rejected");
+            assertThatThrownBy(() -> rejecting.registerWorker(worker.connectionId,
+                    new WorkerRegisterPayload("worker", "host", JDK),
+                    message -> {
+                        assertThat(worker.closed).isFalse();
+                        worker.received.add(message);
+                    }, () -> worker.closed = true))
+                    .isInstanceOf(IllegalStateException.class).hasMessage("Simulated rejection event write failure");
+            assertRejected(worker, "POOL_REQUIRED");
+        }
+    }
+
+    @Test
+    void persistsWorkerRejectionWhenTheSocketWriteThrows() {
+        useControlledClock(true);
+        var worker = new Worker("rejected");
+        assertThatThrownBy(() -> coordinator.registerWorker(worker.connectionId,
+                new WorkerRegisterPayload("worker", "host", JDK),
+                message -> { throw new IllegalStateException("Simulated socket write failure"); },
+                () -> worker.closed = true))
+                .isInstanceOf(IllegalStateException.class).hasMessage("Simulated socket write failure");
+        assertThat(worker.closed).isTrue();
+        var events = new java.util.ArrayList<CoordinatorEvent>();
+        store.replayEvents(null, 0, 100, events::add);
+        assertThat(events).singleElement().satisfies(event -> {
+            assertThat(event.type()).isEqualTo("worker.rejected");
+            assertThat(event.data()).containsEntry("code", "POOL_REQUIRED");
+        });
+    }
+
+    @Test
+    void honorsRevocationDeadlineAndReassignsActiveWorkOnRenewal() {
+        var now = useControlledClock(false);
+        var a = coordinator.createAgentPool("A", JDK, true, "key");
+        String pool = a.pool().poolId();
+        var generated = a.generatedKey();
+        var worker = join("pooled", pool, generated.secretKey(), JDK);
+        var second = join("second", pool, generated.secretKey(), JDK);
+        var fallback = join("fallback", null, null, JDK);
+        String session = newSession(2);
+        demand(session, "first", JDK);
+        now.incrementAndGet();
+        coordinator.revokeRegistrationKey(pool, generated.metadata().keyId());
+        long deadline = now.get() + 3_600_000L;
+        assertThat(row("pooled").warnings()).singleElement().satisfies(w -> {
+            assertThat(w.code()).isEqualTo(WorkerWarningCode.KEY_REVOKED);
+            assertThat(w.disconnectAt()).isEqualTo(deadline);
+        });
+        coordinator.deleteAgentPool(pool);
+        renew(worker, pool, generated.secretKey());
+        assertRejected(worker, "REVOKED_REGISTRATION_KEY");
+        assertThat(fallback.lastAssignment().attempt()).isEqualTo(2);
+        now.set(deadline);
+        coordinator.sweepExpiredLeases();
+        assertRejected(second, "REVOKED_REGISTRATION_KEY");
+        assertThat(row("second").state()).isEqualTo(WorkerState.OFFLINE);
+    }
+
+    @Test
+    void preservesDriftDeadlineOnRenewalAndClearsOnlyWhenRequirementsRestored() {
+        var now = useControlledClock(false);
+        var a = coordinator.createAgentPool("A", JDK, true, null);
+        String pool = a.pool().poolId();
+        String key = a.generatedKey().secretKey();
+        var worker = join("worker", pool, key, JDK);
+        coordinator.updateAgentPool(pool, "renamed", DOCKER);
+        var drift = row("worker").warnings().getFirst();
+        assertThat(drift.code()).isEqualTo(WorkerWarningCode.POOL_CAPABILITY_MISMATCH);
+        assertThat(drift.disconnectAt()).isEqualTo(now.get() + 14_400_000L);
+        String session = newSession(1);
+        demand(session, "docker", DOCKER);
+        assertThat(worker.assignments()).isEmpty();
+        demand(session, "java", JDK);
+        assertThat(worker.assignments()).hasSize(1);
+        now.set(drift.disconnectAt() - 1);
+        renew(worker, pool, key);
+        assertThat(worker.messagesOfType(WorkerWsMessage.WORKER_RENEWED)).hasSize(1);
+        assertThat(row("worker").warnings()).containsExactly(drift);
+        assertThat(coordinator.listRegistrationKeys(pool).orElseThrow().getFirst().lastUsedAt()).isEqualTo(now.get());
+        coordinator.updateAgentPool(pool, "renamed again", DOCKER);
+        assertThat(row("worker").warnings()).containsExactly(drift);
+        coordinator.updateAgentPool(pool, "restored", JDK);
+        assertThat(row("worker").warnings()).isEmpty();
+        coordinator.updateAgentPool(pool, "drift", DOCKER);
+        now.set(row("worker").warnings().getFirst().disconnectAt());
+        renew(worker, pool, key);
+        assertRejected(worker, "MISSING_POOL_CAPABILITIES");
+    }
+
+    @Test
+    void keepsDeletedPoolWorkersOnExistingPartitionUntilDeadlineAndPreventsNewAssignments() {
+        var now = useControlledClock(false);
+        var a = coordinator.createAgentPool("A", JDK, true, null);
+        String pool = a.pool().poolId();
+        String key = a.generatedKey().secretKey();
+        var worker = join("worker", pool, key, JDK);
+        var other = join("other", pool, key, JDK);
+        String session = newSession(1);
+        demand(session, "first", JDK);
+        var assigned = other.lastAssignment();
+        coordinator.deleteAgentPool(pool);
+        var warning = row("other").warnings().getFirst();
+        assertThat(warning.code()).isEqualTo(WorkerWarningCode.POOL_DELETED);
+        assertThat(warning.disconnectAt()).isEqualTo(now.get() + 14_400_000L);
+        demand(session, "second", JDK);
+        other.complete(assigned, assigned.attempt(), List.of());
+        assertThat(other.assignments()).hasSize(1);
+        assertThat(worker.assignments()).isEmpty();
+        now.set(warning.disconnectAt() - 1);
+        renew(other, pool, key);
+        assertThat(other.messagesOfType(WorkerWsMessage.WORKER_RENEWED)).hasSize(1);
+        assertThat(row("other").warnings()).containsExactly(warning);
+        renew(worker, pool, "different-secret");
+        assertRejected(worker, "INVALID_REGISTRATION_KEY");
+        now.incrementAndGet();
+        renew(other, pool, key);
+        assertRejected(other, "POOL_NOT_FOUND");
+        assertThat(lastEvent(null, "pool.deleted").data()).containsEntry("poolId", pool);
+    }
+
+    @Test
+    void choosesByPoolPriorityThenFallsBackAndIgnoresWorkerOnlyCapabilities() {
+        useControlledClock(false);
+        var low = coordinator.createAgentPool("low", JDK, true, "");
+        var high = coordinator.createAgentPool("high", JDK, true, "");
+        coordinator.reorderAgentPools(List.of(high.pool().poolId(), low.pool().poolId()));
+        var preferred = join("z", high.pool().poolId(), high.generatedKey().secretKey(), DOCKER);
+        var next = join("y", low.pool().poolId(), low.generatedKey().secretKey(), JDK);
+        var fallback = join("a", null, null, JDK);
+        String session = newSession(1);
+        demand(session, "docker", DOCKER);
+        demand(session, "first", JDK);
+        assertThat(preferred.lastAssignment().workUnits().getFirst().key()).isEqualTo("first");
+        demand(session, "second", JDK);
+        assertThat(next.lastAssignment().workUnits().getFirst().key()).isEqualTo("second");
+        demand(session, "third", JDK);
+        assertThat(fallback.lastAssignment().workUnits().getFirst().key()).isEqualTo("third");
+        var sample = coordinator.sampleUsageNow();
+        assertThat(sample.activeJobs()).hasSize(2).allSatisfy(j -> assertThat(j.activeSessionIds()).containsExactly(session));
+        assertThat(coordinator.queryHistoricalUsage("1h", "").series().getLast().activeJobs()).isOne();
+        assertThat(coordinator.queryHistoricalUsage("1h", "docker").series().getLast().connected()).isZero();
+    }
+
+    @Test
+    void updatesLiveTestOnlyForCurrentAttemptAndPreservesMetadataOnRestart() {
+        var now = useControlledClock(false);
+        var pool = coordinator.createAgentPool("First", JDK, true, "");
+        var worker = join("worker", pool.pool().poolId(), pool.generatedKey().secretKey(), JDK);
+        String session = newSession(2);
+        demand(session, "first", JDK);
+        var assignment = worker.lastAssignment();
+        var start = new WorkerTestEventPayload(assignment.partitionId(), session, 1, "key", "org.acme.OrderIT", "shouldCreate",
+                TestOutcomeStatus.STARTED, 0L, null, null, List.of());
+        now.incrementAndGet();
+        worker.send(WorkerWsMessage.TEST_EVENT, DistributionJson.convert(start, Map.class));
+        assertThat(row("worker").activeTestDisplay()).isEqualTo("OrderIT > shouldCreate");
+        assertThat(row("worker").stateUpdatedAt()).isEqualTo(now.get());
+        now.incrementAndGet();
+        worker.complete(assignment, assignment.attempt(), List.of());
+        assertThat(row("worker").activeTestDisplay()).isNull();
+        assertThat(row("worker").stateUpdatedAt()).isEqualTo(now.get());
+        demand(session, "second", JDK);
+        @SuppressWarnings("unchecked")
+        Map<String, Object> replay = DistributionJson.convert(start, Map.class);
+        replay.put(WorkerWsMessage.DELIVERY_ID, "0000000000000000001-00000000-0000-0000-0000-000000000001");
+        worker.send(WorkerWsMessage.TEST_EVENT, replay);
+        assertThat(row("worker").activeTestDisplay()).isNull();
+        coordinator = new SessionCoordinator(DistributionCoordinatorConfig.builder().clock(now::get).build(), store, hub);
+        coordinator.restorePendingWork();
+        var offline = row("worker");
+        assertThat(offline.state()).isEqualTo(WorkerState.OFFLINE);
+        assertThat(offline.activePartitionId()).isNull();
+        assertThat(offline.version()).isEqualTo("5.0");
+        assertThat(offline.poolId()).isEqualTo(pool.pool().poolId());
+        assertThat(offline.poolDisplayName()).isEqualTo("First");
+        assertThat(coordinator.listAgentPools()).singleElement().satisfies(p -> assertThat(p.connectedWorkers()).isZero());
+    }
+
+    @Test
+    void countsDeletedPoolCapacityDuringGraceWithoutAllocatingNewDemandToIt() {
+        useControlledClock(false);
+        var old = coordinator.createAgentPool("Retired", JDK, true, null);
+        var active = coordinator.createAgentPool("Current", JDK, true, null);
+        join("old-worker", old.pool().poolId(), old.generatedKey().secretKey(), DOCKER);
+        join("new-worker", active.pool().poolId(), active.generatedKey().secretKey(), JDK);
+        var session = newSession(0);
+        demand(session, "one", JDK);
+        coordinator.deleteAgentPool(old.pool().poolId());
+        demand(session, "two", JDK);
+        coordinator.sampleUsageNow();
+        var usage = coordinator.queryHistoricalUsage("1h", "jdk=21");
+        assertThat(usage.series().getLast().connected()).isEqualTo(2);
+        assertThat(usage.series().getLast().utilized()).isEqualTo(2);
+        assertThat(usage.pools()).extracting(p -> p.displayName(), p -> p.points().getLast().desired())
+                .containsExactly(tuple("Retired", 0), tuple("Current", 2));
+        assertThat(coordinator.queryHistoricalUsage("1h", "docker").pools()).isEmpty();
+    }
+
+    @Test
+    void aRenewalCannotSwitchWorkerPoolOrKeyOrTouchAnotherKeysUsage() {
+        var now = useControlledClock(false);
+        var first = coordinator.createAgentPool("First", JDK, true, null);
+        var second = coordinator.createAgentPool("Second", JDK, true, null);
+        String pool = first.pool().poolId();
+        var unused = coordinator.generateRegistrationKey(pool, "second key").orElseThrow();
+        var registered = join("worker", pool, first.generatedKey().secretKey(), JDK);
+        long registeredAt = now.getAndIncrement();
+        renew(registered, pool, unused.secretKey());
+        assertRejected(registered, "INVALID_REGISTRATION_KEY");
+        assertThat(store.findRegistrationKey(unused.metadata().keyId()).orElseThrow().metadata().lastUsedAt()).isNull();
+        assertThat(store.findRegistrationKey(first.generatedKey().metadata().keyId()).orElseThrow().metadata().lastUsedAt())
+                .isEqualTo(registeredAt);
+        var reconnected = join("other", pool, first.generatedKey().secretKey(), JDK);
+        renew(reconnected, second.pool().poolId(), second.generatedKey().secretKey());
+        assertRejected(reconnected, "INVALID_REGISTRATION_KEY");
+        assertThat(store.findRegistrationKey(second.generatedKey().metadata().keyId()).orElseThrow().metadata().lastUsedAt())
+                .isNull();
+        var third = join("third", pool, first.generatedKey().secretKey(), JDK);
+        third.send(WorkerWsMessage.WORKER_RENEW, Map.of("workerId", "other", "poolId", pool,
+                "registrationKey", first.generatedKey().secretKey()));
+        assertRejected(third, "INVALID_REGISTRATION_KEY");
+    }
+
+    @Test
+    void adaptiveSizingUsesPoolCapabilitiesAndIncludesBusyWorkers() {
+        var now = new AtomicLong(500L);
+        coordinator = new SessionCoordinator(DistributionCoordinatorConfig.builder().clock(now::get)
+                .defaultMaxPartitionSize(2).minPartitionDurationMs(0).maxWavesPerWorker(2).build(), store, hub);
+        var java = coordinator.createAgentPool("Java", JDK, true, null);
+        var containers = coordinator.createAgentPool("Containers", DOCKER, true, null);
+        join("hidden-docker", java.pool().poolId(), java.generatedKey().secretKey(), DOCKER);
+        join("busy-docker", containers.pool().poolId(), containers.generatedKey().secretKey(), DOCKER);
+        demand(newSession(0), "busy", DOCKER);
+        String session = coordinator.createSession(new CreateSessionRequest("p", "main", "sha", List.of(), 0, 0)).sessionId();
+        WorkUnitSpec[] units = IntStream.range(0, 12)
+                .mapToObj(i -> new WorkUnitSpec("T" + i, "T" + i, null, null, DOCKER, 100L)).toArray(WorkUnitSpec[]::new);
+        submit(session, "adaptive", List.of(), List.of(), false, units);
+        assertThat(store.listPartitions(session)).hasSize(2)
+                .allSatisfy(partition -> assertThat(partition.workUnits()).hasSize(6));
+    }
+
+    @Test
+    void earlierCompletionCannotConfirmCancellationOfALaterAttempt() {
+        var now = useControlledClock(false);
+        var worker = join("worker", null, null, JDK);
+        String session = newSession(3);
+        demand(session, "work", JDK);
+        var first = worker.lastAssignment();
+        startTest(worker, first, "First", "one");
+        now.addAndGet(100_000_001L);
+        coordinator.sweepExpiredLeases();
+        assertThat(row("worker").activeTestDisplay()).isNull();
+        worker.complete(first, 1, List.of());
+        var second = worker.lastAssignment();
+        assertThat(second.attempt()).isEqualTo(2);
+        startTest(worker, second, "Second", "two");
+        assertThat(row("worker").activeTestDisplay()).isEqualTo("Second > two");
+        now.addAndGet(100_000_001L);
+        coordinator.sweepExpiredLeases();
+        worker.complete(first, 1, List.of());
+        assertThat(worker.assignments()).hasSize(2);
+        worker.complete(second, 2, List.of());
+        var third = worker.lastAssignment();
+        assertThat(third.attempt()).isEqualTo(3);
+        startTest(worker, third, "Third", "three");
+        coordinator.handleWorkerDisconnect("worker");
+        assertThat(row("worker").activeTestDisplay()).isNull();
+        assertThat(row("worker").state()).isEqualTo(WorkerState.OFFLINE);
+    }
+
+    private void startTest(Worker worker, PartitionAssignPayload assignment, String className, String testName) {
+        worker.send(WorkerWsMessage.TEST_EVENT, DistributionJson.convert(new WorkerTestEventPayload(assignment.partitionId(),
+                assignment.sessionId(), assignment.attempt(), "key", className, testName, TestOutcomeStatus.STARTED,
+                0L, null, null, List.of()), Map.class));
+    }
+
+    @Test
+    void prefersTheHighestPriorityPoolEvenWhenItsWorkerAlreadyAttemptedThePartition() {
+        useControlledClock(false);
+        var pool = coordinator.createAgentPool("First", JDK, true, null);
+        var original = join("worker", pool.pool().poolId(), pool.generatedKey().secretKey(), JDK);
+        var session = newSession(2);
+        demand(session, "first", JDK);
+        var first = original.lastAssignment();
+        startTest(original, first, "T", "one");
+        var duplicate = new Worker("duplicate");
+        coordinator.registerWorker(duplicate.connectionId, new WorkerRegisterPayload("worker", "host", "5.0",
+                pool.pool().poolId(), pool.generatedKey().secretKey(), JDK, null), duplicate.received::add);
+        var fallback = join("fallback", null, null, JDK);
+        assertThat(row("worker").activeTestDisplay()).isEqualTo("T > one");
+        assertThat(coordinator.getAgentPoolDetail(pool.pool().poolId()).orElseThrow().pool().connectedWorkers()).isOne();
+        assertThat(coordinator.sampleUsageNow().pools().getFirst().connected()).isOne();
+        coordinator.handleWorkerDisconnect("worker");
+        assertThat(duplicate.lastAssignment().attempt()).isEqualTo(2);
+        assertThat(fallback.assignments()).isEmpty();
+        assertThat(row("worker").state()).isEqualTo(WorkerState.BUSY);
+    }
+
+    @Test
+    void sweepRequeuesAnActiveWorkerAtTheOriginalRevocationDeadline() {
+        var now = useControlledClock(false);
+        var pool = coordinator.createAgentPool("A", JDK, true, null);
+        var original = join("worker", pool.pool().poolId(), pool.generatedKey().secretKey(), JDK);
+        var fallback = join("fallback", null, null, JDK);
+        demand(newSession(2), "work", JDK);
+        var assigned = original.lastAssignment();
+        startTest(original, assigned, "T", "test");
+        coordinator.revokeRegistrationKey(pool.pool().poolId(), pool.generatedKey().metadata().keyId());
+        now.addAndGet(3_599_999);
+        coordinator.revokeRegistrationKey(pool.pool().poolId(), pool.generatedKey().metadata().keyId());
+        coordinator.sweepExpiredLeases();
+        assertThat(original.closed).isFalse();
+        now.incrementAndGet();
+        coordinator.sweepExpiredLeases();
+        assertRejected(original, "REVOKED_REGISTRATION_KEY");
+        assertThat(row("worker").activeTestDisplay()).isNull();
+        assertThat(row("worker").warnings()).isEmpty();
+        assertThat(fallback.lastAssignment().attempt()).isEqualTo(2);
+        assertThat(fallback.lastAssignment().partitionId()).isEqualTo(assigned.partitionId());
+    }
+
+    @Test
+    void registersLegacyWorkersWithLargeCapabilityMapsAndMatchesTheirExactValues() {
+        useControlledClock(false);
+        var capabilities = Map.of("large", "x".repeat(5000), "variant", "exact");
+        var worker = register("legacy", "legacy", capabilities);
+        assertThat(worker.messagesOfType(WorkerWsMessage.WORKER_REGISTERED)).hasSize(1);
+        assertThat(row("legacy").capabilities()).isEqualTo(capabilities);
+        var session = newSession(0);
+        demand(session, "wrong", Map.of("variant", "other"));
+        demand(session, "right", Map.of("variant", "exact"));
+        assertThat(worker.assignments()).singleElement().satisfies(
+                assignment -> assertThat(assignment.workUnits().getFirst().key()).isEqualTo("right"));
+        assertThat(coordinator.sampleUsageNow().unpooledWorkers().getFirst().capabilities()).isEqualTo(capabilities);
+    }
+
+    private static final class FailingWorkerProjectionStore extends JdbcDistributionStore {
+        private boolean failWorkerRow;
+        private boolean failWorkerEvent;
+
+        FailingWorkerProjectionStore() {
+            super("jdbc:hsqldb:mem:worker_projection_" + System.nanoTime(), "SA", "");
+        }
+
+        @Override
+        public void upsertWorker(WorkerRecord worker) {
+            if (failWorkerRow) {
+                failWorkerRow = false;
+                throw new IllegalStateException("Simulated worker row failure");
+            }
+            super.upsertWorker(worker);
+        }
+
+        @Override
+        public long appendEvent(CoordinatorEvent event, String deliveryId, TestExecutionRecord result,
+                                List<PartitionRecord> partitions) {
+            if (failWorkerEvent && "worker.updated".equals(event.type())) {
+                failWorkerEvent = false;
+                throw new IllegalStateException("Simulated worker event failure");
+            }
+            return super.appendEvent(event, deliveryId, result, partitions);
+        }
+    }
+
+    private AtomicLong useProjectionStore(FailingWorkerProjectionStore failing) {
+        failing.initialize();
+        store = failing;
+        hub = new CoordinatorEventStreamHub(store);
+        return useControlledClock(false);
+    }
+
+    @Test
+    void preservesDeletedPoolGraceForEveryConnectionWhenWorkerProjectionFails() {
+        try (var failing = new FailingWorkerProjectionStore()) {
+            var clock = useProjectionStore(failing);
+            var pool = coordinator.createAgentPool("Retiring", JDK, true, null);
+            String id = pool.pool().poolId();
+            String key = pool.generatedKey().secretKey();
+            var first = join("first", id, key, JDK);
+            var second = join("second", id, key, JDK);
+            failing.failWorkerRow = true;
+            assertThat(coordinator.deleteAgentPool(id)).isTrue();
+            long deadline = clock.get() + 14_400_000L;
+            clock.set(deadline - 1);
+            demand(newSession(0), "unassigned", JDK);
+            for (Worker worker : List.of(first, second)) {
+                renew(worker, id, key);
+                assertThat(worker.messagesOfType(WorkerWsMessage.WORKER_RENEWED)).hasSize(1);
+                worker.heartbeat(null);
+                assertThat(row(worker.connectionId).warnings()).singleElement().satisfies(warning -> {
+                    assertThat(warning.code()).isEqualTo(WorkerWarningCode.POOL_DELETED);
+                    assertThat(warning.disconnectAt()).isEqualTo(deadline);
+                });
+                assertThat(worker.assignments()).isEmpty();
+            }
+            clock.set(deadline);
+            coordinator.sweepExpiredLeases();
+            assertRejected(first, "POOL_NOT_FOUND");
+            assertRejected(second, "POOL_NOT_FOUND");
+        }
+    }
+
+    @Test
+    void appliesPoolEditsAndRevocationsToAllWorkersWhenTheirUpdateEventFails() {
+        try (var failing = new FailingWorkerProjectionStore()) {
+            var clock = useProjectionStore(failing);
+            var pool = coordinator.createAgentPool("Pool", JDK, true, null);
+            String id = pool.pool().poolId();
+            String key = pool.generatedKey().secretKey();
+            var first = join("first", id, key, JDK);
+            var second = join("second", id, key, JDK);
+            failing.failWorkerEvent = true;
+            coordinator.updateAgentPool(id, "Renamed", DOCKER);
+            for (Worker worker : List.of(first, second)) {
+                worker.heartbeat(null);
+                assertThat(row(worker.connectionId).warnings()).singleElement().satisfies(warning -> {
+                    assertThat(warning.code()).isEqualTo(WorkerWarningCode.POOL_CAPABILITY_MISMATCH);
+                    assertThat(warning.detectedAt()).isEqualTo(clock.get());
+                });
+            }
+            failing.failWorkerRow = true;
+            coordinator.revokeRegistrationKey(id, pool.generatedKey().metadata().keyId());
+            for (Worker worker : List.of(first, second)) {
+                worker.heartbeat(null);
+                assertThat(row(worker.connectionId).warnings()).anySatisfy(warning -> {
+                    assertThat(warning.code()).isEqualTo(WorkerWarningCode.KEY_REVOKED);
+                    assertThat(warning.disconnectAt()).isEqualTo(clock.get() + 3_600_000L);
+                });
+            }
+            clock.addAndGet(3_600_000L);
+            coordinator.sweepExpiredLeases();
+            assertRejected(first, "REVOKED_REGISTRATION_KEY");
+            assertRejected(second, "REVOKED_REGISTRATION_KEY");
+        }
+    }
+
+    @Test
+    void dispatchesCommittedAssignmentAndRetriesItsWorkerUpdateOnHeartbeat() {
+        try (var failing = new FailingWorkerProjectionStore()) {
+            var clock = useProjectionStore(failing);
+            var worker = join("worker", null, null, JDK);
+            var session = newSession(0);
+            failing.failWorkerEvent = true;
+            demand(session, "only-attempt", JDK);
+            var assignment = worker.lastAssignment();
+            assertThat(partition(session).state()).isEqualTo(PartitionState.ASSIGNED);
+            long assignedAt = row("worker").stateUpdatedAt();
+            assertThat(lastEvent(null, "worker.updated").data()).containsEntry("state", "IDLE");
+            clock.incrementAndGet();
+            worker.heartbeat(assignment.partitionId());
+            assertThat(row("worker").stateUpdatedAt()).isEqualTo(assignedAt);
+            assertThat(lastEvent(null, "worker.updated").data()).containsEntry("state", "BUSY");
+            worker.complete(assignment, 1, List.of());
+            assertThat(partition(session).state()).isEqualTo(PartitionState.COMPLETED);
+            assertThat(worker.assignments()).hasSize(1);
+        }
+    }
+
+    @Test
+    void samplesLegacyUnpooledCapabilitiesContainingNullValues() {
+        useControlledClock(false);
+        var capabilities = new java.util.LinkedHashMap<String, String>();
+        capabilities.put("jdk", "21");
+        capabilities.put("gpu", null);
+        register("legacy-connection", "legacy", capabilities);
+        register("other-connection", "other", Map.of("gpu", "true"));
+
+        var sample = coordinator.sampleUsageNow();
+        assertThat(sample.unpooledWorkers()).hasSize(2);
+        assertThat(sample.unpooledWorkers()).filteredOn(bucket -> bucket.capabilities().containsKey("jdk")).singleElement()
+                .satisfies(bucket -> assertThat(bucket.capabilities()).containsEntry("gpu", null));
+        assertThat(coordinator.queryHistoricalUsage("1h", "").series().getLast().connected()).isEqualTo(2);
+        assertThat(coordinator.queryHistoricalUsage("1h", "jdk=21").series().getLast().connected()).isOne();
+        assertThat(coordinator.queryHistoricalUsage("1h", "gpu").series().getLast().connected()).isOne();
+    }
+
+    @Test
+    void keepsCommittedResultInSummaryWhenWorkerStatusWriteFailsBeforeAcknowledgement() {
+        assertRecoveryAfter(FailedWrite.WORKER_STATUS);
+    }
+
+    @Test
+    void heartbeatShowsRemainingTestAfterSummaryWriteFailureAndJournalReplay() {
+        assertRecoveryAfter(FailedWrite.SESSION_SUMMARY);
+    }
+
+    private enum FailedWrite { WORKER_STATUS, SESSION_SUMMARY }
+
+    private void assertRecoveryAfter(FailedWrite failure) {
+        class FailingStore extends JdbcDistributionStore {
+            FailedWrite failNext;
+
+            FailingStore() {
+                super("jdbc:hsqldb:mem:status_failure_" + System.nanoTime(), "SA", "");
+            }
+
+            @Override
+            public void upsertWorker(WorkerRecord worker) {
+                failOnce(FailedWrite.WORKER_STATUS);
+                super.upsertWorker(worker);
+            }
+
+            @Override
+            public void updateSessionStatus(String sessionId, SessionStatus status, long finishedAt,
+                                            SessionSummary summary, String failureReason) {
+                failOnce(FailedWrite.SESSION_SUMMARY);
+                super.updateSessionStatus(sessionId, status, finishedAt, summary, failureReason);
+            }
+
+            private void failOnce(FailedWrite write) {
+                if (failNext == write) {
+                    failNext = null;
+                    throw new IllegalStateException("Simulated write failure: " + write);
+                }
+            }
+        }
+
+        try (var failing = new FailingStore()) {
+            failing.initialize();
+            var config = DistributionCoordinatorConfig.builder().leaseTimeoutMs(60_000L).build();
+            coordinator = new SessionCoordinator(config, failing, new CoordinatorEventStreamHub(failing));
+            var worker = join("worker", null, null, JDK);
+            String session = newSession(1);
+            demand(session, "partition", JDK);
+            var assignment = worker.lastAssignment();
+            startTest(worker, assignment, "Test", "remaining");
+            startTest(worker, assignment, "Test", "one");
+            assertThat(failing.listWorkers().getFirst().activeTestDisplay()).isEqualTo("Test > one");
+            var failed = new WorkerTestEventPayload(assignment.partitionId(), session, assignment.attempt(), "key",
+                    "Test", "one", TestOutcomeStatus.FAILED, 22L, "assertion failed", null, List.of());
+            @SuppressWarnings("unchecked")
+            Map<String, Object> payload = DistributionJson.convert(failed, Map.class);
+            String delivery = "0000000000000000001-00000000-0000-0000-0000-000000000001";
+            payload.put(WorkerWsMessage.DELIVERY_ID, delivery);
+            failing.failNext = failure;
+            assertThatThrownBy(() -> worker.send(WorkerWsMessage.TEST_EVENT, payload))
+                    .isInstanceOf(IllegalStateException.class).hasMessage("Simulated write failure: " + failure);
+            assertThat(failing.hasDelivery(delivery)).isTrue();
+            assertThat(worker.messagesOfType(WorkerWsMessage.RESULT_ACK)).isEmpty();
+
+            worker.send(WorkerWsMessage.TEST_EVENT, payload);
+            assertThat(worker.messagesOfType(WorkerWsMessage.RESULT_ACK)).hasSize(1);
+            assertThat(failing.listTestExecutions(session)).hasSize(1);
+            var events = new java.util.ArrayList<CoordinatorEvent>();
+            failing.replayEvents(null, 0L, 100, events::add);
+            long beforeHeartbeat = events.getLast().sequence();
+            worker.heartbeat(assignment.partitionId());
+            events.clear();
+            failing.replayEvents(null, beforeHeartbeat, 100, events::add);
+            assertThat(events).extracting(CoordinatorEvent::type).contains("worker.updated");
+            assertThat(failing.listWorkers().getFirst().activeTestDisplay()).isEqualTo("Test > remaining");
+            worker.complete(assignment, assignment.attempt(), List.of());
+            var summary = coordinator.completeSession(session, new CompleteSessionRequest(0, 0, 0, 0L));
+            assertThat(summary.failedTests()).isOne();
+            assertThat(summary.status()).isEqualTo(SessionStatus.FAILED);
+        }
+    }
+
     private String newSession(int maxRetries) {
         return coordinator.createSession(new CreateSessionRequest("citrus", "main", "abc", List.of(), 1, maxRetries)).sessionId();
     }
@@ -1152,7 +1793,7 @@ class SessionCoordinatorTest {
 
     private CoordinatorEvent lastEvent(String sessionId, String type) {
         List<CoordinatorEvent> matching = new java.util.ArrayList<>();
-        store.replayEvents(sessionId, 0, 0, event -> {
+        store.replayEvents(sessionId, 0, 2000, event -> {
             if (event.type().equals(type)) {
                 matching.add(event);
             }
@@ -1172,6 +1813,7 @@ class SessionCoordinatorTest {
     }
 
     private final class Worker {
+        private boolean closed;
         private final String connectionId;
         private final List<WorkerWsMessage> received = new CopyOnWriteArrayList<>();
 

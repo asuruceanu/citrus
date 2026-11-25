@@ -38,6 +38,7 @@ class DistributionCoordinatorUiTest {
         DistributionCoordinatorConfig config = DistributionCoordinatorConfig.builder()
                 .port(0)
                 .authToken("ui-token")
+                .usageSampleIntervalMs(150L)
                 .cacheDir(tempDir.resolve("ui-cache"))
                 .jdbcUrl("jdbc:hsqldb:file:" + tempDir.resolve("coordinator_ui_" + System.nanoTime()) + ";shutdown=true")
                 .build();
@@ -70,10 +71,27 @@ class DistributionCoordinatorUiTest {
                     HttpResponse.BodyHandlers.ofString());
             assertThat(jsResp.statusCode()).isEqualTo(200);
             assertThat(jsResp.body())
+                    .contains("Inspect distributed build sessions, artifact cache hit rates, and test outcomes.")
+                    .doesNotContain("Inspect distributed Maven & JBang reactor runs, classpath cache hit rates, and test outcomes.")
+                    .contains("data-view=${id}", "navItem('usage', 'Historical Usage'", "navItem('pools', 'Agent Pools'")
+                    .doesNotContainIgnoringCase("Connecting Builds")
+                    .doesNotContainIgnoringCase("project groups")
+                    .doesNotContainIgnoringCase("access control")
+                    .doesNotContain("minSize", "maxSize")
+                    .contains("renderAgentPools", "renderHistoricalUsage", "apiPut", "apiDelete")
+                    .contains("/api/v1/agent-pools", "/api/v1/agent-pools/priority", "/api/v1/usage")
+                    .contains("POOL_CAPABILITY_MISMATCH", "POOL_DELETED", "KEY_REVOKED")
+                    .contains("Waiting for test execution requests", "activeTestDisplay")
                     .contains("renderWaterfallSvg")
                     .contains("/api/v1/events/stream")
                     .contains("/api/v1/workers")
                     .contains("/api/v1/tests/history");
+
+            HttpResponse<String> chartResp = client.send(
+                    HttpRequest.newBuilder(URI.create(server.baseUrl() + "/ui/usage-chart.js")).GET().build(),
+                    HttpResponse.BodyHandlers.ofString());
+            assertThat(chartResp.statusCode()).isEqualTo(200);
+            assertThat(chartResp.body()).contains("export function renderUsageChart", "<svg", "usage-tooltip");
 
             HttpResponse<String> htmResp = client.send(
                     HttpRequest.newBuilder(URI.create(server.baseUrl() + "/ui/vendor/htm-mini.js")).GET().build(),
@@ -82,6 +100,18 @@ class DistributionCoordinatorUiTest {
             assertThat(htmResp.body())
                     .contains("export function html")
                     .contains("export function h");
+
+            HttpResponse<String> usageResp = client.send(
+                    HttpRequest.newBuilder(URI.create(server.baseUrl() + "/api/v1/usage"))
+                            .header("Authorization", "Bearer ui-token")
+                            .header("Origin", "http://dashboard.example")
+                            .GET().build(),
+                    HttpResponse.BodyHandlers.ofString());
+            assertThat(usageResp.statusCode()).isEqualTo(200);
+            assertThat(usageResp.headers().firstValue("X-Citrus-Usage-Sample-Interval-Ms")).hasValue("150");
+            assertThat(usageResp.headers().firstValue("Access-Control-Expose-Headers"))
+                    .hasValueSatisfying(value -> assertThat(value).containsIgnoringCase("X-Citrus-Usage-Sample-Interval-Ms"));
+            assertThat(usageResp.body()).contains("\"window\":\"1h\"", "\"series\"");
 
             assertThat(jsResp.body()).doesNotContain("Seed Demo Data");
             HttpResponse<String> removedSeedRoute = client.send(
