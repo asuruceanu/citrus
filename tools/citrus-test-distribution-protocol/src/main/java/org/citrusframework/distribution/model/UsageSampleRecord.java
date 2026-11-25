@@ -36,11 +36,18 @@ public record UsageSampleRecord(
             Map<String, String> requiredCapabilities,
             int activeSessions,
             int activePartitions,
-            int pendingPartitions
+            int pendingPartitions,
+            List<String> activeSessionIds
     ) {
 
         public JobDemandBucket {
+            activeSessionIds = activeSessionIds == null ? List.of() : List.copyOf(activeSessionIds);
             requiredCapabilities = requiredCapabilities == null ? Map.of() : Map.copyOf(requiredCapabilities);
+        }
+
+        public JobDemandBucket(Map<String, String> requiredCapabilities, int activeSessions, int activePartitions,
+                               int pendingPartitions) {
+            this(requiredCapabilities, activeSessions, activePartitions, pendingPartitions, List.of());
         }
     }
 
@@ -50,11 +57,17 @@ public record UsageSampleRecord(
             int priorityOrder,
             Map<String, String> capabilities,
             int connected,
-            int utilized
+            int utilized,
+            boolean deleted
     ) {
 
         public PoolSampleBucket {
             capabilities = capabilities == null ? Map.of() : Map.copyOf(capabilities);
+        }
+
+        public PoolSampleBucket(String poolId, String displayName, int priorityOrder, Map<String, String> capabilities,
+                                int connected, int utilized) {
+            this(poolId, displayName, priorityOrder, capabilities, connected, utilized, false);
         }
     }
 

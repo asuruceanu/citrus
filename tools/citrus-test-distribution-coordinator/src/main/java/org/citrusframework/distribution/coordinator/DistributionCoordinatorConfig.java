@@ -17,6 +17,8 @@
 package org.citrusframework.distribution.coordinator;
 
 import java.nio.file.Path;
+import java.util.Objects;
+import java.util.function.LongSupplier;
 
 import org.citrusframework.distribution.config.DistributionSettings;
 
@@ -45,6 +47,12 @@ public final class DistributionCoordinatorConfig {
     private final long minPartitionDurationMs;
     private final int maxWavesPerWorker;
     private final long leaseTimeoutMs;
+    private final boolean requireAgentPool;
+    private final long keyRevocationGraceMs;
+    private final long poolDriftGraceMs;
+    private final long usageSampleIntervalMs;
+    private final long usageRetentionMs;
+    private final LongSupplier clock;
 
     private DistributionCoordinatorConfig(Builder builder) {
         this.host = builder.host;
@@ -60,6 +68,12 @@ public final class DistributionCoordinatorConfig {
         this.minPartitionDurationMs = Math.max(0L, builder.minPartitionDurationMs);
         this.maxWavesPerWorker = Math.max(0, builder.maxWavesPerWorker);
         this.leaseTimeoutMs = builder.leaseTimeoutMs;
+        this.requireAgentPool = builder.requireAgentPool;
+        this.keyRevocationGraceMs = builder.keyRevocationGraceMs;
+        this.poolDriftGraceMs = builder.poolDriftGraceMs;
+        this.usageSampleIntervalMs = builder.usageSampleIntervalMs;
+        this.usageRetentionMs = builder.usageRetentionMs;
+        this.clock = builder.clock;
     }
 
     public static Builder builder() {
@@ -131,6 +145,30 @@ public final class DistributionCoordinatorConfig {
         return leaseTimeoutMs;
     }
 
+    public boolean requireAgentPool() {
+        return requireAgentPool;
+    }
+
+    public long keyRevocationGraceMs() {
+        return keyRevocationGraceMs;
+    }
+
+    public long poolDriftGraceMs() {
+        return poolDriftGraceMs;
+    }
+
+    public long usageSampleIntervalMs() {
+        return usageSampleIntervalMs;
+    }
+
+    public long usageRetentionMs() {
+        return usageRetentionMs;
+    }
+
+    public LongSupplier clock() {
+        return clock;
+    }
+
     public static final class Builder {
         private String host = "0.0.0.0";
         private int port = 8084;
@@ -145,6 +183,12 @@ public final class DistributionCoordinatorConfig {
         private long minPartitionDurationMs = DistributionSettings.getCoordinatorMinPartitionDurationMs();
         private int maxWavesPerWorker = DistributionSettings.getCoordinatorMaxWavesPerWorker();
         private long leaseTimeoutMs = 60_000L;
+        private boolean requireAgentPool = DistributionSettings.isCoordinatorRequireAgentPool();
+        private long keyRevocationGraceMs = 3_600_000L;
+        private long poolDriftGraceMs = 14_400_000L;
+        private long usageSampleIntervalMs = 15_000L;
+        private long usageRetentionMs = 604_800_000L;
+        private LongSupplier clock = System::currentTimeMillis;
 
         public Builder host(String host) {
             this.host = host;
@@ -208,6 +252,48 @@ public final class DistributionCoordinatorConfig {
 
         public Builder leaseTimeoutMs(long leaseTimeoutMs) {
             this.leaseTimeoutMs = leaseTimeoutMs;
+            return this;
+        }
+
+        public Builder requireAgentPool(boolean requireAgentPool) {
+            this.requireAgentPool = requireAgentPool;
+            return this;
+        }
+
+        public Builder keyRevocationGraceMs(long keyRevocationGraceMs) {
+            if (keyRevocationGraceMs < 0) {
+                throw new IllegalArgumentException("Invalid keyRevocationGraceMs");
+            }
+            this.keyRevocationGraceMs = keyRevocationGraceMs;
+            return this;
+        }
+
+        public Builder poolDriftGraceMs(long poolDriftGraceMs) {
+            if (poolDriftGraceMs < 0) {
+                throw new IllegalArgumentException("Invalid poolDriftGraceMs");
+            }
+            this.poolDriftGraceMs = poolDriftGraceMs;
+            return this;
+        }
+
+        public Builder usageSampleIntervalMs(long usageSampleIntervalMs) {
+            if (usageSampleIntervalMs <= 0) {
+                throw new IllegalArgumentException("Invalid usageSampleIntervalMs");
+            }
+            this.usageSampleIntervalMs = usageSampleIntervalMs;
+            return this;
+        }
+
+        public Builder usageRetentionMs(long usageRetentionMs) {
+            if (usageRetentionMs < 0) {
+                throw new IllegalArgumentException("Invalid usageRetentionMs");
+            }
+            this.usageRetentionMs = usageRetentionMs;
+            return this;
+        }
+
+        public Builder clock(LongSupplier clock) {
+            this.clock = Objects.requireNonNull(clock);
             return this;
         }
 
