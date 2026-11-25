@@ -24,31 +24,39 @@ import java.net.http.WebSocket;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.stream.Stream;
 
 import org.citrusframework.distribution.cache.BlobCacheDirectory;
 import org.citrusframework.distribution.cache.ClasspathPackager;
 import org.citrusframework.distribution.config.DistributionJson;
+import org.citrusframework.distribution.model.AgentPoolSummary;
 import org.citrusframework.distribution.model.ArtifactKind;
 import org.citrusframework.distribution.model.ArtifactRef;
 import org.citrusframework.distribution.model.BuildSessionResponse;
 import org.citrusframework.distribution.model.CompleteSessionRequest;
+import org.citrusframework.distribution.model.CoordinatorEvent;
 import org.citrusframework.distribution.model.CreateSessionRequest;
+import org.citrusframework.distribution.model.GeneratedRegistrationKey;
 import org.citrusframework.distribution.model.HistoricalDurationsRequest;
 import org.citrusframework.distribution.model.HistoricalDurationsResponse;
+import org.citrusframework.distribution.model.HistoricalUsageResponse;
 import org.citrusframework.distribution.model.MissingDigestsRequest;
 import org.citrusframework.distribution.model.MissingDigestsResponse;
 import org.citrusframework.distribution.model.PartitionAssignPayload;
 import org.citrusframework.distribution.model.PartitionCompletedPayload;
 import org.citrusframework.distribution.model.PartitionPolicy;
 import org.citrusframework.distribution.model.PartitionState;
+import org.citrusframework.distribution.model.RegistrationKeyRecord;
 import org.citrusframework.distribution.model.ReportLocalTestsRequest;
 import org.citrusframework.distribution.model.SessionDetailResponse;
 import org.citrusframework.distribution.model.SessionStatus;
@@ -103,6 +111,250 @@ class DistributionCoordinatorServerTest {
         } else {
             System.setProperty(key, previous);
         }
+    }
+
+    @Test
+    void shouldManagePoolsAndReturnSecretsOnlyOnCreation() throws Exception {
+        var config = poolConfig().authToken("top-secret-token").build();
+        try (var server = new DistributionCoordinatorServer(config)) {
+            server.start();
+            String pools = server.baseUrl() + "/api/v1/agent-pools";
+            assertThat(postJson(pools, Map.of("displayName", "Unauthorized")).statusCode()).isEqualTo(401);
+            assertThat(httpClient.send(HttpRequest.newBuilder(URI.create(server.baseUrl() + "/api/v1/usage")).build(),
+                    HttpResponse.BodyHandlers.ofString()).statusCode()).isEqualTo(401);
+
+            var created = api("POST", pools, Map.of("displayName", "Linux", "capabilities", Map.of("os", "linux"),
+                    "generateRegistrationKey", true, "keyDescription", "Bootstrap"));
+            assertThat(created.statusCode()).isEqualTo(201);
+            assertThat(created.headers().firstValue("Cache-Control")).contains("no-store");
+            var result = DistributionJson.fromJson(created.body(), SessionCoordinator.CreatedAgentPool.class);
+            String poolId = result.pool().poolId();
+            String pool = pools + "/" + poolId;
+            var preflight = httpClient.send(HttpRequest.newBuilder(URI.create(pool))
+                    .method("OPTIONS", HttpRequest.BodyPublishers.noBody()).header("Origin", "https://example.org")
+                    .header("Access-Control-Request-Method", "DELETE").build(), HttpResponse.BodyHandlers.discarding());
+            assertThat(preflight.statusCode()).isEqualTo(204);
+            assertThat(preflight.headers().firstValue("Access-Control-Allow-Methods").orElseThrow()).contains("DELETE");
+            var first = result.generatedKey();
+            assertThat(first.secretKey()).isNotBlank();
+            assertThat(first.metadata().description()).isEqualTo("Bootstrap");
+
+            var detail = api("GET", pool, null);
+            assertThat(detail.statusCode()).isEqualTo(200);
+            assertThat(detail.body()).doesNotContain("secretKey", "keyHash", first.secretKey());
+            assertThat(DistributionJson.fromJson(detail.body(), SessionCoordinator.AgentPoolDetail.class).registrationKeys())
+                    .containsExactly(first.metadata());
+            assertThat(api("PUT", pool, Map.of()).statusCode()).isEqualTo(400);
+            var replaced = api("PUT", pool, Map.of("displayName", "Renamed"));
+            assertThat(replaced.statusCode()).isEqualTo(200);
+            var updated = DistributionJson.fromJson(replaced.body(), AgentPoolSummary.class);
+            assertThat(updated.displayName()).isEqualTo("Renamed");
+            assertThat(updated.capabilities()).isEmpty();
+
+            var nextKey = api("POST", pool + "/keys", null);
+            assertThat(nextKey.statusCode()).isEqualTo(201);
+            assertThat(nextKey.headers().firstValue("Cache-Control")).contains("no-store");
+            var second = DistributionJson.fromJson(nextKey.body(), GeneratedRegistrationKey.class);
+            assertThat(second.secretKey()).isNotBlank().isNotEqualTo(first.secretKey());
+            var revoke = api("POST", pool + "/keys/" + first.metadata().keyId() + "/revoke", null);
+            assertThat(revoke.statusCode()).isEqualTo(200);
+            var revoked = DistributionJson.fromJson(revoke.body(), RegistrationKeyRecord.class);
+            assertThat(revoked.revokedAt()).isNotNull();
+            var keys = api("GET", pool + "/keys", null);
+            assertThat(keys.statusCode()).isEqualTo(200);
+            assertThat(keys.body()).doesNotContain("secretKey", "keyHash", first.secretKey(), second.secretKey());
+            assertThat(DistributionJson.fromJson(keys.body(), RegistrationKeyRecord[].class))
+                    .containsExactlyInAnyOrder(revoked, second.metadata());
+
+            var deleted = api("DELETE", pool, null);
+            assertThat(deleted.statusCode()).isEqualTo(200);
+            assertThat(DistributionJson.mapper().readTree(deleted.body()))
+                    .isEqualTo(DistributionJson.mapper().valueToTree(Map.of("deleted", true, "poolId", poolId)));
+            assertThat(api("GET", pool, null).statusCode()).isEqualTo(404);
+            assertThat(api("PUT", pool, Map.of("displayName", "Gone")).statusCode()).isEqualTo(404);
+            assertThat(api("DELETE", pool, null).statusCode()).isEqualTo(404);
+            assertThat(api("GET", pool + "/keys", null).statusCode()).isEqualTo(404);
+            assertThat(api("POST", pool + "/keys", Map.of("description", "Gone")).statusCode()).isEqualTo(404);
+            assertThat(api("POST", pool + "/keys/missing/revoke", null).statusCode()).isEqualTo(404);
+            assertThat(api("POST", pools, null).statusCode()).isEqualTo(400);
+            assertThat(api("POST", pools, Map.of("displayName", " ")).statusCode()).isEqualTo(400);
+            for (var invalid : List.of(Map.of("displayName", 123), Map.of("displayName", "Bad", "capabilities", List.of("linux")),
+                    Map.of("displayName", "Bad", "capabilities", Map.of("jdk", 21)),
+                    Map.of("displayName", "Bad", "generateRegistrationKey", "true"))) {
+                assertThat(api("POST", pools, invalid).statusCode()).isEqualTo(400);
+            }
+            var withoutKey = api("POST", pools, Map.of("displayName", "No credentials"));
+            assertThat(withoutKey.statusCode()).isEqualTo(201);
+            assertThat(DistributionJson.fromJson(withoutKey.body(), SessionCoordinator.CreatedAgentPool.class).generatedKey())
+                    .isNull();
+        }
+    }
+
+    @Test
+    void shouldReorderPoolsThroughPriorityRoute() throws Exception {
+        try (var server = new DistributionCoordinatorServer(poolConfig().build())) {
+            server.start();
+            String pools = server.baseUrl() + "/api/v1/agent-pools";
+            String first = createPool(pools, "First", Map.of()).pool().poolId();
+            String second = createPool(pools, "Second", Map.of()).pool().poolId();
+            var result = api("PUT", pools + "/priority", Map.of("poolIds", List.of(second, first)));
+            assertThat(result.statusCode()).isEqualTo(200);
+            assertThat(DistributionJson.fromJson(result.body(), AgentPoolSummary[].class))
+                    .extracting(AgentPoolSummary::poolId).containsExactly(second, first);
+            for (var invalid : List.of(Map.of(), Map.of("poolIds", List.of(second)),
+                    Map.of("poolIds", List.of(first, first)), Map.of("poolIds", List.of(second, "unknown")))) {
+                assertThat(api("PUT", pools + "/priority", invalid).statusCode()).isEqualTo(400);
+            }
+            var listed = api("GET", pools, null);
+            assertThat(listed.statusCode()).isEqualTo(200);
+            assertThat(DistributionJson.fromJson(listed.body(), AgentPoolSummary[].class))
+                    .extracting(AgentPoolSummary::poolId).containsExactly(second, first);
+        }
+    }
+
+    @Test
+    void shouldQueryAndSampleFilteredHistoricalUsage() throws Exception {
+        try (var server = new DistributionCoordinatorServer(poolConfig().usageSampleIntervalMs(100).build())) {
+            server.start();
+            String usage = server.baseUrl() + "/api/v1/usage";
+            var defaultWindow = api("GET", usage, null);
+            assertThat(defaultWindow.statusCode()).isEqualTo(200);
+            assertThat(DistributionJson.fromJson(defaultWindow.body(), HistoricalUsageResponse.class).window()).isEqualTo("1h");
+            assertThat(api("GET", usage + "?window=bad", null).statusCode()).isEqualTo(400);
+            assertThat(api("GET", usage + "?window=1h&filter=a=b=c", null).statusCode()).isEqualTo(400);
+
+            String pools = server.baseUrl() + "/api/v1/agent-pools";
+            var matching = createPool(pools, "JDK 21", Map.of("jdk", "21"));
+            createPool(pools, "JDK 17", Map.of("jdk", "17"));
+            var collector = new WsCollector();
+            var worker = connectWorker(server.wsUrl(), collector, new WorkerRegisterPayload("worker", "host", null,
+                    matching.pool().poolId(), matching.generatedKey().secretKey(), Map.of("jdk", "21"), null));
+            try {
+                assertThat(collector.nextMessage().type()).isEqualTo(WorkerWsMessage.WORKER_REGISTERED);
+                long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+                HistoricalUsageResponse response;
+                do {
+                    var filtered = api("GET", usage + "?window=1h&filter=jdk=21", null);
+                    assertThat(filtered.statusCode()).isEqualTo(200);
+                    response = DistributionJson.fromJson(filtered.body(), HistoricalUsageResponse.class);
+                    if (response.series().stream().anyMatch(point -> point.connected() == 1)) {
+                        break;
+                    }
+                    Thread.sleep(25);
+                } while (System.nanoTime() < deadline);
+                assertThat(response.series()).hasSize(60).anyMatch(point -> point.connected() == 1);
+                assertThat(response.pools()).singleElement().satisfies(pool -> {
+                    assertThat(pool.poolId()).isEqualTo(matching.pool().poolId());
+                    assertThat(pool.points()).hasSize(60).anyMatch(point -> point.connected() == 1);
+                });
+            } finally {
+                worker.abort();
+            }
+        }
+    }
+
+    @Test
+    void shouldRecordUsageOnStartupBeforeTheFirstPeriodicSample() throws Exception {
+        try (var server = new DistributionCoordinatorServer(poolConfig().usageSampleIntervalMs(60_000).build())) {
+            server.start();
+            assertThat(server.store().listUsageSamples(0, System.currentTimeMillis())).hasSize(1);
+        }
+    }
+
+    @Test
+    void shouldCloseAfterRejectingTheInitialWorkerRegistration() throws Exception {
+        try (var server = new DistributionCoordinatorServer(poolConfig().requireAgentPool(true).build())) {
+            server.start();
+            var collector = new WsCollector();
+            var worker = connectWorker(server.wsUrl(), collector, new WorkerRegisterPayload("worker", "host", Map.of()));
+            try {
+                var rejection = collector.nextMessage();
+                assertThat(rejection.type()).isEqualTo(WorkerWsMessage.WORKER_REJECTED);
+                assertThat(rejection.payload()).containsEntry("code", "POOL_REQUIRED");
+                assertThat(collector.closeCode.get(5, TimeUnit.SECONDS)).isEqualTo(4003);
+            } finally {
+                worker.abort();
+            }
+        }
+    }
+
+    @Test
+    void shouldSendSafePoolAndWarningEventsAndRejectWorkerBeforeClosing() throws Exception {
+        try (var server = new DistributionCoordinatorServer(poolConfig().build())) {
+            server.start();
+            String pools = server.baseUrl() + "/api/v1/agent-pools";
+            var created = createPool(pools, "Builders", Map.of());
+            String poolId = created.pool().poolId();
+            String pool = pools + "/" + poolId;
+            var key = created.generatedKey();
+            String hash = server.store().findRegistrationKey(key.metadata().keyId()).orElseThrow().keyHash();
+            var collector = new WsCollector();
+            var worker = connectWorker(server.wsUrl(), collector, new WorkerRegisterPayload("worker", "host", null,
+                    poolId, key.secretKey(), Map.of(), null));
+            try {
+                assertThat(collector.nextMessage().type()).isEqualTo(WorkerWsMessage.WORKER_REGISTERED);
+                var stream = httpClient.send(HttpRequest.newBuilder(URI.create(server.baseUrl() + "/api/v1/events/stream"))
+                        .build(), HttpResponse.BodyHandlers.ofLines());
+                assertThat(stream.statusCode()).isEqualTo(200);
+                try (var lines = stream.body()) {
+                    var delivered = CompletableFuture.supplyAsync(() -> collectUntilPoolDeleted(lines));
+                    assertThat(api("POST", pool + "/keys/" + key.metadata().keyId() + "/revoke", null).statusCode())
+                            .isEqualTo(200);
+                    assertThat(api("GET", server.baseUrl() + "/api/v1/workers", null).body()).contains("KEY_REVOKED");
+                    sendWs(worker, WorkerWsMessage.WORKER_RENEW, Map.of("workerId", "worker", "poolId", poolId,
+                            "registrationKey", key.secretKey()));
+                    var rejection = collector.nextMessage();
+                    assertThat(rejection.type()).isEqualTo(WorkerWsMessage.WORKER_REJECTED);
+                    assertThat(rejection.payload()).containsEntry("code", "REVOKED_REGISTRATION_KEY");
+                    assertThat(DistributionJson.toJson(rejection)).doesNotContain(key.secretKey(), hash, "keyHash");
+                    assertThat(collector.closeCode.get(5, TimeUnit.SECONDS)).isEqualTo(4003);
+                    assertThat(collector.closeReason).doesNotContain(key.secretKey(), hash);
+                    assertThat(api("DELETE", pool, null).statusCode()).isEqualTo(200);
+                    var events = delivered.get(5, TimeUnit.SECONDS);
+                    assertThat(events).extracting(CoordinatorEvent::type).containsSubsequence("pool.updated",
+                            "worker.registered", "worker.updated", "pool.updated", "worker.rejected", "pool.deleted");
+                    assertThat(events).filteredOn(event -> event.type().equals("worker.rejected")).singleElement()
+                            .satisfies(event -> assertThat(event.data()).containsEntry("code", "REVOKED_REGISTRATION_KEY"));
+                    assertThat(DistributionJson.toJson(events)).doesNotContain(key.secretKey(), hash, "secretKey", "keyHash");
+                }
+            } finally {
+                worker.abort();
+            }
+        }
+    }
+
+    private static List<CoordinatorEvent> collectUntilPoolDeleted(Stream<String> lines) {
+        var events = new ArrayList<CoordinatorEvent>();
+        var data = lines.filter(line -> line.startsWith("data: ")).iterator();
+        while (data.hasNext()) {
+            var event = DistributionJson.fromJson(data.next().substring("data: ".length()), CoordinatorEvent.class);
+            events.add(event);
+            if ("pool.deleted".equals(event.type())) {
+                break;
+            }
+        }
+        return events;
+    }
+
+    private DistributionCoordinatorConfig.Builder poolConfig() {
+        return DistributionCoordinatorConfig.builder().port(0).cacheDir(tempDir.resolve("pool-cache"))
+                .jdbcUrl("jdbc:hsqldb:file:" + tempDir.resolve("coordinator_pools") + ";shutdown=true");
+    }
+
+    private SessionCoordinator.CreatedAgentPool createPool(String url, String name, Map<String, String> capabilities)
+            throws Exception {
+        var response = api("POST", url, Map.of("displayName", name, "capabilities", capabilities,
+                "generateRegistrationKey", true));
+        assertThat(response.statusCode()).isEqualTo(201);
+        return DistributionJson.fromJson(response.body(), SessionCoordinator.CreatedAgentPool.class);
+    }
+
+    private HttpResponse<String> api(String method, String url, Object body) throws Exception {
+        var request = HttpRequest.newBuilder(URI.create(url)).timeout(Duration.ofSeconds(5))
+                .header("Authorization", "Bearer top-secret-token").header("Content-Type", "application/json")
+                .method(method, body == null ? HttpRequest.BodyPublishers.noBody()
+                        : HttpRequest.BodyPublishers.ofString(DistributionJson.toJson(body)));
+        return httpClient.send(request.build(), HttpResponse.BodyHandlers.ofString());
     }
 
     @Test
@@ -574,6 +826,8 @@ class DistributionCoordinatorServerTest {
     }
 
     private static final class WsCollector implements WebSocket.Listener {
+        private final CompletableFuture<Integer> closeCode = new CompletableFuture<>();
+        private String closeReason;
         private final StringBuilder buffer = new StringBuilder();
         private final BlockingQueue<WorkerWsMessage> messages = new LinkedBlockingQueue<>();
 
@@ -586,6 +840,13 @@ class DistributionCoordinatorServerTest {
                 messages.offer(DistributionJson.fromJson(json, WorkerWsMessage.class));
             }
             webSocket.request(1);
+            return null;
+        }
+
+        @Override
+        public CompletionStage<?> onClose(WebSocket webSocket, int statusCode, String reason) {
+            closeReason = reason;
+            closeCode.complete(statusCode);
             return null;
         }
 
