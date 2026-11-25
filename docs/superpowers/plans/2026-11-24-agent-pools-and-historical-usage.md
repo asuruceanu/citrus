@@ -82,7 +82,7 @@
     - `COORDINATOR_REQUIRE_AGENT_POOL_PROPERTY = "citrus.test.distribution.coordinator.requireAgentPool"`, `COORDINATOR_REQUIRE_AGENT_POOL_ENV = "CITRUS_DIST_COORDINATOR_REQUIRE_AGENT_POOL"`, `isCoordinatorRequireAgentPool()`
     - `resolveWorkerPool(Properties, Map<String, String>)`, `resolveWorkerRegistrationKey(Properties, Map<String, String>)`, `resolveWorkerId(Properties, Map<String, String>)`, `resolveWorkerCapabilitiesCsv(Properties, Map<String, String>)`
 
-- [ ] **Step 1: Write failing protocol serialization, capability validation, annotation, and settings tests**
+- [x] **Step 1: Write failing protocol serialization, capability validation, annotation, and settings tests**
 
 In `ProtocolModelSerializationTest.java`, add round-trip JSON assertions via `DistributionJson.MAPPER` for `AgentPoolRecord`, `AgentPoolSummary`, `RegistrationKeyRecord`, `GeneratedRegistrationKey`, `WorkerWarning`, `WorkerRejectedPayload`, `WorkerRenewPayload`, `UsageSampleRecord`, `HistoricalUsageResponse`, extended `WorkerRegisterPayload`, and extended `WorkerRecord` (verifying 8-arg legacy `WorkerRecord` constructor defaults `warnings` to `List.of()`).
 
@@ -92,21 +92,21 @@ In `CapabilityMatcherTest.java`, add tests verifying:
 
 In `DistributionSettingsAndPathRewriterTest.java`, add tests verifying precedence `CITRUS_DIST_WORKER_POOL` > `TEST_DISTRIBUTION_AGENT_POOL` > `citrus.test.distribution.worker.pool` (and matching precedence for `registrationKey`, `workerId` / `TEST_DISTRIBUTION_AGENT_NAME`, `capabilities` / `TEST_DISTRIBUTION_AGENT_CAPABILITIES`). Verify the coordinator strict setting separately with explicit Java property > environment > default `false`.
 
-- [ ] **Step 2: Run protocol tests to verify they fail**
+- [x] **Step 2: Run protocol tests to verify they fail**
 
 Run: `./mvnw test -pl tools/citrus-test-distribution-protocol`
 Expected: FAIL with compilation errors for missing model records and `DistributionSettings` methods.
 
-- [ ] **Step 3: Implement protocol records, `@AgentRequirement` default, strict capability validation, and `DistributionSettings` resolvers**
+- [x] **Step 3: Implement protocol records, `@AgentRequirement` default, strict capability validation, and `DistributionSettings` resolvers**
 
 Create all records listed in **Produces** with defensive collection copies and empty defaults for omitted collections. Preserve legacy worker capability maps containing null values during deserialization. Add `default "true"` to `AgentRequirement#value()`, add `CapabilityMatcher.validateCapabilities` + `DistributionSettings.parseStrictCapabilitiesCsv`, and add the pool/key/alias constants and resolvers in `DistributionSettings`.
 
-- [ ] **Step 4: Run protocol tests to verify they pass**
+- [x] **Step 4: Run protocol tests to verify they pass**
 
 Run: `./mvnw test -pl tools/citrus-test-distribution-protocol`
 Expected: PASS (`BUILD SUCCESS`, 0 failures).
 
-- [ ] **Step 5: Commit Task 1**
+- [x] **Step 5: Commit Task 1**
 
 ```bash
 git add tools/citrus-test-distribution-protocol
@@ -142,7 +142,7 @@ git commit -m "feat(test-distribution-protocol): add agent pool, registration ke
     - `void recordUsageSample(UsageSampleRecord sample, long pruneBeforeTimestamp)`
     - `List<UsageSampleRecord> listUsageSamples(long fromTimestamp, long toTimestamp)`
 
-- [ ] **Step 1: Write failing JDBC store tests**
+- [x] **Step 1: Write failing JDBC store tests**
 
 In `JdbcDistributionStoreTest.java`, add tests covering:
 1. Agent pool CRUD + `listAgentPools()` ordered by `priority_order ASC, created_at ASC` + `updateAgentPoolPriorities(List.of("pool2", "pool1"), now)` + `deleteAgentPool`. Cover atomic rollback on a failed initial key insert and bulk priority change, and removal of a deleted pool’s keys.
@@ -150,21 +150,21 @@ In `JdbcDistributionStoreTest.java`, add tests covering:
 3. `upsertWorker` / `listWorkers` round-tripping `version`, `poolId`, `poolDisplayName`, `activeTestDisplay`, `stateUpdatedAt`, and `List<WorkerWarning>`, plus schema migration when opening an existing `dist_workers` table created before the new columns existed.
 4. `recordUsageSample` persisting snapshots, pruning rows with `sampled_at < pruneBeforeTimestamp`, and `listUsageSamples(from, to)` returning ascending samples within `[from, to]`.
 
-- [ ] **Step 2: Run `JdbcDistributionStoreTest` to verify it fails**
+- [x] **Step 2: Run `JdbcDistributionStoreTest` to verify it fails**
 
 Run: `./mvnw test -Dtest=JdbcDistributionStoreTest -pl tools/citrus-test-distribution-coordinator -am -Dsurefire.failIfNoSpecifiedTests=false`
 Expected: FAIL with compilation errors on missing `DistributionStore` methods and `StoredRegistrationKey`.
 
-- [ ] **Step 3: Implement schema tables, `ensureColumns` migration, and JDBC queries in `JdbcDistributionStore`**
+- [x] **Step 3: Implement schema tables, `ensureColumns` migration, and JDBC queries in `JdbcDistributionStore`**
 
 Add `dist_agent_pools`, `dist_registration_keys` (plus `idx_dist_reg_keys_pool`), and `dist_usage_samples` in `JdbcDistributionStore.initialize()` using `longText` (`CLOB` on HSQLDB, `TEXT` on PostgreSQL). Extend `dist_workers` and `ensureColumns(...)` with `version`, `pool_id`, `pool_display_name`, `active_test_display`, `state_updated_at`, and `warnings_json`. Implement all methods in `DistributionStore` and `JdbcDistributionStore`. Use transactions for pool creation with an initial key, pool deletion with its keys, reordering, and sample write/pruning. Update usage metadata only for active keys.
 
-- [ ] **Step 4: Run `JdbcDistributionStoreTest` to verify it passes**
+- [x] **Step 4: Run `JdbcDistributionStoreTest` to verify it passes**
 
 Run: `./mvnw test -Dtest=JdbcDistributionStoreTest -pl tools/citrus-test-distribution-coordinator -am -Dsurefire.failIfNoSpecifiedTests=false`
 Expected: PASS (`BUILD SUCCESS`, 0 failures).
 
-- [ ] **Step 5: Commit Task 2**
+- [x] **Step 5: Commit Task 2**
 
 ```bash
 git add tools/citrus-test-distribution-coordinator/src/main/java/org/citrusframework/distribution/store \
@@ -217,7 +217,7 @@ git commit -m "feat(test-distribution-coordinator): persist agent pools, registr
     - `UsageSampleRecord sampleUsageNow()`
     - `HistoricalUsageResponse queryHistoricalUsage(String window, String filterCsv)`
 
-- [ ] **Step 1: Write failing unit tests for `HistoricalUsageAggregator` and `SessionCoordinator`**
+- [x] **Step 1: Write failing unit tests for `HistoricalUsageAggregator` and `SessionCoordinator`**
 
 In `HistoricalUsageAggregatorTest.java`, add tests verifying:
 1. Window sizing: `"1h"` -> 60 x `60_000ms` buckets; `"24h"` -> 96 x `900_000ms` buckets; `"7d"` -> 84 x `7_200_000ms` buckets; unknown window throws `IllegalArgumentException`.
@@ -235,21 +235,21 @@ In `SessionCoordinatorTest.java` (using controllable `AtomicLong` clock on `Dist
 3. **Review Focus #2 & priority scheduling:** Between two matching pools (`prio 0` and `prio 1`) plus an unpooled worker, jobs dispatch to `prio 0` first, then `prio 1`, then unpooled; a pooled worker advertising extra `postgres=18` not configured on its pool never matches a job requiring `postgres=18`.
 4. **Live worker status:** `TEST_EVENT` with `STARTED` (`className="org.acme.OrderIT"`, `testName="shouldCreate"`) updates `WorkerRecord.activeTestDisplay()` to `"OrderIT > shouldCreate"` (falling back to full name if unqualified), and `PARTITION_COMPLETED` clears `activeTestDisplay` and updates `stateUpdatedAt`. Exercise stale/replayed events, cancellation, and disconnect so only the current attempt changes live status. At coordinator restart, preserve persisted pool and version fields while marking workers offline and clearing live execution state.
 
-- [ ] **Step 2: Run coordinator unit tests to verify they fail**
+- [x] **Step 2: Run coordinator unit tests to verify they fail**
 
 Run: `./mvnw test -Dtest=HistoricalUsageAggregatorTest,SessionCoordinatorTest -pl tools/citrus-test-distribution-coordinator -am -Dsurefire.failIfNoSpecifiedTests=false`
 Expected: FAIL with compilation errors on missing `RegistrationKeyCrypto`, `HistoricalUsageAggregator`, and `SessionCoordinator` methods.
 
-- [ ] **Step 3: Implement `RegistrationKeyCrypto`, `HistoricalUsageAggregator`, `DistributionCoordinatorConfig` clock/grace fields, and `SessionCoordinator` pool/key/scheduling/usage logic**
+- [x] **Step 3: Implement `RegistrationKeyCrypto`, `HistoricalUsageAggregator`, `DistributionCoordinatorConfig` clock/grace fields, and `SessionCoordinator` pool/key/scheduling/usage logic**
 
-Implement `RegistrationKeyCrypto` (8-char `[a-z0-9]` pool IDs; `ctrk_<8chars>_<32chars>` keys hashed with SHA-256). Implement `HistoricalUsageAggregator` with shared connected capacity across demand buckets, priority-ordered `desired` attribution and per-bucket `max` aggregation as specified. Extend `DistributionCoordinatorConfig` and `SessionCoordinator` to load pools from `store` on construction, enforce registration/renewal/grace rules, track `version`, `activeTestDisplay`, `stateUpdatedAt`, and `warnings` on `WorkerConnection`, schedule by pool priority using pool capabilities for both assignment and adaptive sizing, and expose `sampleUsageNow()` + `queryHistoricalUsage(...)`. Publish `pool.updated`, `pool.deleted`, `worker.updated`, and `worker.rejected` via the existing durable event hub, with no secret or hash in event payloads. Preserve the upstream result journal and restart behavior.
+Implement `RegistrationKeyCrypto` (8-char `[a-z0-9]` pool IDs; `ctrk_<8chars>_<32chars>` keys hashed with SHA-256). Implement `HistoricalUsageAggregator` with shared connected capacity across demand buckets, priority-ordered `desired` attribution and per-bucket `max` aggregation as specified. Extend `DistributionCoordinatorConfig` and `SessionCoordinator` to load pools from `store` on construction, enforce registration/renewal/grace rules, track `version`, `activeTestDisplay`, `stateUpdatedAt`, and `warnings` on `WorkerConnection`, schedule by pool priority using pool capabilities for both assignment and adaptive sizing, and expose `sampleUsageNow()` + `queryHistoricalUsage(...)`. During deletion grace, sample connected/utilized workers under the last pool capabilities and exclude that deleted sample bucket from desired allocation. Extend `PoolSampleBucket` with an optional `deleted` flag and preserve the original constructor and deserialization default. Publish `pool.updated`, `pool.deleted`, `worker.updated`, and `worker.rejected` via the existing durable event hub, with no secret or hash in event payloads. Keep test-result bookkeeping durable if a later worker status write fails, and preserve legacy null-valued capabilities without blocking usage sampling. Preserve the upstream result journal and restart behavior.
 
-- [ ] **Step 4: Run coordinator unit tests to verify they pass**
+- [x] **Step 4: Run coordinator unit tests to verify they pass**
 
 Run: `./mvnw test -Dtest=HistoricalUsageAggregatorTest,SessionCoordinatorTest -pl tools/citrus-test-distribution-coordinator -am -Dsurefire.failIfNoSpecifiedTests=false`
 Expected: PASS (`BUILD SUCCESS`, 0 failures).
 
-- [ ] **Step 5: Commit Task 3**
+- [x] **Step 5: Commit Task 3**
 
 ```bash
 git add tools/citrus-test-distribution-coordinator/src/main/java/org/citrusframework/distribution/coordinator \
@@ -270,15 +270,15 @@ git commit -m "feat(test-distribution-coordinator): implement agent pool auth, g
 - Consumes: Task 3 `SessionCoordinator` pool, key, worker closer, and usage methods
 - Produces HTTP endpoints under `/api/v1`:
   - `GET /api/v1/agent-pools` -> `200` `List<AgentPoolSummary>`
-  - `POST /api/v1/agent-pools` -> `201` `SessionCoordinator.CreatedAgentPool` (`400` on invalid input)
-  - `PUT /api/v1/agent-pools/priority` -> `200` `List<AgentPoolSummary>` (`400` on invalid pool IDs)
+  - `POST /api/v1/agent-pools` accepts `{displayName, capabilities?, generateRegistrationKey?, keyDescription?}` and returns `201` `SessionCoordinator.CreatedAgentPool` (`400` on invalid input)
+  - `PUT /api/v1/agent-pools/priority` accepts `{poolIds}` with every current ID once and returns `200` `List<AgentPoolSummary>` (`400` on invalid pool IDs)
   - `GET /api/v1/agent-pools/:poolId` -> `200` `SessionCoordinator.AgentPoolDetail` (`404` if missing)
-  - `PUT /api/v1/agent-pools/:poolId` -> `200` `AgentPoolSummary` (`400` / `404`)
+  - `PUT /api/v1/agent-pools/:poolId` replaces the pool’s `{displayName, capabilities?}` and returns `200` `AgentPoolSummary` (`400` / `404`)
   - `DELETE /api/v1/agent-pools/:poolId` -> `200` `{"deleted": true, "poolId": "..."}` (`404` if missing)
   - `GET /api/v1/agent-pools/:poolId/keys` -> `200` `List<RegistrationKeyRecord>` (`404` if missing)
-  - `POST /api/v1/agent-pools/:poolId/keys` -> `201` `GeneratedRegistrationKey` (`404` if missing)
+  - `POST /api/v1/agent-pools/:poolId/keys` accepts optional `{description}` and returns `201` `GeneratedRegistrationKey` (`404` if missing)
   - `POST /api/v1/agent-pools/:poolId/keys/:keyId/revoke` -> `200` `RegistrationKeyRecord` (`404` if missing)
-  - `GET /api/v1/usage?window=1h|24h|7d&filter=...` -> `200` `HistoricalUsageResponse` (`400` on invalid window or malformed filter)
+  - `GET /api/v1/usage?window=1h|24h|7d&filter=...` -> `200` `HistoricalUsageResponse` (`400` on invalid window or malformed filter, defaults to `1h` when window is absent)
 
 - [ ] **Step 1: Write failing HTTP & WebSocket server tests in `DistributionCoordinatorServerTest`**
 
@@ -286,7 +286,7 @@ Add tests in `DistributionCoordinatorServerTest.java` verifying:
 1. Full HTTP lifecycle: `POST /api/v1/agent-pools` (with `generateRegistrationKey=true` returning secret once), `GET /api/v1/agent-pools`, `GET /api/v1/agent-pools/:poolId` (verifying `secretKey` and `keyHash` are absent from listed keys), `PUT /api/v1/agent-pools/:poolId`, `POST /api/v1/agent-pools/:poolId/keys`, `POST /api/v1/agent-pools/:poolId/keys/:keyId/revoke`, and `DELETE /api/v1/agent-pools/:poolId`.
 2. **Review Focus #3 (route order):** `PUT /api/v1/agent-pools/priority` with `{"poolIds": [poolB, poolA]}` returns `200` and reorders `GET /api/v1/agent-pools` without colliding with `PUT /api/v1/agent-pools/:poolId`.
 3. `GET /api/v1/usage?window=1h&filter=jdk=21` returns `200` with 60 points and matching pool series; `GET /api/v1/usage?window=bad` and `GET /api/v1/usage?window=1h&filter=a=b=c` return `400`.
-4. Verify SSE delivery of pool updates/deletions, worker warning changes and worker rejection. Verify that structured WebSocket rejection is written before close with code `4003` and neither channel leaks key material.
+4. Verify SSE delivery of pool updates/deletions, worker warning changes and worker rejection. Verify that structured WebSocket rejection is written before close with code `4003` and neither channel leaks key material. Exercise the existing bearer authorization on the new routes and assert `Cache-Control: no-store` for responses returning a generated key.
 
 - [ ] **Step 2: Run `DistributionCoordinatorServerTest` to verify it fails**
 
@@ -297,9 +297,9 @@ Expected: FAIL with `404` on `/api/v1/agent-pools` and `/api/v1/usage`.
 
 In `DistributionCoordinatorVerticle.java`:
 1. Add `HttpMethod.DELETE` to `CorsHandler` and reuse the existing size-limited PUT body handler and bearer authentication on `/api/*`.
-2. Register `PUT /api/v1/agent-pools/priority` **before** `/api/v1/agent-pools/:poolId`, plus all remaining `/api/v1/agent-pools*` and `/api/v1/usage` handlers on `executeBlocking`.
+2. Register `PUT /api/v1/agent-pools/priority` **before** `/api/v1/agent-pools/:poolId`, plus all remaining `/api/v1/agent-pools*` and `/api/v1/usage` handlers on `executeBlocking`. Responses containing generated credentials use `Cache-Control: no-store`.
 3. Wire the close callback into `coordinator.registerWorker(...)`. Write the structured rejection before initiating WebSocket close `4003` and close even when the write fails.
-4. Start a periodic timer `usageTimerId = vertx.setPeriodic(config.usageSampleIntervalMs(), ...)` calling `coordinator.sampleUsageNow()` on `executeBlocking` (and trigger one initial sample on startup; cancel `usageTimerId` in `stop()`).
+4. Start a periodic timer `usageTimerId = vertx.setPeriodic(config.usageSampleIntervalMs(), ...)` calling `coordinator.sampleUsageNow()` on `executeBlocking` (and trigger one initial sample on startup; cancel `usageTimerId` in `stop()`). Avoid queueing overlapping samples. Run the existing lease/warning sweep off the event loop while preserving its cadence.
 
 - [ ] **Step 4: Run `DistributionCoordinatorServerTest` to verify it passes**
 
@@ -348,10 +348,10 @@ git commit -m "feat(test-distribution-coordinator): expose agent pool and histor
 
 1. In `DistributionWorkerConfigTest.java`: verify `poolId`, `registrationKey`, `TEST_DISTRIBUTION_AGENT_POOL`, `TEST_DISTRIBUTION_AGENT_REGISTRATION_KEY`, `TEST_DISTRIBUTION_AGENT_NAME`, `TEST_DISTRIBUTION_AGENT_CAPABILITIES`, and non-blank `version()` resolution.
 2. In `DistributionWorkerClientTest.java`:
-   - **Review Focus #1:** A structured `WORKER_REJECTED("INVALID_REGISTRATION_KEY", "Invalid key")` makes `awaitRegistered(2, SECONDS)` return `false` promptly and preserves `"INVALID_REGISTRATION_KEY"` in `rejectionReason()`. A bare `4003` close yields a generic terminal rejection. Neither case reconnects.
-   - When configured with `poolId`, `registrationKey`, and `registrationRenewalIntervalMs(150)`, the client sends `WORKER_RENEW` payloads periodically and stops if a renewal returns `WORKER_REJECTED`.
+   - **Review Focus #1:** A structured `WORKER_REJECTED("INVALID_REGISTRATION_KEY", "Invalid key")` makes `awaitRegistration(2, SECONDS)` return `false` promptly and preserves `"INVALID_REGISTRATION_KEY"` in `rejectionReason()`. A bare `4003` close yields a generic terminal rejection. Neither case reconnects.
+   - When configured with `poolId`, `registrationKey`, and `registrationRenewalIntervalMs(150)`, the client sends `WORKER_RENEW` payloads periodically and stops if a renewal returns `WORKER_REJECTED`. Start renewal only after registration and cancel it when the connection ends. After ordinary socket loss, the next successfully registered socket renews again.
 3. In `DistCommandTest.java`: **Review Focus #4** — verify `DistWorkerStart.normalizeWorkerStartArgs(new String[]{"dist", "worker", "start", "-p", "pool1", "-k", "ctrk_1_2", "--no-cache-cleanup"})` preserves `-p pool1 -k ctrk_1_2` and normalizes `--cache-cleanup=false`.
-4. In `CitrusAgentWorkerOptionsTest.java`: **Review Focus #4** — verify `new CitrusAgentOptions().apply(new String[]{"--mode", "worker", "-p", "com.acme.tests", "--pool", "pool1", "-k", "ctrk_1_2"})` binds `packages` to `["com.acme.tests"]`, `pool` to `"pool1"`, and `registrationKey` to `"ctrk_1_2"`, and `DistributionWorkerBridge.buildWorkerConfig(...)` forwards both to `DistributionWorkerConfig`.
+4. In `CitrusAgentWorkerOptionsTest.java`: **Review Focus #4** — verify `new CitrusAgentOptions().apply(new String[]{"--mode", "worker", "-p", "com.acme.tests", "--pool", "pool1", "-k", "ctrk_1_2"})` binds `packages` to `["com.acme.tests"]`, `pool` to `"pool1"`, and `registrationKey` to `"ctrk_1_2"`, and `DistributionWorkerBridge.buildWorkerConfig(...)` forwards both to `DistributionWorkerConfig`. A missing CLI/agent value leaves the worker’s resolved settings intact, including capabilities discovered from aliases.
 
 - [ ] **Step 2: Run worker, JBang, agent, and schema tests to verify they fail**
 
@@ -361,7 +361,7 @@ Expected: FAIL with compilation errors on missing `poolId` / `registrationKey` /
 - [ ] **Step 3: Implement worker config/client, JBang options, agent options/config/bridge, and control schema JSON**
 
 1. Extend `DistributionWorkerConfig` (resolving `version` from `Implementation-Version` or `/META-INF/maven/org.citrusframework/citrus-test-distribution-worker/pom.properties` with `"dev"` fallback) and `DistributionWorkerClient` (sending `version`, `poolId`, `registrationKey`; scheduling periodic `WORKER_RENEW` when `poolId` is non-blank; halting reconnects and releasing `registeredLatch` on `WORKER_REJECTED` or close status `4003`).
-2. Add `-p` / `--pool` and `-k` / `--registration-key` to `DistWorkerStart` (and `VALUE_OPTIONS`) and fail fast with the coordinator's rejection message when `client.rejectionReason()` is present.
+2. Add `-p` / `--pool` and `-k` / `--registration-key` to `DistWorkerStart` (and `VALUE_OPTIONS`) and wake the command’s stop latch on terminal rejection so it exits with failure and the coordinator’s reason even without a duration limit. Keep the normal shutdown/drain path and use a small client rejection notification API.
 3. Add `pool` and `registrationKey` to `CitrusAgentConfiguration`, `CitrusAgentOptions` (`--pool` with `""` short name; `-k` / `--registration-key`), `DistributionWorkerBridge`, and `tools/schema-generator/src/test/resources/control/citrus-agent-configuration.json`.
 
 - [ ] **Step 4: Run worker, JBang, agent, and schema tests to verify they pass**
