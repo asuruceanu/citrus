@@ -239,12 +239,12 @@ In `DistributionWorkerBridge.java`:
 - Keep `.coordinatorUrl(configuration.getCoordinatorUrl(fallbackUrl))`.
 - Replace unconditional `.authToken(configuration.getAuthToken())` with a guarded call: only set the token when `StringUtils.hasText(configuration.getAuthToken())`, so an unset CLI token leaves `DistributionWorkerConfig.builder()`'s inherited value intact.
 
-- [ ] **Step 5: Run tests and verify they pass**
+- [ ] **Step 6: Run tests and verify they pass**
 
 Run: `./mvnw test -Dtest=CitrusAgentWorkerOptionsTest -pl tools/agent`
 Expected: PASS. Then run `./mvnw test -pl tools/agent` — all module tests green.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
 git add tools/agent/src/main/java/org/citrusframework/agent/CitrusAgentOptions.java \
@@ -303,20 +303,7 @@ void shouldResolveWorkerCoordinatorUrlFromPropertyWhenCliUrlAbsent() {
 Run: `./mvnw test -Dtest=DistCommandTest#shouldResolveWorkerCoordinatorUrlFromPropertyWhenCliUrlAbsent -pl tools/jbang`
 Expected: FAIL — the built config URL is `http://localhost:8765` because Aesh injected the hardcoded default before the system property could be consulted.
 
-- [ ] **Step 3: Add `resolveCoordinatorUrl` to `DistributionSettings`**
-
-`DistributionSettings` currently has no `resolveCoordinatorUrl(defaultValue)` method. Add next to `getCoordinatorUrl()`:
-
-```java
-public static String resolveCoordinatorUrl(String defaultValue) {
-    String value = getString(COORDINATOR_URL_PROPERTY, COORDINATOR_URL_ENV, defaultValue);
-    return value == null || value.isBlank() ? defaultValue : value;
-}
-```
-
-Keep `getCoordinatorUrl()` unchanged. This preserves all existing precedence tests.
-
-- [ ] **Step 4: Remove the hardcoded Aesh default**
+- [ ] **Step 3: Remove the hardcoded Aesh default**
 
 In `DistWorkerStart.java`, add `static final String DEFAULT_COORDINATOR_URL = "http://localhost:8765";` and change the option at line 57 to `@Option(name = "coordinator-url", shortName = 'u', description = "Coordinator base URL (default: http://localhost:8765)")` with no `defaultValue`. In `buildWorkerConfig()`, resolve:
 
@@ -328,12 +315,12 @@ String effectiveUrl = (coordinatorUrl != null && !coordinatorUrl.isBlank())
 
 and pass `.coordinatorUrl(effectiveUrl)` to the builder. Note `DistributionSettings` is a dependency of `tools/jbang`, so `tools/citrus-test-distribution-protocol` must be installed locally: run `./mvnw install -DskipTests -pl tools/citrus-test-distribution-protocol -am` before running the tests if the module was not already installed.
 
-- [ ] **Step 5: Run tests and verify they pass**
+- [ ] **Step 4: Run tests and verify they pass**
 
 Run: `./mvnw test -Dtest=DistCommandTest -pl tools/jbang`
 Expected: PASS. Then `./mvnw test -pl tools/jbang` — all module tests green.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
 git add tools/citrus-test-distribution-protocol/src/main/java/org/citrusframework/distribution/config/DistributionSettings.java \
