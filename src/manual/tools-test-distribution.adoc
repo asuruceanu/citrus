@@ -139,6 +139,29 @@ The script prints the dashboard URL and opens it on a supported desktop after st
 http://127.0.0.1:8765/ui/. On a headless machine, use the URL printed in the terminal. Check the Workers view for
 eight connected workers.
 
+=== Run modules from the Citrus checkout
+
+With the stack running, run the tests for one module by its Maven artifact ID or reactor path.
+
+[source,bash]
+----
+./tools/citrus-test-distribution/docker/run-tests.sh -module citrus-api
+----
+
+Use `-all` in place of `-module citrus-api` to run `verify` across the whole reactor. The runner builds
+the distribution extension and any prerequisites in a checkout-local Maven repository with tests skipped.
+It loads the extension from a temporary Maven configuration for the test run.
+
+The runner uses the published coordinator port for the selected Compose project. You can export
+`CITRUS_DIST_COORDINATOR_URL` to set the address explicitly. Export the same `CITRUS_DIST_AUTH_TOKEN` as
+the stack if you enabled authentication. The runner disables local fallback with
+`-Dcitrus.test.distribution.fallbackLocal=false` and sets both
+`-Dcitrus.test.distribution.minRemoteDurationMs=0` and `-Dcitrus.test.distribution.minRemoteColdUnits=0`
+so duration and cold-start thresholds allow eligible tests to run on the workers. The normal test placement
+rules still apply. Tests that use external services or tools require those dependencies in their execution environment.
+
+=== Run a Maven project against the stack
+
 Register the Maven extension as shown in <<tools-test-distribution-maven>>, then run your tests on the host.
 Use the published port from `start.sh` if you changed it.
 
