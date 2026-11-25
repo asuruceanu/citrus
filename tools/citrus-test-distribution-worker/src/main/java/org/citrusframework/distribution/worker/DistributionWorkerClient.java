@@ -73,7 +73,8 @@ public final class DistributionWorkerClient implements AutoCloseable {
     private final AtomicBoolean closed = new AtomicBoolean(false);
     private final AtomicBoolean cacheStatsFailureActive = new AtomicBoolean();
     private final AtomicReference<WebSocket> activeWebSocket = new AtomicReference<>();
-    private final CompletableFuture<WorkerRejectedPayload> rejection = new CompletableFuture<>();
+    private final CompletableFuture<Void> rejectionNotification = new CompletableFuture<>();
+    private volatile WorkerRejectedPayload rejectionReason;
     // Guarded by this client's monitor from the handshake through the end of the connection.
     private WorkerWsListener connection;
     private ScheduledFuture<?> renewal;
@@ -112,7 +113,7 @@ public final class DistributionWorkerClient implements AutoCloseable {
      *                               it, or if this client is closed
      */
     public void start() {
-        if (rejection.isDone() || !running.compareAndSet(false, true)) {
+        if (rejectionReason != null || !running.compareAndSet(false, true)) {
             return;
         }
         try {
@@ -165,16 +166,16 @@ public final class DistributionWorkerClient implements AutoCloseable {
     }
 
     public boolean awaitRegistration(long timeout, TimeUnit unit) throws InterruptedException {
-        return registeredLatch.await(timeout, unit) && !rejection.isDone();
+        return registeredLatch.await(timeout, unit) && rejectionReason == null;
     }
 
     public Optional<WorkerRejectedPayload> rejectionReason() {
-        return Optional.ofNullable(rejection.getNow(null));
+        return Optional.ofNullable(rejectionReason);
     }
 
     /** Runs the notification once when registration or renewal is rejected, including a prior rejection. */
     public void onRejection(Runnable notification) {
-        rejection.thenRun(notification);
+        rejectionNotification.thenRun(notification);
     }
 
     public boolean isConnected() {
@@ -293,7 +294,7 @@ public final class DistributionWorkerClient implements AutoCloseable {
     }
 
     private synchronized void connectInternal() {
-        if (!running.get() || draining.get() || closed.get() || rejection.isDone() || connection != null) {
+        if (!running.get() || draining.get() || closed.get() || rejectionReason != null || connection != null) {
             return;
         }
         if (registeredLatch.getCount() == 0) {
@@ -322,7 +323,7 @@ public final class DistributionWorkerClient implements AutoCloseable {
 
     @SuppressWarnings("unchecked")
     private synchronized void register(WorkerWsListener listener, WebSocket ws) {
-        if (connection != listener || closed.get() || !running.get() || rejection.isDone()) {
+        if (connection != listener || closed.get() || !running.get() || rejectionReason != null) {
             ws.abort();
             return;
         }
@@ -353,7 +354,7 @@ public final class DistributionWorkerClient implements AutoCloseable {
     }
 
     private void scheduleReconnect() {
-        if (!running.get() || draining.get() || closed.get() || rejection.isDone()) {
+        if (!running.get() || draining.get() || closed.get() || rejectionReason != null) {
             return;
         }
         scheduler.schedule(this::connectInternal, config.reconnectDelayMs(), TimeUnit.MILLISECONDS);
@@ -464,11 +465,6 @@ public final class DistributionWorkerClient implements AutoCloseable {
             case WorkerWsMessage.WORKER_RENEWED -> {
                 // The next renewal is already scheduled for this connection.
             }
-            case WorkerWsMessage.WORKER_REJECTED -> {
-                WorkerRejectedPayload reason = DistributionJson.convert(message.payload(), WorkerRejectedPayload.class);
-                disconnected(ws, reason != null ? reason : genericRejection());
-                ws.abort();
-            }
             case WorkerWsMessage.RESULT_ACK -> resultOutbox.acknowledge(
                     (String) message.payload().get(WorkerWsMessage.DELIVERY_ID));
             case WorkerWsMessage.PARTITION_ASSIGN -> {
@@ -555,23 +551,30 @@ public final class DistributionWorkerClient implements AutoCloseable {
         return new WorkerRejectedPayload("WORKER_REJECTED", "The coordinator rejected the worker registration");
     }
 
-    private synchronized void disconnected(WebSocket ws, WorkerRejectedPayload reason) {
-        if (!activeWebSocket.compareAndSet(ws, null)) {
-            return;
-        }
-        connection = null;
-        cancelRenewal();
-        // The coordinator requeues the partition of a lost connection.
-        assignments.cancel(null, 0);
-        if (reason != null) {
-            rejection.complete(reason);
-            registeredLatch.countDown();
-        } else {
-            if (registeredLatch.getCount() == 0) {
-                registeredLatch = new CountDownLatch(1);
+    private void disconnected(WebSocket ws, WorkerRejectedPayload reason) {
+        synchronized (this) {
+            if (!activeWebSocket.compareAndSet(ws, null)) {
+                return;
             }
-            scheduleReconnect();
+            connection = null;
+            cancelRenewal();
+            // The coordinator requeues the partition of a lost connection.
+            assignments.cancel(null, 0);
+            if (reason == null) {
+                if (registeredLatch.getCount() == 0) {
+                    registeredLatch = new CountDownLatch(1);
+                }
+                scheduleReconnect();
+                return;
+            }
+            rejectionReason = reason;
+            registeredLatch.countDown();
         }
+        if (!ws.isInputClosed()) {
+            ws.abort();
+        }
+        // Application callbacks may wait for registration or close the client.
+        rejectionNotification.complete(null);
     }
 
     private final class WorkerWsListener implements WebSocket.Listener {
@@ -590,7 +593,12 @@ public final class DistributionWorkerClient implements AutoCloseable {
                 buffer.setLength(0);
                 try {
                     WorkerWsMessage msg = DistributionJson.fromJson(json, WorkerWsMessage.class);
-                    handleWsMessage(webSocket, msg);
+                    if (msg != null && WorkerWsMessage.WORKER_REJECTED.equals(msg.type())) {
+                        var reason = DistributionJson.convert(msg.payload(), WorkerRejectedPayload.class);
+                        disconnected(webSocket, reason != null ? reason : genericRejection());
+                    } else {
+                        handleWsMessage(webSocket, msg);
+                    }
                 } catch (Exception e) {
                     LOG.warn("Invalid WebSocket message on worker {}", config.workerId());
                 }

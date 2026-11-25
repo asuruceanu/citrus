@@ -125,6 +125,16 @@ class DistributionWorkerClientTest {
 
     private void assertTerminalRejection(boolean structured) throws Exception {
         try (var peer = new WorkerPeer(); var worker = new DistributionWorkerClient(peer.config(tempDir))) {
+            var callback = new CompletableFuture<Boolean>();
+            worker.onRejection(() -> {
+                try {
+                    boolean registered = worker.awaitRegistration(3, TimeUnit.SECONDS);
+                    callback.complete(!registered && !Thread.holdsLock(worker) && worker.rejectionReason().isPresent());
+                } catch (InterruptedException e) {
+                    callback.completeExceptionally(e);
+                    Thread.currentThread().interrupt();
+                }
+            });
             worker.start();
             var socket = peer.nextSocket();
             peer.nextMessage(WorkerWsMessage.WORKER_REGISTER);
@@ -135,6 +145,7 @@ class DistributionWorkerClientTest {
             socket.close((short) 4003, "rejected");
             assertTimeout(Duration.ofSeconds(1),
                     () -> assertThat(worker.awaitRegistration(2, TimeUnit.SECONDS)).isFalse());
+            assertThat(callback.get(1, TimeUnit.SECONDS)).isTrue();
             assertThat(worker.rejectionReason()).hasValueSatisfying(reason -> {
                 assertThat(reason.code()).isEqualTo(structured ? "INVALID_REGISTRATION_KEY" : "WORKER_REJECTED");
                 assertThat(reason.message()).isNotBlank();
