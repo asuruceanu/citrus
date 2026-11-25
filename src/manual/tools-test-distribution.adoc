@@ -432,8 +432,8 @@ grace window for existing work. Reconfigure and restart them with another pool a
 
 ==== Historical Usage (`#usage`)
 
-Choose *1 hour*, *24 hours*, or *7 days* to see active jobs and partitions, fleet utilization, and utilization for each
-pool. *Connected* counts online workers, *Utilized* counts workers handling work, and *Desired* counts active and
+Choose *1 hour*, *24 hours*, or *7 days* to see active jobs, fleet utilization, and utilization for each pool.
+The REST response also reports active partitions in the fleet series. *Connected* counts online workers, *Utilized* counts workers handling work, and *Desired* counts active and
 pending partitions. Per-pool desired demand fills compatible pools by priority up to their connected capacity.
 Excess demand goes to the highest-priority compatible pool. Deleted pools retain connected and utilized counts while
 their workers remain connected during grace and receive no new desired demand.
@@ -495,9 +495,10 @@ The JBang worker accepts `--pool` / `-p` and `--registration-key` / `-k`. In Cit
 |`CITRUS_DIST_WORKER_REGISTRATION_KEY` / `TEST_DISTRIBUTION_AGENT_REGISTRATION_KEY`
 |===
 
-For each setting, command-line options take precedence over system properties, followed by `CITRUS_DIST_WORKER_*`
-environment variables and their `TEST_DISTRIBUTION_AGENT_*` aliases. Blank values count as unset. The following
-command takes its registration key from the environment.
+An explicit worker option or typed agent setting takes precedence. Otherwise the worker checks the
+`CITRUS_DIST_WORKER_*` variable first, then the `TEST_DISTRIBUTION_AGENT_*` alias, then the JVM system property,
+skipping blank values. Citrus Agent rejects an explicitly blank `--pool` or `--registration-key` argument.
+The following command takes its registration key from the environment.
 
 [source,bash]
 ----

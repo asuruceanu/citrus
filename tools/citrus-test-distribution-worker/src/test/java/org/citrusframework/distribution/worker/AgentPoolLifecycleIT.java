@@ -141,6 +141,7 @@ class AgentPoolLifecycleIT {
         var artifact = ClasspathPackager.packagePath(Path.of(BlockingFixture.class.getProtectionDomain()
                 .getCodeSource().getLocation().toURI()));
         var upload = HttpRequest.newBuilder(api("/cache/blobs/" + artifact.ref().sha256()))
+                .timeout(Duration.ofSeconds(10))
                 .PUT(HttpRequest.BodyPublishers.ofByteArray(artifact.bytes())).build();
         assertThat(http.send(upload, HttpResponse.BodyHandlers.discarding()).statusCode()).isEqualTo(201);
 
