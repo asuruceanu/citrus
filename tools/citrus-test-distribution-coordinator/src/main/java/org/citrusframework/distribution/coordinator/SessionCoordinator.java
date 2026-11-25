@@ -1022,17 +1022,19 @@ public final class SessionCoordinator {
         data.put("sessionId", record.sessionId());
         data.put("partitionId", record.partitionId());
         eventHub.publish("test.event", record.sessionId(), record.partitionId(), conn.workerId, data, deliveryId, result, List.of());
-        // Duplicate journal deliveries are acknowledged immediately, so apply the committed result before updating live status.
-        if (result != null && session != null) {
-            session.recordExecution(result);
-            refreshRunningSessionSummary(session);
-        }
+        // Replay only acknowledges the journal entry. Apply both in-memory changes before either status write can fail.
         if (live) {
             if (evt.status() == TestOutcomeStatus.STARTED) {
                 conn.activeTests.putLast(testKey, testDisplay(evt));
             } else {
                 conn.activeTests.remove(testKey);
             }
+        }
+        if (result != null && session != null) {
+            session.recordExecution(result);
+            refreshRunningSessionSummary(session);
+        }
+        if (live) {
             persistWorker(conn);
         }
         if (deliveryId != null) {
@@ -1429,14 +1431,15 @@ public final class SessionCoordinator {
                 conn.pool == null ? null : conn.pool.displayName(), conn.capabilities, conn.state, conn.activePartitionId,
                 display, conn.stateUpdatedAt, conn.lastHeartbeatAt, conn.connectedAt, conn.cacheStats,
                 List.copyOf(conn.warnings.values()));
-        conn.lastPersisted = row;
         var connections = connectionsByWorker.get(conn.workerId);
-        WorkerRecord visible = connections == null ? row : displayedWorker(connections).lastPersisted;
+        WorkerConnection displayed = connections == null ? conn : displayedWorker(connections);
+        WorkerRecord visible = displayed == conn ? row : displayed.lastPersisted;
         store.upsertWorker(visible);
         if (stateChanged || !Objects.equals(old.poolDisplayName(), row.poolDisplayName())
                 || !old.warnings().equals(row.warnings()) || !Objects.equals(old.cacheStats(), row.cacheStats())) {
             eventHub.publish("worker.updated", null, visible.activePartitionId(), visible.workerId(), Map.of("state", visible.state().name()));
         }
+        conn.lastPersisted = row;
     }
 
     private void resetPersistedWorker(WorkerRecord worker, WorkerState state) {

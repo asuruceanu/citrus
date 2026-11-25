@@ -38,6 +38,7 @@ import org.citrusframework.distribution.model.PartitionRecord;
 import org.citrusframework.distribution.model.PartitionState;
 import org.citrusframework.distribution.model.ReportLocalTestsRequest;
 import org.citrusframework.distribution.model.SessionStatus;
+import org.citrusframework.distribution.model.SessionSummary;
 import org.citrusframework.distribution.model.SubmitWorkRequest;
 import org.citrusframework.distribution.model.TestExecutionRecord;
 import org.citrusframework.distribution.model.TestOutcomeStatus;
@@ -1502,24 +1503,46 @@ class SessionCoordinatorTest {
 
     @Test
     void keepsCommittedResultInSummaryWhenWorkerStatusWriteFailsBeforeAcknowledgement() {
-        class FailingStatusStore extends JdbcDistributionStore {
-            boolean failNextStatus;
+        assertRecoveryAfter(FailedWrite.WORKER_STATUS);
+    }
 
-            FailingStatusStore() {
+    @Test
+    void heartbeatShowsRemainingTestAfterSummaryWriteFailureAndJournalReplay() {
+        assertRecoveryAfter(FailedWrite.SESSION_SUMMARY);
+    }
+
+    private enum FailedWrite { WORKER_STATUS, SESSION_SUMMARY }
+
+    private void assertRecoveryAfter(FailedWrite failure) {
+        class FailingStore extends JdbcDistributionStore {
+            FailedWrite failNext;
+
+            FailingStore() {
                 super("jdbc:hsqldb:mem:status_failure_" + System.nanoTime(), "SA", "");
             }
 
             @Override
             public void upsertWorker(WorkerRecord worker) {
-                if (failNextStatus) {
-                    failNextStatus = false;
-                    throw new IllegalStateException("Simulated status write failure");
-                }
+                failOnce(FailedWrite.WORKER_STATUS);
                 super.upsertWorker(worker);
+            }
+
+            @Override
+            public void updateSessionStatus(String sessionId, SessionStatus status, long finishedAt,
+                                            SessionSummary summary, String failureReason) {
+                failOnce(FailedWrite.SESSION_SUMMARY);
+                super.updateSessionStatus(sessionId, status, finishedAt, summary, failureReason);
+            }
+
+            private void failOnce(FailedWrite write) {
+                if (failNext == write) {
+                    failNext = null;
+                    throw new IllegalStateException("Simulated write failure: " + write);
+                }
             }
         }
 
-        try (var failing = new FailingStatusStore()) {
+        try (var failing = new FailingStore()) {
             failing.initialize();
             var config = DistributionCoordinatorConfig.builder().leaseTimeoutMs(60_000L).build();
             coordinator = new SessionCoordinator(config, failing, new CoordinatorEventStreamHub(failing));
@@ -1527,22 +1550,32 @@ class SessionCoordinatorTest {
             String session = newSession(1);
             demand(session, "partition", JDK);
             var assignment = worker.lastAssignment();
+            startTest(worker, assignment, "Test", "remaining");
             startTest(worker, assignment, "Test", "one");
+            assertThat(failing.listWorkers().getFirst().activeTestDisplay()).isEqualTo("Test > one");
             var failed = new WorkerTestEventPayload(assignment.partitionId(), session, assignment.attempt(), "key",
                     "Test", "one", TestOutcomeStatus.FAILED, 22L, "assertion failed", null, List.of());
             @SuppressWarnings("unchecked")
             Map<String, Object> payload = DistributionJson.convert(failed, Map.class);
             String delivery = "0000000000000000001-00000000-0000-0000-0000-000000000001";
             payload.put(WorkerWsMessage.DELIVERY_ID, delivery);
-            failing.failNextStatus = true;
+            failing.failNext = failure;
             assertThatThrownBy(() -> worker.send(WorkerWsMessage.TEST_EVENT, payload))
-                    .isInstanceOf(IllegalStateException.class).hasMessage("Simulated status write failure");
+                    .isInstanceOf(IllegalStateException.class).hasMessage("Simulated write failure: " + failure);
             assertThat(failing.hasDelivery(delivery)).isTrue();
             assertThat(worker.messagesOfType(WorkerWsMessage.RESULT_ACK)).isEmpty();
 
             worker.send(WorkerWsMessage.TEST_EVENT, payload);
             assertThat(worker.messagesOfType(WorkerWsMessage.RESULT_ACK)).hasSize(1);
             assertThat(failing.listTestExecutions(session)).hasSize(1);
+            var events = new java.util.ArrayList<CoordinatorEvent>();
+            failing.replayEvents(null, 0L, 100, events::add);
+            long beforeHeartbeat = events.getLast().sequence();
+            worker.heartbeat(assignment.partitionId());
+            events.clear();
+            failing.replayEvents(null, beforeHeartbeat, 100, events::add);
+            assertThat(events).extracting(CoordinatorEvent::type).contains("worker.updated");
+            assertThat(failing.listWorkers().getFirst().activeTestDisplay()).isEqualTo("Test > remaining");
             worker.complete(assignment, assignment.attempt(), List.of());
             var summary = coordinator.completeSession(session, new CompleteSessionRequest(0, 0, 0, 0L));
             assertThat(summary.failedTests()).isOne();
