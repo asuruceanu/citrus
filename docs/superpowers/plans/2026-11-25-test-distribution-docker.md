@@ -15,7 +15,7 @@
 - Build both Citrus images locally from the same checkout. The rollout target is a developer's Docker engine.
 - Use Java 21 and non-root users in both images. Preserve the existing Citrus coordinator and dedicated worker entry points.
 - Default to PostgreSQL 16, one coordinator, and eight worker replicas. Publish only the coordinator on `127.0.0.1:8765`.
-- Keep PostgreSQL history and coordinator artifacts in named volumes. Keep each worker cache in that replica's writable container storage. Allow 65 seconds for worker drain.
+- Keep PostgreSQL history and coordinator artifacts in named volumes. Keep each worker cache in that replica's writable container storage. Allow a Compose shutdown grace period of 65 seconds. The worker gives an active partition 30 seconds to finish.
 - Use `CITRUS_DIST_HOST_PORT`, `CITRUS_DIST_WORKERS`, `CITRUS_DIST_JDBC_PASSWORD`, and optional `CITRUS_DIST_AUTH_TOKEN` as specified. All scripts use the same Compose file and `COMPOSE_PROJECT_NAME` selection.
 - The current worktree has an exploratory draft. Use it as a reference, reproduce red checks against the base where necessary, and verify the final changes as a whole.
 

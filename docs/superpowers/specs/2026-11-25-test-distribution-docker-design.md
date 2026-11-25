@@ -36,8 +36,9 @@ host port.
 | Worker | Eight Java 21 replicas, each with a cache in its own writable container storage | Connects to `http://coordinator:8765` on the Compose network |
 
 PostgreSQL readiness gates coordinator startup. The coordinator's `/health` response gates
-worker startup. Use the dashboard or worker API to confirm registration after startup. Allow
-65 seconds for a worker to drain at shutdown.
+worker startup. Use the dashboard or worker API to confirm registration after startup. The
+worker gives an active partition 30 seconds to finish. Compose allows a shutdown grace period
+of 65 seconds for the container to drain and close its connections.
 [Docker Compose startup order](https://docs.docker.com/compose/how-tos/startup-order/)
 
 ## Local development workflow
@@ -55,7 +56,8 @@ distribution-enabled Maven build at `http://127.0.0.1:8765`. Use `CITRUS_DIST_HO
 Compose supplies a development database password for a fresh PostgreSQL volume. The developer
 can override it with `CITRUS_DIST_JDBC_PASSWORD` before the first start. Set
 `CITRUS_DIST_AUTH_TOKEN` in Compose and Maven when testing bearer authentication. Compose
-passes the same token to the coordinator and all workers.
+passes the same token to the coordinator and all workers. With bearer authentication enabled,
+the dashboard uses a trusted reverse proxy that supplies the bearer header for its requests.
 
 ### Lifecycle scripts
 

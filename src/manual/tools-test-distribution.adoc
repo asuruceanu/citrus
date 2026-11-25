@@ -195,7 +195,8 @@ in PostgreSQL before restarting the stack with a new value.
 
 |`CITRUS_DIST_AUTH_TOKEN`
 |Enables shared bearer authentication on the coordinator. The workers get the same token from Compose.
-Pass it to Maven via the environment and enter it in the dashboard when prompted. The default is empty.
+Pass it to Maven via the environment. If you enable authentication and want to use the dashboard, follow
+the instructions for <<tools-test-distribution-ui,authenticated dashboard access>>. The default is empty.
 
 |`CITRUS_DIST_WORKER_CAPABILITIES`
 |Adds comma-separated capability tags to every worker in the Compose stack.
@@ -214,10 +215,11 @@ Use the stop script to pause services and preserve their containers, images, and
 ./tools/citrus-test-distribution/docker/stop.sh
 ----
 
-Workers have up to 65 seconds to drain. Starting again with the same source and settings reuses worker identities
-and caches. PostgreSQL
-and the coordinator artifact cache use named volumes, so their data also survives container recreation.
-Replacing a worker starts it with a fresh cache.
+The worker gives an active partition up to 30 seconds to finish. Compose gives the container a shutdown
+grace period of 65 seconds, which also covers closing connections and releasing resources.
+Starting again with the same source and settings reuses worker identities and caches. PostgreSQL and the
+coordinator artifact cache use named volumes, so their data also survives container recreation. Replacing a
+worker starts it with a fresh cache.
 
 For a fresh stack, run the cleanup script. It deletes the selected Compose project's containers and networks,
 both source-built Citrus images, and the named volumes holding test history and artifacts.
