@@ -87,8 +87,9 @@ let refreshInFlight = false;
 let refreshPending = false;
 let lastDetailLoadAt = 0;
 let detailTimer = null;
-// Increases with every session detail request; a response that is no longer the latest is discarded.
+// A new request or leaving the detail view invalidates earlier responses.
 let detailRequestSeq = 0;
+let detailRequestInFlight = null;
 let workerRequestSeq = 0;
 let poolDataRevision = 0;
 let poolRefreshInFlight = false;
@@ -181,6 +182,12 @@ function applyHashFromLocation() {
 function changeView(view, poolId = null) {
   if (view === state.view && poolId === state.selectedPoolId) return;
   if (state.view === 'usage') stopUsageRefresh();
+  if (state.view === 'session-detail') {
+    detailRequestSeq++;
+    detailRequestInFlight = null;
+    clearTimeout(detailTimer);
+    detailTimer = null;
+  }
   if (state.view === 'pools' || view === 'pools') {
     poolViewSeq++;
     state.selectedPoolId = poolId;
@@ -388,7 +395,6 @@ async function refreshAll() {
 }
 
 async function loadSessionDetail(sessionId, switchView = true) {
-  const requestSeq = ++detailRequestSeq;
   if (switchView) {
     state.selectedSessionId = sessionId;
     changeView('session-detail');
@@ -398,8 +404,11 @@ async function loadSessionDetail(sessionId, switchView = true) {
   }
   const selectionAtStart = state.selectedSessionId;
   const hashAtStart = location.hash;
+  if (detailRequestInFlight?.sessionId === sessionId && detailRequestInFlight.isCurrent()) return;
+  const requestSeq = ++detailRequestSeq;
   const isCurrent = () => requestSeq === detailRequestSeq && location.hash === hashAtStart
     && state.view === 'session-detail' && state.selectedSessionId === selectionAtStart;
+  detailRequestInFlight = { sessionId, isCurrent };
   try {
     const detail = await apiGet(`/api/v1/sessions/${encodeURIComponent(sessionId)}`);
     if (!isCurrent()) return;
@@ -429,6 +438,8 @@ async function loadSessionDetail(sessionId, switchView = true) {
       renderApp();
     }
     console.warn('Failed to load session detail:', err.message);
+  } finally {
+    if (requestSeq === detailRequestSeq) detailRequestInFlight = null;
   }
 }
 
@@ -621,9 +632,12 @@ function renderSidebar() {
           onOpen();
           return;
         }
-        if (id === 'session-detail' && !state.sessionDetail && state.sessions.length > 0) {
-          loadSessionDetail(state.sessions[0].sessionId, true);
-          return;
+        if (id === 'session-detail') {
+          const sessionId = state.selectedSessionId || state.sessions[0]?.sessionId;
+          if (sessionId && state.sessionDetail?.session?.sessionId !== sessionId) {
+            loadSessionDetail(sessionId);
+            return;
+          }
         }
         setView(id);
       }}
