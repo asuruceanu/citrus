@@ -1482,6 +1482,74 @@ class SessionCoordinatorTest {
         assertThat(fallback.lastAssignment().partitionId()).isEqualTo(assigned.partitionId());
     }
 
+    @Test
+    void samplesLegacyUnpooledCapabilitiesContainingNullValues() {
+        useControlledClock(false);
+        var capabilities = new java.util.LinkedHashMap<String, String>();
+        capabilities.put("jdk", "21");
+        capabilities.put("gpu", null);
+        register("legacy-connection", "legacy", capabilities);
+        register("other-connection", "other", Map.of("gpu", "true"));
+
+        var sample = coordinator.sampleUsageNow();
+        assertThat(sample.unpooledWorkers()).hasSize(2);
+        assertThat(sample.unpooledWorkers()).filteredOn(bucket -> bucket.capabilities().containsKey("jdk")).singleElement()
+                .satisfies(bucket -> assertThat(bucket.capabilities()).containsEntry("gpu", null));
+        assertThat(coordinator.queryHistoricalUsage("1h", "").series().getLast().connected()).isEqualTo(2);
+        assertThat(coordinator.queryHistoricalUsage("1h", "jdk=21").series().getLast().connected()).isOne();
+        assertThat(coordinator.queryHistoricalUsage("1h", "gpu").series().getLast().connected()).isOne();
+    }
+
+    @Test
+    void keepsCommittedResultInSummaryWhenWorkerStatusWriteFailsBeforeAcknowledgement() {
+        class FailingStatusStore extends JdbcDistributionStore {
+            boolean failNextStatus;
+
+            FailingStatusStore() {
+                super("jdbc:hsqldb:mem:status_failure_" + System.nanoTime(), "SA", "");
+            }
+
+            @Override
+            public void upsertWorker(WorkerRecord worker) {
+                if (failNextStatus) {
+                    failNextStatus = false;
+                    throw new IllegalStateException("Simulated status write failure");
+                }
+                super.upsertWorker(worker);
+            }
+        }
+
+        try (var failing = new FailingStatusStore()) {
+            failing.initialize();
+            var config = DistributionCoordinatorConfig.builder().leaseTimeoutMs(60_000L).build();
+            coordinator = new SessionCoordinator(config, failing, new CoordinatorEventStreamHub(failing));
+            var worker = join("worker", null, null, JDK);
+            String session = newSession(1);
+            demand(session, "partition", JDK);
+            var assignment = worker.lastAssignment();
+            startTest(worker, assignment, "Test", "one");
+            var failed = new WorkerTestEventPayload(assignment.partitionId(), session, assignment.attempt(), "key",
+                    "Test", "one", TestOutcomeStatus.FAILED, 22L, "assertion failed", null, List.of());
+            @SuppressWarnings("unchecked")
+            Map<String, Object> payload = DistributionJson.convert(failed, Map.class);
+            String delivery = "0000000000000000001-00000000-0000-0000-0000-000000000001";
+            payload.put(WorkerWsMessage.DELIVERY_ID, delivery);
+            failing.failNextStatus = true;
+            assertThatThrownBy(() -> worker.send(WorkerWsMessage.TEST_EVENT, payload))
+                    .isInstanceOf(IllegalStateException.class).hasMessage("Simulated status write failure");
+            assertThat(failing.hasDelivery(delivery)).isTrue();
+            assertThat(worker.messagesOfType(WorkerWsMessage.RESULT_ACK)).isEmpty();
+
+            worker.send(WorkerWsMessage.TEST_EVENT, payload);
+            assertThat(worker.messagesOfType(WorkerWsMessage.RESULT_ACK)).hasSize(1);
+            assertThat(failing.listTestExecutions(session)).hasSize(1);
+            worker.complete(assignment, assignment.attempt(), List.of());
+            var summary = coordinator.completeSession(session, new CompleteSessionRequest(0, 0, 0, 0L));
+            assertThat(summary.failedTests()).isOne();
+            assertThat(summary.status()).isEqualTo(SessionStatus.FAILED);
+        }
+    }
+
     private String newSession(int maxRetries) {
         return coordinator.createSession(new CreateSessionRequest("citrus", "main", "abc", List.of(), 1, maxRetries)).sessionId();
     }

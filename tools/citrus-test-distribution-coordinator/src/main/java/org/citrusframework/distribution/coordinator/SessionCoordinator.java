@@ -1022,6 +1022,11 @@ public final class SessionCoordinator {
         data.put("sessionId", record.sessionId());
         data.put("partitionId", record.partitionId());
         eventHub.publish("test.event", record.sessionId(), record.partitionId(), conn.workerId, data, deliveryId, result, List.of());
+        // Duplicate journal deliveries are acknowledged immediately, so apply the committed result before updating live status.
+        if (result != null && session != null) {
+            session.recordExecution(result);
+            refreshRunningSessionSummary(session);
+        }
         if (live) {
             if (evt.status() == TestOutcomeStatus.STARTED) {
                 conn.activeTests.putLast(testKey, testDisplay(evt));
@@ -1029,10 +1034,6 @@ public final class SessionCoordinator {
                 conn.activeTests.remove(testKey);
             }
             persistWorker(conn);
-        }
-        if (result != null && session != null) {
-            session.recordExecution(result);
-            refreshRunningSessionSummary(session);
         }
         if (deliveryId != null) {
             acknowledgeResult(conn, deliveryId);
