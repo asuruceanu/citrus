@@ -13,7 +13,7 @@
 ## Global Constraints
 
 - Do **not** implement Connecting Builds / Jobs view, separate `Agents` tab, access control / RBAC, project groups, or autoscaling (`minSize` / `maxSize`).
-- Keep `tools/citrus-test-distribution-protocol` free of `citrus-api` and Vert.x dependencies (`jackson-databind` and `slf4j-api` only).
+- Keep `tools/citrus-test-distribution-protocol` free of `citrus-api` and Vert.x dependencies (reuse the existing Jackson and SLF4J dependencies).
 - Keep `tools/citrus-test-distribution-ui` dependency-free browser ESM (`htm-mini.js`, vanilla JS, inline SVG, CSS custom properties) with no Node/npm build step.
 - Never store plaintext registration keys in JDBC or return secret keys after initial generation (`GeneratedRegistrationKey.secretKey` is returned once on `POST`; `RegistrationKeyRecord` exposes only `keyPrefix` + metadata).
 - Preserve backward-compatible hybrid mode (`citrus.test.distribution.coordinator.requireAgentPool=false` by default) so existing unpooled workers continue working unless strict pool mode is enabled.
@@ -90,7 +90,7 @@ In `CapabilityMatcherTest.java`, add tests verifying:
 1. `@AgentRequirement(key = "docker")` compiles without `value` and defaults `value()` to `"true"`, matching `DistributionSettings.parseStrictCapabilitiesCsv("docker,postgres=18")` (`{"docker": "true", "postgres": "18"}`).
 2. `DistributionSettings.parseStrictCapabilitiesCsv` rejects malformed entries (`"a=b=c"`, `"bad space=1"`, `"=val"`, `"key="`) with `IllegalArgumentException`.
 
-In `DistributionSettingsAndPathRewriterTest.java`, add tests verifying precedence `CITRUS_DIST_WORKER_POOL` > `TEST_DISTRIBUTION_AGENT_POOL` > `citrus.test.distribution.worker.pool` (and matching precedence for `registrationKey`, `workerId` / `TEST_DISTRIBUTION_AGENT_NAME`, `capabilities` / `TEST_DISTRIBUTION_AGENT_CAPABILITIES`, and `isCoordinatorRequireAgentPool()`).
+In `DistributionSettingsAndPathRewriterTest.java`, add tests verifying precedence `CITRUS_DIST_WORKER_POOL` > `TEST_DISTRIBUTION_AGENT_POOL` > `citrus.test.distribution.worker.pool` (and matching precedence for `registrationKey`, `workerId` / `TEST_DISTRIBUTION_AGENT_NAME`, `capabilities` / `TEST_DISTRIBUTION_AGENT_CAPABILITIES`). Verify the coordinator strict setting separately with explicit Java property > environment > default `false`.
 
 - [ ] **Step 2: Run protocol tests to verify they fail**
 
@@ -99,7 +99,7 @@ Expected: FAIL with compilation errors for missing model records and `Distributi
 
 - [ ] **Step 3: Implement protocol records, `@AgentRequirement` default, strict capability validation, and `DistributionSettings` resolvers**
 
-Create all records listed in **Produces** with defensive `Map.copyOf` / `List.copyOf` canonical constructors where nullable collections may arrive from Jackson. Add `default "true"` to `AgentRequirement#value()`, add `CapabilityMatcher.validateCapabilities` + `DistributionSettings.parseStrictCapabilitiesCsv`, and add the pool/key/alias constants and resolvers in `DistributionSettings`.
+Create all records listed in **Produces** with defensive collection copies and empty defaults for omitted collections. Preserve legacy worker capability maps containing null values during deserialization. Add `default "true"` to `AgentRequirement#value()`, add `CapabilityMatcher.validateCapabilities` + `DistributionSettings.parseStrictCapabilitiesCsv`, and add the pool/key/alias constants and resolvers in `DistributionSettings`.
 
 - [ ] **Step 4: Run protocol tests to verify they pass**
 
@@ -129,6 +129,7 @@ git commit -m "feat(test-distribution-protocol): add agent pool, registration ke
   - `StoredRegistrationKey(RegistrationKeyRecord metadata, String keyHash)`
   - `DistributionStore`:
     - `void upsertAgentPool(AgentPoolRecord pool)`
+    - `void insertAgentPool(AgentPoolRecord pool, StoredRegistrationKey initialKey)` where the optional key and pool are committed atomically
     - `Optional<AgentPoolRecord> findAgentPool(String poolId)`
     - `List<AgentPoolRecord> listAgentPools()`
     - `boolean deleteAgentPool(String poolId)`
@@ -144,23 +145,23 @@ git commit -m "feat(test-distribution-protocol): add agent pool, registration ke
 - [ ] **Step 1: Write failing JDBC store tests**
 
 In `JdbcDistributionStoreTest.java`, add tests covering:
-1. Agent pool CRUD + `listAgentPools()` ordered by `priority_order ASC, created_at ASC` + `updateAgentPoolPriorities(List.of("pool2", "pool1"), now)` + `deleteAgentPool`.
+1. Agent pool CRUD + `listAgentPools()` ordered by `priority_order ASC, created_at ASC` + `updateAgentPoolPriorities(List.of("pool2", "pool1"), now)` + `deleteAgentPool`. Cover atomic rollback on a failed initial key insert and bulk priority change, and removal of a deleted pool’s keys.
 2. Registration key insert, `listRegistrationKeys(poolId)` returning `keyHash` + `RegistrationKeyRecord`, `touchRegistrationKeyUsage` updating `lastUsedAt` and `lastUsedBy`, and `revokeRegistrationKey` setting `revokedAt` (returning `false` when `poolId` does not match).
 3. `upsertWorker` / `listWorkers` round-tripping `version`, `poolId`, `poolDisplayName`, `activeTestDisplay`, `stateUpdatedAt`, and `List<WorkerWarning>`, plus schema migration when opening an existing `dist_workers` table created before the new columns existed.
 4. `recordUsageSample` persisting snapshots, pruning rows with `sampled_at < pruneBeforeTimestamp`, and `listUsageSamples(from, to)` returning ascending samples within `[from, to]`.
 
 - [ ] **Step 2: Run `JdbcDistributionStoreTest` to verify it fails**
 
-Run: `./mvnw test -Dtest=JdbcDistributionStoreTest -pl tools/citrus-test-distribution-coordinator -am`
+Run: `./mvnw test -Dtest=JdbcDistributionStoreTest -pl tools/citrus-test-distribution-coordinator -am -Dsurefire.failIfNoSpecifiedTests=false`
 Expected: FAIL with compilation errors on missing `DistributionStore` methods and `StoredRegistrationKey`.
 
 - [ ] **Step 3: Implement schema tables, `ensureColumns` migration, and JDBC queries in `JdbcDistributionStore`**
 
-Add `dist_agent_pools`, `dist_registration_keys` (plus `idx_dist_reg_keys_pool`), and `dist_usage_samples` in `JdbcDistributionStore.initialize()` using `longText` (`CLOB` on HSQLDB, `TEXT` on PostgreSQL). Extend `dist_workers` and `ensureColumns(...)` with `version`, `pool_id`, `pool_display_name`, `active_test_display`, `state_updated_at`, and `warnings_json`. Implement all methods in `DistributionStore` and `JdbcDistributionStore`.
+Add `dist_agent_pools`, `dist_registration_keys` (plus `idx_dist_reg_keys_pool`), and `dist_usage_samples` in `JdbcDistributionStore.initialize()` using `longText` (`CLOB` on HSQLDB, `TEXT` on PostgreSQL). Extend `dist_workers` and `ensureColumns(...)` with `version`, `pool_id`, `pool_display_name`, `active_test_display`, `state_updated_at`, and `warnings_json`. Implement all methods in `DistributionStore` and `JdbcDistributionStore`. Use transactions for pool creation with an initial key, pool deletion with its keys, reordering, and sample write/pruning. Update usage metadata only for active keys.
 
 - [ ] **Step 4: Run `JdbcDistributionStoreTest` to verify it passes**
 
-Run: `./mvnw test -Dtest=JdbcDistributionStoreTest -pl tools/citrus-test-distribution-coordinator`
+Run: `./mvnw test -Dtest=JdbcDistributionStoreTest -pl tools/citrus-test-distribution-coordinator -am -Dsurefire.failIfNoSpecifiedTests=false`
 Expected: PASS (`BUILD SUCCESS`, 0 failures).
 
 - [ ] **Step 5: Commit Task 2**
@@ -234,7 +235,7 @@ In `SessionCoordinatorTest.java` (using controllable `AtomicLong` clock on `Dist
 
 - [ ] **Step 2: Run coordinator unit tests to verify they fail**
 
-Run: `./mvnw test -Dtest=HistoricalUsageAggregatorTest,SessionCoordinatorTest -pl tools/citrus-test-distribution-coordinator`
+Run: `./mvnw test -Dtest=HistoricalUsageAggregatorTest,SessionCoordinatorTest -pl tools/citrus-test-distribution-coordinator -am -Dsurefire.failIfNoSpecifiedTests=false`
 Expected: FAIL with compilation errors on missing `RegistrationKeyCrypto`, `HistoricalUsageAggregator`, and `SessionCoordinator` methods.
 
 - [ ] **Step 3: Implement `RegistrationKeyCrypto`, `HistoricalUsageAggregator`, `DistributionCoordinatorConfig` clock/grace fields, and `SessionCoordinator` pool/key/scheduling/usage logic**
@@ -243,7 +244,7 @@ Implement `RegistrationKeyCrypto` (8-char `[a-z0-9]` pool IDs; `ctrk_<8chars>_<3
 
 - [ ] **Step 4: Run coordinator unit tests to verify they pass**
 
-Run: `./mvnw test -Dtest=HistoricalUsageAggregatorTest,SessionCoordinatorTest -pl tools/citrus-test-distribution-coordinator`
+Run: `./mvnw test -Dtest=HistoricalUsageAggregatorTest,SessionCoordinatorTest -pl tools/citrus-test-distribution-coordinator -am -Dsurefire.failIfNoSpecifiedTests=false`
 Expected: PASS (`BUILD SUCCESS`, 0 failures).
 
 - [ ] **Step 5: Commit Task 3**
@@ -286,7 +287,7 @@ Add tests in `DistributionCoordinatorServerTest.java` verifying:
 
 - [ ] **Step 2: Run `DistributionCoordinatorServerTest` to verify it fails**
 
-Run: `./mvnw test -Dtest=DistributionCoordinatorServerTest -pl tools/citrus-test-distribution-coordinator`
+Run: `./mvnw test -Dtest=DistributionCoordinatorServerTest -pl tools/citrus-test-distribution-coordinator -am -Dsurefire.failIfNoSpecifiedTests=false`
 Expected: FAIL with `404` on `/api/v1/agent-pools` and `/api/v1/usage`.
 
 - [ ] **Step 3: Register routes, `DELETE` CORS + `PUT` body handler, WebSocket close callback, and periodic usage sampler in `DistributionCoordinatorVerticle`**
@@ -299,7 +300,7 @@ In `DistributionCoordinatorVerticle.java`:
 
 - [ ] **Step 4: Run `DistributionCoordinatorServerTest` to verify it passes**
 
-Run: `./mvnw test -Dtest=DistributionCoordinatorServerTest -pl tools/citrus-test-distribution-coordinator`
+Run: `./mvnw test -Dtest=DistributionCoordinatorServerTest -pl tools/citrus-test-distribution-coordinator -am -Dsurefire.failIfNoSpecifiedTests=false`
 Expected: PASS (`BUILD SUCCESS`, 0 failures).
 
 - [ ] **Step 5: Commit Task 4**
@@ -351,7 +352,7 @@ git commit -m "feat(test-distribution-coordinator): expose agent pool and histor
 
 - [ ] **Step 2: Run worker, JBang, agent, and schema tests to verify they fail**
 
-Run: `./mvnw test -Dtest=DistributionWorkerConfigTest,DistributionWorkerClientTest,DistCommandTest,CitrusAgentWorkerOptionsTest,CitrusSchemaGeneratorTest -pl core/citrus-api,tools/citrus-test-distribution-worker,tools/jbang,tools/agent,tools/schema-generator -am`
+Run: `./mvnw test -Dtest=DistributionWorkerConfigTest,DistributionWorkerClientTest,DistCommandTest,CitrusAgentWorkerOptionsTest,CitrusSchemaGeneratorTest -pl core/citrus-api,tools/citrus-test-distribution-worker,tools/jbang,tools/agent,tools/schema-generator -am -Dsurefire.failIfNoSpecifiedTests=false`
 Expected: FAIL with compilation errors on missing `poolId` / `registrationKey` / `rejectionReason` methods.
 
 - [ ] **Step 3: Implement worker config/client, JBang options, agent options/config/bridge, and control schema JSON**
@@ -362,7 +363,7 @@ Expected: FAIL with compilation errors on missing `poolId` / `registrationKey` /
 
 - [ ] **Step 4: Run worker, JBang, agent, and schema tests to verify they pass**
 
-Run: `./mvnw test -Dtest=DistributionWorkerConfigTest,DistributionWorkerClientTest,DistCommandTest,CitrusAgentWorkerOptionsTest,CitrusSchemaGeneratorTest -pl core/citrus-api,tools/citrus-test-distribution-worker,tools/jbang,tools/agent,tools/schema-generator -am`
+Run: `./mvnw test -Dtest=DistributionWorkerConfigTest,DistributionWorkerClientTest,DistCommandTest,CitrusAgentWorkerOptionsTest,CitrusSchemaGeneratorTest -pl core/citrus-api,tools/citrus-test-distribution-worker,tools/jbang,tools/agent,tools/schema-generator -am -Dsurefire.failIfNoSpecifiedTests=false`
 Expected: PASS (`BUILD SUCCESS`, 0 failures, including `CitrusSchemaGeneratorTest#verifyAgentConfigurationJson`).
 
 - [ ] **Step 5: Commit Task 5**
@@ -405,7 +406,7 @@ In `DistributionUiResourcesTest.java` and `DistributionCoordinatorUiTest.java`, 
 
 - [ ] **Step 2: Run UI tests to verify they fail**
 
-Run: `./mvnw test -Dtest=DistributionUiResourcesTest,DistributionCoordinatorUiTest -pl tools/citrus-test-distribution-ui,tools/citrus-test-distribution-coordinator -am`
+Run: `./mvnw test -Dtest=DistributionUiResourcesTest,DistributionCoordinatorUiTest -pl tools/citrus-test-distribution-ui,tools/citrus-test-distribution-coordinator -am -Dsurefire.failIfNoSpecifiedTests=false`
 Expected: FAIL with missing subtitle/views/functions in `app.js` and `index.html`.
 
 - [ ] **Step 3: Implement UI navigation, subtitle update, `Workers Pool` upgrades, `Agent Pools` view, and `Historical Usage` SVG charts**
@@ -414,7 +415,7 @@ Update `index.html`, `styles.css`, and `app.js` with hash routes `#pools`, `#poo
 
 - [ ] **Step 4: Run UI tests to verify they pass**
 
-Run: `./mvnw test -Dtest=DistributionUiResourcesTest,DistributionCoordinatorUiTest -pl tools/citrus-test-distribution-ui,tools/citrus-test-distribution-coordinator -am`
+Run: `./mvnw test -Dtest=DistributionUiResourcesTest,DistributionCoordinatorUiTest -pl tools/citrus-test-distribution-ui,tools/citrus-test-distribution-coordinator -am -Dsurefire.failIfNoSpecifiedTests=false`
 Expected: PASS (`BUILD SUCCESS`, 0 failures).
 
 - [ ] **Step 5: Commit Task 6**

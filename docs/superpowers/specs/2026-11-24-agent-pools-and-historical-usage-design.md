@@ -32,7 +32,7 @@ Citrus Test Distribution currently lets any worker connect directly to the coord
 ## Constraints
 
 - **Zero-Node UI:** `tools/citrus-test-distribution-ui` must remain dependency-free browser ESM (`htm-mini.js`, vanilla JS, inline SVG charts, CSS custom properties) with no npm/Node build step.
-- **Protocol module dependency boundary:** `tools/citrus-test-distribution-protocol` depends only on `jackson-databind` and `slf4j-api`; do not add `citrus-api` or Vert.x dependencies to it.
+- **Protocol module dependency boundary:** `tools/citrus-test-distribution-protocol` keeps its existing Jackson and SLF4J dependencies; do not add `citrus-api` or Vert.x dependencies to it.
 - **JDBC portability:** Schema and queries in `JdbcDistributionStore` must work identically on embedded HSQLDB (`CLOB`) and PostgreSQL (`TEXT`), including `ensureColumns` upgrades on existing databases.
 - **CLI short-flag collision:** `CitrusAppOptions` reserves `-p` for `--package`. Therefore `citrus dist worker start` supports `-p` / `--pool` and `-k` / `--registration-key`, whereas `citrus-agent` supports long `--pool` (no `-p` short alias) and `-k` / `--registration-key`. Both must register new value-taking flags with `WorkerCacheCliOptions` host value-option sets.
 - **JSON Schema control test:** Any `@SchemaProperty` added to `CitrusAgentConfiguration` (`core/citrus-api`) must update `tools/schema-generator/src/test/resources/control/citrus-agent-configuration.json` in exact property order.
@@ -144,7 +144,7 @@ Citrus Test Distribution currently lets any worker connect directly to the coord
   - Pool ID: `citrus.test.distribution.worker.pool`, `CITRUS_DIST_WORKER_POOL`, `TEST_DISTRIBUTION_AGENT_POOL`.
   - Registration key: `citrus.test.distribution.worker.registrationKey`, `CITRUS_DIST_WORKER_REGISTRATION_KEY`, `TEST_DISTRIBUTION_AGENT_REGISTRATION_KEY`.
   - Develocity env aliases also honored for worker name (`TEST_DISTRIBUTION_AGENT_NAME`) and capabilities (`TEST_DISTRIBUTION_AGENT_CAPABILITIES`).
-  - Coordinator strict pool flag: `citrus.test.distribution.coordinator.requireAgentPool` / `CITRUS_DIST_COORDINATOR_REQUIRE_AGENT_POOL` (default `false`).
+  - Coordinator strict pool flag: `citrus.test.distribution.coordinator.requireAgentPool` / `CITRUS_DIST_COORDINATOR_REQUIRE_AGENT_POOL` (property wins when set, default `false`).
 - **CLI flags:**
   - `citrus dist worker start`: `-p` / `--pool` and `-k` / `--registration-key` (added to `VALUE_OPTIONS`).
   - `citrus-agent`: `--pool` (long option only) and `-k` / `--registration-key`, backed by `CitrusAgentConfiguration` (`pool`, `registrationKey`) and synced with `citrus-agent-configuration.json`.
