@@ -473,7 +473,7 @@ class DistributedLauncherTest {
             DistributionCoordinatorServer coordinator = new DistributionCoordinatorServer(DistributionCoordinatorConfig.builder()
                     .port(0)
                     .cacheDir(tempDir.resolve("coordinator-cache"))
-                    .jdbcUrl("jdbc:hsqldb:mem:launcher_ws_" + System.nanoTime())
+                    .jdbcUrl("jdbc:hsqldb:file:" + tempDir.resolve("launcher_ws_" + System.nanoTime()) + ";shutdown=true")
                     .build());
             coordinator.start();
             List<DistributionWorkerClient> workers = new ArrayList<>();
@@ -529,7 +529,7 @@ class DistributedLauncherTest {
         DistributionCoordinatorConfig coordinatorCfg = DistributionCoordinatorConfig.builder()
                 .port(0)
                 .cacheDir(tempDir.resolve("coordinator-cache"))
-                .jdbcUrl("jdbc:hsqldb:mem:junit_dist_" + System.nanoTime())
+                .jdbcUrl("jdbc:hsqldb:file:" + tempDir.resolve("junit_dist_" + System.nanoTime()) + ";shutdown=true")
                 .build();
 
         try (DistributionCoordinatorServer coordinator = new DistributionCoordinatorServer(coordinatorCfg)) {
@@ -1006,7 +1006,7 @@ class DistributedLauncherTest {
         DistributionCoordinatorServer coordinator = new DistributionCoordinatorServer(DistributionCoordinatorConfig.builder()
                 .port(0)
                 .cacheDir(coordinatorCacheDir)
-                .jdbcUrl("jdbc:hsqldb:mem:launcher_warm_" + System.nanoTime())
+                .jdbcUrl("jdbc:hsqldb:file:" + tempDir.resolve("launcher_warm_" + System.nanoTime()) + ";shutdown=true")
                 .build());
         coordinator.start();
         try {

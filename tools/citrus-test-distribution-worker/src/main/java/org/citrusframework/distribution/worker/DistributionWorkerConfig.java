@@ -16,6 +16,7 @@
 
 package org.citrusframework.distribution.worker;
 
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.Collections;
@@ -52,13 +53,15 @@ public final class DistributionWorkerConfig {
     private final WorkerCwdCheckMode cwdCheckMode;
 
     private DistributionWorkerConfig(Builder builder) {
-        this.workerId = builder.workerId;
         this.hostName = builder.hostName;
         this.coordinatorUrl = builder.coordinatorUrl;
         this.authToken = builder.authToken;
         // Cache settings fall back to system property / environment / default only when not set explicitly, so an
         // invalid lower-tier value cannot break a configuration whose explicit option overrides it.
         this.cacheDir = builder.cacheDir != null ? builder.cacheDir : DistributionSettings.getWorkerCacheDir();
+        String identity = hostName + ":" + cacheDir.toAbsolutePath().normalize();
+        this.workerId = builder.workerId != null ? builder.workerId
+                : "worker-" + UUID.nameUUIDFromBytes(identity.getBytes(StandardCharsets.UTF_8));
         this.cacheCleanup = builder.cacheCleanup != null ? builder.cacheCleanup
                 : DistributionSettings.isWorkerCacheCleanupEnabled();
         this.cacheFreeSpaceBufferBytes = builder.cacheFreeSpaceBufferBytes != null
@@ -159,7 +162,7 @@ public final class DistributionWorkerConfig {
     }
 
     public static final class Builder {
-        private String workerId = "worker-" + UUID.randomUUID().toString().substring(0, 8);
+        private String workerId;
         private String hostName = resolveHostName();
         private String coordinatorUrl = normalizeCoordinatorBaseUrl(DistributionSettings.getCoordinatorUrl());
         private String authToken = DistributionSettings.getAuthToken();

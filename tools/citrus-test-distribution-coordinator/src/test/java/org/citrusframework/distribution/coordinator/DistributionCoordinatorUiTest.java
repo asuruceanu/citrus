@@ -39,7 +39,7 @@ class DistributionCoordinatorUiTest {
                 .port(0)
                 .authToken("ui-token")
                 .cacheDir(tempDir.resolve("ui-cache"))
-                .jdbcUrl("jdbc:hsqldb:mem:coordinator_ui_" + System.nanoTime())
+                .jdbcUrl("jdbc:hsqldb:file:" + tempDir.resolve("coordinator_ui_" + System.nanoTime()) + ";shutdown=true")
                 .build();
 
         HttpClient client = HttpClient.newBuilder()

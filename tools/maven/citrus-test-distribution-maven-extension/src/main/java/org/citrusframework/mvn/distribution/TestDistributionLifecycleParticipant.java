@@ -36,8 +36,11 @@ import org.apache.maven.project.MavenProject;
 import org.citrusframework.distribution.config.DistributionJson;
 import org.citrusframework.distribution.config.DistributionSettings;
 import org.citrusframework.distribution.junit.CoordinatorHttpClient;
+import org.citrusframework.distribution.junit.LocalResultDelivery;
 import org.citrusframework.distribution.junit.DistributionLauncherInterceptor;
+import org.citrusframework.distribution.model.BuildSessionRecord;
 import org.citrusframework.distribution.model.BuildSessionResponse;
+import org.citrusframework.distribution.model.SessionStatus;
 import org.citrusframework.distribution.model.CompleteSessionRequest;
 import org.citrusframework.distribution.model.CreateSessionRequest;
 import org.slf4j.Logger;
@@ -108,23 +111,29 @@ public class TestDistributionLifecycleParticipant extends AbstractMavenLifecycle
                 coordinatorUrl, authToken, DistributionSettings.getConnectTimeoutMs());
 
         String sessionId = null;
+        String resumeId = resolveProperty(session, DistributionSettings.RESUME_SESSION_ID_PROPERTY, null);
         try {
-            BuildSessionResponse created = client.createSession(new CreateSessionRequest(
-                    projectName,
-                    gitInfo.branch(),
-                    gitInfo.commit(),
-                    gitInfo.changedFiles(),
-                    maxPartitionSize.orElse(0),
-                    maxRetries,
-                    gitInfo.workspaceChanges(),
-                    projectKey));
-            sessionId = created.sessionId();
+            if (resumeId != null && !resumeId.isBlank()) {
+                BuildSessionRecord existing = client.getSession(resumeId);
+                if (existing.status() != SessionStatus.RUNNING
+                        || !java.util.Objects.equals(existing.projectName(), projectName)
+                        || !java.util.Objects.equals(existing.gitCommit(), gitInfo.commit())) {
+                    throw new IllegalArgumentException("Resuming requires a running session for this project and revision");
+                }
+                sessionId = existing.sessionId();
+                LOG.info("Resumed Citrus Test Distribution reactor session {} on coordinator {}", sessionId, coordinatorUrl);
+            } else {
+                BuildSessionResponse created = client.createSession(new CreateSessionRequest(
+                        projectName, gitInfo.branch(), gitInfo.commit(), gitInfo.changedFiles(), maxPartitionSize.orElse(0),
+                        maxRetries, gitInfo.workspaceChanges(), projectKey));
+                sessionId = created.sessionId();
+                LOG.info("Opened Citrus Test Distribution reactor session {} on coordinator {}", sessionId, coordinatorUrl);
+            }
             this.activeSessionId = sessionId;
             this.activeCoordinatorClient = client;
             registerAbortShutdownHook(sessionId, client);
-            LOG.info("Opened Citrus Test Distribution reactor session {} on coordinator {}", sessionId, coordinatorUrl);
         } catch (Exception e) {
-            if (!fallbackLocal) {
+            if (!fallbackLocal || (resumeId != null && !resumeId.isBlank())) {
                 throw new MavenExecutionException(
                         "Failed to open Citrus Test Distribution session on coordinator " + coordinatorUrl, e);
             }
@@ -200,6 +209,7 @@ public class TestDistributionLifecycleParticipant extends AbstractMavenLifecycle
                 LOG.info("Aborted Citrus Test Distribution reactor session {}", sessionId);
                 return;
             }
+            LocalResultDelivery.flushSession(client, sessionId);
             boolean buildFailed = session.getResult() != null && session.getResult().hasExceptions();
             String failureReason = buildFailed ? describeBuildFailure(session.getResult().getExceptions()) : null;
             client.completeSession(sessionId, new CompleteSessionRequest(0, 0, 0, 0L, buildFailed, failureReason));

@@ -78,7 +78,7 @@ class SessionCoordinatorTest {
                 .build();
         store = new JdbcDistributionStore("jdbc:hsqldb:mem:coordinator_" + System.nanoTime(), "SA", "");
         store.initialize();
-        hub = new CoordinatorEventStreamHub();
+        hub = new CoordinatorEventStreamHub(store);
         coordinator = new SessionCoordinator(config, store, hub);
     }
 
@@ -109,7 +109,7 @@ class SessionCoordinatorTest {
             before.initialize();
             SessionCoordinator running = new SessionCoordinator(
                     DistributionCoordinatorConfig.builder().defaultMaxPartitionSize(10).build(),
-                    before, new CoordinatorEventStreamHub());
+                    before, new CoordinatorEventStreamHub(before));
             sessionId = running.createSession(
                     new CreateSessionRequest("citrus", "main", "abc", List.of(), requestedSize, 1)).sessionId();
         }
@@ -118,7 +118,7 @@ class SessionCoordinatorTest {
             after.initialize();
             SessionCoordinator restarted = new SessionCoordinator(
                     DistributionCoordinatorConfig.builder().defaultMaxPartitionSize(4).minPartitionDurationMs(5_000L).build(),
-                    after, new CoordinatorEventStreamHub());
+                    after, new CoordinatorEventStreamHub(after));
             List<WorkUnitSpec> units = IntStream.range(0, 6).mapToObj(i -> unit("pkg.RestartTest" + i)).toList();
             restarted.submitWork(sessionId, new SubmitWorkRequest("sub-after-restart", "module", List.of(), Map.of(),
                     units, 0, 0));
@@ -126,6 +126,77 @@ class SessionCoordinatorTest {
             assertThat(after.listPartitions(sessionId)).hasSize(partitionCount)
                     .allSatisfy(partition -> assertThat(partition.workUnits()).hasSize(largestPartition));
         }
+    }
+
+    @Test
+    void shouldRestoreAssignmentsAndDeduplicateReplayedWorkerResultsAfterRestart() {
+        String jdbcUrl = "jdbc:hsqldb:file:" + tempDir.resolve("recovery/store") + ";shutdown=true";
+        var config = DistributionCoordinatorConfig.builder().defaultMaxPartitionSize(1).build();
+        String sessionId;
+        PartitionAssignPayload interrupted;
+        SubmitWorkRequest request = new SubmitWorkRequest("stable-submission", "module", List.of(),
+                Map.of("test.setting", "durable"), List.of(unit("pkg.First"), unit("pkg.Second")), 0, 0);
+        try (var running = new JdbcDistributionStore(jdbcUrl, "SA", "")) {
+            running.initialize();
+            coordinator = new SessionCoordinator(config, running, new CoordinatorEventStreamHub(running));
+            sessionId = coordinator.createSession(new CreateSessionRequest("citrus", "main", "abc", List.of(), 1, 2))
+                    .sessionId();
+            coordinator.submitWork(sessionId, request);
+            Worker worker = register("old-connection", "worker-a", Map.of());
+            interrupted = worker.lastAssignment();
+            assertThat(running.listPartitions(sessionId)).extracting(PartitionRecord::state)
+                    .containsExactlyInAnyOrder(PartitionState.ASSIGNED, PartitionState.PENDING);
+        }
+        try (var persisted = new JdbcDistributionStore(jdbcUrl, "SA", "")) {
+            persisted.initialize();
+            coordinator = new SessionCoordinator(config, persisted, new CoordinatorEventStreamHub(persisted));
+            coordinator.restorePendingWork();
+            assertThat(coordinator.submitWork(sessionId, request).partitionIds()).hasSize(2);
+            Worker recovered = register("new-connection", "worker-a", Map.of());
+            var test = new WorkerTestEventPayload(interrupted.partitionId(), sessionId, 1, "key", "pkg.Test", "one",
+                    TestOutcomeStatus.PASSED, 10L, null, null, List.of());
+            Map<String, Object> delivery = new java.util.LinkedHashMap<>(DistributionJson.convert(test, Map.class));
+            delivery.put(WorkerWsMessage.DELIVERY_ID, "0000000000000000001-00000000-0000-0000-0000-000000000001");
+            recovered.send(WorkerWsMessage.TEST_EVENT, delivery);
+            recovered.send(WorkerWsMessage.TEST_EVENT, delivery);
+            assertThat(recovered.messagesOfType(WorkerWsMessage.RESULT_ACK)).hasSize(2);
+            assertThat(persisted.listTestExecutions(sessionId)).hasSize(1);
+
+            Worker another = register("another-connection", "worker-b", Map.of());
+            var retried = List.of(recovered.lastAssignment(), another.lastAssignment()).stream()
+                    .filter(a -> a.partitionId().equals(interrupted.partitionId())).findFirst().orElseThrow();
+            assertThat(retried.attempt()).isEqualTo(2);
+            assertThat(retried.systemProperties()).containsEntry("test.setting", "durable");
+            for (Worker worker : List.of(recovered, another)) {
+                var assignment = worker.lastAssignment();
+                worker.testEvent(assignment, assignment.attempt(),
+                        assignment.partitionId().equals(retried.partitionId()) ? "one" : "two");
+                worker.complete(assignment, assignment.attempt(), List.of());
+            }
+            assertThat(coordinator.completeSession(sessionId, new CompleteSessionRequest(0, 0, 0, 0L)).passedTests())
+                    .isEqualTo(2);
+            List<CoordinatorEvent> events = new java.util.ArrayList<>();
+            persisted.replayEvents(sessionId, 0, 0, events::add);
+            assertThat(events).extracting(CoordinatorEvent::type)
+                    .contains("session.created", "work.submitted", "partition.requeued", "session.completed");
+            assertThat(events).extracting(CoordinatorEvent::sequence).doesNotHaveDuplicates().isSorted();
+        }
+    }
+
+    @Test
+    void shouldStoreRepeatedLocalJournalDeliveryOnce() {
+        String sessionId = coordinator.createSession(new CreateSessionRequest("citrus", "main", "abc", List.of(), 0, 1))
+                .sessionId();
+        var event = new WorkerTestEventPayload("local", sessionId, 1, "key", "pkg.Test", "test",
+                TestOutcomeStatus.PASSED, 7L, null, null, List.of());
+        var delivery = new ReportLocalTestsRequest("local-host", List.of(event),
+                "0000000000000000001-00000000-0000-0000-0000-000000000002");
+        assertThat(coordinator.reportLocalTests(sessionId, delivery)).isEqualTo(1);
+        coordinator = new SessionCoordinator(DistributionCoordinatorConfig.builder().build(), store, new CoordinatorEventStreamHub(store));
+        assertThat(coordinator.reportLocalTests(sessionId, delivery)).isZero();
+        assertThat(store.listTestExecutions(sessionId)).hasSize(1);
+        assertThat(coordinator.completeSession(sessionId, new CompleteSessionRequest(0, 0, 0, 0L)).passedTests())
+                .isEqualTo(1);
     }
 
     @Test
@@ -1044,7 +1115,7 @@ class SessionCoordinatorTest {
         SessionCoordinator rehydrated = new SessionCoordinator(
                 DistributionCoordinatorConfig.builder().cacheDir(tempDir.resolve("cache-rehydrated")).leaseTimeoutMs(LEASE_MS).build(),
                 store,
-                new CoordinatorEventStreamHub());
+                new CoordinatorEventStreamHub(store));
         BuildSessionRecord completed = rehydrated.completeSession(
                 sessionId, new CompleteSessionRequest(2, 0, 0, 250L));
 
@@ -1080,7 +1151,12 @@ class SessionCoordinatorTest {
     }
 
     private CoordinatorEvent lastEvent(String sessionId, String type) {
-        List<CoordinatorEvent> matching = hub.sessionEvents(sessionId).stream().filter(e -> e.type().equals(type)).toList();
+        List<CoordinatorEvent> matching = new java.util.ArrayList<>();
+        store.replayEvents(sessionId, 0, 0, event -> {
+            if (event.type().equals(type)) {
+                matching.add(event);
+            }
+        });
         assertThat(matching).as("events of type %s", type).isNotEmpty();
         return matching.getLast();
     }

@@ -17,6 +17,7 @@
 package org.citrusframework.distribution.coordinator;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -63,6 +64,7 @@ import org.citrusframework.distribution.model.WorkspaceFileSet;
 import org.citrusframework.distribution.scheduler.CapabilityMatcher;
 import org.citrusframework.distribution.scheduler.LptPartitionScheduler;
 import org.citrusframework.distribution.store.DistributionStore;
+import org.citrusframework.distribution.store.DistributionStore.RecoverableWork;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -79,7 +81,6 @@ public final class SessionCoordinator {
     private final LptPartitionScheduler scheduler = new LptPartitionScheduler();
 
     private final Map<String, SessionRuntime> sessions = new ConcurrentHashMap<>();
-    private final Map<String, SubmitWorkResponse> submissionResponses = new ConcurrentHashMap<>();
     private final Map<String, PartitionRuntime> partitions = new ConcurrentHashMap<>();
     private final Map<String, WorkerConnection> workers = new ConcurrentHashMap<>();
     private long assignmentSequence;
@@ -88,6 +89,57 @@ public final class SessionCoordinator {
         this.config = config;
         this.store = store;
         this.eventHub = eventHub;
+    }
+
+    synchronized void restorePendingWork() {
+        for (WorkerRecord worker : store.listWorkers()) {
+            if (worker.state() != WorkerState.OFFLINE) {
+                store.upsertWorker(new WorkerRecord(worker.workerId(), worker.host(), worker.capabilities(), WorkerState.OFFLINE,
+                        null, worker.lastHeartbeatAt(), worker.registeredAt(), worker.cacheStats()));
+            }
+        }
+        Map<String, Map<String, PartitionRecord>> latest = new HashMap<>();
+        for (RecoverableWork work : store.listRecoverableWork()) {
+            Map<String, PartitionRecord> records = latest.computeIfAbsent(work.sessionId(), sessionId -> {
+                Map<String, PartitionRecord> byId = new HashMap<>();
+                for (PartitionRecord record : store.listPartitions(sessionId)) {
+                    byId.merge(record.partitionId(), record, (a, b) -> a.attempt() > b.attempt() ? a : b);
+                }
+                return byId;
+            });
+            for (String partitionId : work.response().partitionIds()) {
+                PartitionRecord record = records.get(partitionId);
+                if (record == null || (record.state() != PartitionState.PENDING
+                        && record.state() != PartitionState.ASSIGNED && record.state() != PartitionState.RUNNING)) {
+                    continue;
+                }
+                PartitionRuntime runtime = new PartitionRuntime(record, work.request(), work.maxRetries());
+                runtime.retriesUsed = Math.max(0, record.attempt() - 1);
+                runtime.lastAssignedWorkerId = record.workerId();
+                partitions.put(partitionId, runtime);
+                if (record.state() != PartitionState.PENDING) {
+                    restoreInFlightTests(runtime);
+                    requeueOrLosePartition(runtime, record.workerId(), "Coordinator restarted during execution");
+                }
+            }
+        }
+    }
+
+    private void restoreInFlightTests(PartitionRuntime runtime) {
+        PartitionRecord partition = runtime.record;
+        SessionRuntime session = getOrRehydrateSession(partition.sessionId());
+        store.replayEvents(partition.sessionId(), 0, 0, event -> {
+            if ("test.event".equals(event.type()) && partition.partitionId().equals(event.partitionId())
+                    && intField(event.data(), "attempt") == partition.attempt()) {
+                WorkerTestEventPayload test = DistributionJson.convert(event.data(), WorkerTestEventPayload.class);
+                String key = session.testKey(test.workUnitKey(), test.className(), test.testName(), test.uniqueId());
+                if (test.status() == TestOutcomeStatus.STARTED) {
+                    runtime.inFlightTestKeys.add(key);
+                } else {
+                    runtime.inFlightTestKeys.remove(key);
+                }
+            }
+        });
     }
 
     public synchronized BuildSessionResponse createSession(CreateSessionRequest request) {
@@ -107,7 +159,7 @@ public final class SessionCoordinator {
                 0, 0, 0, 0, 0, 0, 0L, 0L
         );
         String historyScope = DistributionSettings.historyScope(request.projectKey(), record.projectName());
-        store.saveSession(record, request.maxPartitionSize(), historyScope);
+        store.saveSession(record, request.maxPartitionSize(), historyScope, maxRetries);
         store.saveChangedFiles(sessionId, request.changedFiles(), request.workspaceChanges());
 
         sessions.put(sessionId, new SessionRuntime(record, maxPartSize, maxRetries, request.maxPartitionSize(), historyScope));
@@ -122,14 +174,8 @@ public final class SessionCoordinator {
         if (session == null) {
             throw new IllegalArgumentException("Unknown sessionId: " + sessionId);
         }
-        String dedupKey = sessionId + "::" + request.submissionId();
-        SubmitWorkResponse existing = submissionResponses.get(dedupKey);
-        if (existing != null) {
-            return existing;
-        }
         Optional<SubmitWorkResponse> persisted = store.findWorkSubmission(sessionId, request.submissionId());
         if (persisted.isPresent()) {
-            submissionResponses.put(dedupKey, persisted.get());
             return persisted.get();
         }
 
@@ -169,6 +215,7 @@ public final class SessionCoordinator {
                 .toList();
 
         List<String> partitionIds = new ArrayList<>(scheduled.size());
+        List<PartitionRuntime> runtimes = new ArrayList<>();
         for (PartitionRecord part : scheduled) {
             PartitionRecord enriched = new PartitionRecord(
                     part.partitionId(),
@@ -189,25 +236,11 @@ public final class SessionCoordinator {
                     List.of(),
                     null
             );
-            store.savePartition(enriched);
             PartitionRuntime runtime = new PartitionRuntime(
-                    enriched,
-                    request.moduleName(),
-                    request.classpathArtifacts() != null ? List.copyOf(request.classpathArtifacts()) : List.of(),
-                    request.systemProperties() != null ? Map.copyOf(request.systemProperties()) : Map.of(),
-                    request.inputArtifacts(),
-                    inputPaths,
-                    request.outputPaths(),
-                    request.forkWorkspace(),
-                    request.workingDirectory(),
-                    session.maxRetries
-            );
-            partitions.put(enriched.partitionId(), runtime);
-            session.partitionIds.add(enriched.partitionId());
+                    enriched, request, session.maxRetries);
+            runtimes.add(runtime);
             partitionIds.add(enriched.partitionId());
         }
-        refreshRunningSessionSummary(session);
-
         SubmitWorkResponse response = new SubmitWorkResponse(
                 request.submissionId(),
                 scheduled.size(),
@@ -215,16 +248,18 @@ public final class SessionCoordinator {
                 request.cachedBlobs(),
                 request.uploadedBlobs()
         );
-        store.saveWorkSubmission(sessionId, response);
-        submissionResponses.put(dedupKey, response);
-
-        eventHub.publish("work.submitted", sessionId, null, null, Map.of(
-                "moduleName", request.moduleName() != null ? request.moduleName() : "",
-                "partitionsCreated", scheduled.size(),
-                "workUnits", units.size(),
-                "cachedBlobs", request.cachedBlobs(),
-                "uploadedBlobs", request.uploadedBlobs()
-        ));
+        eventHub.publishSubmission(new RecoverableWork(sessionId, request, response, session.maxRetries),
+                runtimes.stream().map(runtime -> runtime.record).toList(), Map.of(
+                        "moduleName", request.moduleName() != null ? request.moduleName() : "",
+                        "partitionsCreated", scheduled.size(),
+                        "workUnits", units.size(),
+                        "cachedBlobs", request.cachedBlobs(),
+                        "uploadedBlobs", request.uploadedBlobs()));
+        for (PartitionRuntime runtime : runtimes) {
+            partitions.put(runtime.record.partitionId(), runtime);
+            session.partitionIds.add(runtime.record.partitionId());
+        }
+        refreshRunningSessionSummary(session);
 
         dispatchPendingPartitions();
         return response;
@@ -241,6 +276,15 @@ public final class SessionCoordinator {
         String workerId = (request.workerId() != null && !request.workerId().isBlank())
                 ? request.workerId()
                 : "local-host";
+        String deliveryId = request.deliveryId();
+        if (deliveryId != null) {
+            if (!validDeliveryId(deliveryId) || request.executions().size() != 1) {
+                throw new IllegalArgumentException("A local result delivery must contain one test and a valid delivery ID");
+            }
+            if (store.hasDelivery(deliveryId)) {
+                return 0;
+            }
+        }
         int recorded = 0;
         for (WorkerTestEventPayload evt : request.executions()) {
             if (evt == null || evt.status() == null || evt.status() == TestOutcomeStatus.STARTED) {
@@ -252,7 +296,7 @@ public final class SessionCoordinator {
                     && evt.status() == TestOutcomeStatus.PASSED
                     && session.failedOrInterruptedTests.contains(testKey);
             TestExecutionRecord execRecord = new TestExecutionRecord(
-                    UUID.randomUUID().toString(),
+                    deliveryId == null ? UUID.randomUUID().toString() : deliveryId,
                     sessionId,
                     "local",
                     workerId,
@@ -269,7 +313,7 @@ public final class SessionCoordinator {
                     System.currentTimeMillis(),
                     evt.uniqueId()
             );
-            store.saveTestExecution(execRecord);
+
             session.recordExecution(execRecord);
             if (evt.workUnitKey() != null && !evt.workUnitKey().isBlank()) {
                 session.locallyExecutedWorkUnitKeys.add(evt.workUnitKey());
@@ -281,7 +325,7 @@ public final class SessionCoordinator {
             Map<String, Object> evtData = DistributionJson.convert(evt, Map.class);
             evtData.put("sessionId", sessionId);
             evtData.put("partitionId", "local");
-            eventHub.publish("test.event", sessionId, "local", workerId, evtData);
+            eventHub.publish("test.event", sessionId, "local", workerId, evtData, deliveryId, execRecord, List.of());
         }
         if (recorded > 0) {
             refreshRunningSessionSummary(session);
@@ -310,7 +354,7 @@ public final class SessionCoordinator {
                 abortedPartitionIds.add(pr.record.partitionId());
                 releaseStalledWorker(pr);
                 pr.activeConnectionId = null;
-                pr.inFlightTestKey = null;
+                pr.inFlightTestKeys.clear();
                 pr.record = pr.buildRecord(
                         activeWorkerId,
                         PartitionState.LOST,
@@ -388,11 +432,7 @@ public final class SessionCoordinator {
         }
 
         SessionSummary summary = computeSessionSummary(session, null, now);
-        store.updateSessionStatus(sessionId, SessionStatus.ABORTED, now, summary, abortReason);
-        BuildSessionRecord updated = store.findSession(sessionId).orElse(session.record);
-        session.record = updated;
-
-        eventHub.publish("session.aborted", sessionId, null, null, Map.of(
+        eventHub.finishSession("session.aborted", sessionId, now, SessionStatus.ABORTED, summary, abortReason, Map.of(
                 "status", SessionStatus.ABORTED.name(),
                 "reason", abortReason,
                 "totalTests", summary.totalTests(),
@@ -401,6 +441,8 @@ public final class SessionCoordinator {
                 "skippedTests", summary.skippedTests(),
                 "wallDurationMs", summary.wallDurationMs()
         ));
+        BuildSessionRecord updated = store.findSession(sessionId).orElse(session.record);
+        discardSessionRuntime(sessionId);
         dispatchPendingPartitions();
         return updated;
     }
@@ -410,7 +452,7 @@ public final class SessionCoordinator {
         if (session == null) {
             throw new IllegalArgumentException("Unknown sessionId: " + sessionId);
         }
-        if (session.record.status() == SessionStatus.ABORTED) {
+        if (session.record.status() != SessionStatus.RUNNING) {
             return session.record;
         }
 
@@ -448,11 +490,7 @@ public final class SessionCoordinator {
         String failureReason = finalStatus == SessionStatus.FAILED
                 ? describeFailure(request, summary, unrecoveredPartitionFailure)
                 : null;
-        store.updateSessionStatus(sessionId, finalStatus, finishedAt, summary, failureReason);
-
-        BuildSessionRecord updated = store.findSession(sessionId).orElse(session.record);
-        session.record = updated;
-        eventHub.publish("session.completed", sessionId, null, null, Map.of(
+        eventHub.finishSession("session.completed", sessionId, finishedAt, finalStatus, summary, failureReason, Map.of(
                 "status", finalStatus.name(),
                 "totalTests", summary.totalTests(),
                 "passedTests", summary.passedTests(),
@@ -461,7 +499,14 @@ public final class SessionCoordinator {
                 "serialDurationMs", summary.serialDurationMs(),
                 "wallDurationMs", summary.wallDurationMs()
         ));
+        BuildSessionRecord updated = store.findSession(sessionId).orElse(session.record);
+        discardSessionRuntime(sessionId);
         return updated;
+    }
+
+    private void discardSessionRuntime(String sessionId) {
+        sessions.remove(sessionId);
+        partitions.values().removeIf(partition -> sessionId.equals(partition.record.sessionId()));
     }
 
     private static String describeFailure(CompleteSessionRequest request, SessionSummary summary,
@@ -609,85 +654,122 @@ public final class SessionCoordinator {
                             pr.record.producedOutputs(),
                             null
                     );
-                    store.savePartition(pr.record);
                     eventHub.publish("partition.started", pr.record.sessionId(), partitionId, conn.workerId, Map.of(
-                            "attempt", pr.record.attempt()));
+                            "attempt", pr.record.attempt()), null, null, List.of(pr.record));
                 }
             }
-            case WorkerWsMessage.TEST_EVENT -> {
-                WorkerTestEventPayload evt = DistributionJson.convert(message.payload(), WorkerTestEventPayload.class);
-                if (evt != null) {
-                    PartitionRuntime pr = partitions.get(evt.partitionId());
-                    if (!acceptsAttempt(pr, conn, evt.attempt())) {
-                        LOG.warn("Discarding stale {} for partition {} attempt {} from worker {} (connection {})",
-                                message.type(), evt.partitionId(), evt.attempt(), conn.workerId, conn.connectionId);
-                        return;
-                    }
-                    pr.lastProgressAt = System.currentTimeMillis();
-                    SessionRuntime session = getOrRehydrateSession(pr.record.sessionId());
-                    String testKey = session != null
-                            ? session.testKey(evt.workUnitKey(), evt.className(), evt.testName(), evt.uniqueId())
-                            : TestExecutionIdentity.key(evt.workUnitKey(), evt.className(), evt.testName(), evt.uniqueId());
-                    if (evt.status() == TestOutcomeStatus.STARTED) {
-                        pr.inFlightTestKey = testKey;
-                    } else {
-                        if (testKey.equals(pr.inFlightTestKey)) {
-                            pr.inFlightTestKey = null;
-                        }
-                        boolean hadPriorFailure = session != null && session.failedOrInterruptedTests.contains(testKey);
-                        boolean flaky = pr.record.attempt() > 1
-                                && evt.status() == TestOutcomeStatus.PASSED
-                                && hadPriorFailure;
-                        TestExecutionRecord execRecord = new TestExecutionRecord(
-                                UUID.randomUUID().toString(),
-                                pr.record.sessionId(),
-                                pr.record.partitionId(),
-                                conn.workerId,
-                                evt.workUnitKey(),
-                                evt.className(),
-                                evt.testName(),
-                                evt.status(),
-                                evt.durationMs(),
-                                pr.record.attempt(),
-                                flaky,
-                                evt.errorMessage(),
-                                evt.stackTrace(),
-                                evt.endpoints() != null ? evt.endpoints() : List.of(),
-                                System.currentTimeMillis(),
-                                evt.uniqueId()
-                        );
-                        store.saveTestExecution(execRecord);
-                        if (session != null) {
-                            session.recordExecution(execRecord);
-                            refreshRunningSessionSummary(session);
-                        }
-                    }
-                    @SuppressWarnings("unchecked")
-                    Map<String, Object> evtData = DistributionJson.convert(evt, Map.class);
-                    // Attribute to the partition's own session, not whatever session the payload claims.
-                    evtData.put("sessionId", pr.record.sessionId());
-                    evtData.put("partitionId", pr.record.partitionId());
-                    eventHub.publish("test.event", pr.record.sessionId(), pr.record.partitionId(), conn.workerId, evtData);
-                }
-            }
-            case WorkerWsMessage.PARTITION_COMPLETED -> {
-                PartitionCompletedPayload done = DistributionJson.convert(message.payload(), PartitionCompletedPayload.class);
-                if (done == null) {
-                    return;
-                }
-                boolean accepted = acceptsAttempt(partitions.get(done.partitionId()), conn, done.attempt());
-                if (done.partitionId() != null && done.partitionId().equals(conn.cancelledPartitionId)) {
-                    confirmCancellation(conn);
-                }
-                if (!accepted) {
-                    LOG.warn("Discarding stale {} for partition {} attempt {} from worker {} (connection {})",
-                            message.type(), done.partitionId(), done.attempt(), conn.workerId, conn.connectionId);
-                    return;
-                }
-                completePartition(conn, done);
-            }
+            case WorkerWsMessage.TEST_EVENT -> handleTestEvent(conn, message.payload());
+            case WorkerWsMessage.PARTITION_COMPLETED -> handleCompletion(conn, message.payload());
             default -> LOG.debug("Ignoring unknown worker message type {}", message.type());
         }
+    }
+
+    private void handleTestEvent(WorkerConnection conn, Map<String, Object> payload) {
+        WorkerTestEventPayload evt = DistributionJson.convert(payload, WorkerTestEventPayload.class);
+        if (evt == null || evt.status() == null) {
+            return;
+        }
+        String deliveryId = stringField(payload, WorkerWsMessage.DELIVERY_ID);
+        if (deliveryId != null) {
+            if (!validDeliveryId(deliveryId)) {
+                return;
+            }
+            if (store.hasDelivery(deliveryId)) {
+                acknowledgeResult(conn, deliveryId);
+                return;
+            }
+        }
+        PartitionRuntime runtime = partitions.get(evt.partitionId());
+        boolean live = acceptsAttempt(runtime, conn, evt.attempt());
+        PartitionRecord record = live ? runtime.record : null;
+        if (record == null && deliveryId != null && evt.sessionId() != null) {
+            // A durable worker result can arrive after the coordinator requeued that attempt.
+            record = store.listPartitions(evt.sessionId()).stream()
+                    .filter(p -> p.partitionId().equals(evt.partitionId()) && p.attempt() == evt.attempt()
+                            && conn.workerId.equals(p.workerId()))
+                    .findFirst().orElse(null);
+        }
+        if (record == null) {
+            return;
+        }
+        if (live) {
+            runtime.lastProgressAt = System.currentTimeMillis();
+        }
+        boolean running = live || store.findSession(record.sessionId()).map(s -> s.status() == SessionStatus.RUNNING).orElse(false);
+        SessionRuntime session = running ? getOrRehydrateSession(record.sessionId()) : null;
+        String testKey = session != null ? session.testKey(evt.workUnitKey(), evt.className(), evt.testName(), evt.uniqueId())
+                : TestExecutionIdentity.key(evt.workUnitKey(), evt.className(), evt.testName(), evt.uniqueId());
+        TestExecutionRecord result = null;
+        if (evt.status() == TestOutcomeStatus.STARTED) {
+            if (live) {
+                runtime.inFlightTestKeys.add(testKey);
+            }
+        } else {
+            if (live) {
+                runtime.inFlightTestKeys.remove(testKey);
+            }
+            boolean flaky = record.attempt() > 1 && evt.status() == TestOutcomeStatus.PASSED
+                    && session != null && session.failedOrInterruptedTests.contains(testKey);
+            result = new TestExecutionRecord(deliveryId == null ? UUID.randomUUID().toString() : deliveryId,
+                    record.sessionId(), record.partitionId(), conn.workerId, evt.workUnitKey(), evt.className(),
+                    evt.testName(), evt.status(), evt.durationMs(), record.attempt(), flaky, evt.errorMessage(),
+                    evt.stackTrace(), evt.endpoints() == null ? List.of() : evt.endpoints(), System.currentTimeMillis(), evt.uniqueId());
+        }
+        @SuppressWarnings("unchecked")
+        Map<String, Object> data = DistributionJson.convert(evt, Map.class);
+        data.put("sessionId", record.sessionId());
+        data.put("partitionId", record.partitionId());
+        eventHub.publish("test.event", record.sessionId(), record.partitionId(), conn.workerId, data, deliveryId, result, List.of());
+        if (result != null && session != null) {
+            session.recordExecution(result);
+            refreshRunningSessionSummary(session);
+        }
+        if (deliveryId != null) {
+            acknowledgeResult(conn, deliveryId);
+        }
+    }
+
+    private void handleCompletion(WorkerConnection conn, Map<String, Object> payload) {
+        PartitionCompletedPayload done = DistributionJson.convert(payload, PartitionCompletedPayload.class);
+        if (done == null) {
+            return;
+        }
+        String deliveryId = stringField(payload, WorkerWsMessage.DELIVERY_ID);
+        if (deliveryId != null) {
+            if (!validDeliveryId(deliveryId)) {
+                return;
+            }
+            if (store.hasDelivery(deliveryId)) {
+                acknowledgeResult(conn, deliveryId);
+                return;
+            }
+        }
+        boolean accepted = acceptsAttempt(partitions.get(done.partitionId()), conn, done.attempt());
+        if (done.partitionId() != null && done.partitionId().equals(conn.cancelledPartitionId)) {
+            confirmCancellation(conn);
+        }
+        if (accepted) {
+            completePartition(conn, done, deliveryId);
+        } else if (deliveryId != null && done.sessionId() != null && store.listPartitions(done.sessionId()).stream()
+                .anyMatch(p -> p.partitionId().equals(done.partitionId()) && p.attempt() == done.attempt()
+                        && conn.workerId.equals(p.workerId()))) {
+            // Retain the completion for diagnostics without replacing a newer attempt.
+            eventHub.publish("partition.stale-completion", done.sessionId(), done.partitionId(), conn.workerId,
+                    payload, deliveryId, null, List.of());
+        } else {
+            return;
+        }
+        if (deliveryId != null) {
+            acknowledgeResult(conn, deliveryId);
+        }
+    }
+
+    private static boolean validDeliveryId(String id) {
+        return id.matches("[0-9]{19}-[a-f0-9-]{36}");
+    }
+
+    private void acknowledgeResult(WorkerConnection conn, String deliveryId) {
+        conn.sender.accept(new WorkerWsMessage(WorkerWsMessage.RESULT_ACK, Map.of(WorkerWsMessage.DELIVERY_ID, deliveryId)));
     }
 
     public synchronized void handleWorkerDisconnect(String connectionId) {
@@ -724,11 +806,11 @@ public final class SessionCoordinator {
         dispatchPendingPartitions();
     }
 
-    private void completePartition(WorkerConnection conn, PartitionCompletedPayload done) {
+    private void completePartition(WorkerConnection conn, PartitionCompletedPayload done, String deliveryId) {
         PartitionRuntime pr = partitions.get(done.partitionId());
         if (pr != null) {
             pr.activeConnectionId = null;
-            pr.inFlightTestKey = null;
+            pr.inFlightTestKeys.clear();
             PartitionState endState = done.success() ? PartitionState.COMPLETED : PartitionState.FAILED;
             long now = System.currentTimeMillis();
             long started = pr.record.startedAt() > 0L ? pr.record.startedAt() : now;
@@ -744,7 +826,6 @@ public final class SessionCoordinator {
                     producedOutputs,
                     done.errorMessage()
             );
-            store.savePartition(pr.record);
             Map<String, Object> data = new LinkedHashMap<>();
             data.put("state", endState.name());
             data.put("attempt", pr.record.attempt());
@@ -755,7 +836,8 @@ public final class SessionCoordinator {
             if (!done.outputArtifacts().isEmpty()) {
                 data.put("outputArtifacts", done.outputArtifacts());
             }
-            eventHub.publish("partition.completed", pr.record.sessionId(), pr.record.partitionId(), conn.workerId, data);
+            eventHub.publish("partition.completed", pr.record.sessionId(), pr.record.partitionId(), conn.workerId, data,
+                    deliveryId, null, List.of(pr.record));
         }
 
         if (done.partitionId().equals(conn.activePartitionId)) {
@@ -771,12 +853,11 @@ public final class SessionCoordinator {
     private void requeueOrLosePartition(PartitionRuntime pr, String previousWorkerId, String reason) {
         pr.activeConnectionId = null;
         SessionRuntime session = getOrRehydrateSession(pr.record.sessionId());
-        if (pr.inFlightTestKey != null) {
-            if (session != null) {
-                session.failedOrInterruptedTests.add(pr.inFlightTestKey);
-            }
-            pr.inFlightTestKey = null;
+        List<String> interrupted = List.copyOf(pr.inFlightTestKeys);
+        if (session != null) {
+            session.failedOrInterruptedTests.addAll(interrupted);
         }
+        pr.inFlightTestKeys.clear();
         long now = System.currentTimeMillis();
         long startedAt = pr.record.startedAt() > 0L ? pr.record.startedAt() : now;
         if (pr.retriesUsed < pr.maxRetries) {
@@ -789,8 +870,6 @@ public final class SessionCoordinator {
                     pr.record.producedOutputs(),
                     reason
             );
-            store.savePartition(evictedAttempt);
-
             pr.retriesUsed++;
             int nextAttempt = pr.retriesUsed + 1;
             pr.record = pr.buildRecord(
@@ -802,13 +881,13 @@ public final class SessionCoordinator {
                     List.of(),
                     null
             );
-            store.savePartition(pr.record);
             eventHub.publish("partition.requeued", pr.record.sessionId(), pr.record.partitionId(), previousWorkerId, Map.of(
                     "reason", reason,
                     "retriesUsed", pr.retriesUsed,
                     "maxRetries", pr.maxRetries,
-                    "nextAttempt", nextAttempt
-            ));
+                    "nextAttempt", nextAttempt,
+                    "interruptedTestKeys", interrupted
+            ), null, null, List.of(evictedAttempt, pr.record));
         } else {
             pr.record = pr.buildRecord(
                     previousWorkerId,
@@ -819,11 +898,11 @@ public final class SessionCoordinator {
                     pr.record.producedOutputs(),
                     reason
             );
-            store.savePartition(pr.record);
             eventHub.publish("partition.lost", pr.record.sessionId(), pr.record.partitionId(), previousWorkerId, Map.of(
                     "reason", reason,
-                    "workUnits", pr.record.workUnits().stream().map(WorkUnitSpec::key).toList()
-            ));
+                    "workUnits", pr.record.workUnits().stream().map(WorkUnitSpec::key).toList(),
+                    "interruptedTestKeys", interrupted
+            ), null, null, List.of(pr.record));
         }
     }
 
@@ -855,7 +934,10 @@ public final class SessionCoordinator {
                     List.of(),
                     null
             );
-            store.savePartition(pr.record);
+            eventHub.publish("partition.assigned", pr.record.sessionId(), pr.record.partitionId(), matchingWorker.workerId, Map.of(
+                    "attempt", nextAttempt,
+                    "workUnits", pr.record.workUnits().size()
+            ), null, null, List.of(pr.record));
 
             matchingWorker.state = WorkerState.BUSY;
             matchingWorker.lastAssignedAt = ++assignmentSequence;
@@ -879,10 +961,6 @@ public final class SessionCoordinator {
             Map<String, Object> payloadMap = DistributionJson.convert(assignPayload, Map.class);
             matchingWorker.sender.accept(new WorkerWsMessage(WorkerWsMessage.PARTITION_ASSIGN, payloadMap));
 
-            eventHub.publish("partition.assigned", pr.record.sessionId(), pr.record.partitionId(), matchingWorker.workerId, Map.of(
-                    "attempt", nextAttempt,
-                    "workUnits", pr.record.workUnits().size()
-            ));
         }
     }
 
@@ -1125,7 +1203,7 @@ public final class SessionCoordinator {
                 .orElse(Math.max(1, defaultPartitionSize));
         int maxPartitionSize = requestedMaxPartitionSize > 0 ? requestedMaxPartitionSize : defaultPartitionSize;
         SessionRuntime rehydrated = new SessionRuntime(
-                record, maxPartitionSize, config.defaultMaxRetries(), requestedMaxPartitionSize,
+                record, maxPartitionSize, store.findSessionMaxRetries(sessionId).orElse(config.defaultMaxRetries()), requestedMaxPartitionSize,
                 store.findSessionHistoryScope(sessionId)
                         .orElseGet(() -> DistributionSettings.historyScope(null, record.projectName())));
         rehydrated.cachedBlobs = Math.max(0, record.cachedBlobs());
@@ -1146,6 +1224,13 @@ public final class SessionCoordinator {
                 }
             }
         }
+        store.replayEvents(sessionId, 0, 0, event -> {
+            Object interrupted = event.data().get("interruptedTestKeys");
+            if (interrupted instanceof List<?> keys) {
+                keys.stream().filter(String.class::isInstance).map(String.class::cast)
+                        .forEach(rehydrated.failedOrInterruptedTests::add);
+            }
+        });
         sessions.put(sessionId, rehydrated);
         return rehydrated;
     }
@@ -1236,32 +1321,23 @@ public final class SessionCoordinator {
         private long lastProgressAt = System.currentTimeMillis();
         /** Connection of the worker currently holding this partition; {@code null} while not assigned. */
         private String activeConnectionId;
-        /** Test key currently STARTED on this partition attempt and not yet completed. */
-        private String inFlightTestKey;
+        /** Tests currently started on this attempt, reconstructed from events on restart. */
+        private final Set<String> inFlightTestKeys = new HashSet<>();
         /** Worker that received the most recent attempt. */
         private String lastAssignedWorkerId;
         /** Workers that received an attempt before the current one. */
         private final Set<String> earlierAttemptWorkerIds = new HashSet<>();
 
-        private PartitionRuntime(PartitionRecord record,
-                                 String moduleName,
-                                 List<ArtifactRef> classpathArtifacts,
-                                 Map<String, String> systemProperties,
-                                 List<WorkspaceFileSet> inputArtifacts,
-                                 List<String> inputPaths,
-                                 List<String> outputPaths,
-                                 boolean forkWorkspace,
-                                 String workingDirectory,
-                                 int maxRetries) {
+        private PartitionRuntime(PartitionRecord record, SubmitWorkRequest request, int maxRetries) {
             this.record = record;
-            this.moduleName = moduleName;
-            this.classpathArtifacts = classpathArtifacts;
-            this.systemProperties = systemProperties;
-            this.inputArtifacts = inputArtifacts;
-            this.inputPaths = inputPaths;
-            this.outputPaths = outputPaths;
-            this.forkWorkspace = forkWorkspace;
-            this.workingDirectory = workingDirectory;
+            this.moduleName = record.moduleName();
+            this.classpathArtifacts = request.classpathArtifacts() == null ? List.of() : List.copyOf(request.classpathArtifacts());
+            this.systemProperties = request.systemProperties() == null ? Map.of() : Map.copyOf(request.systemProperties());
+            this.inputArtifacts = request.inputArtifacts();
+            this.inputPaths = record.inputPaths();
+            this.outputPaths = request.outputPaths();
+            this.forkWorkspace = request.forkWorkspace();
+            this.workingDirectory = request.workingDirectory();
             this.maxRetries = maxRetries;
         }
 

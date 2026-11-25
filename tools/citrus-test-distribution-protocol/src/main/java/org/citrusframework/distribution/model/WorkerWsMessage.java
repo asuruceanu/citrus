@@ -28,6 +28,8 @@ public record WorkerWsMessage(
     public static final String WORKER_DRAINING = "worker.draining";
     public static final String PARTITION_ASSIGN = "partition.assign";
     public static final String PARTITION_STARTED = "partition.started";
+    public static final String RESULT_ACK = "result.ack";
+    public static final String DELIVERY_ID = "deliveryId";
     public static final String TEST_EVENT = "test.event";
     public static final String PARTITION_COMPLETED = "partition.completed";
     public static final String PARTITION_CANCEL = "partition.cancel";

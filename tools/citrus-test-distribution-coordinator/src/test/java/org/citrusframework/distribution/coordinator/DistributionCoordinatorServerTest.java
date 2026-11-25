@@ -111,7 +111,7 @@ class DistributionCoordinatorServerTest {
                 .port(0)
                 .authToken("top-secret-token")
                 .cacheDir(tempDir.resolve("cache"))
-                .jdbcUrl("jdbc:hsqldb:mem:coordinator_duration_" + System.nanoTime())
+                .jdbcUrl("jdbc:hsqldb:file:" + tempDir.resolve("coordinator_duration_" + System.nanoTime()) + ";shutdown=true")
                 .build();
 
         try (DistributionCoordinatorServer server = new DistributionCoordinatorServer(config)) {
@@ -155,7 +155,7 @@ class DistributionCoordinatorServerTest {
                 .port(0)
                 .authToken("top-secret-token")
                 .cacheDir(tempDir.resolve("cache"))
-                .jdbcUrl("jdbc:hsqldb:mem:coordinator_auth_" + System.nanoTime())
+                .jdbcUrl("jdbc:hsqldb:file:" + tempDir.resolve("coordinator_auth_" + System.nanoTime()) + ";shutdown=true")
                 .build();
 
         try (DistributionCoordinatorServer server = new DistributionCoordinatorServer(config)) {
@@ -205,7 +205,7 @@ class DistributionCoordinatorServerTest {
         DistributionCoordinatorConfig config = DistributionCoordinatorConfig.builder()
                 .port(0)
                 .cacheDir(tempDir.resolve("blob-cache"))
-                .jdbcUrl("jdbc:hsqldb:mem:coordinator_blobs_" + System.nanoTime())
+                .jdbcUrl("jdbc:hsqldb:file:" + tempDir.resolve("coordinator_blobs_" + System.nanoTime()) + ";shutdown=true")
                 .build();
 
         try (DistributionCoordinatorServer server = new DistributionCoordinatorServer(config)) {
@@ -262,7 +262,7 @@ class DistributionCoordinatorServerTest {
         DistributionCoordinatorConfig config = DistributionCoordinatorConfig.builder()
                 .port(0)
                 .cacheDir(tempDir.resolve("dispatch-cache"))
-                .jdbcUrl("jdbc:hsqldb:mem:coordinator_dispatch_" + System.nanoTime())
+                .jdbcUrl("jdbc:hsqldb:file:" + tempDir.resolve("coordinator_dispatch_" + System.nanoTime()) + ";shutdown=true")
                 .build();
 
         try (DistributionCoordinatorServer server = new DistributionCoordinatorServer(config)) {
@@ -406,7 +406,7 @@ class DistributionCoordinatorServerTest {
         DistributionCoordinatorConfig config = DistributionCoordinatorConfig.builder()
                 .port(0)
                 .cacheDir(tempDir.resolve("single-cache"))
-                .jdbcUrl("jdbc:hsqldb:mem:coordinator_single_" + System.nanoTime())
+                .jdbcUrl("jdbc:hsqldb:file:" + tempDir.resolve("coordinator_single_" + System.nanoTime()) + ";shutdown=true")
                 .build();
 
         try (DistributionCoordinatorServer server = new DistributionCoordinatorServer(config)) {
@@ -504,7 +504,7 @@ class DistributionCoordinatorServerTest {
         DistributionCoordinatorConfig config = DistributionCoordinatorConfig.builder()
                 .port(0)
                 .cacheDir(tempDir.resolve("abort-cache"))
-                .jdbcUrl("jdbc:hsqldb:mem:coordinator_abort_" + System.nanoTime())
+                .jdbcUrl("jdbc:hsqldb:file:" + tempDir.resolve("coordinator_abort_" + System.nanoTime()) + ";shutdown=true")
                 .build();
 
         try (DistributionCoordinatorServer server = new DistributionCoordinatorServer(config)) {
@@ -610,7 +610,7 @@ class DistributionCoordinatorServerTest {
             DistributionCoordinatorConfig config = DistributionCoordinatorConfig.builder()
                     .port(0)
                     .cacheDir(cacheDir)
-                    .jdbcUrl("jdbc:hsqldb:mem:coordinator_owner_" + System.nanoTime())
+                    .jdbcUrl("jdbc:hsqldb:file:" + tempDir.resolve("coordinator_owner_" + System.nanoTime()) + ";shutdown=true")
                     .build();
             try (DistributionCoordinatorServer server = new DistributionCoordinatorServer(config)) {
                 server.start();
@@ -626,13 +626,13 @@ class DistributionCoordinatorServerTest {
         DistributionCoordinatorConfig ephemeralWildcard = DistributionCoordinatorConfig.builder()
             .host("0.0.0.0")
             .port(0)
-            .jdbcUrl("jdbc:hsqldb:mem:ephemeral_host_test")
+            .jdbcUrl("jdbc:hsqldb:file:" + tempDir.resolve("ephemeral_host_test") + ";shutdown=true")
             .cacheDir(tempDir.resolve("ephemeral-cache"))
             .build();
         DistributionCoordinatorConfig explicitPortWildcard = DistributionCoordinatorConfig.builder()
             .host("0.0.0.0")
             .port(8765)
-            .jdbcUrl("jdbc:hsqldb:mem:explicit_host_test")
+            .jdbcUrl("jdbc:hsqldb:file:" + tempDir.resolve("explicit_host_test") + ";shutdown=true")
             .cacheDir(tempDir.resolve("explicit-cache"))
             .build();
 

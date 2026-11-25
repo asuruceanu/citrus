@@ -1,14 +1,13 @@
 Feature: Configuration script
 
   Scenario: Inline config
-    Given URL: http://localhost:18080
     Given create configuration
     """
     configuration {
         endpoints {
             http {
                 server('helloServer') {
-                    port = 18080
+                    port = 0
                     autoStart = true
                 }
             }
@@ -16,6 +15,8 @@ Feature: Configuration script
     }
     """
     When verify endpoint helloServer
+    And store the port of HTTP server helloServer as serverPort
+    Given URL: http://localhost:${serverPort}
     Then send GET /hello
     And receive HTTP 200 OK
 

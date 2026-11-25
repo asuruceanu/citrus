@@ -49,6 +49,7 @@ const state = {
 
   // Modals
   selectedPartition: null,
+  waterfallExpanded: false,
   pages: {}, // current page per paginated table
   pageContexts: {}, // session and filters each table's current page belongs to
   selectedTestExecution: null,
@@ -141,6 +142,7 @@ function applyHashFromLocation() {
 }
 
 function setView(view, detailTab = null) {
+  state.waterfallExpanded = false;
   state.view = view;
   if (detailTab && VALID_DETAIL_TABS.has(detailTab)) {
     state.detailTab = detailTab;
@@ -875,6 +877,30 @@ function fitBarLabel(label, barWidth) {
   return maxChars >= 5 ? `${distinctive.slice(0, maxChars - 1)}…` : '';
 }
 
+// The session records worker activity, so Maven build time is inferred from idle time between modules.
+function mavenBuildGaps(partitions, endOf) {
+  const started = partitions.filter(p => p.startedAt > 0).sort((a, b) => a.startedAt - b.startedAt);
+  const gaps = [];
+  let latest = null;
+  for (const p of started) {
+    const previousEnd = latest ? endOf(latest) : 0;
+    if (latest?.finishedAt > 0 && latest.moduleName && p.moduleName &&
+        latest.moduleName !== p.moduleName && previousEnd < p.startedAt) {
+      gaps.push({ start: previousEnd, end: p.startedAt, from: latest.moduleName, to: p.moduleName });
+    }
+    if (endOf(p) > previousEnd) {
+      latest = p;
+    }
+  }
+  return gaps;
+}
+
+function toggleWaterfall() {
+  state.waterfallExpanded = !state.waterfallExpanded;
+  renderApp();
+  document.querySelector('[data-focus-id="waterfall-toggle"]')?.focus();
+}
+
 function renderWaterfallSvg(session, partitions) {
   if (!partitions || partitions.length === 0) {
     return html`<div class="empty-state">No partitions recorded for this session yet.</div>`;
@@ -886,7 +912,7 @@ function renderWaterfallSvg(session, partitions) {
   const startOf = p => p.startedAt > 0 ? p.startedAt : minStart;
   const endOf = p => p.finishedAt > 0
     ? p.finishedAt
-    : ((p.state === 'RUNNING' || p.state === 'ASSIGNED') ? Math.max(startOf(p) + 300, nowMs) : startOf(p) + estOf(p));
+    : ((p.state === 'RUNNING' || p.state === 'ASSIGNED') ? Math.max(startOf(p), nowMs) : startOf(p) + estOf(p));
   const maxEnd = Math.max(
     minStart + 1000,
     session.finishedAt > 0 ? session.finishedAt : 0,
@@ -907,8 +933,11 @@ function renderWaterfallSvg(session, partitions) {
   const chartWidth = 760;
   const svgWidth = labelWidth + chartWidth + 30;
   const rowHeight = 46;
-  const headerHeight = 34;
+  const buildGaps = mavenBuildGaps(partitions, endOf);
+  const headerHeight = buildGaps.length > 0 ? 60 : 34;
   const svgHeight = headerHeight + laneEntries.length * rowHeight + 16;
+  const timeToX = time => labelWidth + ((time - minStart) / totalSpan) * chartWidth;
+  let lastGapLabelEnd = labelWidth;
 
   const modules = moduleOrder(session, partitions);
   // Fill shows the module; the outline shows the state.
@@ -936,7 +965,7 @@ function renderWaterfallSvg(session, partitions) {
         <span style="margin-left:auto;font-size:12px;color:var(--text-muted)">Hover a bar for details · click to inspect</span>
       </div>
 
-      <div class="waterfall-scroll">
+      <div class="waterfall-scroll" tabindex="0" aria-label="Worker partition timeline">
         <svg style="width:100%;height:auto;display:block" viewBox=${`0 0 ${svgWidth} ${svgHeight}`}>
           ${ticks.map((t, tIdx) => {
             const x = labelWidth + Math.round(t * chartWidth);
@@ -944,8 +973,37 @@ function renderWaterfallSvg(session, partitions) {
             const anchor = tIdx === ticks.length - 1 ? 'end' : 'middle';
             return html`
               <g>
-                <line x1=${x} y1=${headerHeight - 6} x2=${x} y2=${svgHeight - 8} stroke="#94a3b8" stroke-opacity="0.25" stroke-dasharray="3,3" />
+                <line x1=${x} y1="28" x2=${x} y2=${svgHeight - 8} stroke="#94a3b8" stroke-opacity="0.25" stroke-dasharray="3,3" />
                 <text x=${x} y="20" text-anchor=${anchor} font-size="11" fill="#64748b">${label}</text>
+              </g>
+            `;
+          })}
+
+          ${buildGaps.length > 0 ? html`
+            <text class="waterfall-gap-heading" x="14" y="45">Maven build time (estimated)</text>
+          ` : null}
+          ${buildGaps.map(gap => {
+            const x = timeToX(gap.start);
+            const endX = timeToX(gap.end);
+            const width = endX - x;
+            const center = x + width / 2;
+            const duration = formatDuration(gap.end - gap.start);
+            const chipWidth = Math.max(32, duration.length * 6 + 12);
+            const labelX = center - chipWidth / 2;
+            const showLabel = labelX >= lastGapLabelEnd && labelX + chipWidth <= svgWidth - 8;
+            if (showLabel) {
+              lastGapLabelEnd = labelX + chipWidth + 6;
+            }
+            const tooltip = `Maven build time (estimated) · ${gap.from} → ${gap.to} · ${duration}`;
+            return html`
+              <g class="waterfall-build-gap" role="img" aria-label=${tooltip}>
+                <title>${tooltip}</title>
+                <rect class="waterfall-gap-band" x=${x} y="52" width=${width} height=${svgHeight - 60} />
+                <path class="waterfall-gap-edges" d=${`M ${x} ${svgHeight - 8} V 52 H ${endX} V ${svgHeight - 8}`} />
+                ${showLabel ? html`
+                  <rect class="waterfall-gap-chip" x=${labelX} y="32" width=${chipWidth} height="17" rx="8.5" />
+                  <text class="waterfall-gap-duration" x=${center} y="44" text-anchor="middle">${duration}</text>
+                ` : null}
               </g>
             `;
           })}
@@ -954,17 +1012,15 @@ function renderWaterfallSvg(session, partitions) {
             const y = headerHeight + idx * rowHeight;
             return html`
               <g>
-                <rect x="4" y=${y + 3} width=${svgWidth - 8} height=${rowHeight - 6} rx="6" fill="#94a3b8" fill-opacity="0.07" />
+                <rect x="4" y=${y + 3} width=${svgWidth - 8} height=${rowHeight - 6} rx="6" fill="#94a3b8" fill-opacity="0.07" pointer-events="none" />
                 <text x="14" y=${y + 26} font-size="12" font-weight="600" fill="currentColor">${workerId}</text>
                 ${laneParts.map(p => {
                   const pStart = startOf(p);
                   const pEnd = endOf(p);
-                  const relX = Math.min(chartWidth - 24, Math.max(0, Math.round(((pStart - minStart) / totalSpan) * chartWidth)));
-                  const x = labelWidth + relX;
-                  const w = Math.max(44, Math.round(((Math.max(300, pEnd - pStart)) / totalSpan) * chartWidth));
-                  const clampedW = Math.max(24, Math.min(w, chartWidth - relX));
+                  const x = timeToX(pStart);
+                  const width = Math.max(0, timeToX(pEnd) - x);
                   const barLabel = `${p.partitionId} ${p.attempt > 1 ? `(#${p.attempt})` : p.state === 'LOST' ? `(LOST #${p.attempt || 1})` : ''}`.trim();
-                  const shownLabel = fitBarLabel(barLabel, clampedW);
+                  const shownLabel = fitBarLabel(barLabel, width);
                   const outline = outlineFor(p.state);
                   const timing = partitionTiming(p, state.sessionDetail?.tests);
                   const tooltip = [
@@ -978,10 +1034,14 @@ function renderWaterfallSvg(session, partitions) {
                   return html`
                     <g class="waterfall-bar" onClick=${() => { state.selectedPartition = p; renderApp(); }}>
                       <title>${tooltip}</title>
-                      <rect x=${x} y=${y + 8} width=${clampedW} height=${rowHeight - 16} rx="6"
+                      <rect x=${x} y=${y + 8} width=${width} height=${rowHeight - 16} rx="6"
                         fill=${moduleColor(modules, p.moduleName)}
                         fill-opacity=${p.state === 'RUNNING' || p.state === 'ASSIGNED' ? 0.55 : 1}
                         stroke=${outline.stroke} stroke-width=${outline.width} stroke-dasharray=${outline.dash} />
+                      ${width === 0 ? html`
+                        <line x1=${x} x2=${x} y1=${y + 8} y2=${y + rowHeight - 8}
+                          stroke=${outline.width > 0 ? outline.stroke : moduleColor(modules, p.moduleName)} />
+                      ` : null}
                       ${shownLabel ? html`<text
                         x=${x + 8}
                         y=${y + 26}
@@ -1249,11 +1309,17 @@ function renderSessionDetail() {
 
       ${state.detailTab === 'waterfall' ? html`
         <div>
-          <div class="card">
+          <div class=${`card ${state.waterfallExpanded ? 'waterfall-expanded' : ''}`}
+              role=${state.waterfallExpanded ? 'dialog' : undefined}
+              aria-modal=${state.waterfallExpanded ? 'true' : undefined}
+              aria-labelledby="waterfall-heading">
             <div class="card-header">
-              <h2 class="card-title">Worker Swimlane Gantt Waterfall</h2>
+              <h2 class="card-title" id="waterfall-heading">Worker Swimlane Gantt Waterfall</h2>
+              <button class="btn btn-sm" data-focus-id="waterfall-toggle"
+                  aria-expanded=${String(state.waterfallExpanded)} aria-controls="worker-waterfall"
+                  onClick=${toggleWaterfall}>${state.waterfallExpanded ? 'Collapse waterfall' : 'Expand waterfall'}</button>
             </div>
-            <div class="card-body">
+            <div class="card-body" id="worker-waterfall">
               ${renderWaterfallSvg(session, partitions)}
             </div>
           </div>
@@ -2032,6 +2098,7 @@ window.addEventListener('hashchange', () => {
   if (suppressHashChange) return;
   const prevSid = state.selectedSessionId;
   if (applyHashFromLocation()) {
+    state.waterfallExpanded = false;
     if (state.view === 'session-detail'
         && state.selectedSessionId
         && (state.selectedSessionId !== prevSid || state.sessionDetail?.session?.sessionId !== state.selectedSessionId)) {
@@ -2044,11 +2111,22 @@ window.addEventListener('hashchange', () => {
 });
 
 window.addEventListener('keydown', e => {
-  if (e.key === 'Escape' && (state.selectedPartition || state.selectedTestExecution || state.historyRunDetails)) {
+  const inspecting = state.selectedPartition || state.selectedTestExecution || state.historyRunDetails;
+  if (e.key === 'Escape' && inspecting) {
     state.selectedPartition = null;
     state.selectedTestExecution = null;
     state.historyRunDetails = null;
     renderApp();
+    if (state.waterfallExpanded) document.querySelector('[data-focus-id="waterfall-toggle"]')?.focus();
+  } else if (e.key === 'Escape' && state.waterfallExpanded) {
+    toggleWaterfall();
+  } else if (e.key === 'Tab' && state.waterfallExpanded && !inspecting) {
+    const button = document.querySelector('.waterfall-expanded [data-focus-id="waterfall-toggle"]');
+    const chart = document.querySelector('.waterfall-expanded .waterfall-scroll');
+    if (button) {
+      e.preventDefault();
+      (document.activeElement === button && chart ? chart : button).focus();
+    }
   }
 });
 

@@ -132,7 +132,7 @@ public class TestNGCitrusSupport implements IHookable, GherkinTestActionRunner {
 
             TestLoader testLoader;
             if (method.getAnnotation(CitrusTestSource.class) != null && !methodTestLoaders.isEmpty()) {
-                testLoader = methodTestLoaders.get(invocationCount % methodTestLoaders.size());
+                testLoader = methodTestLoaders.get(TestNGHelper.sourceIndex(testResult, invocationCount, methodTestLoaders.size()));
             } else {
                 testLoader = createTestLoader();
             }

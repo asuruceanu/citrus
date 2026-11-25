@@ -20,6 +20,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.net.JarURLConnection;
 import java.net.URL;
+import java.net.URLClassLoader;
 import java.net.URLConnection;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -30,11 +31,19 @@ import java.util.jar.JarEntry;
 import java.util.jar.JarFile;
 import java.util.jar.JarOutputStream;
 
+import javax.tools.ToolProvider;
+
 import org.citrusframework.distribution.model.TestOutcomeStatus;
 import org.citrusframework.distribution.model.WorkerTestEventPayload;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.platform.engine.TestEngine;
+import org.junit.platform.engine.discovery.DiscoverySelectors;
+import org.junit.platform.launcher.EngineFilter;
+import org.junit.platform.launcher.core.LauncherDiscoveryRequestBuilder;
+import org.junit.platform.launcher.core.LauncherFactory;
+import org.junit.platform.launcher.listeners.SummaryGeneratingListener;
+import org.junit.vintage.engine.VintageTestEngine;
 import org.w3c.dom.Document;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -132,6 +141,66 @@ class PartitionClassLoaderTest {
             assertThat(loader.loadClass(TestEngine.class.getName())).isSameAs(TestEngine.class);
             assertThat(loader.loadClass(String.class.getName())).isSameAs(String.class);
             assertThat(loader.getResource("java/lang/String.class")).isNotNull();
+        }
+    }
+
+    @Test
+    void shouldIsolateJUnitSupportWhileSharingPlatformAndJupiter() throws Exception {
+        String className = "org.junit.support.probe.SupportProbe";
+        String resource = "org/junit/support/probe/source.txt";
+        Path source = Files.writeString(tempDir.resolve("SupportProbe.java"),
+                "package org.junit.support.probe; public class SupportProbe {}");
+        Path parentPath = Files.createDirectory(tempDir.resolve("parent"));
+        Path partitionPath = Files.createDirectory(tempDir.resolve("partition"));
+        assertThat(ToolProvider.getSystemJavaCompiler().run(null, null, null,
+                "-d", parentPath.toString(), source.toString())).isZero();
+        Path partitionClass = partitionPath.resolve(className.replace('.', '/') + ".class");
+        Files.createDirectories(partitionClass.getParent());
+        Files.copy(parentPath.resolve(className.replace('.', '/') + ".class"), partitionClass);
+        Path provider = parentPath.resolve("META-INF/services/org.junit.platform.engine.TestEngine");
+        Files.createDirectories(provider.getParent());
+        Files.writeString(provider, className);
+        Files.writeString(parentPath.resolve(resource), "parent");
+        Files.writeString(partitionPath.resolve(resource), "partition");
+
+        try (URLClassLoader parent = new URLClassLoader(new URL[] {parentPath.toUri().toURL()}, WORKER);
+             IsolatedPartitionRunner.PartitionClassLoader loader = new IsolatedPartitionRunner.PartitionClassLoader(
+                     new URL[] {partitionPath.toUri().toURL()}, parent);
+             InputStream in = loader.getResourceAsStream(resource)) {
+            assertThat(loader.loadClass(className)).isNotSameAs(parent.loadClass(className));
+            assertThat(loader.loadClass(className).getClassLoader()).isSameAs(loader);
+            assertThat(in).isNotNull();
+            assertThat(new String(in.readAllBytes(), StandardCharsets.UTF_8)).isEqualTo("partition");
+            assertThat(loader.loadClass(TestEngine.class.getName())).isSameAs(TestEngine.class);
+            assertThat(loader.loadClass(Test.class.getName())).isSameAs(Test.class);
+        }
+    }
+
+    @Test
+    void shouldKeepVintageAndJUnit4SharingTheWorkerTypes() throws Exception {
+        URL junit4 = org.junit.Test.class.getProtectionDomain().getCodeSource().getLocation();
+        URL vintage = VintageTestEngine.class.getProtectionDomain().getCodeSource().getLocation();
+        Path classes = Files.createDirectory(tempDir.resolve("vintage-classes"));
+        Path source = Files.writeString(tempDir.resolve("VintageProbe.java"), """
+                public class VintageProbe {
+                    @org.junit.Test public void runs() {}
+                }
+                """);
+        assertThat(ToolProvider.getSystemJavaCompiler().run(null, null, null, "-classpath",
+                Path.of(junit4.toURI()).toString(), "-d", classes.toString(), source.toString())).isZero();
+
+        try (var loader = new IsolatedPartitionRunner.PartitionClassLoader(
+                new URL[] {classes.toUri().toURL(), junit4, vintage}, WORKER)) {
+            Class<?> fixture = loader.loadClass("VintageProbe");
+            var listener = new SummaryGeneratingListener();
+            LauncherFactory.create().execute(LauncherDiscoveryRequestBuilder.request()
+                    .selectors(DiscoverySelectors.selectClass(fixture))
+                    .filters(EngineFilter.includeEngines("junit-vintage"))
+                    .build(), listener);
+            assertThat(listener.getSummary().getFailures()).isEmpty();
+            assertThat(listener.getSummary().getTestsSucceededCount()).isEqualTo(1);
+            assertThat(loader.loadClass(org.junit.Test.class.getName())).isSameAs(org.junit.Test.class);
+            assertThat(loader.loadClass(VintageTestEngine.class.getName())).isSameAs(VintageTestEngine.class);
         }
     }
 

@@ -115,7 +115,7 @@ class DistributionWorkerClientTest {
                 .port(0)
                 .authToken("worker-secret")
                 .cacheDir(tempDir.resolve("coordinator-cache"))
-                .jdbcUrl("jdbc:hsqldb:mem:worker_it_" + System.nanoTime())
+                .jdbcUrl("jdbc:hsqldb:file:" + tempDir.resolve("worker_it_" + System.nanoTime()) + ";shutdown=true")
                 .build();
 
         try (DistributionCoordinatorServer coordinator = new DistributionCoordinatorServer(coordinatorConfig)) {
@@ -203,7 +203,7 @@ class DistributionWorkerClientTest {
                 .port(0)
                 .authToken("worker-secret")
                 .cacheDir(tempDir.resolve("coordinator-concurrent-cache"))
-                .jdbcUrl("jdbc:hsqldb:mem:worker_concurrent_" + System.nanoTime())
+                .jdbcUrl("jdbc:hsqldb:file:" + tempDir.resolve("worker_concurrent_" + System.nanoTime()) + ";shutdown=true")
                 .defaultMaxPartitionSize(1)
                 .build();
 
@@ -563,7 +563,7 @@ class DistributionWorkerClientTest {
                 .port(0)
                 .authToken("worker-secret")
                 .cacheDir(tempDir.resolve("coordinator-" + dbPrefix + "cache"))
-                .jdbcUrl("jdbc:hsqldb:mem:" + dbPrefix + System.nanoTime())
+                .jdbcUrl("jdbc:hsqldb:file:" + tempDir.resolve(dbPrefix + System.nanoTime()) + ";shutdown=true")
                 .build());
         coordinator.start();
         return coordinator;

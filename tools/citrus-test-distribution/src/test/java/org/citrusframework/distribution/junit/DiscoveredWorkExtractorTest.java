@@ -25,11 +25,19 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.Callable;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
+import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.TestTemplate;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.junit.jupiter.api.extension.ExtensionContext;
+import org.junit.jupiter.api.extension.TestTemplateInvocationContext;
+import org.junit.jupiter.api.extension.TestTemplateInvocationContextProvider;
 import org.junit.jupiter.engine.JupiterTestEngine;
 import org.junit.platform.engine.discovery.DiscoverySelectors;
 import org.junit.platform.launcher.Launcher;
+import org.junit.platform.launcher.TagFilter;
 import org.junit.platform.launcher.TestPlan;
 import org.junit.platform.launcher.core.LauncherConfig;
 import org.junit.platform.launcher.core.LauncherDiscoveryRequestBuilder;
@@ -71,6 +79,46 @@ class DiscoveredWorkExtractorTest {
             java.lang.reflect.Method isAvailable = support.getDeclaredMethod("isAvailable");
             isAvailable.setAccessible(true);
             assertThat(isAvailable.invoke(null)).isEqualTo(false);
+        }
+    }
+
+    @Test
+    void splitsClassesWithExcludedTemplateMethods() {
+        Launcher launcher = LauncherFactory.create();
+        TestPlan filtered = launcher.discover(LauncherDiscoveryRequestBuilder.request()
+                .selectors(DiscoverySelectors.selectClass(MixedTemplateFixture.class))
+                .filters(TagFilter.excludeTags("slow"))
+                .build());
+
+        var partial = DiscoveredWorkExtractor.partiallySelectedClasses(launcher, filtered);
+        var work = DiscoveredWorkExtractor.extract(filtered, 1_000, partial);
+
+        assertThat(partial).hasSize(1);
+        assertThat(work.remoteUnits()).extracting(unit -> unit.key())
+                .containsExactly(MixedTemplateFixture.class.getName() + "#fast");
+    }
+
+    @ExtendWith(SingleInvocationProvider.class)
+    static class MixedTemplateFixture {
+        @TestTemplate
+        void fast() {
+        }
+
+        @TestTemplate
+        @Tag("slow")
+        void slow() {
+        }
+    }
+
+    static class SingleInvocationProvider implements TestTemplateInvocationContextProvider {
+        @Override
+        public boolean supportsTestTemplate(ExtensionContext context) {
+            return true;
+        }
+
+        @Override
+        public Stream<TestTemplateInvocationContext> provideTestTemplateInvocationContexts(ExtensionContext context) {
+            return Stream.of(new TestTemplateInvocationContext() {});
         }
     }
 

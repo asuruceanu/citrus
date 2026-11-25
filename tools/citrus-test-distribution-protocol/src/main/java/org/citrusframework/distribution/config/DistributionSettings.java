@@ -44,6 +44,8 @@ public final class DistributionSettings {
     public static final String ROLE_WORKER = "worker";
     public static final String ROLE_COORDINATOR = "coordinator";
 
+    public static final String RESUME_SESSION_ID_PROPERTY = "citrus.test.distribution.resumeSessionId";
+    public static final String MAVEN_TEST_EXECUTION_PROPERTY = "citrus.test.distribution.mavenTestExecution";
     public static final String SESSION_ID_PROPERTY = "citrus.test.distribution.sessionId";
     public static final String MODULE_NAME_PROPERTY = "citrus.test.distribution.moduleName";
     public static final String REPORT_DIR_PROPERTY = "citrus.test.distribution.reportDir";
@@ -175,7 +177,7 @@ public final class DistributionSettings {
 
     public static final String WORKER_FORK_JVM_ARGS_PROPERTY = "citrus.test.distribution.worker.forkJvmArgs";
     public static final String WORKER_FORK_JVM_ARGS_ENV = "CITRUS_DIST_WORKER_FORK_JVM_ARGS";
-    public static final List<String> DEFAULT_FORK_JVM_ARGS = List.of("-Xmx768m", "-XX:ActiveProcessorCount=2");
+    public static final List<String> DEFAULT_FORK_JVM_ARGS = List.of();
 
     public static final String WORKER_CWD_CHECK_PROPERTY = "citrus.test.distribution.worker.cwdCheck";
     public static final String WORKER_CWD_CHECK_ENV = "CITRUS_DIST_WORKER_CWD_CHECK";

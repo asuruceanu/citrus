@@ -1,0 +1,4 @@
+name: SecondEchoTest
+actions:
+  - echo:
+      message: "Second Citrus source"

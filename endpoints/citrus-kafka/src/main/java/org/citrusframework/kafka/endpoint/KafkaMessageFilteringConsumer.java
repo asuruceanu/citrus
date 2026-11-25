@@ -48,7 +48,6 @@ import static java.util.Objects.nonNull;
 import static java.util.concurrent.Executors.newSingleThreadExecutor;
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
 import static java.util.stream.Collectors.toMap;
-import static org.apache.commons.lang3.exception.ExceptionUtils.getRootCause;
 import static org.citrusframework.kafka.endpoint.KafkaMessageConsumerUtils.parseConsumerRecordsToMessage;
 import static org.citrusframework.kafka.endpoint.KafkaMessageConsumerUtils.resolveTopic;
 import static org.citrusframework.util.StringUtils.hasText;
@@ -123,16 +122,22 @@ public class KafkaMessageFilteringConsumer extends AbstractSelectiveMessageConsu
         }
 
         Duration messageTimeout = Duration.ofMillis(timeout);
-        if (kafkaMessageFilter.getPollTimeout().compareTo(messageTimeout) > 0) {
+        Duration pollTimeout = kafkaMessageFilter.getPollTimeout();
+        boolean pollUsesReceiveBudget = pollTimeout.compareTo(messageTimeout) >= 0;
+        if (pollTimeout.compareTo(messageTimeout) > 0) {
             logger.warn(
                     "Truncating poll timeout to maximum message timeout ({} ms) - having one single poll exceeding the total timeout would prevent proper timeout handling",
                     messageTimeout.toMillis());
-            kafkaMessageFilter.setPollTimeout(messageTimeout);
+            pollTimeout = messageTimeout;
         }
 
-        var consumerRecords = findMatchingMessageInTopicWithTimeout(topic, timeout);
+        var consumerRecords = findMatchingMessageInTopicWithTimeout(topic, timeout, pollTimeout);
 
         if (consumerRecords.isEmpty()) {
+            // The final poll and the future can complete in either order when they share the receive budget.
+            if (pollUsesReceiveBudget) {
+                throw new MessageTimeoutException(timeout, topic);
+            }
             throw new CitrusRuntimeException("Failed to resolve Kafka message using selector: " + selector);
         }
 
@@ -146,11 +151,11 @@ public class KafkaMessageFilteringConsumer extends AbstractSelectiveMessageConsu
         return received;
     }
 
-    private List<ConsumerRecord<Object, Object>> findMatchingMessageInTopicWithTimeout(String topic, long timeout) {
+    private List<ConsumerRecord<Object, Object>> findMatchingMessageInTopicWithTimeout(String topic, long timeout, Duration pollTimeout) {
         logger.trace("Applied timeout is {} ms", timeout);
 
         var executorService = newSingleThreadExecutor();
-        final Future<List<ConsumerRecord<Object, Object>>> handler = executorService.submit(() -> findMessagesSatisfyingMatcher(topic));
+        final Future<List<ConsumerRecord<Object, Object>>> handler = executorService.submit(() -> findMessagesSatisfyingMatcher(topic, pollTimeout));
 
         try {
             return handler.get(timeout, MILLISECONDS);
@@ -160,22 +165,22 @@ public class KafkaMessageFilteringConsumer extends AbstractSelectiveMessageConsu
         } catch (ExecutionException e) {
             throw new CitrusRuntimeException(format("Failed to receive message on Kafka topic '%s'", topic), e);
         } catch (TimeoutException e) {
-            logger.error("Failed to receive message on  Kafka topic '{}': {}", topic, getRootCause(e).getMessage());
+            logger.error("Timed out after {} ms waiting for a message on Kafka topic '{}'", timeout, topic);
 
             handler.cancel(true);
 
             throw new MessageTimeoutException(timeout, topic, e);
         } finally {
-            shutdownExecutorAwaitingCurrentPoll(executorService);
+            shutdownExecutorAwaitingCurrentPoll(executorService, pollTimeout);
         }
     }
 
-    private void shutdownExecutorAwaitingCurrentPoll(ExecutorService executorService) {
+    private void shutdownExecutorAwaitingCurrentPoll(ExecutorService executorService, Duration pollTimeout) {
         executorService.shutdown();
         try {
-            if (!executorService.awaitTermination(kafkaMessageFilter.getPollTimeout().toMillis(), MILLISECONDS)) {
+            if (!executorService.awaitTermination(pollTimeout.toMillis(), MILLISECONDS)) {
                 executorService.shutdownNow();
-                if (!executorService.awaitTermination(kafkaMessageFilter.getPollTimeout().toMillis(), MILLISECONDS)) {
+                if (!executorService.awaitTermination(pollTimeout.toMillis(), MILLISECONDS)) {
                     logger.error("Executor did not terminate, check for memory leaks!");
                 }
             }
@@ -195,7 +200,7 @@ public class KafkaMessageFilteringConsumer extends AbstractSelectiveMessageConsu
     }
 
     @SuppressWarnings("unchecked")
-    private List<ConsumerRecord<Object, Object>> findMessagesSatisfyingMatcher(String topic) {
+    private List<ConsumerRecord<Object, Object>> findMessagesSatisfyingMatcher(String topic, Duration pollTimeout) {
         List<TopicPartition> partitions = consumer.partitionsFor(topic).stream()
                 .map(partitionInfo -> new TopicPartition(topic, partitionInfo.partition()))
                 .toList();
@@ -210,7 +215,7 @@ public class KafkaMessageFilteringConsumer extends AbstractSelectiveMessageConsu
         var matchingConsumerRecords = new ArrayList<ConsumerRecord<Object, Object>>();
 
         while (true) {
-            var consumerRecords = consumer.poll(kafkaMessageFilter.getPollTimeout());
+            var consumerRecords = consumer.poll(pollTimeout);
             if (consumerRecords.isEmpty()) {
                 break;  // No more records to process
             }

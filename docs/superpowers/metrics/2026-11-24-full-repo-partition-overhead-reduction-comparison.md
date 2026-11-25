@@ -1,5 +1,38 @@
 # Full-repository test distribution benchmark after partition overhead reduction
 
+## 105-module verify with eight workers
+
+On 2026-11-25 (Europe/Chisinau), all 105 modules passed Maven 3.9.8 `verify` in one serial reactor in **30m 04s** (1,804.37s, measured by the run harness). The run used Temurin Java 21 on macOS, commit `69cebd1454bc`, and the Kafka timeout and Cucumber Groovy port fixes recorded with this benchmark entry. All eight workers used `ALWAYS` fork mode and reused their caches from the earlier eight-worker run. The coordinator recorded 209 completed partitions, zero retries, 18,986 worker passes, and three worker skips. Both the Kafka timeout test and the Cucumber Groovy `Inline config` scenario passed on workers. [Run dashboard](http://127.0.0.1:54592/ui/index.html#session/sess-89a3fadf-b73/waterfall) · [Run audit](/tmp/citrus-full-verify-fixed.YYOeBP/final-audit.json)
+
+### Comparison with GitHub Actions
+
+Both totals below come from Surefire and Failsafe `TEST-*.xml` reports. The GitHub Actions baseline used Ubuntu, Java 21, and commit `6fc097db1c`. [CI report](https://github.com/asuruceanu/citrus/actions/runs/45484682676/job/138774535801) · [Per-module comparison](/tmp/citrus-full-verify-fixed.YYOeBP/comparison.json)
+
+| Run | Surefire passed | Failsafe passed | Total passed | Failed | Skipped |
+|---|---:|---:|---:|---:|---:|
+| GitHub Actions | 17,860 | 1,023 | 18,883 | 0 | 9 |
+| Eight-worker verify | 17,878 | 1,126 | **19,004** | **0** | **3** |
+| Difference | +18 | +103 | **+121** | 0 | **−6** |
+
+TestNG Failsafe XML accounts for 100 of the additional passes. The CI Maven log records 101 passes in the default TestNG integration execution, and its uploaded TestNG Failsafe XML contains six passes across the module. The worker run reports 106 TestNG Failsafe passes in XML. The other 21 additional passes appear in the TestNG, Kafka, Test Distribution launcher, and worker Surefire reports and the Maven plugin integration Failsafe reports. The Test Distribution worker module reports eight platform-dependent skips on Linux and two on macOS. Both runs skipped the same Docker integration test. [CI runtime job](https://github.com/asuruceanu/citrus/actions/runs/45484682676/job/138768118889)
+
+### Command and worker settings
+
+The run used the CI Maven flags and `playwright-runtimes` profile with the Test Distribution Maven extension loaded. The local thresholds were zero, and local fallback was disabled.
+
+```sh
+./mvnw --no-transfer-progress --fail-at-end verify \
+  -Dmaven.javadoc.skip=true -Dmaven.source.skip=true -Pplaywright-runtimes \
+  -Dcitrus.test.distribution.enabled=true \
+  -Dcitrus.test.distribution.coordinatorUrl=http://127.0.0.1:54592 \
+  -Dcitrus.test.distribution.fallbackLocal=false \
+  -Dcitrus.test.distribution.minRemoteColdUnits=0 \
+  -Dcitrus.test.distribution.minRemoteDurationMs=0 \
+  -Dcitrus.test.distribution.projectKey=verify8-yyoebp-verify
+```
+
+The harness temporarily applied `SINGLE` to the previously retried modules that needed it, including JMS. HTTP, SOAP, and REST Docs received `src/test/resources` in their worker workspaces. The harness restored the module POMs, Maven extension configuration, and Docker VM async I/O setting after the run. [Worker overrides](/tmp/citrus-full-verify-fixed.YYOeBP/worker-overrides.json) · [Maven log](/tmp/citrus-full-verify-fixed.YYOeBP/verify.log)
+
 ## 104-module Maven 3.9.8 warm benchmark
 
 Measured on 2026-11-24 (Europe/Chisinau) at `d53a0b0dfc` with the four worker-parity test edits applied. Both runs used Java 21, Maven 3.9.8 in serial reactor mode, and the same 104-module selection. The main pass selected 98 modules and the follow-on selected the six Test Distribution modules. Only `runtime/citrus-testng` was excluded. The warm run reused the coordinator database and blob cache and all six worker caches. All six workers ran in `ALWAYS` fork mode and local fallback was disabled.

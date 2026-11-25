@@ -1205,7 +1205,7 @@ public final class IsolatedPartitionRunner implements PartitionRunner {
             synchronized (getClassLoadingLock(name)) {
                 Class<?> loaded = findLoadedClass(name);
                 if (loaded == null) {
-                    if (shouldDelegateToParent(name) || workerServiceProviders.contains(name)) {
+                    if (shouldDelegateToParent(name) || isSharedWorkerServiceProvider(name)) {
                         loaded = super.loadClass(name, false);
                     } else {
                         try {
@@ -1227,6 +1227,12 @@ public final class IsolatedPartitionRunner implements PartitionRunner {
                 }
                 return loaded;
             }
+        }
+
+        private boolean isSharedWorkerServiceProvider(String name) {
+            // A partition-provided JUnit Support engine must link against the partition's framework classes.
+            return workerServiceProviders.contains(name) && (!name.startsWith("org.junit.support.")
+                    || super.findResource(name.replace('.', '/') + ".class") == null);
         }
 
         @Override
@@ -1284,6 +1290,9 @@ public final class IsolatedPartitionRunner implements PartitionRunner {
         }
 
         private static boolean isSharedResource(String name) {
+            if (name.startsWith("org/junit/support/")) {
+                return false;
+            }
             for (String prefix : SHARED_RESOURCE_PREFIXES) {
                 if (name.startsWith(prefix)) {
                     return true;
@@ -1296,7 +1305,7 @@ public final class IsolatedPartitionRunner implements PartitionRunner {
             // JDK packages are matched exactly (isJdkPackage), not by javax./jdk./sun. prefixes: third-party javax.*
             // libraries such as wsdl4j's javax.wsdl must load from the partition with their implementation.
             return name.startsWith("java.")
-                    || name.startsWith("org.junit.")
+                    || (name.startsWith("org.junit.") && !name.startsWith("org.junit.support."))
                     || name.startsWith("org.opentest4j.")
                     || name.startsWith("org.apiguardian.")
                     || name.startsWith("org.slf4j.")

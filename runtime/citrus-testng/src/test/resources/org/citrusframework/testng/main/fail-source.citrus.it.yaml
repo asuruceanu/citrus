@@ -1,0 +1,4 @@
+name: FailSource
+actions:
+  - fail:
+      message: "Failure from the selected Citrus source"

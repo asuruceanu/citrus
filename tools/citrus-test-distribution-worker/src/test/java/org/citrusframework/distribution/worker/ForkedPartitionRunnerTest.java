@@ -357,7 +357,7 @@ class ForkedPartitionRunnerTest {
         DistributionCoordinatorConfig coordinatorConfig = DistributionCoordinatorConfig.builder()
                 .port(0)
                 .cacheDir(tempDir.resolve("coordinator-cache"))
-                .jdbcUrl("jdbc:hsqldb:mem:forked_" + System.nanoTime())
+                .jdbcUrl("jdbc:hsqldb:file:" + tempDir.resolve("forked_" + System.nanoTime()) + ";shutdown=true")
                 .build();
         try (DistributionCoordinatorServer coordinator = new DistributionCoordinatorServer(coordinatorConfig)) {
             coordinator.start();
@@ -457,7 +457,7 @@ class ForkedPartitionRunnerTest {
         DistributionCoordinatorConfig coordinatorConfig = DistributionCoordinatorConfig.builder()
                 .port(0)
                 .cacheDir(tempDir.resolve("coordinator-cache"))
-                .jdbcUrl("jdbc:hsqldb:mem:forked_wd_" + System.nanoTime())
+                .jdbcUrl("jdbc:hsqldb:file:" + tempDir.resolve("forked_wd_" + System.nanoTime()) + ";shutdown=true")
                 .build();
         try (DistributionCoordinatorServer coordinator = new DistributionCoordinatorServer(coordinatorConfig)) {
             coordinator.start();
@@ -739,7 +739,7 @@ class ForkedPartitionRunnerTest {
         DistributionCoordinatorConfig coordinatorConfig = DistributionCoordinatorConfig.builder()
                 .port(0)
                 .cacheDir(tempDir.resolve("coordinator-cache"))
-                .jdbcUrl("jdbc:hsqldb:mem:forked_hook_" + System.nanoTime())
+                .jdbcUrl("jdbc:hsqldb:file:" + tempDir.resolve("forked_hook_" + System.nanoTime()) + ";shutdown=true")
                 .build();
         try (DistributionCoordinatorServer coordinator = new DistributionCoordinatorServer(coordinatorConfig)) {
             coordinator.start();

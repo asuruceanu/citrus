@@ -16,21 +16,15 @@
 
 package org.citrusframework.testng.spring;
 
-import org.citrusframework.annotations.CitrusTestSource;
-import org.citrusframework.common.ResolvedTestSource;
-import org.citrusframework.common.TestSourceResolver;
+import org.citrusframework.testng.TestNGHelper;
 import org.testng.IMethodInstance;
 import org.testng.IMethodInterceptor;
 import org.testng.ITestContext;
-import org.testng.internal.MethodInstance;
 
-import java.util.ArrayList;
 import java.util.List;
 
 /**
- * TestNG method interceptor duplicates method instances for each package scan test and test name in
- * Citrus annotated test method. So TestNG test is executed multiple times respectively for each Citrus test
- * constructed by method annotation.
+ * Applies the configured TestNG invocation count to each resolved Citrus test source.
  *
  * @since 1.3.1
  */
@@ -38,33 +32,6 @@ public class TestNGCitrusSpringMethodInterceptor implements IMethodInterceptor {
 
     @Override
     public List<IMethodInstance> intercept(List<IMethodInstance> methods, ITestContext context) {
-        List<IMethodInstance> interceptedMethods = new ArrayList<>();
-
-        for (IMethodInstance method : methods) {
-            boolean baseMethodAdded = false;
-            if (method.getInstance() instanceof TestNGCitrusSpringSupport) {
-                java.lang.reflect.Method testMethod = method.getMethod().getConstructorOrMethod().getMethod();
-                CitrusTestSource citrusTestAnnotation = testMethod.getAnnotation(CitrusTestSource.class);
-                if (citrusTestAnnotation != null) {
-                    List<ResolvedTestSource> resolvedTestSources = TestSourceResolver.resolve(citrusTestAnnotation, testMethod);
-                    if (resolvedTestSources.size() > 1) {
-                        for (int i = 0; i < resolvedTestSources.size(); i++) {
-                            if (i == 0) {
-                                baseMethodAdded = true;
-                                interceptedMethods.add(method);
-                            } else {
-                                interceptedMethods.add(new MethodInstance(method.getMethod()));
-                            }
-                        }
-                    }
-                }
-            }
-
-            if (!baseMethodAdded) {
-                interceptedMethods.add(method);
-            }
-        }
-
-        return interceptedMethods;
+        return TestNGHelper.scheduleTestSources(methods, context, TestNGCitrusSpringSupport.class);
     }
 }

@@ -218,17 +218,16 @@ public final class SurefirePluginMutator {
         Xpp3Dom config = ensureDom(plugin.getConfiguration());
         String assertions = assertionSetting(config, resolution.cliUserProperties().getProperty("enableAssertions",
                 project.getProperties() == null ? "true" : project.getProperties().getProperty("enableAssertions", "true")));
-        applyDomMutations(project, config, sessionId, extraClasspathJars, sharedProperties, resolution, assertions);
+        applyDomMutations(project, config, sessionId, extraClasspathJars, sharedProperties, resolution, assertions,
+                plugin.getArtifactId());
         plugin.setConfiguration(config);
 
         if (plugin.getExecutions() != null) {
             for (PluginExecution execution : plugin.getExecutions()) {
-                if (execution.getConfiguration() != null) {
-                    Xpp3Dom execDom = ensureDom(execution.getConfiguration());
-                    applyDomMutations(project, execDom, sessionId, extraClasspathJars, sharedProperties, resolution,
-                            assertionSetting(execDom, assertions));
-                    execution.setConfiguration(execDom);
-                }
+                Xpp3Dom execDom = ensureDom(execution.getConfiguration());
+                applyDomMutations(project, execDom, sessionId, extraClasspathJars, sharedProperties, resolution,
+                        assertionSetting(execDom, assertions), plugin.getArtifactId() + "/" + execution.getId());
+                execution.setConfiguration(execDom);
             }
         }
     }
@@ -243,7 +242,7 @@ public final class SurefirePluginMutator {
                                           String sessionId,
                                           List<Path> extraClasspathJars,
                                           Map<String, String> sharedProperties,
-                                          Resolution resolution, String assertions) {
+                                          Resolution resolution, String assertions, String executionId) {
         Xpp3Dom additionalCp = getOrCreateChild(config, "additionalClasspathElements");
         for (Path jar : extraClasspathJars) {
             String absPath = jar.toAbsolutePath().toString();
@@ -262,6 +261,7 @@ public final class SurefirePluginMutator {
             setChildValue(sysProps, DistributionSettings.SESSION_ID_PROPERTY, sessionId);
         }
         setChildValue(sysProps, DistributionSettings.MODULE_NAME_PROPERTY, project.getArtifactId());
+        setChildValue(sysProps, DistributionSettings.MAVEN_TEST_EXECUTION_PROPERTY, project.getId() + "/" + executionId);
         // No REPORT_DIR_PROPERTY: remote results are replayed into Surefire/Failsafe, which write the reports themselves.
         if (sharedProperties != null) {
             sharedProperties.forEach((k, v) -> {

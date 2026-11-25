@@ -1,0 +1,81 @@
+/*
+ * Copyright the original author or authors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.citrusframework.testng;
+
+import java.util.ArrayList;
+import java.util.List;
+
+import org.citrusframework.CitrusContext;
+import org.citrusframework.TestCase;
+import org.citrusframework.report.AbstractTestListener;
+import org.citrusframework.annotations.CitrusTestSource;
+import org.citrusframework.api.common.TestLoader;
+import org.testng.IRetryAnalyzer;
+import org.testng.ITestResult;
+import org.testng.annotations.Test;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+public class PlainSourceFixture extends TestNGCitrusSupport {
+    private static final String FIRST = "classpath:org/citrusframework/testng/main/echo.citrus.it.yaml";
+    private static final String SECOND = "classpath:org/citrusframework/testng/main/second-echo.citrus.it.yaml";
+    private static final String FAILING = "classpath:org/citrusframework/testng/main/fail-source.citrus.it.yaml";
+
+    static final List<String> ATTEMPTS = new ArrayList<>();
+    static final List<String> SOURCES = new ArrayList<>();
+    static volatile Thread launcherThread;
+
+    @Override
+    protected void before(CitrusContext context) {
+        TestNGCitrusMethodInterceptorTest.recordSources(context, SOURCES);
+        context.addTestListener(new AbstractTestListener() {
+            @Override
+            public void onTestStart(TestCase test) {
+                ATTEMPTS.add(test.getName());
+            }
+        });
+    }
+
+    @Test(threadPoolSize = 2)
+    @CitrusTestSource(type = TestLoader.YAML, sources = {FIRST, SECOND})
+    public void runSources() {
+        assertThat(Thread.currentThread()).isSameAs(launcherThread);
+    }
+
+    @Test(invocationCount = 2, invocationTimeOut = 10_000)
+    @CitrusTestSource(type = TestLoader.YAML, sources = {FIRST, SECOND})
+    public void repeatTimedSources() {
+    }
+
+    @Test(invocationTimeOut = 10_000, retryAnalyzer = RetryOnce.class)
+    @CitrusTestSource(type = TestLoader.YAML, sources = {FIRST, FAILING})
+    public void retryTimedSource() {
+    }
+
+    public static class RetryOnce implements IRetryAnalyzer {
+        private boolean retried;
+
+        @Override
+        public boolean retry(ITestResult result) {
+            if (retried) {
+                return false;
+            }
+            retried = true;
+            return true;
+        }
+    }
+}
