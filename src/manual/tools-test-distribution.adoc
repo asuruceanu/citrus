@@ -58,7 +58,8 @@ JUnit Platform tags, so Surefire and Failsafe group filters apply before work is
 
 TIP: Projects that do not use the Maven extension can add `org.citrusframework:citrus-test-distribution` to the test runtime classpath and enable JUnit Platform interceptor discovery (`-Djunit.platform.launcher.interceptors.enabled=true -Dcitrus.test.distribution.enabled=true`).
 
-To start a PostgreSQL-backed coordinator and a local worker pool in containers, see <<tools-test-distribution-docker>>.
+To start a PostgreSQL-backed coordinator and worker pool on your development machine, see
+<<tools-test-distribution-docker>>.
 
 .Build host system properties and environment variables
 [cols="2,4,1",options="header"]
@@ -123,9 +124,10 @@ Local bypass applies when the selection has no `@RemoteOnly` tests, remote capab
 For module-level workspace and isolation settings (`inputs`, `outputs`, `fork`, `partitionPolicy`, `skip`), see <<tools-test-distribution-external-resources>>.
 
 [[tools-test-distribution-docker]]
-== Docker Compose
+== Local Development with Docker Compose
 
-With Docker and Docker Compose installed, run the start script from the Citrus checkout. It builds separate,
+The scripts under `tools/citrus-test-distribution/docker/` manage a local stack from the Citrus checkout.
+With Docker and Docker Compose installed, run `start.sh`. It builds separate,
 non-root coordinator and worker images from the same source tree, starts PostgreSQL 16, and runs eight Java 21
 workers. PostgreSQL must be ready before the coordinator starts, and the coordinator must be healthy before the
 workers start. Only the coordinator publishes a host port, bound to loopback.
@@ -148,8 +150,14 @@ With the stack running, run the tests for one module by its Maven artifact ID or
 ./tools/citrus-test-distribution/docker/run-tests.sh -module citrus-api
 ----
 
-Use `-all` in place of `-module citrus-api` to run `verify` across the whole reactor. The runner builds
-the distribution extension and any prerequisites in a checkout-local Maven repository with tests skipped.
+Run `verify` across the whole reactor with `-all`.
+
+[source,bash]
+----
+./tools/citrus-test-distribution/docker/run-tests.sh -all
+----
+
+The runner builds the distribution extension and any prerequisites in a checkout-local Maven repository with tests skipped.
 It loads the extension from a temporary Maven configuration for the test run.
 
 The runner uses the published coordinator port for the selected Compose project. You can export
@@ -225,8 +233,8 @@ the instructions for <<tools-test-distribution-ui,authenticated dashboard access
 |Adds comma-separated capability tags to every worker in the Compose stack.
 
 |`COMPOSE_PROJECT_NAME`
-|Selects a different Compose project. Export the same value for all three lifecycle scripts. The default is
-`citrus-test-distribution`.
+|Selects a different Compose project. Export the same value for `start.sh`, `run-tests.sh`, `stop.sh`, and
+`clean.sh`. The default is `citrus-test-distribution`.
 |===
 
 === Stop or remove the stack
@@ -284,10 +292,19 @@ For focused verification of the Citrus checkout, `-Dtest=DistCommandTest` select
 For a disposable Maven smoke project, `-Dmaven.repo.local=<directory>` selects a separate local repository
 and `-Dmaven.repo.local.tail=<directory>` lets Maven reuse dependencies from an existing local cache.
 
+[[tools-test-distribution-docker-production]]
+== Docker Images for Production Deployments
+
+The Dockerfile provides separate `coordinator` and `worker` image targets for deployment with your own
+container tooling. For the coordinator, configure <<tools-test-distribution-coordinator,PostgreSQL and the
+artifact cache>> on persistent storage. See <<tools-test-distribution-docker>> for the Compose stack and scripts
+that run on a developer machine.
+
 === Run a worker against an existing coordinator
 
 Build the `worker` image target and pass the reachable coordinator URL via the environment. The dedicated worker
-opens an outbound connection and needs zero published ports.
+opens an outbound connection and needs no published ports. The example connects to a coordinator already
+available over HTTPS.
 
 [source,bash]
 ----
