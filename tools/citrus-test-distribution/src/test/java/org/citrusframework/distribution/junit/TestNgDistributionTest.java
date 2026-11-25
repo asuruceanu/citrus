@@ -62,7 +62,7 @@ class TestNgDistributionTest {
         try (var coordinator = new DistributionCoordinatorServer(DistributionCoordinatorConfig.builder()
                 .port(0)
                 .cacheDir(tempDir.resolve("coordinator"))
-                .jdbcUrl("jdbc:hsqldb:mem:testng_" + System.nanoTime())
+                .jdbcUrl("jdbc:hsqldb:file:" + tempDir.resolve("testng_" + System.nanoTime()) + ";shutdown=true")
                 .build())) {
             coordinator.start();
             try (var worker = new DistributionWorkerClient(DistributionWorkerConfig.builder()

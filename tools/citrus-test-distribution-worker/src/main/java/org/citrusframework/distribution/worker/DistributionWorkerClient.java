@@ -41,6 +41,7 @@ import org.citrusframework.distribution.model.PartitionCompletedPayload;
 import org.citrusframework.distribution.model.WorkerCacheStats;
 import org.citrusframework.distribution.model.WorkerHeartbeatPayload;
 import org.citrusframework.distribution.model.WorkerRegisterPayload;
+import org.citrusframework.distribution.model.ResultJournal;
 import org.citrusframework.distribution.model.WorkerWsMessage;
 import org.junit.platform.engine.CancellationToken;
 import org.slf4j.Logger;
@@ -68,6 +69,7 @@ public final class DistributionWorkerClient implements AutoCloseable {
     private final AtomicBoolean closed = new AtomicBoolean(false);
     private final AtomicBoolean cacheStatsFailureActive = new AtomicBoolean();
     private final AtomicReference<WebSocket> activeWebSocket = new AtomicReference<>();
+    private volatile ResultJournal resultOutbox;
     private final ActiveAssignmentTracker assignments = new ActiveAssignmentTracker();
     private volatile CountDownLatch registeredLatch = new CountDownLatch(1);
     private volatile CompletableFuture<Void> currentExecution = CompletableFuture.completedFuture(null);
@@ -133,6 +135,9 @@ public final class DistributionWorkerClient implements AutoCloseable {
             CoordinatorBlobClient blobs = new CoordinatorBlobClient(config, cache);
             inProcessRunner = new IsolatedPartitionRunner(config, cache, blobs);
             forkedRunner = new ForkedPartitionRunner(config, cache, blobs);
+            String resultScope = java.util.UUID.nameUUIDFromBytes((config.coordinatorUrl() + "\n" + config.workerId())
+                    .getBytes(java.nio.charset.StandardCharsets.UTF_8)).toString();
+            resultOutbox = new ResultJournal(config.cacheDir().resolve("result-outbox").resolve(resultScope));
             blobClient = blobs;
             workerCache = cache;
         } catch (RuntimeException | Error e) {
@@ -337,6 +342,7 @@ public final class DistributionWorkerClient implements AutoCloseable {
         @SuppressWarnings("unchecked")
         Map<String, Object> map = DistributionJson.convert(hb, Map.class);
         sendMessageSafe(WorkerWsMessage.WORKER_HEARTBEAT, map);
+        replayPendingResults();
     }
 
     /** Lock-free cache statistics, or {@code null} before the cache is open. */
@@ -390,12 +396,29 @@ public final class DistributionWorkerClient implements AutoCloseable {
         }
     }
 
+    private void replayPendingResults() {
+        ResultJournal outbox = resultOutbox;
+        if (outbox == null || !isConnected()) {
+            return;
+        }
+        try {
+            outbox.replay(message -> sendMessageSafe(message.type(), message.payload()));
+        } catch (RuntimeException e) {
+            LOG.warn("Worker {} could not replay pending test results", config.workerId(), e);
+        }
+    }
+
     private void handleWsMessage(WorkerWsMessage message) {
         if (message == null || message.type() == null) {
             return;
         }
         switch (message.type()) {
-            case WorkerWsMessage.WORKER_REGISTERED -> registeredLatch.countDown();
+            case WorkerWsMessage.WORKER_REGISTERED -> {
+                registeredLatch.countDown();
+                scheduler.execute(this::replayPendingResults);
+            }
+            case WorkerWsMessage.RESULT_ACK -> resultOutbox.acknowledge(
+                    (String) message.payload().get(WorkerWsMessage.DELIVERY_ID));
             case WorkerWsMessage.PARTITION_ASSIGN -> {
                 PartitionAssignPayload assign = DistributionJson.convert(message.payload(), PartitionAssignPayload.class);
                 if (!assignments.canAccept()) {
@@ -426,17 +449,19 @@ public final class DistributionWorkerClient implements AutoCloseable {
                                 : runner.execute(assign, token, event -> {
                                     @SuppressWarnings("unchecked")
                                     Map<String, Object> eventMap = DistributionJson.convert(event, Map.class);
-                                    sendMessageSafe(WorkerWsMessage.TEST_EVENT, eventMap);
+                                    var messageToSend = resultOutbox.persist(WorkerWsMessage.TEST_EVENT, eventMap);
+                                    sendMessageSafe(messageToSend.type(), messageToSend.payload());
                                 });
                         PartitionCompletedPayload completed = new PartitionCompletedPayload(assign.partitionId(),
                                 assign.sessionId(), assign.attempt(), result.success(), result.errorMessage(),
                                 result.outputArtifacts());
                         @SuppressWarnings("unchecked")
                         Map<String, Object> completedMap = DistributionJson.convert(completed, Map.class);
+                        var durableCompletion = resultOutbox.persist(WorkerWsMessage.PARTITION_COMPLETED, completedMap);
                         // Free the slot before reporting: the coordinator may answer with the next assignment at once.
                         assignments.finish(assignment);
                         finished = true;
-                        sendMessageSafe(WorkerWsMessage.PARTITION_COMPLETED, completedMap);
+                        sendMessageSafe(durableCompletion.type(), durableCompletion.payload());
                     } finally {
                         if (!finished) {
                             assignments.finish(assignment);

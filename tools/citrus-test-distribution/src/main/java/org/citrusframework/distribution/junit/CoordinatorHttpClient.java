@@ -40,6 +40,7 @@ import java.util.function.Predicate;
 import org.citrusframework.distribution.cache.ClasspathPackager;
 import org.citrusframework.distribution.config.DistributionJson;
 import org.citrusframework.distribution.model.CoordinatorEvent;
+import org.citrusframework.distribution.model.BuildSessionRecord;
 import org.citrusframework.distribution.model.BuildSessionResponse;
 import org.citrusframework.distribution.model.CompleteSessionRequest;
 import org.citrusframework.distribution.model.CreateSessionRequest;
@@ -48,6 +49,7 @@ import org.citrusframework.distribution.model.HistoricalDurationsResponse;
 import org.citrusframework.distribution.model.MissingDigestsRequest;
 import org.citrusframework.distribution.model.MissingDigestsResponse;
 import org.citrusframework.distribution.model.ReportLocalTestsRequest;
+import org.citrusframework.distribution.model.SessionDetailResponse;
 import org.citrusframework.distribution.model.SubmitWorkRequest;
 import org.citrusframework.distribution.model.SubmitWorkResponse;
 import tools.jackson.core.JacksonException;
@@ -73,10 +75,24 @@ public class CoordinatorHttpClient {
                 .build();
     }
 
+    String baseUrl() {
+        return baseUrl;
+    }
+
     public BuildSessionResponse createSession(CreateSessionRequest request) throws IOException, InterruptedException {
         HttpResponse<String> resp = sendJsonPost("/api/v1/sessions", request);
         ensureSuccess(resp, "createSession");
         return DistributionJson.fromJson(resp.body(), BuildSessionResponse.class);
+    }
+
+    public BuildSessionRecord getSession(String sessionId) throws IOException, InterruptedException {
+        if (!sessionId.matches("sess-[A-Za-z0-9-]+")) {
+            throw new IllegalArgumentException("Invalid distribution session ID");
+        }
+        HttpResponse<String> response = httpClient.send(requestBuilder("/api/v1/sessions/" + sessionId).GET().build(),
+                HttpResponse.BodyHandlers.ofString());
+        ensureSuccess(response, "getSession");
+        return DistributionJson.fromJson(response.body(), SessionDetailResponse.class).session();
     }
 
     public Optional<Map<String, Long>> findHistoricalDurations(List<String> workUnitKeys, int recentLimit) {
@@ -244,9 +260,10 @@ public class CoordinatorHttpClient {
                             String json = dataLines.toString();
                             dataLines.setLength(0);
                             CoordinatorEvent event = DistributionJson.fromJson(json, CoordinatorEvent.class);
-                            if (event.sequence() > lastSeq) {
-                                lastSeq = event.sequence();
+                            if (event.sequence() <= lastSeq) {
+                                continue;
                             }
+                            lastSeq = event.sequence();
                             if (shouldStop.test(event)) {
                                 return lastSeq;
                             }

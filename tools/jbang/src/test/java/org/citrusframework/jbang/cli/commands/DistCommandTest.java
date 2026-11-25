@@ -85,7 +85,7 @@ class DistCommandTest extends CommandTest {
         DistributionCoordinatorConfig config = DistributionCoordinatorConfig.builder()
                 .port(0)
                 .cacheDir(tempDir.resolve("cache"))
-                .jdbcUrl("jdbc:hsqldb:mem:jbang_dist_" + System.nanoTime())
+                .jdbcUrl("jdbc:hsqldb:file:" + tempDir.resolve("jbang_dist_" + System.nanoTime()) + ";shutdown=true")
                 .build();
 
         try (DistributionCoordinatorServer coordinator = new DistributionCoordinatorServer(config)) {
@@ -121,7 +121,7 @@ class DistCommandTest extends CommandTest {
         DistributionCoordinatorConfig config = DistributionCoordinatorConfig.builder()
                 .port(0)
                 .cacheDir(tempDir.resolve("worker-coordinator-cache"))
-                .jdbcUrl("jdbc:hsqldb:mem:jbang_worker_" + System.nanoTime())
+                .jdbcUrl("jdbc:hsqldb:file:" + tempDir.resolve("jbang_worker_" + System.nanoTime()) + ";shutdown=true")
                 .build();
 
         try (DistributionCoordinatorServer coordinator = new DistributionCoordinatorServer(config)) {
@@ -140,7 +140,7 @@ class DistCommandTest extends CommandTest {
         CitrusJBangMain main = createCitrusJBangMain();
         assertThat(main.execute("dist", "coordinator", "start",
                 "--port", "0",
-                "--jdbc-url", "jdbc:hsqldb:mem:jbang_coordinator_cli_" + System.nanoTime(),
+                "--jdbc-url", "jdbc:hsqldb:file:" + tempDir.resolve("jbang_coordinator_cli_" + System.nanoTime()) + ";shutdown=true",
                 "--cache-dir", tempDir.resolve("coordinator-cache").toString(),
                 "--duration-seconds", "1")).isZero();
         assertThat(printer.getOutput()).contains("Citrus Test Distribution Coordinator listening on");
@@ -377,7 +377,7 @@ class DistCommandTest extends CommandTest {
         DistributionCoordinatorConfig config = DistributionCoordinatorConfig.builder()
                 .port(0)
                 .cacheDir(tempDir.resolve("cache-opts-coordinator-cache"))
-                .jdbcUrl("jdbc:hsqldb:mem:jbang_worker_cache_opts_" + System.nanoTime())
+                .jdbcUrl("jdbc:hsqldb:file:" + tempDir.resolve("jbang_worker_cache_opts_" + System.nanoTime()) + ";shutdown=true")
                 .build();
 
         try (DistributionCoordinatorServer coordinator = new DistributionCoordinatorServer(config)) {
@@ -416,7 +416,7 @@ class DistCommandTest extends CommandTest {
         DistributionCoordinatorConfig config = DistributionCoordinatorConfig.builder()
                 .port(0)
                 .cacheDir(tempDir.resolve("lock-coordinator-cache"))
-                .jdbcUrl("jdbc:hsqldb:mem:jbang_worker_lock_" + System.nanoTime())
+                .jdbcUrl("jdbc:hsqldb:file:" + tempDir.resolve("jbang_worker_lock_" + System.nanoTime()) + ";shutdown=true")
                 .build();
         Path workerCache = tempDir.resolve("lock-wcache");
 

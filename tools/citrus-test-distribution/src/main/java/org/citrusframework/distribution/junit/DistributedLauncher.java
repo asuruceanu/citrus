@@ -18,6 +18,7 @@ package org.citrusframework.distribution.junit;
 
 import java.io.File;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -47,7 +48,6 @@ import org.citrusframework.distribution.model.BuildSessionResponse;
 import org.citrusframework.distribution.model.CompleteSessionRequest;
 import org.citrusframework.distribution.model.CreateSessionRequest;
 import org.citrusframework.distribution.model.PartitionPolicy;
-import org.citrusframework.distribution.model.ReportLocalTestsRequest;
 import org.citrusframework.distribution.model.SubmitWorkRequest;
 import org.citrusframework.distribution.model.SubmitWorkResponse;
 import org.citrusframework.distribution.model.WorkUnitSpec;
@@ -148,24 +148,13 @@ public class DistributedLauncher implements Launcher {
         }
 
         if (extracted.remoteUnits().isEmpty()) {
-            LocalFallbackExecutor.LocalExecutionStats onlyLocal =
-                    LocalFallbackExecutor.executeLocally(delegate, extracted.localUnits(),
-                            combineListeners(callListeners).toArray(TestExecutionListener[]::new));
             String sharedSessionId = System.getProperty(DistributionSettings.SESSION_ID_PROPERTY);
-            if (sharedSessionId != null && !sharedSessionId.isBlank() && !onlyLocal.executions().isEmpty()) {
-                try {
-                    CoordinatorHttpClient sharedClient = new CoordinatorHttpClient(
-                            DistributionSettings.getCoordinatorUrl(),
-                            DistributionSettings.getAuthToken(),
-                            DistributionSettings.getConnectTimeoutMs());
-                    sharedClient.reportLocalTests(
-                            sharedSessionId,
-                            new ReportLocalTestsRequest("local-host", onlyLocal.executions()));
-                } catch (Exception e) {
-                    LOG.log(System.Logger.Level.WARNING, "Failed to report @LocalOnly test executions to session {0}: {1}",
-                            sharedSessionId, e.getMessage());
-                }
-            }
+            var delivery = new LocalResultDelivery(new CoordinatorHttpClient(DistributionSettings.getCoordinatorUrl(),
+                    DistributionSettings.getAuthToken(), DistributionSettings.getConnectTimeoutMs()), sharedSessionId, "local-host");
+            delivery.flush();
+            LocalFallbackExecutor.executeLocally(delegate, extracted.localUnits(),
+                    combineListeners(callListeners).toArray(TestExecutionListener[]::new), delivery);
+            delivery.flush();
             return;
         }
 
@@ -199,19 +188,11 @@ public class DistributedLauncher implements Launcher {
         if (bypassRemote) {
             List<WorkUnitSpec> units = new ArrayList<>(extracted.localUnits());
             units.addAll(extracted.remoteUnits());
-            var stats = LocalFallbackExecutor.executeTestPlanLocally(delegate, testPlan, units,
-                    combineListeners(callListeners).toArray(TestExecutionListener[]::new));
-            if (!ownsSession && !stats.executions().isEmpty()) {
-                try {
-                    client.reportLocalTestsWithDeadline(
-                            externalSessionId, new ReportLocalTestsRequest("local-host", stats.executions()));
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    LOG.log(System.Logger.Level.WARNING, "Interrupted while reporting local test executions to session {0}", externalSessionId);
-                } catch (IOException | RuntimeException e) {
-                    LOG.log(System.Logger.Level.WARNING, "Failed to report local test executions to session {0}: {1}", externalSessionId, e.getMessage());
-                }
-            }
+            var delivery = new LocalResultDelivery(client, externalSessionId, "local-host");
+            delivery.flush();
+            LocalFallbackExecutor.executeTestPlanLocally(delegate, testPlan, units,
+                    combineListeners(callListeners).toArray(TestExecutionListener[]::new), delivery);
+            delivery.flush();
             return;
         }
 
@@ -308,7 +289,7 @@ public class DistributedLauncher implements Launcher {
             String moduleName = System.getProperty(DistributionSettings.MODULE_NAME_PROPERTY, "default");
 
             SubmitWorkResponse submitted = client.submitWork(sessionId, new SubmitWorkRequest(
-                    UUID.randomUUID().toString(),
+                    submissionId(ownsSession ? null : sessionId, moduleName, remoteUnits),
                     moduleName,
                     packaged.artifacts(),
                     properties,
@@ -334,16 +315,12 @@ public class DistributedLauncher implements Launcher {
             try {
                 notifyTestPlanExecutionStarted(allListeners, testPlan);
                 try {
+                    var localDelivery = new LocalResultDelivery(client, sessionId, "local-host");
+                    localDelivery.flush();
                     localStats = LocalFallbackExecutor.executeLocally(delegate, extracted.localUnits(),
-                            new TestExecutionListener[] {replayer.liveListener()});
+                            new TestExecutionListener[] {replayer.liveListener()}, localDelivery);
                     replayer.localUnitsDone(keysOf(extracted.localUnits()));
-                    if (!localStats.executions().isEmpty()) {
-                        try {
-                            client.reportLocalTests(sessionId, new ReportLocalTestsRequest("local-host", localStats.executions()));
-                        } catch (Exception e) {
-                            LOG.log(System.Logger.Level.WARNING, "Failed to report @LocalOnly test executions to session {0}: {1}", sessionId, e.getMessage());
-                        }
-                    }
+                    localDelivery.flush();
                     if (!pendingPartitions.isEmpty()) {
                         client.streamSessionEvents(
                                 sessionId,
@@ -357,19 +334,12 @@ public class DistributedLauncher implements Launcher {
                             throw new IllegalStateException("Remote partitions were lost: " + lostUnits.size());
                         }
                         LOG.log(System.Logger.Level.WARNING, "Executing {0} lost remote work unit(s) locally", lostUnits.size());
+                        var fallbackDelivery = new LocalResultDelivery(client, sessionId, "local-fallback");
+                        fallbackDelivery.flush();
                         lostStats = LocalFallbackExecutor.executeLocally(delegate, lostUnits,
-                                new TestExecutionListener[] {replayer.liveListener()});
+                                new TestExecutionListener[] {replayer.liveListener()}, fallbackDelivery);
                         replayer.localUnitsDone(keysOf(lostUnits));
-                        if (!lostStats.executions().isEmpty()) {
-                            try {
-                                client.reportLocalTests(
-                                        sessionId,
-                                        new ReportLocalTestsRequest("local-fallback", lostStats.executions()));
-                            } catch (Exception e) {
-                                LOG.log(System.Logger.Level.WARNING, "Failed to report fallback test executions to session {0}: {1}",
-                                        sessionId, e.getMessage());
-                            }
-                        }
+                        fallbackDelivery.flush();
                     }
                 } finally {
                     replayer.finishStartedContainers();
@@ -669,6 +639,16 @@ public class DistributedLauncher implements Launcher {
     private static final java.util.Set<String> HOST_SYSTEM_PROPERTY_KEYS = java.util.Set.of(
             "basedir", "localRepository", "env", "PID"
     );
+
+    private static String submissionId(String reactorSessionId, String moduleName, List<WorkUnitSpec> work) {
+        String execution = System.getProperty(DistributionSettings.MAVEN_TEST_EXECUTION_PROPERTY);
+        if (reactorSessionId == null || execution == null || execution.isBlank()) {
+            return UUID.randomUUID().toString();
+        }
+        String identity = DistributionJson.toJson(List.of(reactorSessionId, moduleName, execution,
+                work.stream().map(WorkUnitSpec::key).sorted().toList()));
+        return UUID.nameUUIDFromBytes(identity.getBytes(StandardCharsets.UTF_8)).toString();
+    }
 
     private static Map<String, String> collectPropagatedProperties() {
         return collectPropagatedProperties(System.getProperties());

@@ -8,7 +8,7 @@ Citrus Test Distribution partitions and executes JUnit Platform and Citrus integ
 
 * `org.citrusframework:citrus-test-distribution-protocol` — Shared WebSocket/REST protocol DTOs, SHA-256 content-addressed blob cache, Citrus endpoint telemetry collector, capability matcher, and `@LocalOnly` / `@RemoteOnly` / `@AgentRequirement` annotations.
 * `org.citrusframework:citrus-test-distribution-ui` — Zero-Node monitoring Web UI served at `/ui/` (overview KPIs, live SVG Gantt partition waterfall, workspace/resource inspector, worker pool health, test history/flakiness, and failing test / partition crash diagnostics).
-* `org.citrusframework:citrus-test-distribution-coordinator` — Vert.x HTTP/WebSocket coordinator, Longest-Processing-Time (LPT) scheduler, SSE event hub, and JDBC persistence (`HSQLDB` file/mem or `PostgreSQL`).
+* `org.citrusframework:citrus-test-distribution-coordinator` — Vert.x HTTP/WebSocket coordinator, Longest-Processing-Time (LPT) scheduler, SSE event hub, and JDBC persistence (file-backed `HSQLDB` or `PostgreSQL`).
 * `org.citrusframework:citrus-test-distribution-worker` — Standalone Java worker runtime with child-first `ClassLoader` or forked-JVM workspace isolation and graceful `SIGTERM` draining (`citrus-agent --mode=worker` or `citrus dist worker start`).
 * `org.citrusframework:citrus-test-distribution` — JUnit Platform launcher interceptor, `@LocalOnly` / lost-partition local fallback executor, Surefire XML writer, and `@CitrusTestFactory` declarative source splitter.
 * `org.citrusframework.mvn:citrus-test-distribution-maven-extension` — Opt-in Maven Core Extension (`-Dcitrus.test.distribution.enabled=true`) coordinating reactor-wide build sessions.
@@ -140,6 +140,33 @@ The coordinator (`citrus-test-distribution-coordinator`) runs an embedded Vert.x
 
 Adaptive sizing applies to LPT submissions that do not declare workspace outputs and leave `maxPartitionSize` unset.
 
+=== Recovering a distributed run after a process crash
+
+Use file-backed HSQLDB or PostgreSQL for the coordinator and keep its artifact cache on persistent storage.
+Queued work, dispatch instructions, partition attempts, retry limits, results, and the event stream are stored in JDBC.
+After a coordinator restart, pending work becomes available to reconnecting workers. Interrupted attempts are retried
+under the original policy, and the previous attempts remain visible in the session history.
+
+Use a persistent cache directory for each worker and keep the same worker identity when restarting it. The worker writes
+test events and partition completions to its on-disk journal and removes them after the coordinator acknowledges them.
+The coordinator keeps a record of accepted delivery IDs, so repeating a delivery does not create another test result.
+
+If Maven or its test JVM exits abruptly, use the same checkout, Maven goals, selectors, and options, and add the existing
+running session ID from the log or dashboard:
+
+[source,shell]
+----
+./mvnw verify -Dcitrus.test.distribution.enabled=true \
+  -Dcitrus.test.distribution.resumeSessionId=sess-your-session-id
+----
+
+Keep the same coordinator URL and local user account. Maven reuses the existing remote submissions for each test plugin
+execution and reads their stored events to recreate test reports. Launcher-managed local test results are journaled under
+`${user.home}/.citrus/distribution-local-results` until accepted. A deliberate session abort remains terminal.
+
+Event replay is available for events written after the upgrade. Existing session, partition, and test result records stay
+available in the dashboard. Saved dispatch instructions include the system properties forwarded to the test JVM.
+
 === JBang CLI Commands
 
 `citrus-jbang` ships built-in subcommands under `citrus dist` for starting and inspecting a distribution cluster:
@@ -178,7 +205,7 @@ citrus dist sessions --coordinator-url=http://localhost:8765 --limit=20
 |`8765`
 
 |`--jdbc-url`
-|JDBC URL for session, partition, worker, and test history persistence (`jdbc:hsqldb:file:...`, `jdbc:hsqldb:mem:...`, or `jdbc:postgresql://...`).
+|JDBC URL for session, partition, worker, and test history persistence (`jdbc:hsqldb:file:...` or `jdbc:postgresql://...`).
 |`jdbc:hsqldb:file:~/.citrus/dist-db/citrus_dist`
 
 |`--cache-dir`
@@ -619,7 +646,7 @@ only those with inputs, outputs or `fork=true`.
 |`ALWAYS`
 |`citrus.test.distribution.worker.forkJvmArgs` / `CITRUS_DIST_WORKER_FORK_JVM_ARGS`
 |Whitespace-separated JVM arguments for forked partitions (quoting is not interpreted).
-|`-Xmx768m -XX:ActiveProcessorCount=2`
+|Empty. Java determines the heap size and available processor count.
 |`citrus.test.distribution.worker.cwdCheck` / `CITRUS_DIST_WORKER_CWD_CHECK`
 |For partitions in the shared worker JVM: `FAIL` the partition, only `WARN`, or turn the check `OFF` when tests write
 into the worker's working directory (new entries, writes into existing top-level directories, and new or changed files below

@@ -69,7 +69,7 @@ class TestDistributionMavenExtensionTest {
         DistributionCoordinatorConfig coordinatorConfig = DistributionCoordinatorConfig.builder()
                 .port(0)
                 .cacheDir(tempDir.resolve("coordinator-cache"))
-                .jdbcUrl("jdbc:hsqldb:mem:mvn_ext_" + System.nanoTime())
+                .jdbcUrl("jdbc:hsqldb:file:" + tempDir.resolve("mvn_ext_" + System.nanoTime()) + ";shutdown=true")
                 .build();
 
         try (DistributionCoordinatorServer coordinator = new DistributionCoordinatorServer(coordinatorConfig)) {
@@ -169,7 +169,7 @@ class TestDistributionMavenExtensionTest {
         DistributionCoordinatorConfig coordinatorConfig = DistributionCoordinatorConfig.builder()
                 .port(0)
                 .cacheDir(tempDir.resolve("coordinator-cache-outcomes"))
-                .jdbcUrl("jdbc:hsqldb:mem:mvn_ext_outcomes_" + System.nanoTime())
+                .jdbcUrl("jdbc:hsqldb:file:" + tempDir.resolve("mvn_ext_outcomes_" + System.nanoTime()) + ";shutdown=true")
                 .build();
 
         try (DistributionCoordinatorServer coordinator = new DistributionCoordinatorServer(coordinatorConfig)) {

@@ -81,6 +81,12 @@ public final class LocalFallbackExecutor {
     public static LocalExecutionStats executeLocally(Launcher delegate,
                                                      List<WorkUnitSpec> units,
                                                      TestExecutionListener[] additionalListeners) {
+        return executeLocally(delegate, units, additionalListeners, result -> {});
+    }
+
+    static LocalExecutionStats executeLocally(Launcher delegate, List<WorkUnitSpec> units,
+                                               TestExecutionListener[] additionalListeners,
+                                               Consumer<WorkerTestEventPayload> resultSink) {
         if (units.isEmpty()) {
             return new LocalExecutionStats(0, 0, 0, 0L, List.of());
         }
@@ -100,7 +106,7 @@ public final class LocalFallbackExecutor {
         }
 
         AtomicReference<String> activeDynamicUnitKey = new AtomicReference<>();
-        return collectExecutions(units, additionalListeners, (plan, identifier) -> {
+        return collectExecutions(units, additionalListeners, resultSink, (plan, identifier) -> {
             String className = resolveClassName(identifier, unitKeysByClass);
             return new ExecutionUnit(className, resolveWorkUnitKey(
                     identifier, className, activeDynamicUnitKey.get(), unitKeysByMethod, unitKeysByClass));
@@ -143,9 +149,15 @@ public final class LocalFallbackExecutor {
                                                              TestPlan testPlan,
                                                              List<WorkUnitSpec> units,
                                                              TestExecutionListener[] additionalListeners) {
+        return executeTestPlanLocally(delegate, testPlan, units, additionalListeners, result -> {});
+    }
+
+    static LocalExecutionStats executeTestPlanLocally(Launcher delegate, TestPlan testPlan, List<WorkUnitSpec> units,
+                                                       TestExecutionListener[] additionalListeners,
+                                                       Consumer<WorkerTestEventPayload> resultSink) {
         Map<String, List<WorkUnitSpec>> unitsByClass = units.stream()
                 .collect(Collectors.groupingBy(WorkUnitSpec::className));
-        LocalExecutionStats stats = collectExecutions(units, additionalListeners,
+        LocalExecutionStats stats = collectExecutions(units, additionalListeners, resultSink,
                 (plan, identifier) -> resolvePlanUnit(plan, identifier, unitsByClass),
                 merged -> delegate.execute(testPlan, merged));
 
@@ -211,12 +223,22 @@ public final class LocalFallbackExecutor {
 
     private static LocalExecutionStats collectExecutions(List<WorkUnitSpec> units,
                                                           TestExecutionListener[] additionalListeners,
+                                                          Consumer<WorkerTestEventPayload> resultSink,
                                                           BiFunction<TestPlan, TestIdentifier, ExecutionUnit> resolver,
                                                           Consumer<TestExecutionListener[]> execute) {
         AtomicInteger passed = new AtomicInteger();
         AtomicInteger failed = new AtomicInteger();
         AtomicInteger skipped = new AtomicInteger();
         List<WorkerTestEventPayload> executions = Collections.synchronizedList(new ArrayList<>());
+        AtomicReference<RuntimeException> deliveryFailure = new AtomicReference<>();
+        Consumer<WorkerTestEventPayload> record = result -> {
+            try {
+                resultSink.accept(result);
+                executions.add(result);
+            } catch (RuntimeException e) {
+                deliveryFailure.compareAndSet(null, e);
+            }
+        };
         Map<String, Long> testStartTimes = new ConcurrentHashMap<>();
         long startNs = System.nanoTime();
 
@@ -244,7 +266,7 @@ public final class LocalFallbackExecutor {
                     if (testIdentifier.isTest() || testIdentifier.getSource().isPresent()) {
                         skipped.incrementAndGet();
                         ExecutionUnit unit = resolver.apply(plan, testIdentifier);
-                        executions.add(new WorkerTestEventPayload(
+                        record.accept(new WorkerTestEventPayload(
                                 "local",
                                 "",
                                 1,
@@ -265,7 +287,7 @@ public final class LocalFallbackExecutor {
                         if (result.getStatus() == TestExecutionResult.Status.FAILED) {
                             failed.incrementAndGet();
                             ExecutionUnit unit = resolver.apply(plan, testIdentifier);
-                            executions.add(new WorkerTestEventPayload(
+                            record.accept(new WorkerTestEventPayload(
                                     "local",
                                     "",
                                     1,
@@ -297,7 +319,7 @@ public final class LocalFallbackExecutor {
                         }
                     };
                     ExecutionUnit unit = resolver.apply(plan, testIdentifier);
-                    executions.add(new WorkerTestEventPayload(
+                    record.accept(new WorkerTestEventPayload(
                             "local",
                             "",
                             1,
@@ -320,6 +342,9 @@ public final class LocalFallbackExecutor {
             throw new UncheckedIOException("Failed to lock isolated tests", e);
         }
 
+        if (deliveryFailure.get() != null) {
+            throw deliveryFailure.get();
+        }
         long durationMs = Math.max(1L, (System.nanoTime() - startNs) / 1_000_000L);
         return new LocalExecutionStats(passed.get(), failed.get(), skipped.get(), durationMs, executions);
     }

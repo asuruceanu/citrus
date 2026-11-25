@@ -195,9 +195,9 @@ class DistributionSettingsAndPathRewriterTest {
     }
 
     @Test
-    void shouldParseForkJvmArgsWithDefaults() {
-        assertThat(DistributionSettings.parseForkJvmArgs(null)).containsExactly("-Xmx768m", "-XX:ActiveProcessorCount=2");
-        assertThat(DistributionSettings.parseForkJvmArgs("  ")).containsExactly("-Xmx768m", "-XX:ActiveProcessorCount=2");
+    void shouldParseOnlyExplicitForkJvmArgs() {
+        assertThat(DistributionSettings.parseForkJvmArgs(null)).isEmpty();
+        assertThat(DistributionSettings.parseForkJvmArgs("  ")).isEmpty();
         assertThat(DistributionSettings.parseForkJvmArgs(" -Xmx2g \t -Dfoo=bar\n-ea "))
                 .containsExactly("-Xmx2g", "-Dfoo=bar", "-ea");
     }

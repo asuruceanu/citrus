@@ -42,6 +42,10 @@ public final class DistributionCoordinatorServer implements AutoCloseable {
         if (vertx != null) {
             return;
         }
+        String jdbcUrl = config.jdbcUrl().toLowerCase(java.util.Locale.ROOT);
+        if (!jdbcUrl.startsWith("jdbc:hsqldb:file:") && !jdbcUrl.startsWith("jdbc:postgresql:")) {
+            throw new IllegalArgumentException("The coordinator requires file-backed HSQLDB or PostgreSQL");
+        }
         BlobCacheDirectory blobCache = new BlobCacheDirectory(config.cacheDir());
         try {
             String owner = BlobCacheDirectory.recordOwnerIfAbsent(blobCache.getRootDir(), BlobCacheDirectory.OWNER_COORDINATOR);
@@ -55,8 +59,9 @@ public final class DistributionCoordinatorServer implements AutoCloseable {
 
         store = new JdbcDistributionStore(config.jdbcUrl(), config.jdbcUsername(), config.jdbcPassword());
         store.initialize();
-        CoordinatorEventStreamHub eventHub = new CoordinatorEventStreamHub();
+        CoordinatorEventStreamHub eventHub = new CoordinatorEventStreamHub(store);
         SessionCoordinator coordinator = new SessionCoordinator(config, store, eventHub);
+        coordinator.restorePendingWork();
 
         vertx = Vertx.vertx();
         verticle = new DistributionCoordinatorVerticle(config, blobCache, eventHub, coordinator);

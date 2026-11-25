@@ -21,11 +21,14 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.OptionalInt;
+import java.util.function.Consumer;
 
 import org.citrusframework.distribution.model.BuildSessionRecord;
+import org.citrusframework.distribution.model.CoordinatorEvent;
 import org.citrusframework.distribution.model.PartitionRecord;
 import org.citrusframework.distribution.model.SessionStatus;
 import org.citrusframework.distribution.model.SessionSummary;
+import org.citrusframework.distribution.model.SubmitWorkRequest;
 import org.citrusframework.distribution.model.SubmitWorkResponse;
 import org.citrusframework.distribution.model.TestExecutionRecord;
 import org.citrusframework.distribution.model.WorkspaceChange;
@@ -52,6 +55,10 @@ public interface DistributionStore extends AutoCloseable {
         saveSession(session, requestedMaxPartitionSize);
     }
 
+    void saveSession(BuildSessionRecord session, int requestedMaxPartitionSize, String historyScope, int maxRetries);
+
+    OptionalInt findSessionMaxRetries(String sessionId);
+
     default Optional<String> findSessionHistoryScope(String sessionId) {
         return Optional.empty();
     }
@@ -69,6 +76,8 @@ public interface DistributionStore extends AutoCloseable {
     /** Updates status and totals; {@code failureReason} explains a failed or aborted session ({@code null} for none). */
     void updateSessionStatus(String sessionId, SessionStatus status, long finishedAt, SessionSummary summary,
                              String failureReason);
+
+    long finishSession(CoordinatorEvent event, SessionStatus status, SessionSummary summary, String failureReason);
 
     Optional<BuildSessionRecord> findSession(String sessionId);
 
@@ -92,9 +101,26 @@ public interface DistributionStore extends AutoCloseable {
 
     List<PartitionRecord> listPartitions(String sessionId);
 
+    record RecoverableWork(String sessionId, SubmitWorkRequest request, SubmitWorkResponse response, int maxRetries) {
+    }
+
     void saveWorkSubmission(String sessionId, SubmitWorkResponse response);
 
+    long saveWorkSubmission(RecoverableWork work, List<PartitionRecord> partitions, CoordinatorEvent event);
+
+    List<RecoverableWork> listRecoverableWork();
+
     Optional<SubmitWorkResponse> findWorkSubmission(String sessionId, String submissionId);
+
+    default long appendEvent(CoordinatorEvent event) {
+        return appendEvent(event, null, null, List.of());
+    }
+
+    long appendEvent(CoordinatorEvent event, String deliveryId, TestExecutionRecord result, List<PartitionRecord> partitions);
+
+    boolean hasDelivery(String deliveryId);
+
+    void replayEvents(String sessionId, long afterSequence, int globalLimit, Consumer<CoordinatorEvent> consumer);
 
     void saveTestExecution(TestExecutionRecord execution);
 

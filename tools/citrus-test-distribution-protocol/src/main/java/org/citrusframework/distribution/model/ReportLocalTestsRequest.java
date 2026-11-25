@@ -20,8 +20,13 @@ import java.util.List;
 
 public record ReportLocalTestsRequest(
         String workerId,
-        List<WorkerTestEventPayload> executions
+        List<WorkerTestEventPayload> executions,
+        String deliveryId
 ) {
+
+    public ReportLocalTestsRequest(String workerId, List<WorkerTestEventPayload> executions) {
+        this(workerId, executions, null);
+    }
 
     public ReportLocalTestsRequest {
         workerId = workerId == null || workerId.isBlank() ? "local-maven" : workerId;

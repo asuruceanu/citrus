@@ -401,7 +401,7 @@ class PartitionJUnitLauncherAndCwdGuardTest {
         DistributionWorkerConfig defaults = DistributionWorkerConfig.builder().cacheDir(tempDir).build();
         assertThat(defaults.forkMode()).isEqualTo(WorkerForkMode.ALWAYS);
         assertThat(defaults.cwdCheckMode()).isEqualTo(WorkerCwdCheckMode.FAIL);
-        assertThat(defaults.forkJvmArgs()).containsExactly("-Xmx768m", "-XX:ActiveProcessorCount=2");
+        assertThat(defaults.forkJvmArgs()).isEmpty();
         assertThat(defaults.capabilities()).containsEntry(DistributionSettings.WORKSPACE_CAPABILITY_KEY, "true");
 
         DistributionWorkerConfig custom = DistributionWorkerConfig.builder()
