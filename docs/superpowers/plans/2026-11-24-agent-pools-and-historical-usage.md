@@ -242,7 +242,7 @@ Expected: FAIL with compilation errors on missing `RegistrationKeyCrypto`, `Hist
 
 - [x] **Step 3: Implement `RegistrationKeyCrypto`, `HistoricalUsageAggregator`, `DistributionCoordinatorConfig` clock/grace fields, and `SessionCoordinator` pool/key/scheduling/usage logic**
 
-Implement `RegistrationKeyCrypto` (8-char `[a-z0-9]` pool IDs; `ctrk_<8chars>_<32chars>` keys hashed with SHA-256). Implement `HistoricalUsageAggregator` with shared connected capacity across demand buckets, priority-ordered `desired` attribution and per-bucket `max` aggregation as specified. Extend `DistributionCoordinatorConfig` and `SessionCoordinator` to load pools from `store` on construction, enforce registration/renewal/grace rules, track `version`, `activeTestDisplay`, `stateUpdatedAt`, and `warnings` on `WorkerConnection`, schedule by pool priority using pool capabilities for both assignment and adaptive sizing, and expose `sampleUsageNow()` + `queryHistoricalUsage(...)`. During deletion grace, sample connected/utilized workers under the last pool capabilities and exclude that deleted sample bucket from desired allocation. Extend `PoolSampleBucket` with an optional `deleted` flag and preserve the original constructor and deserialization default. Publish `pool.updated`, `pool.deleted`, `worker.updated`, and `worker.rejected` via the existing durable event hub, with no secret or hash in event payloads. Keep test-result bookkeeping durable if a later worker status write fails, and preserve legacy null-valued capabilities without blocking usage sampling. Preserve the upstream result journal and restart behavior.
+Implement `RegistrationKeyCrypto` (8-char `[a-z0-9]` pool IDs; `ctrk_<8chars>_<32chars>` keys hashed with SHA-256). Implement `HistoricalUsageAggregator` with shared connected capacity across demand buckets, priority-ordered `desired` attribution and per-bucket `max` aggregation as specified. Extend `DistributionCoordinatorConfig` and `SessionCoordinator` to load pools from `store` on construction, enforce registration/renewal/grace rules, track `version`, `activeTestDisplay`, `stateUpdatedAt`, and `warnings` on `WorkerConnection`, schedule by pool priority using pool capabilities for both assignment and adaptive sizing, and expose `sampleUsageNow()` + `queryHistoricalUsage(...)`. Confirm the authenticated pool ID in successful pooled registration. Keep warning transitions consistent if individual status writes fail, and keep advisory UI writes from suppressing committed partition assignments. During deletion grace, sample connected/utilized workers under the last pool capabilities and exclude that deleted sample bucket from desired allocation. Extend `PoolSampleBucket` with an optional `deleted` flag and preserve the original constructor and deserialization default. Publish `pool.updated`, `pool.deleted`, `worker.updated`, and `worker.rejected` via the existing durable event hub, with no secret or hash in event payloads. Keep test-result bookkeeping durable if a later worker status write fails, and preserve legacy null-valued capabilities without blocking usage sampling. Preserve the upstream result journal and restart behavior.
 
 - [x] **Step 4: Run coordinator unit tests to verify they pass**
 
@@ -361,7 +361,7 @@ Expected: FAIL with compilation errors on missing `poolId` / `registrationKey` /
 
 - [x] **Step 3: Implement worker config/client, JBang options, agent options/config/bridge, and control schema JSON**
 
-1. Extend `DistributionWorkerConfig` (resolving `version` from `Implementation-Version` or `/META-INF/maven/org.citrusframework/citrus-test-distribution-worker/pom.properties` with `"dev"` fallback) and `DistributionWorkerClient` (sending `version`, `poolId`, `registrationKey`; scheduling periodic `WORKER_RENEW` when `poolId` is non-blank; halting reconnects and releasing `registeredLatch` on `WORKER_REJECTED` or close status `4003`).
+1. Extend `DistributionWorkerConfig` (resolving `version` from `Implementation-Version` or `/META-INF/maven/org.citrusframework/citrus-test-distribution-worker/pom.properties` with `"dev"` fallback) and `DistributionWorkerClient` (sending `version`, `poolId`, `registrationKey`; scheduling periodic `WORKER_RENEW` when `poolId` is non-blank; requiring confirmation of the configured pool on successful pooled registration, and halting reconnects and releasing registration waiters on rejection or close status `4003`).
 2. Add `-p` / `--pool` and `-k` / `--registration-key` to `DistWorkerStart` (and `VALUE_OPTIONS`) and wake the command’s stop latch on terminal rejection so it exits with failure and the coordinator’s reason even without a duration limit. Keep the normal shutdown/drain path and use a small client rejection notification API.
 3. Add `pool` and `registrationKey` to `CitrusAgentConfiguration`, `CitrusAgentOptions` (`--pool` with `""` short name; `-k` / `--registration-key`), `DistributionWorkerBridge`, and `tools/schema-generator/src/test/resources/control/citrus-agent-configuration.json`. Treat the registration key as write-only when serializing the agent’s configuration. Also redact the supported worker registration key in default properties from configuration output and startup logs.
 
@@ -442,7 +442,7 @@ git commit -m "feat(test-distribution-ui): add agent pools, historical usage cha
 - Consumes: Tasks 1–6 end-to-end (`DistributionCoordinatorServer`, `DistributionWorkerClient`, `DistributionWorkerConfig`, REST endpoints)
 - Produces: End-to-end coordinator + worker pool lifecycle verification and user manual sections for Agent Pools, Registration Keys, Grace Windows, Pool Priority, Workers Pool warnings, and Historical Usage
 
-- [ ] **Step 1: Write end-to-end pool registration, priority routing, key revocation, and historical usage test**
+- [x] **Step 1: Write end-to-end pool registration, priority routing, key revocation, and historical usage test**
 
 In the worker module, add an end-to-end test using real `DistributionCoordinatorServer` + `DistributionWorkerClient` instances verifying:
 1. Creating `high-prio` (`priorityOrder=0`, `capabilities={jdk=21, docker=true}`) and `low-prio` (`priorityOrder=1`, `capabilities={jdk=21, docker=true}`) pools with generated registration keys.
@@ -450,12 +450,14 @@ In the worker module, add an end-to-end test using real `DistributionCoordinator
 3. Connecting valid workers to both pools routes a submitted partition requiring `{docker=true}` to `high-prio` first and populates `version` + `poolDisplayName` on `GET /api/v1/workers`. Use enough concurrent demand to dispatch work to both pools, hold that work active until a usage sample observes it, and synchronize sampling and revocation assertions on observable state.
 4. Revoking `high-prio`'s key surfaces `KEY_REVOKED` warning on `GET /api/v1/workers`, disconnects the worker on its next renewal tick, and `GET /api/v1/usage?window=1h&filter=docker` returns non-zero `connected` / `utilized` / `desired` metrics for both pools.
 
-- [ ] **Step 2: Run end-to-end test and full Test Distribution test suite**
+- [x] **Step 2: Run end-to-end test and full Test Distribution test suite**
 
 Run: `./mvnw verify -pl core/citrus-api,tools/citrus-test-distribution-protocol,tools/citrus-test-distribution-ui,tools/citrus-test-distribution-coordinator,tools/citrus-test-distribution-worker,tools/citrus-test-distribution,tools/maven/citrus-test-distribution-maven-extension,tools/jbang,tools/agent,tools/schema-generator -am`
 Expected: PASS (`BUILD SUCCESS`, 0 failures across all Test Distribution, JBang, Agent, and Schema Generator modules).
 
-- [ ] **Step 3: Document Agent Pools, Registration Keys, Worker CLI/Env Options, Grace Windows, and Historical Usage in `src/manual/tools-test-distribution.adoc`**
+The unfiltered verification stopped in the Testcontainers dependency after Redpanda could not start within the Docker VM’s asynchronous I/O limit. A follow-up Java 21 verification compiled all 66 reactor projects and ran the suites from the ten feature modules. It passed with 1,226 tests successful, two Linux-only tests skipped on macOS, and zero failures or errors. The end-to-end pool lifecycle test passed.
+
+- [x] **Step 3: Document Agent Pools, Registration Keys, Worker CLI/Env Options, Grace Windows, and Historical Usage in `src/manual/tools-test-distribution.adoc`**
 
 Update `src/manual/tools-test-distribution.adoc` to document:
 - Agent Pools configuration, unique pool IDs, mandatory capabilities (including bare capabilities like `docker`), priority ordering, and pool-capability matching rules.
@@ -463,7 +465,7 @@ Update `src/manual/tools-test-distribution.adoc` to document:
 - Worker CLI and environment configuration (`--pool` / `-p`, `--registration-key` / `-k`, `CITRUS_DIST_WORKER_POOL` / `TEST_DISTRIBUTION_AGENT_POOL`, `CITRUS_DIST_WORKER_REGISTRATION_KEY` / `TEST_DISTRIBUTION_AGENT_REGISTRATION_KEY`, and `citrus.test.distribution.coordinator.requireAgentPool`).
 - Historical Usage views (`1 hour`, `24 hours`, `7 days`) and requirement/capability filtering.
 
-- [ ] **Step 4: Commit Task 7**
+- [x] **Step 4: Commit Task 7**
 
 ```bash
 git add tools/citrus-test-distribution-worker/src/test/java/org/citrusframework/distribution/worker/AgentPoolLifecycleIT.java \

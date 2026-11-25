@@ -66,7 +66,7 @@ Citrus Test Distribution currently lets any worker connect directly to the coord
   - `description VARCHAR(512)`
   - `created_at BIGINT NOT NULL`, `last_used_at BIGINT`, `last_used_by VARCHAR(255)`, `revoked_at BIGINT`.
 - **`dist_workers` columns (via `CREATE TABLE` + `ensureColumns`):**
-  - Add `version VARCHAR(64)`, `pool_id VARCHAR(64)`, `pool_display_name VARCHAR(255)`, `active_test_display VARCHAR(512)`, `state_updated_at BIGINT`, `warnings_json CLOB/TEXT`.
+  - Persist complete worker capability maps, including maps larger than the legacy 4,096-character column. Add `version VARCHAR(64)`, `pool_id VARCHAR(64)`, `pool_display_name VARCHAR(255)`, `active_test_display VARCHAR(512)`, `state_updated_at BIGINT`, `warnings_json CLOB/TEXT`.
 - **`dist_usage_samples`:**
   - `sampled_at BIGINT PRIMARY KEY`
   - `payload_json CLOB/TEXT NOT NULL` — serialized `UsageSampleRecord` containing:
@@ -81,7 +81,7 @@ Citrus Test Distribution currently lets any worker connect directly to the coord
 - **Registration validation:**
   - Pooled worker (`poolId` non-blank): pool must exist (`POOL_NOT_FOUND`), `registrationKey` must belong to `poolId` and not be revoked (`INVALID_REGISTRATION_KEY` / `REVOKED_REGISTRATION_KEY`), and worker capabilities must satisfy all mandatory pool capabilities (`MISSING_POOL_CAPABILITIES`).
   - Unpooled worker (`poolId` blank): allowed when `requireAgentPool == false`; rejected with `POOL_REQUIRED` when `requireAgentPool == true`.
-  - Hourly renewal (`worker.renew`): the coordinator checks the credentials against the identity and key bound to the current WebSocket and rejects a revoked key immediately. A matching renewal during an existing capability-drift or pool-deletion grace period leaves the original deadline in place. Successful renewal updates the usage metadata for an active pool key. Renewal with a deleted pool acknowledges the already-connected worker through its grace deadline without updating deleted key metadata. Fresh registration always uses the current pool and capability requirements.
+  - Hourly renewal (`worker.renew`): the coordinator checks the credentials against the identity and key bound to the current WebSocket and rejects a revoked key immediately. A matching renewal during an existing capability-drift or pool-deletion grace period leaves the original deadline in place. Successful renewal updates the usage metadata for an active pool key. Renewal with a deleted pool acknowledges the already-connected worker through its grace deadline without updating deleted key metadata. Fresh registration always uses the current pool and capability requirements. For a configured pooled worker, successful registration requires the coordinator to confirm the authenticated pool ID on the socket. Enable pooled workers after upgrading the coordinator.
 - **Grace windows & eligibility:**
   - **Pool capabilities added (`POOL_CAPABILITY_MISMATCH`):** Already-connected workers in that pool missing a newly added capability stay connected up to **4 hours** (`poolDriftGraceMs = 14_400_000L`) with a warning. During grace, they finish active work and remain eligible only for jobs whose requirements satisfy **both** the pool's current capabilities and the worker's declared capabilities.
   - **Pool deleted (`POOL_DELETED`):** Already-connected workers in that pool stay connected up to **4 hours** with a warning, finish any active partition, and receive no new pool-matched partitions because the pool no longer exists.
