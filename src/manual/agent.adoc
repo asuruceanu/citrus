@@ -40,7 +40,7 @@ The agent REST API provides these operations:
 
 | /configuration
 | GET
-| Returns the current agent configuration.
+| Returns the current agent configuration and omits the worker bearer token and pool registration key.
 
 | /run
 | GET
@@ -416,8 +416,9 @@ java -jar citrus-agent.jar --mode worker \
 
 Use `-u` / `--coordinator-url` to override the coordinator address. The agent's built-in fallback is
 `http://localhost:8084`. Use `--pool` for the pool ID because `-p` selects a test package. A coordinator that
-allows unpooled workers can accept an agent without a pool ID or key. The agent also accepts `--auth-token TOKEN`,
-but passing the token on the command line exposes it in the agent's `/configuration` response.
+allows unpooled workers can accept an agent without a pool ID or key. Use `--auth-token TOKEN` to supply the
+coordinator bearer token on the command line. The agent uses it to authenticate the worker and omits it from
+`/configuration`.
 
 For a container deployment, set `CITRUS_AGENT_MODE=worker` and `CITRUS_DIST_COORDINATOR_URL` in the
 container environment. Supply pool credentials and the bearer token through the corresponding environment

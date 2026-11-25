@@ -20,6 +20,10 @@ import java.io.ByteArrayOutputStream;
 import java.io.PrintStream;
 import java.net.InetAddress;
 import java.net.ServerSocket;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -51,6 +55,7 @@ import org.citrusframework.distribution.config.DistributionSettings;
 import org.citrusframework.distribution.worker.DistributionWorkerClient;
 import org.citrusframework.distribution.worker.DistributionWorkerConfig;
 import org.citrusframework.exceptions.CitrusRuntimeException;
+import org.citrusframework.util.SocketUtils;
 import org.junit.jupiter.api.DynamicTest;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestFactory;
@@ -169,12 +174,48 @@ class CitrusAgentWorkerOptionsTest {
     }
 
     @Test
-    void shouldAcceptRegistrationKeyInConfigurationWithoutPublishingIt() {
+    void shouldAcceptWorkerCredentialsInConfigurationWithoutPublishingThem() {
         var config = JsonSupport.read("""
-                {"pool":"pool1","registrationKey":"test-secret"}
+                {"pool":"pool1","registrationKey":"test-secret","authToken":"test-bearer-token"}
                 """, CitrusAgentConfiguration.class);
         assertThat(config.getRegistrationKey()).isEqualTo("test-secret");
-        assertThat(JsonSupport.render(config)).contains("pool1").doesNotContain("registrationKey", "test-secret");
+        assertThat(config.getAuthToken()).isEqualTo("test-bearer-token");
+        assertThat(JsonSupport.render(config)).contains("pool1")
+                .doesNotContain("registrationKey", "test-secret", "authToken", "test-bearer-token");
+    }
+
+    @Test
+    @ResourceLock(Resources.SYSTEM_OUT)
+    void shouldAuthenticateWithCliTokenWithoutExposingItInHttpConfiguration() throws Exception {
+        var peer = Vertx.vertx();
+        PrintStream originalOutput = System.out;
+        String token = "test-cli-bearer-token";
+        var authorization = new CompletableFuture<String>();
+        try (var http = HttpClient.newHttpClient()) {
+            var endpoint = peer.createHttpServer()
+                    .webSocketHandler(socket -> authorization.complete(socket.headers().get("Authorization")))
+                    .listen(0, "127.0.0.1").toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
+            int agentPort = SocketUtils.findAvailableTcpPort(1024, 32767);
+            var server = new CitrusAgentServer(parse("--mode", "worker", "--port", Integer.toString(agentPort),
+                    "--duration", "-1", "--coordinator-url", "http://127.0.0.1:" + endpoint.actualPort(),
+                    "--auth-token", token, "--cache-dir", tempDir.resolve("auth-token-cache").toString()));
+            try {
+                server.start();
+                assertThat(authorization.get(5, TimeUnit.SECONDS)).isEqualTo("Bearer " + token);
+
+                var request = HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + agentPort + "/configuration"))
+                        .timeout(Duration.ofSeconds(5)).build();
+                var response = http.send(request, HttpResponse.BodyHandlers.ofString());
+                assertThat(response.statusCode()).isEqualTo(200);
+                assertThat(response.body()).contains("\"mode\"").doesNotContain("authToken", token);
+            } finally {
+                server.stop();
+                server.completed.get(5, TimeUnit.SECONDS);
+            }
+        } finally {
+            System.setOut(originalOutput);
+            peer.close().toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
+        }
     }
 
     @Test

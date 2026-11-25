@@ -91,6 +91,9 @@ public final class JsonSupport {
 
     private interface WorkerCredentials {
         @JsonProperty(access = JsonProperty.Access.WRITE_ONLY)
+        String getAuthToken();
+
+        @JsonProperty(access = JsonProperty.Access.WRITE_ONLY)
         String getRegistrationKey();
 
         @JsonIgnoreProperties(value = DistributionSettings.WORKER_REGISTRATION_KEY_PROPERTY, allowSetters = true)
