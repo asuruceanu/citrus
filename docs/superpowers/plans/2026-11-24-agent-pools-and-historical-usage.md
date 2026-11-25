@@ -280,7 +280,7 @@ git commit -m "feat(test-distribution-coordinator): implement agent pool auth, g
   - `POST /api/v1/agent-pools/:poolId/keys/:keyId/revoke` -> `200` `RegistrationKeyRecord` (`404` if missing)
   - `GET /api/v1/usage?window=1h|24h|7d&filter=...` -> `200` `HistoricalUsageResponse` (`400` on invalid window or malformed filter, defaults to `1h` when window is absent)
 
-- [ ] **Step 1: Write failing HTTP & WebSocket server tests in `DistributionCoordinatorServerTest`**
+- [x] **Step 1: Write failing HTTP & WebSocket server tests in `DistributionCoordinatorServerTest`**
 
 Add tests in `DistributionCoordinatorServerTest.java` verifying:
 1. Full HTTP lifecycle: `POST /api/v1/agent-pools` (with `generateRegistrationKey=true` returning secret once), `GET /api/v1/agent-pools`, `GET /api/v1/agent-pools/:poolId` (verifying `secretKey` and `keyHash` are absent from listed keys), `PUT /api/v1/agent-pools/:poolId`, `POST /api/v1/agent-pools/:poolId/keys`, `POST /api/v1/agent-pools/:poolId/keys/:keyId/revoke`, and `DELETE /api/v1/agent-pools/:poolId`.
@@ -288,12 +288,12 @@ Add tests in `DistributionCoordinatorServerTest.java` verifying:
 3. `GET /api/v1/usage?window=1h&filter=jdk=21` returns `200` with 60 points and matching pool series; `GET /api/v1/usage?window=bad` and `GET /api/v1/usage?window=1h&filter=a=b=c` return `400`.
 4. Verify SSE delivery of pool updates/deletions, worker warning changes and worker rejection. Verify that structured WebSocket rejection is written before close with code `4003` and neither channel leaks key material. Exercise the existing bearer authorization on the new routes and assert `Cache-Control: no-store` for responses returning a generated key.
 
-- [ ] **Step 2: Run `DistributionCoordinatorServerTest` to verify it fails**
+- [x] **Step 2: Run `DistributionCoordinatorServerTest` to verify it fails**
 
 Run: `./mvnw test -Dtest=DistributionCoordinatorServerTest -pl tools/citrus-test-distribution-coordinator -am -Dsurefire.failIfNoSpecifiedTests=false`
 Expected: FAIL with `404` on `/api/v1/agent-pools` and `/api/v1/usage`.
 
-- [ ] **Step 3: Register routes, `DELETE` CORS + `PUT` body handler, WebSocket close callback, and periodic usage sampler in `DistributionCoordinatorVerticle`**
+- [x] **Step 3: Register routes, `DELETE` CORS + `PUT` body handler, WebSocket close callback, and periodic usage sampler in `DistributionCoordinatorVerticle`**
 
 In `DistributionCoordinatorVerticle.java`:
 1. Add `HttpMethod.DELETE` to `CorsHandler` and reuse the existing size-limited PUT body handler and bearer authentication on `/api/*`.
@@ -301,12 +301,12 @@ In `DistributionCoordinatorVerticle.java`:
 3. Wire the close callback into `coordinator.registerWorker(...)`. Write the structured rejection before initiating WebSocket close `4003` and close even when the write fails.
 4. Start a periodic timer `usageTimerId = vertx.setPeriodic(config.usageSampleIntervalMs(), ...)` calling `coordinator.sampleUsageNow()` on `executeBlocking` (and trigger one initial sample on startup; cancel `usageTimerId` in `stop()`). Avoid queueing overlapping samples. Run the existing lease/warning sweep off the event loop while preserving its cadence.
 
-- [ ] **Step 4: Run `DistributionCoordinatorServerTest` to verify it passes**
+- [x] **Step 4: Run `DistributionCoordinatorServerTest` to verify it passes**
 
 Run: `./mvnw test -Dtest=DistributionCoordinatorServerTest -pl tools/citrus-test-distribution-coordinator -am -Dsurefire.failIfNoSpecifiedTests=false`
 Expected: PASS (`BUILD SUCCESS`, 0 failures).
 
-- [ ] **Step 5: Commit Task 4**
+- [x] **Step 5: Commit Task 4**
 
 ```bash
 git add tools/citrus-test-distribution-coordinator/src/main/java/org/citrusframework/distribution/coordinator/DistributionCoordinatorVerticle.java \
@@ -386,7 +386,6 @@ git commit -m "feat(test-distribution-worker): support agent pool registration, 
 ### Task 6: Web UI — Generic Sessions Subtitle, Workers Pool Parity, Agent Pools View, and Historical Usage View
 
 **Files:**
-- Modify: `tools/citrus-test-distribution-ui/src/main/resources/META-INF/resources/dist-ui/index.html`
 - Modify: `tools/citrus-test-distribution-ui/src/main/resources/META-INF/resources/dist-ui/styles.css`
 - Modify: `tools/citrus-test-distribution-ui/src/main/resources/META-INF/resources/dist-ui/app.js`
 - Test: `tools/citrus-test-distribution-ui/src/test/java/org/citrusframework/distribution/ui/DistributionUiResourcesTest.java`
@@ -404,7 +403,7 @@ git commit -m "feat(test-distribution-worker): support agent pool registration, 
 
 In `DistributionUiResourcesTest.java` and `DistributionCoordinatorUiTest.java`, add assertions verifying:
 1. `app.js` contains `"Inspect distributed build sessions, artifact cache hit rates, and test outcomes."` and does **not** contain `"Inspect distributed Maven & JBang reactor runs, classpath cache hit rates, and test outcomes."`
-2. `index.html` exposes navigation items for `data-view="usage"` (`Historical Usage`) and `data-view="pools"` (`Agent Pools`) and does **not** expose Connecting Builds, project groups, access control, or `minSize`/`maxSize` controls.
+2. The sidebar rendered by `app.js` through `index.html` exposes navigation items for `data-view="usage"` (`Historical Usage`) and `data-view="pools"` (`Agent Pools`) and does **not** expose Connecting Builds, project groups, access control, or `minSize`/`maxSize` controls.
 3. `app.js` defines `renderAgentPools`, `renderHistoricalUsage`, `apiPut`, `apiDelete`, `/api/v1/agent-pools`, `/api/v1/agent-pools/priority`, `/api/v1/usage`, `POOL_CAPABILITY_MISMATCH`, `POOL_DELETED`, `KEY_REVOKED`, `Waiting for test execution requests`, `activeTestDisplay`, and preserves all existing `renderWorkerCacheTelemetry` and pagination assertions.
 
 - [ ] **Step 2: Run UI tests to verify they fail**
@@ -414,7 +413,7 @@ Expected: FAIL with missing subtitle/views/functions in `app.js` and `index.html
 
 - [ ] **Step 3: Implement UI navigation, subtitle update, `Workers Pool` upgrades, `Agent Pools` view, and `Historical Usage` SVG charts**
 
-Update `index.html`, `styles.css`, and `app.js` with hash routes `#pools`, `#pools/<poolId>`, and `#usage`, `apiPut`/`apiDelete` helpers, live SSE event handling (`pool.updated`, `pool.deleted`, `worker.updated`, `worker.rejected`), pool-grouped `Workers Pool` with version/live status/warnings, `Agent Pools` CRUD + drag-reorder + registration keys UI, and `Historical Usage` interactive SVG time-series charts.
+Extend the existing sidebar and `styles.css` / `app.js` with hash routes `#pools`, `#pools/<poolId>`, and `#usage`, `apiPut`/`apiDelete` helpers, live SSE event handling (`pool.updated`, `pool.deleted`, `worker.updated`, `worker.rejected`), pool-grouped `Workers Pool` with version/live status/warnings, `Agent Pools` CRUD + drag-reorder + registration keys UI, and `Historical Usage` interactive SVG time-series charts. Preserve in-progress form inputs on live refresh, clear one-time secrets on dismissal or navigation, and discard stale usage responses when the time window or filter changes.
 
 - [ ] **Step 4: Run UI tests to verify they pass**
 
