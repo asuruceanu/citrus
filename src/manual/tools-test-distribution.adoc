@@ -58,6 +58,8 @@ JUnit Platform tags, so Surefire and Failsafe group filters apply before work is
 
 TIP: Projects that do not use the Maven extension can add `org.citrusframework:citrus-test-distribution` to the test runtime classpath and enable JUnit Platform interceptor discovery (`-Djunit.platform.launcher.interceptors.enabled=true -Dcitrus.test.distribution.enabled=true`).
 
+To start a PostgreSQL-backed coordinator and a local worker pool in containers, see <<tools-test-distribution-docker>>.
+
 .Build host system properties and environment variables
 [cols="2,4,1",options="header"]
 |===
@@ -119,6 +121,161 @@ TIP: Projects that do not use the Maven extension can add `org.citrusframework:c
 Local bypass applies when the selection has no `@RemoteOnly` tests, remote capability requirements, declared workspace inputs or outputs, or explicit workspace fork. The launcher runs the discovered tests directly and reports the results to an existing Maven reactor session, when present. Scheduling and warm bypass use timing history scoped to the Maven root group ID and artifact ID. Set `citrus.test.distribution.projectKey` to distinguish builds that share coordinates. Older sessions without a project key retain their recorded timing history under their project name.
 
 For module-level workspace and isolation settings (`inputs`, `outputs`, `fork`, `partitionPolicy`, `skip`), see <<tools-test-distribution-external-resources>>.
+
+[[tools-test-distribution-docker]]
+== Docker Compose
+
+With Docker and Docker Compose installed, run the start script from the Citrus checkout. It builds separate,
+non-root coordinator and worker images from the same source tree, starts PostgreSQL 16, and runs eight Java 21
+workers. PostgreSQL must be ready before the coordinator starts, and the coordinator must be healthy before the
+workers start. Only the coordinator publishes a host port, bound to loopback.
+
+[source,bash]
+----
+./tools/citrus-test-distribution/docker/start.sh
+----
+
+The script prints the dashboard URL and opens it on a supported desktop after startup. The default is
+http://127.0.0.1:8765/ui/. On a headless machine, use the URL printed in the terminal. Check the Workers view for
+eight connected workers.
+
+Register the Maven extension as shown in <<tools-test-distribution-maven>>, then run your tests on the host.
+Use the published port from `start.sh` if you changed it.
+
+[source,bash]
+----
+./mvnw verify \
+  -Dcitrus.test.distribution.enabled=true \
+  -Dcitrus.test.distribution.coordinatorUrl=http://127.0.0.1:8765
+----
+
+.Maven properties for local Docker runs
+[cols="2,3",options="header"]
+|===
+|Maven option |Effect
+
+|`-Dcitrus.test.distribution.enabled=true`
+|Enables test distribution for this Maven invocation. The default is `false`.
+
+|`-Dcitrus.test.distribution.coordinatorUrl=http://127.0.0.1:8765`
+|Points Maven at the Docker coordinator. Use its published host port.
+
+|`-Dcitrus.test.distribution.authToken=<token>`
+|Sets the shared bearer token when the stack uses authentication. Exporting `CITRUS_DIST_AUTH_TOKEN` also supplies
+the token to the Maven build and to Compose.
+
+|`-Dcitrus.test.distribution.fallbackLocal=false`
+|Turns off the default local fallback for an unreachable coordinator or lost partitions. This helps expose
+distribution failures when validating the stack.
+
+|`-Dcitrus.test.distribution.maxPartitionSize=1`
+|Limits each partition to one work unit. Use it to check scheduling across workers. Leave it unset for adaptive sizing.
+
+|`-Djunit.platform.launcher.interceptors.enabled=true`
+|Enables JUnit Platform interceptor discovery for projects that use the Citrus distribution library directly.
+The Maven extension sets this property itself.
+|===
+
+See <<tools-test-distribution-maven>> for the other build host properties and environment variables.
+
+[cols="2,3",options="header"]
+|===
+|Environment variable |Effect
+
+|`CITRUS_DIST_WORKERS`
+|Sets the number of worker containers. The default is eight.
+
+|`CITRUS_DIST_HOST_PORT`
+|Changes the coordinator's localhost port. The default is `8765`.
+
+|`CITRUS_DIST_JDBC_PASSWORD`
+|Sets the initial PostgreSQL password and the coordinator's JDBC password. The default `citrus` is for local use.
+Set the password before creating the PostgreSQL volume. An existing database role's password must be updated
+in PostgreSQL before restarting the stack with a new value.
+
+|`CITRUS_DIST_AUTH_TOKEN`
+|Enables shared bearer authentication on the coordinator. The workers get the same token from Compose.
+Pass it to Maven via the environment and enter it in the dashboard when prompted. The default is empty.
+
+|`CITRUS_DIST_WORKER_CAPABILITIES`
+|Adds comma-separated capability tags to every worker in the Compose stack.
+
+|`COMPOSE_PROJECT_NAME`
+|Selects a different Compose project. Export the same value for all three lifecycle scripts. The default is
+`citrus-test-distribution`.
+|===
+
+=== Stop or remove the stack
+
+Use the stop script to pause services and preserve their containers, images, and data.
+
+[source,bash]
+----
+./tools/citrus-test-distribution/docker/stop.sh
+----
+
+Workers have up to 65 seconds to drain. Starting again with the same source and settings reuses worker identities
+and caches. PostgreSQL
+and the coordinator artifact cache use named volumes, so their data also survives container recreation.
+Replacing a worker starts it with a fresh cache.
+
+For a fresh stack, run the cleanup script. It deletes the selected Compose project's containers and networks,
+both source-built Citrus images, and the named volumes holding test history and artifacts.
+
+[source,bash]
+----
+./tools/citrus-test-distribution/docker/clean.sh --yes
+----
+
+=== Maven properties used to build the images
+
+The Dockerfile supplies these Maven options during the source build.
+
+[cols="2,3",options="header"]
+|===
+|Maven option |Effect
+
+|`-DskipTests`
+|Skips the checkout's unit and integration test runs during packaging.
+
+|`-Dmaven.test.skip=true`
+|Skips compiling the checkout's test sources during packaging.
+
+|`-Dmaven.source.skip=true`
+|Skips the source JARs.
+
+|`-Dmaven.javadoc.skip=true`
+|Skips the Javadoc JARs.
+
+|`-DincludeScope=runtime`
+|Stages the libraries the Citrus CLI needs at runtime, including those used by the test distribution worker.
+
+|`-DoutputDirectory=/opt/citrus/lib`
+|Places those libraries on the container's Java classpath.
+|===
+
+For focused verification of the Citrus checkout, `-Dtest=DistCommandTest` selects the CLI regression tests.
+`-Dsurefire.failIfNoSpecifiedTests=false` lets upstream reactor modules without that test class pass.
+For a disposable Maven smoke project, `-Dmaven.repo.local=<directory>` selects a separate local repository
+and `-Dmaven.repo.local.tail=<directory>` lets Maven reuse dependencies from an existing local cache.
+
+=== Run a worker against an existing coordinator
+
+Build the `worker` image target and pass the reachable coordinator URL via the environment. The dedicated worker
+opens an outbound connection and needs zero published ports.
+
+[source,bash]
+----
+docker build -f tools/citrus-test-distribution/docker/Dockerfile --target worker -t citrus-dist-worker .
+docker run -d --init --stop-timeout 65 \
+  -e CITRUS_DIST_COORDINATOR_URL=https://coordinator.example.org \
+  -e CITRUS_DIST_AUTH_TOKEN \
+  citrus-dist-worker
+----
+
+For a pooled worker, also pass `-e CITRUS_DIST_WORKER_POOL -e CITRUS_DIST_WORKER_REGISTRATION_KEY` after exporting
+the corresponding values. Use the same settings and CLI options as <<tools-test-distribution-workers>>.
+For workloads that require another JDK or tools, extend the worker image with the required software.
 
 [[tools-test-distribution-coordinator]]
 == Coordinator, CLI, and REST API
@@ -233,7 +390,12 @@ citrus dist sessions --coordinator-url=http://localhost:8765 --limit=20
 |`0`
 |===
 
-When embedding `DistributionCoordinatorConfig.fromSettings()`, the coordinator also reads `citrus.test.distribution.jdbcUrl` (`CITRUS_DIST_JDBC_URL`), `citrus.test.distribution.jdbcUser` (`CITRUS_DIST_JDBC_USER`, default `SA`), `citrus.test.distribution.jdbcPassword` (`CITRUS_DIST_JDBC_PASSWORD`), `citrus.test.distribution.cacheDir` (`CITRUS_DIST_CACHE_DIR`), `citrus.test.distribution.authToken` (`CITRUS_DIST_AUTH_TOKEN`).
+The CLI reads `citrus.test.distribution.jdbcUser` (`CITRUS_DIST_JDBC_USER`, default `SA`) and
+`citrus.test.distribution.jdbcPassword` (`CITRUS_DIST_JDBC_PASSWORD`) for JDBC authentication. If
+`--auth-token` is omitted, the CLI reads `citrus.test.distribution.authToken` (`CITRUS_DIST_AUTH_TOKEN`).
+When embedding `DistributionCoordinatorConfig.fromSettings()`, the coordinator also reads the JDBC URL and cache
+directory from `citrus.test.distribution.jdbcUrl` (`CITRUS_DIST_JDBC_URL`) and
+`citrus.test.distribution.cacheDir` (`CITRUS_DIST_CACHE_DIR`).
 
 === Coordinator HTTP, SSE, and WebSocket Endpoints
 
