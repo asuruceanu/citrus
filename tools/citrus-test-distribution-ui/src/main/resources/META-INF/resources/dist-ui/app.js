@@ -11,8 +11,9 @@ import { renderUsageChart } from './usage-chart.js';
 const STORAGE_THEME_KEY = 'citrus.dist.theme';
 const POLL_INTERVAL_MS = 4000;
 const AGENT_POOLS_API = '/api/v1/agent-pools';
-// Match the coordinator's default usage sampling interval.
-const USAGE_REFRESH_INTERVAL_MS = 15000;
+const USAGE_INTERVAL_HEADER = 'X-Citrus-Usage-Sample-Interval-Ms';
+const DEFAULT_USAGE_REFRESH_INTERVAL_MS = 15_000;
+const MAX_TIMEOUT_MS = 2 ** 31 - 1;
 // Full session detail can be several MB for large suites: reload it at most this often during live updates.
 const DETAIL_MIN_INTERVAL_MS = 2000;
 const VALID_DETAIL_TABS = new Set(['waterfall', 'tests', 'failures', 'files']);
@@ -35,6 +36,7 @@ const state = {
   sessions: [],
   selectedSessionId: null,
   sessionDetail: null,
+  sessionDetailError: null,
   workers: [],
   history: [],
   pools: null,
@@ -52,6 +54,7 @@ const state = {
   usageFilter: { chips: {}, input: '', error: '' },
   usage: null,
   usageError: '',
+  usageSelections: new Map(),
 
   // Filters
   sessionQuery: '',
@@ -87,11 +90,14 @@ let detailTimer = null;
 // Increases with every session detail request; a response that is no longer the latest is discarded.
 let detailRequestSeq = 0;
 let workerRequestSeq = 0;
-let poolListRequestSeq = 0;
+let poolDataRevision = 0;
+let poolRefreshInFlight = false;
+let poolRefreshPending = false;
 let poolViewSeq = 0;
 let poolRefreshTimer = null;
 let usageRefreshTimer = null;
 let usageRequest = null;
+let usageRefreshIntervalMs = DEFAULT_USAGE_REFRESH_INTERVAL_MS;
 let workerPollInFlight = false;
 let pollTimer = null;
 let suppressHashChange = false;
@@ -190,7 +196,7 @@ function changeView(view, poolId = null) {
 }
 
 function refreshCurrentView() {
-  if (state.view === 'workers' || state.view === 'pools') loadPools();
+  loadPools();
   if (state.view === 'usage') loadUsage(true);
 }
 
@@ -225,14 +231,18 @@ function requireApiAccess(response) {
   throw new Error('Unauthorized');
 }
 
-async function apiGet(path, signal) {
+async function apiGetResponse(path, signal) {
   const res = await fetch(path, { headers: { 'Accept': 'application/json' }, signal });
   signal?.throwIfAborted();
   requireApiAccess(res);
   if (!res.ok) {
     throw Object.assign(new Error(`HTTP ${res.status}`), { status: res.status });
   }
-  return res.json();
+  return res;
+}
+
+async function apiGet(path, signal) {
+  return (await apiGetResponse(path, signal)).json();
 }
 
 async function apiWrite(method, path, body) {
@@ -363,7 +373,6 @@ async function refreshAll() {
         await loadSessionDetail(state.selectedSessionId, false);
       }
     }
-    syncHash();
     renderApp();
   } catch (err) {
     if (err.message !== 'Unauthorized') {
@@ -379,15 +388,25 @@ async function refreshAll() {
 }
 
 async function loadSessionDetail(sessionId, switchView = true) {
+  const requestSeq = ++detailRequestSeq;
+  if (switchView) {
+    state.selectedSessionId = sessionId;
+    changeView('session-detail');
+    state.mobileMenuOpen = false;
+    syncHash();
+    renderApp();
+  }
+  const selectionAtStart = state.selectedSessionId;
+  const hashAtStart = location.hash;
+  const isCurrent = () => requestSeq === detailRequestSeq && location.hash === hashAtStart
+    && state.view === 'session-detail' && state.selectedSessionId === selectionAtStart;
   try {
-    const requestSeq = ++detailRequestSeq;
     const detail = await apiGet(`/api/v1/sessions/${encodeURIComponent(sessionId)}`);
-    if (requestSeq !== detailRequestSeq) {
-      return; // a newer request (e.g. the user switched sessions) superseded this one
-    }
+    if (!isCurrent()) return;
     lastDetailLoadAt = Date.now();
     state.selectedSessionId = sessionId;
     state.sessionDetail = detail;
+    state.sessionDetailError = null;
 
     if (state.selectedPartition && Array.isArray(detail.partitions)) {
       const exact = detail.partitions.find(
@@ -401,13 +420,14 @@ async function loadSessionDetail(sessionId, switchView = true) {
       state.selectedTestExecution = detail.tests.find(t => t.id === state.selectedTestExecution.id) || null;
     }
 
-    if (switchView) {
-      changeView('session-detail');
-      state.mobileMenuOpen = false;
-    }
     syncHash();
     renderApp();
   } catch (err) {
+    if (!isCurrent() || err.message === 'Unauthorized') return;
+    if (sessionId === state.selectedSessionId && state.sessionDetail?.session?.sessionId !== sessionId) {
+      state.sessionDetailError = { sessionId, message: `Could not load build session (${err.message}).` };
+      renderApp();
+    }
     console.warn('Failed to load session detail:', err.message);
   }
 }
@@ -420,7 +440,7 @@ function ensurePollingLoop() {
         connectSse();
       }
       refreshAll();
-      if (state.view === 'workers' || state.view === 'pools') schedulePoolRefresh();
+      if (showsPoolData()) schedulePoolRefresh();
     } else if (shouldPollWorkers()) {
       // Heartbeats update worker telemetry without publishing a lifecycle event.
       pollWorkers();
@@ -441,7 +461,7 @@ function connectSse() {
   eventSource = new EventSource('/api/v1/events/stream');
   eventSource.onopen = () => {
     state.sseConnected = true;
-    if (state.view === 'workers' || state.view === 'pools') schedulePoolRefresh();
+    if (showsPoolData()) schedulePoolRefresh();
     renderApp();
     if (shouldPollWorkers()) {
       pollWorkers();
@@ -466,7 +486,7 @@ function connectSse() {
   }
   for (const evt of ['pool.updated', 'pool.deleted']) {
     eventSource.addEventListener(evt, () => {
-      if (state.view === 'pools' || state.view === 'workers') schedulePoolRefresh();
+      if (showsPoolData()) schedulePoolRefresh();
     });
   }
 }
@@ -1259,12 +1279,12 @@ function renderWorkspaceChanges(sessionId, changes) {
 }
 
 function renderSessionDetail() {
-  if (!state.sessionDetail || !state.sessionDetail.session) {
-    return html`
-      <div class="card">
-        <div class="empty-state">Select a build session from Overview or Build Sessions to inspect its waterfall timeline.</div>
-      </div>
-    `;
+  if (!state.sessionDetail?.session || state.sessionDetail.session.sessionId !== state.selectedSessionId) {
+    const sessionId = state.selectedSessionId;
+    const message = sessionId
+      ? (state.sessionDetailError?.sessionId === sessionId ? state.sessionDetailError.message : 'Loading build session…')
+      : 'Select a build session from Overview or Build Sessions to inspect its waterfall timeline.';
+    return html`<div class="card"><div class="empty-state" role="status">${message}</div></div>`;
   }
 
   const { session, changedFiles = [], workspaceChanges, partitions = [], tests = [] } = state.sessionDetail;
@@ -1819,44 +1839,62 @@ function isCurrentPoolVisit(visit) {
   return visit === poolViewSeq && state.view === 'pools' && location.hash === buildHash();
 }
 
+function showsPoolData() {
+  return state.view === 'pools' || state.view === 'workers';
+}
+
 async function loadPools() {
-  const requestSeq = ++poolListRequestSeq;
+  if (!showsPoolData()) return;
+  if (poolRefreshInFlight) {
+    poolRefreshPending = true;
+    return;
+  }
+  poolRefreshInFlight = true;
+  poolRefreshPending = false;
+  const revision = poolDataRevision;
   const visit = poolViewSeq;
   const poolId = state.selectedPoolId;
-  const list = apiGet(AGENT_POOLS_API).then(pools => {
-    if (requestSeq !== poolListRequestSeq) return;
-    state.pools = pools;
-    state.poolListError = '';
-  }).catch(err => {
-    if (requestSeq === poolListRequestSeq && err.message !== 'Unauthorized') {
-      state.poolListError = `Could not load agent pools (${err.message}).`;
-    }
-  });
-  const detail = poolId ? apiGet(poolPath(poolId)).then(result => {
-    if (requestSeq !== poolListRequestSeq || !isCurrentPoolVisit(visit)) return;
-    state.poolDetail = result;
-    state.poolDetailError = '';
-    // Live updates must leave the user's unsaved changes alone.
-    if (!state.poolDraft?.edited) state.poolDraft = newPoolDraft(result.pool);
-  }).catch(err => {
-    if (requestSeq !== poolListRequestSeq || !isCurrentPoolVisit(visit) || err.message === 'Unauthorized') return;
-    if (err.status === 404) {
-      state.poolDetail = null;
-      state.poolSecret = null;
-      state.poolDetailError = 'This agent pool is no longer available.';
-    } else {
-      state.poolDetailError = `Could not refresh agent pool (${err.message}).`;
-    }
-  }) : null;
-  await Promise.all([list, detail]);
-  if (state.view === 'pools' || state.view === 'workers') renderApp();
+  const isCurrent = () => revision === poolDataRevision && !state.poolMutationInFlight;
+  const isCurrentDetail = () => isCurrent() && isCurrentPoolVisit(visit);
+  try {
+    const list = apiGet(AGENT_POOLS_API).then(pools => {
+      if (!isCurrent()) return;
+      state.pools = pools;
+      state.poolListError = '';
+    }).catch(err => {
+      if (isCurrent() && err.message !== 'Unauthorized') {
+        state.poolListError = `Could not load agent pools (${err.message}).`;
+      }
+    });
+    const detail = poolId ? apiGet(poolPath(poolId)).then(result => {
+      if (!isCurrentDetail()) return;
+      state.poolDetail = result;
+      state.poolDetailError = '';
+      // Live updates must leave the user's unsaved changes alone.
+      if (!state.poolDraft?.edited) state.poolDraft = newPoolDraft(result.pool);
+    }).catch(err => {
+      if (!isCurrentDetail() || err.message === 'Unauthorized') return;
+      if (err.status === 404) {
+        state.poolDetail = null;
+        state.poolSecret = null;
+        state.poolDetailError = 'This agent pool is no longer available.';
+      } else {
+        state.poolDetailError = `Could not refresh agent pool (${err.message}).`;
+      }
+    }) : null;
+    await Promise.all([list, detail]);
+    if (showsPoolData()) renderApp();
+  } finally {
+    poolRefreshInFlight = false;
+    if (poolRefreshPending && showsPoolData()) loadPools();
+  }
 }
 
 function schedulePoolRefresh() {
   if (poolRefreshTimer) return;
   poolRefreshTimer = setTimeout(() => {
     poolRefreshTimer = null;
-    if (state.view === 'pools' || state.view === 'workers') loadPools();
+    loadPools();
   }, 140);
 }
 
@@ -1927,7 +1965,9 @@ async function runPoolMutation(action, operation) {
     if (isCurrent()) state.poolMutationError = `Could not ${action} (${err.message}).`;
   } finally {
     state.poolMutationInFlight = false;
-    if (state.view === 'pools' || state.view === 'workers') {
+    // Reload after the write, including partial saves. Any GET started before it finished is stale.
+    poolDataRevision++;
+    if (showsPoolData()) {
       renderApp();
       loadPools();
     }
@@ -1991,8 +2031,6 @@ function moveAgentPool(poolId, destination) {
   runPoolMutation('save pool priority', async isCurrent => {
     const pools = await apiPut('/api/v1/agent-pools/priority', { poolIds: ids });
     if (!isCurrent()) return;
-    // Invalidate any list request started before the priority save completed.
-    poolListRequestSeq++;
     state.pools = pools;
   });
 }
@@ -2255,6 +2293,7 @@ async function loadUsage(reset = false) {
     stopUsageRefresh();
     state.usage = null;
     state.usageError = '';
+    state.usageSelections.clear();
   }
   if (state.view !== 'usage' || usageRequest) return;
   const request = new AbortController();
@@ -2263,8 +2302,13 @@ async function loadUsage(reset = false) {
   const filters = Object.entries(state.usageFilter.chips).map(([key, value]) => `${key}=${value}`);
   if (filters.length) params.set('filter', filters.join(','));
   try {
-    const usage = await apiGet(`/api/v1/usage?${params}`, request.signal);
+    const response = await apiGetResponse(`/api/v1/usage?${params}`, request.signal);
+    const usage = await response.json();
     if (usageRequest !== request) return;
+    const intervalHeader = response.headers.get(USAGE_INTERVAL_HEADER);
+    const configuredInterval = intervalHeader && /^\d+$/.test(intervalHeader) ? Number(intervalHeader) : 0;
+    usageRefreshIntervalMs = Number.isFinite(configuredInterval) && configuredInterval > 0
+      ? Math.min(configuredInterval, MAX_TIMEOUT_MS) : DEFAULT_USAGE_REFRESH_INTERVAL_MS;
     state.usage = usage;
     state.usageError = '';
   } catch (err) {
@@ -2273,7 +2317,7 @@ async function loadUsage(reset = false) {
   } finally {
     if (usageRequest === request) {
       usageRequest = null;
-      usageRefreshTimer = setTimeout(() => loadUsage(), USAGE_REFRESH_INTERVAL_MS);
+      usageRefreshTimer = setTimeout(() => loadUsage(), usageRefreshIntervalMs);
       renderApp();
     }
   }
@@ -2289,6 +2333,8 @@ const UTILIZATION_METRICS = [
 
 function renderHistoricalUsage() {
   const usage = state.usage;
+  // A blur or pointer event from a replaced chart can only update its old selection map.
+  const selections = state.usageSelections = new Map(state.usageSelections);
   return html`
     <div>
       <div class="page-header"><h1 class="page-title">Historical Usage</h1></div>
@@ -2313,11 +2359,11 @@ function renderHistoricalUsage() {
       ${state.usageError ? html`<div class="alert-banner alert-banner-rose" role="alert">${state.usageError}</div>` : null}
       ${usage ? html`
         <p id="usage-instructions" class="usage-instructions muted">Hover over a chart or use the arrow keys to inspect a time bucket.</p>
-        ${renderUsageChart('usage-jobs', 'Active jobs', usage.series, ACTIVE_JOBS_METRICS, state.usageWindow)}
-        ${renderUsageChart('usage-workers', 'Worker utilization', usage.series, UTILIZATION_METRICS, state.usageWindow)}
+        ${renderUsageChart('usage-jobs', 'Active jobs', usage.series, ACTIVE_JOBS_METRICS, state.usageWindow, selections)}
+        ${renderUsageChart('usage-workers', 'Worker utilization', usage.series, UTILIZATION_METRICS, state.usageWindow, selections)}
         <h2 class="usage-section-heading">Agent pool utilization</h2>
         ${usage.pools.length ? usage.pools.map(pool => renderUsageChart(
-          `usage-pool-${pool.poolId}`, pool.displayName, pool.points, UTILIZATION_METRICS, state.usageWindow))
+          `usage-pool-${pool.poolId}`, pool.displayName, pool.points, UTILIZATION_METRICS, state.usageWindow, selections))
           : html`<div class="card"><div class="empty-state">No agent pools match this filter.</div></div>`}
       ` : (!state.usageError ? html`<div class="card"><div class="empty-state" role="status">Loading historical usage…</div></div>` : null)}
     </div>
@@ -2781,13 +2827,12 @@ window.addEventListener('hashchange', () => {
   if (!applyHashFromLocation()) changeView('overview');
   state.waterfallExpanded = false;
   refreshCurrentView();
+  renderApp();
   if (state.view === 'session-detail'
       && state.selectedSessionId
       && (state.selectedSessionId !== prevSid || state.sessionDetail?.session?.sessionId !== state.selectedSessionId)) {
     loadSessionDetail(state.selectedSessionId, false);
-    return;
   }
-  renderApp();
   if (state.view === 'history') loadHistory();
 });
 

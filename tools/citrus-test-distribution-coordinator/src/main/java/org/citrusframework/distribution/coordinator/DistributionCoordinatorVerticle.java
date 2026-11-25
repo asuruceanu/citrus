@@ -69,6 +69,7 @@ import tools.jackson.databind.type.LogicalType;
 public final class DistributionCoordinatorVerticle extends AbstractVerticle {
 
     private static final Logger LOG = LoggerFactory.getLogger(DistributionCoordinatorVerticle.class);
+    private static final String USAGE_INTERVAL_HEADER = "X-Citrus-Usage-Sample-Interval-Ms";
     private static final int MAX_HISTORY_TEST_KEYS = 10_000;
     private static final ObjectReader HISTORY_REQUEST_READER = DistributionJson.mapper()
             .readerFor(HistoricalDurationsRequest.class)
@@ -118,7 +119,8 @@ public final class DistributionCoordinatorVerticle extends AbstractVerticle {
                 .allowedMethod(HttpMethod.DELETE)
                 .allowedHeader("Authorization")
                 .allowedHeader("Content-Type")
-                .allowedHeader("Last-Event-ID"));
+                .allowedHeader("Last-Event-ID")
+                .exposedHeader(USAGE_INTERVAL_HEADER));
 
         router.get("/health").handler(ctx -> writeJson(ctx, 200, Map.of("status", "UP")));
         router.get("/").handler(ctx -> ctx.redirect("/ui/index.html"));
@@ -148,8 +150,11 @@ public final class DistributionCoordinatorVerticle extends AbstractVerticle {
         router.get("/api/v1/cache/blobs/:sha256").handler(this::handleGetBlob);
 
         registerAgentPoolRoutes(router);
-        router.get("/api/v1/usage").handler(ctx -> respond(ctx, 200, () ->
-                coordinator.queryHistoricalUsage(ctx.request().getParam("window"), ctx.request().getParam("filter"))));
+        router.get("/api/v1/usage").handler(ctx -> {
+            ctx.response().putHeader(USAGE_INTERVAL_HEADER, Long.toString(config.usageSampleIntervalMs()));
+            respond(ctx, 200, () ->
+                    coordinator.queryHistoricalUsage(ctx.request().getParam("window"), ctx.request().getParam("filter")));
+        });
         router.get("/api/v1/workers").handler(ctx -> writeJson(ctx, 200, coordinator.listWorkers()));
         router.get("/api/v1/tests/history").handler(this::handleTestHistory);
         router.get("/api/v1/tests/history/runs").handler(this::handleTestHistoryRuns);

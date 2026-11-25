@@ -7,7 +7,7 @@
 
 import { html } from './vendor/htm-mini.js';
 
-export function renderUsageChart(id, heading, points, metrics, timeWindow) {
+export function renderUsageChart(id, heading, points, metrics, timeWindow, selections) {
   const width = 820;
   const height = 200;
   const plot = { left: 48, right: width - 32, top: 12, bottom: height - 30 };
@@ -29,7 +29,11 @@ export function renderUsageChart(id, heading, points, metrics, timeWindow) {
   </g>`;
   const markerDots = marker.querySelectorAll('circle');
   const tooltip = html`<div class="usage-tooltip" aria-live="polite"></div>`;
-  const select = (index, announce = true) => {
+  const select = (index, { announce = true, remember = true } = {}) => {
+    if (remember) {
+      if (index < 0) selections.delete(id);
+      else selections.set(id, points[index].timestamp);
+    }
     if (selected === index) return;
     selected = index;
     if (index < 0) {
@@ -43,6 +47,12 @@ export function renderUsageChart(id, heading, points, metrics, timeWindow) {
     tooltip.setAttribute('aria-live', announce ? 'polite' : 'off');
     tooltip.textContent = describe(index);
   };
+  const selectedTimestamp = selections.get(id);
+  if (points.length && selectedTimestamp !== undefined) {
+    const nearest = points.reduce((closest, point, i) =>
+      Math.abs(point.timestamp - selectedTimestamp) < Math.abs(points[closest].timestamp - selectedTimestamp) ? i : closest, 0);
+    select(nearest, { announce: false, remember: false });
+  }
   return html`
     <section class="card usage-card">
       <div class="card-header">
@@ -62,7 +72,7 @@ export function renderUsageChart(id, heading, points, metrics, timeWindow) {
             aria-labelledby=${`${id}-heading`} aria-describedby="usage-instructions"
             data-focus-id=${id}
             onFocus=${() => { if (selected < 0) select(points.length - 1); }}
-            onBlur=${() => select(-1)}
+            onBlur=${e => { if (e.currentTarget.isConnected) select(-1); }}
             onKeyDown=${e => {
               if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(e.key)) return;
               e.preventDefault();
@@ -88,9 +98,9 @@ export function renderUsageChart(id, heading, points, metrics, timeWindow) {
               onPointerMove=${e => {
                 const bounds = e.currentTarget.getBoundingClientRect();
                 select(Math.max(0, Math.min(points.length - 1,
-                  Math.round((e.clientX - bounds.left) / bounds.width * (points.length - 1)))), false);
+                  Math.round((e.clientX - bounds.left) / bounds.width * (points.length - 1)))), { announce: false });
               }}
-              onPointerLeave=${e => { if (document.activeElement !== e.currentTarget.ownerSVGElement) select(-1); }}></rect>
+              onPointerLeave=${e => { if (e.currentTarget.isConnected && document.activeElement !== e.currentTarget.ownerSVGElement) select(-1); }}></rect>
           </svg>
         </div>
         ${tooltip}

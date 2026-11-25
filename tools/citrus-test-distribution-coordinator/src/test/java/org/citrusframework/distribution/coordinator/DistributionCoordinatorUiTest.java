@@ -38,6 +38,7 @@ class DistributionCoordinatorUiTest {
         DistributionCoordinatorConfig config = DistributionCoordinatorConfig.builder()
                 .port(0)
                 .authToken("ui-token")
+                .usageSampleIntervalMs(150L)
                 .cacheDir(tempDir.resolve("ui-cache"))
                 .jdbcUrl("jdbc:hsqldb:file:" + tempDir.resolve("coordinator_ui_" + System.nanoTime()) + ";shutdown=true")
                 .build();
@@ -99,6 +100,18 @@ class DistributionCoordinatorUiTest {
             assertThat(htmResp.body())
                     .contains("export function html")
                     .contains("export function h");
+
+            HttpResponse<String> usageResp = client.send(
+                    HttpRequest.newBuilder(URI.create(server.baseUrl() + "/api/v1/usage"))
+                            .header("Authorization", "Bearer ui-token")
+                            .header("Origin", "http://dashboard.example")
+                            .GET().build(),
+                    HttpResponse.BodyHandlers.ofString());
+            assertThat(usageResp.statusCode()).isEqualTo(200);
+            assertThat(usageResp.headers().firstValue("X-Citrus-Usage-Sample-Interval-Ms")).hasValue("150");
+            assertThat(usageResp.headers().firstValue("Access-Control-Expose-Headers"))
+                    .hasValueSatisfying(value -> assertThat(value).containsIgnoringCase("X-Citrus-Usage-Sample-Interval-Ms"));
+            assertThat(usageResp.body()).contains("\"window\":\"1h\"", "\"series\"");
 
             assertThat(jsResp.body()).doesNotContain("Seed Demo Data");
             HttpResponse<String> removedSeedRoute = client.send(
