@@ -70,7 +70,7 @@ Citrus Test Distribution currently lets any worker connect directly to the coord
 - **`dist_usage_samples`:**
   - `sampled_at BIGINT PRIMARY KEY`
   - `payload_json CLOB/TEXT NOT NULL` — serialized `UsageSampleRecord` containing:
-    - `activeJobs`: aggregated `JobDemandBucket(requiredCapabilities, activeSessions, activePartitions, pendingPartitions)`
+    - `activeJobs`: aggregated `JobDemandBucket(requiredCapabilities, activeSessions, activePartitions, pendingPartitions, activeSessionIds)`
     - `pools`: `PoolSampleBucket(poolId, displayName, priorityOrder, capabilities, connected, utilized)`
     - `unpooledWorkers`: `UnpooledWorkerBucket(capabilities, connected, utilized)`
   - Coordinator samples every 15s (configurable via `usageSampleIntervalMs`) and prunes samples older than 7 days (`usageRetentionMs`).
@@ -88,7 +88,7 @@ Citrus Test Distribution currently lets any worker connect directly to the coord
   - **Key revoked (`KEY_REVOKED`):** Future registrations with the key fail immediately. Connected workers authenticated with that key receive a warning and are forcibly disconnected after **1 hour** (`keyRevocationGraceMs = 3_600_000L`) or on their next renewal attempt, whichever comes first.
 - **Scheduling order:**
   - A pooled worker's effective advertised capability set for job matching is **its pool's capabilities** (extra capabilities declared only on the worker do not satisfy build requirements; removing a capability from a pool immediately stops matching jobs requiring it).
-  - Eligible `IDLE` workers are selected from matching pools in ascending `priorityOrder` (`0` first), tie-broken by least-recently-assigned (`lastAssignedAt`), falling back to matching unpooled `IDLE` workers when no pooled worker is available.
+  - Eligible `IDLE` workers are selected from matching pools in ascending `priorityOrder` (`0` first), preferring workers that have yet to attempt the partition within the selected priority tier, then ordering by least-recently-assigned (`lastAssignedAt`), falling back to matching unpooled `IDLE` workers when no pooled worker is available.
 
 ### 3. Historical Usage Aggregation & Filtering
 
@@ -102,6 +102,7 @@ Citrus Test Distribution currently lets any worker connect directly to the coord
     - Jobs with at least those requirements: `CapabilityMatcher.matches(filterMap, job.requiredCapabilities)`
     - Agent pools with at least those capabilities: `CapabilityMatcher.matches(filterMap, pool.capabilities)` (pooled workers are governed by their pool's capabilities, not worker-only extra tags)
     - Unpooled workers with at least those capabilities: `CapabilityMatcher.matches(filterMap, unpooled.capabilities)`
+- **Active jobs:** Count distinct active build sessions across matching requirement buckets per sample. One build session can submit partitions with different requirements.
 - **Cascading `desired` calculation:**
   - Global `desired` at a sample equals total `activePartitions + pendingPartitions` across matching job buckets.
   - Per-pool `desired` attributes matching demand across compatible pools in priority order using a single connected-capacity budget per pool per sample. Process demand buckets with fewer compatible pools first, breaking ties by canonical sorted requirement pairs. Consume remaining pool capacity in priority order. Attribute demand left after capacity is exhausted to the highest-priority compatible pool as unmet demand. Demand with no compatible pool remains visible in the global series.

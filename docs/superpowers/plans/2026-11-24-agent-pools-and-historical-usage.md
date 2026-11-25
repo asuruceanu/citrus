@@ -181,6 +181,7 @@ git commit -m "feat(test-distribution-coordinator): persist agent pools, registr
 - Create: `tools/citrus-test-distribution-coordinator/src/main/java/org/citrusframework/distribution/coordinator/HistoricalUsageAggregator.java`
 - Modify: `tools/citrus-test-distribution-coordinator/src/main/java/org/citrusframework/distribution/coordinator/DistributionCoordinatorConfig.java`
 - Modify: `tools/citrus-test-distribution-coordinator/src/main/java/org/citrusframework/distribution/coordinator/SessionCoordinator.java`
+- Modify: `tools/citrus-test-distribution-protocol/src/main/java/org/citrusframework/distribution/model/UsageSampleRecord.java`
 - Test: `tools/citrus-test-distribution-coordinator/src/test/java/org/citrusframework/distribution/coordinator/SessionCoordinatorTest.java`
 - Test: `tools/citrus-test-distribution-coordinator/src/test/java/org/citrusframework/distribution/coordinator/HistoricalUsageAggregatorTest.java`
 
@@ -223,6 +224,7 @@ In `HistoricalUsageAggregatorTest.java`, add tests verifying:
 2. **Review Focus #5 (cascading `desired`):** When `high-prio` (`priorityOrder=0, connected=2`) and `low-prio` (`priorityOrder=1, connected=4`) both match a job bucket with `activePartitions=2, pendingPartitions=1` (total demand `3`), global `desired == 3`, `high-prio` `desired == 2`, and `low-prio` `desired == 1`. When demand is `8`, `high-prio` absorbs the unmet remainder (`2 + (8 - 6) = 4`) and `low-prio` gets `4`, while global `desired == 8`.
 3. **Review Focus #2 (filter scoping):** Filtering by `postgres=18` excludes pools whose capabilities are `{jdk=21, os=linux}` and jobs whose requirements are `{jdk=21}`, and includes jobs/pools/unpooled buckets containing `postgres=18`.
 4. Multiple distinct job buckets compatible with A (connected 2) and B (connected 4) and each demanding two workers must yield A=2, B=2, global=4. Cover deterministic processing of buckets with different compatible pool sets and input order.
+5. One session contributing partitions to multiple requirement buckets counts as one active job for an unfiltered query or any filter matching multiple of those buckets. Preserve the existing four-argument `JobDemandBucket` constructor for count-only samples, and add optional `activeSessionIds` to deduplicate live sample jobs after filtering.
 
 In `SessionCoordinatorTest.java` (using controllable `AtomicLong` clock on `DistributionCoordinatorConfig.Builder`), add tests verifying:
 1. **Review Focus #1 (cross-pool & revoked key rejection):** Registering with a non-existent pool (`POOL_NOT_FOUND`), Pool A's key against Pool B (`INVALID_REGISTRATION_KEY`), a revoked key (`REVOKED_REGISTRATION_KEY`), or missing mandatory pool capability (`MISSING_POOL_CAPABILITIES`) sends `WORKER_REJECTED`, invokes `closer`, does not register the worker, and leaves Pool A's key `lastUsedAt` null.
@@ -240,7 +242,7 @@ Expected: FAIL with compilation errors on missing `RegistrationKeyCrypto`, `Hist
 
 - [ ] **Step 3: Implement `RegistrationKeyCrypto`, `HistoricalUsageAggregator`, `DistributionCoordinatorConfig` clock/grace fields, and `SessionCoordinator` pool/key/scheduling/usage logic**
 
-Implement `RegistrationKeyCrypto` (8-char `[a-z0-9]` pool IDs; `ctrk_<8chars>_<32chars>` keys hashed with SHA-256). Implement `HistoricalUsageAggregator` with shared connected capacity across demand buckets, priority-ordered `desired` attribution and per-bucket `max` aggregation as specified. Extend `DistributionCoordinatorConfig` and `SessionCoordinator` to load pools from `store` on construction, enforce registration/renewal/grace rules, track `version`, `activeTestDisplay`, `stateUpdatedAt`, and `warnings` on `WorkerConnection`, schedule by pool priority using pool capabilities, and expose `sampleUsageNow()` + `queryHistoricalUsage(...)`. Publish `pool.updated`, `pool.deleted`, `worker.updated`, and `worker.rejected` via the existing durable event hub, with no secret or hash in event payloads. Preserve the upstream result journal and restart behavior.
+Implement `RegistrationKeyCrypto` (8-char `[a-z0-9]` pool IDs; `ctrk_<8chars>_<32chars>` keys hashed with SHA-256). Implement `HistoricalUsageAggregator` with shared connected capacity across demand buckets, priority-ordered `desired` attribution and per-bucket `max` aggregation as specified. Extend `DistributionCoordinatorConfig` and `SessionCoordinator` to load pools from `store` on construction, enforce registration/renewal/grace rules, track `version`, `activeTestDisplay`, `stateUpdatedAt`, and `warnings` on `WorkerConnection`, schedule by pool priority using pool capabilities for both assignment and adaptive sizing, and expose `sampleUsageNow()` + `queryHistoricalUsage(...)`. Publish `pool.updated`, `pool.deleted`, `worker.updated`, and `worker.rejected` via the existing durable event hub, with no secret or hash in event payloads. Preserve the upstream result journal and restart behavior.
 
 - [ ] **Step 4: Run coordinator unit tests to verify they pass**
 
@@ -251,7 +253,8 @@ Expected: PASS (`BUILD SUCCESS`, 0 failures).
 
 ```bash
 git add tools/citrus-test-distribution-coordinator/src/main/java/org/citrusframework/distribution/coordinator \
-        tools/citrus-test-distribution-coordinator/src/test/java/org/citrusframework/distribution/coordinator
+        tools/citrus-test-distribution-coordinator/src/test/java/org/citrusframework/distribution/coordinator \
+        tools/citrus-test-distribution-protocol/src/main/java/org/citrusframework/distribution/model/UsageSampleRecord.java
 git commit -m "feat(test-distribution-coordinator): implement agent pool auth, grace windows, priority scheduling, and usage aggregation"
 ```
 
