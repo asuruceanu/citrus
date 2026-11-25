@@ -24,28 +24,192 @@ import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
+import org.citrusframework.distribution.model.AgentPoolRecord;
 import org.citrusframework.distribution.model.BuildSessionRecord;
 import org.citrusframework.distribution.model.PartitionRecord;
 import org.citrusframework.distribution.model.PartitionState;
+import org.citrusframework.distribution.model.RegistrationKeyRecord;
 import org.citrusframework.distribution.model.SessionStatus;
 import org.citrusframework.distribution.model.SessionSummary;
 import org.citrusframework.distribution.model.TestExecutionRecord;
 import org.citrusframework.distribution.model.TestHistorySummary;
 import org.citrusframework.distribution.model.TestOutcomeStatus;
+import org.citrusframework.distribution.model.UsageSampleRecord;
 import org.citrusframework.distribution.model.WorkUnitSpec;
 import org.citrusframework.distribution.model.WorkerCacheStats;
 import org.citrusframework.distribution.model.WorkerRecord;
 import org.citrusframework.distribution.model.WorkerState;
+import org.citrusframework.distribution.model.WorkerWarning;
+import org.citrusframework.distribution.model.WorkerWarningCode;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.Assertions.tuple;
 
 class JdbcDistributionStoreTest {
 
     @TempDir
     Path tempDir;
+
+    @Test
+    void shouldPersistPoolEditsAndPrioritiesAndDeleteOnlyTheOwnedKeys() {
+        String url = "jdbc:hsqldb:file:" + tempDir.resolve("pools") + ";shutdown=true";
+        var older = new AgentPoolRecord("pool1", "Older", Map.of("jdk", "21"), 0, 10, 10);
+        var newer = new AgentPoolRecord("pool2", "Newer", Map.of(), 0, 20, 20);
+        var edited = new AgentPoolRecord("pool2", "Updated", Map.of("docker", "true"), 0, 20, 30);
+        var firstKey = registrationKey("key1", "pool1");
+        var secondKey = registrationKey("key2", "pool2");
+        try (DistributionStore store = new JdbcDistributionStore(url, "SA", "")) {
+            store.initialize();
+            store.upsertAgentPool(newer);
+            store.insertAgentPool(older, firstKey);
+            store.insertRegistrationKey(secondKey);
+            store.upsertAgentPool(edited);
+            assertThat(store.listAgentPools()).containsExactly(older, edited);
+            assertThat(store.findAgentPool("pool2")).contains(edited);
+            store.updateAgentPoolPriorities(List.of("pool2", "pool1"), 40);
+        }
+        try (DistributionStore store = new JdbcDistributionStore(url, "SA", "")) {
+            store.initialize();
+            assertThat(store.listAgentPools())
+                    .extracting(AgentPoolRecord::poolId, AgentPoolRecord::priorityOrder, AgentPoolRecord::updatedAt)
+                    .containsExactly(tuple("pool2", 0, 40L), tuple("pool1", 1, 40L));
+            assertThat(store.findRegistrationKey("key1")).contains(firstKey);
+            assertThat(store.deleteAgentPool("pool1")).isTrue();
+            assertThat(store.deleteAgentPool("pool1")).isFalse();
+            assertThat(store.findAgentPool("pool1")).isEmpty();
+            assertThat(store.findRegistrationKey("key1")).isEmpty();
+            assertThat(store.listRegistrationKeys("pool2")).containsExactly(secondKey);
+            assertThatThrownBy(() -> store.insertRegistrationKey(firstKey)).isInstanceOf(IllegalStateException.class);
+        }
+    }
+
+    @Test
+    void shouldRollBackPoolCreationIfTheInitialKeyCannotBeInserted() {
+        var first = new AgentPoolRecord("pool1", "First", Map.of(), 0, 1, 1);
+        var second = new AgentPoolRecord("pool2", "Second", Map.of(), 1, 2, 2);
+        var originalKey = registrationKey("key1", "pool1");
+        try (DistributionStore store = new JdbcDistributionStore("jdbc:hsqldb:mem:pool_insert_rollback", "SA", "")) {
+            store.initialize();
+            store.insertAgentPool(first, originalKey);
+            assertThatThrownBy(() -> store.insertAgentPool(second, registrationKey("key1", "pool2")))
+                    .isInstanceOf(IllegalStateException.class);
+            assertThatThrownBy(() -> store.insertAgentPool(second, registrationKey("key2", "pool1")))
+                    .isInstanceOf(IllegalArgumentException.class);
+            assertThat(store.listAgentPools()).containsExactly(first);
+            assertThat(store.listRegistrationKeys("pool1")).containsExactly(originalKey);
+            assertThat(store.listRegistrationKeys("pool2")).isEmpty();
+        }
+    }
+
+    @Test
+    void shouldRollBackAllPriorityChangesIfReorderingFails() {
+        var first = new AgentPoolRecord("pool1", "First", Map.of(), 0, 1, 1);
+        var second = new AgentPoolRecord("pool2", "Second", Map.of(), 1, 2, 2);
+        try (DistributionStore store = new JdbcDistributionStore("jdbc:hsqldb:mem:priority_rollback", "SA", "")) {
+            store.initialize();
+            store.insertAgentPool(first, null);
+            store.insertAgentPool(second, null);
+            assertThatThrownBy(() -> store.updateAgentPoolPriorities(List.of("pool2", "missing"), 40))
+                    .isInstanceOf(IllegalArgumentException.class);
+            assertThatThrownBy(() -> store.updateAgentPoolPriorities(List.of("pool2", "pool2"), 40))
+                    .isInstanceOf(IllegalArgumentException.class);
+            assertThatThrownBy(() -> store.updateAgentPoolPriorities(List.of("pool2"), 40))
+                    .isInstanceOf(IllegalArgumentException.class);
+            assertThat(store.listAgentPools()).containsExactly(first, second);
+        }
+    }
+
+    private static StoredRegistrationKey registrationKey(String keyId, String poolId) {
+        var metadata = new RegistrationKeyRecord(keyId, poolId, "ctrk_1234abcd", "Build agents", 1, null, null, null);
+        return new StoredRegistrationKey(metadata, "12".repeat(32));
+    }
+
+    @Test
+    void shouldRecordUsageForActiveKeysAndPreserveTheFirstRevocation() {
+        var key = registrationKey("key", "pool");
+        try (DistributionStore store = new JdbcDistributionStore("jdbc:hsqldb:mem:key_usage", "SA", "")) {
+            store.initialize();
+            store.insertAgentPool(new AgentPoolRecord("pool", "Build agents", Map.of(), 0, 1, 1), null);
+            assertThatThrownBy(() -> new StoredRegistrationKey(key.metadata(), "ctrk_" + "a".repeat(8) + "_" + "b".repeat(32)))
+                    .isInstanceOf(IllegalArgumentException.class);
+            store.insertRegistrationKey(key);
+            assertThat(store.listRegistrationKeys("pool")).containsExactly(key);
+            assertThat(store.revokeRegistrationKey("other", "key", 10)).isFalse();
+            store.touchRegistrationKeyUsage("key", 20, "worker");
+            store.touchRegistrationKeyUsage("key", 15, "earlier");
+            assertThat(store.findRegistrationKey("key").orElseThrow().metadata())
+                    .isEqualTo(new RegistrationKeyRecord("key", "pool", "ctrk_1234abcd", "Build agents",
+                            1, 20L, "worker", null));
+            assertThat(store.revokeRegistrationKey("pool", "key", 30)).isTrue();
+            assertThat(store.revokeRegistrationKey("pool", "key", 35)).isTrue();
+            store.touchRegistrationKeyUsage("key", 40, "later");
+            var revoked = new RegistrationKeyRecord("key", "pool", "ctrk_1234abcd", "Build agents",
+                    1, 20L, "worker", 30L);
+            assertThat(store.findRegistrationKey("key")).contains(new StoredRegistrationKey(revoked, key.keyHash()));
+        }
+    }
+
+    @Test
+    void shouldPersistUsageSamplesAndReadInclusiveRangesInTimeOrder() {
+        String url = "jdbc:hsqldb:file:" + tempDir.resolve("usage") + ";shutdown=true";
+        var capabilities = Map.of("docker", "true", "jdk", "21");
+        var earlier = new UsageSampleRecord(20,
+                List.of(new UsageSampleRecord.JobDemandBucket(capabilities, 2, 1, 1)),
+                List.of(new UsageSampleRecord.PoolSampleBucket("pool", "Original name", 0, capabilities, 2, 1)),
+                List.of(new UsageSampleRecord.UnpooledWorkerBucket(Map.of(), 1, 1)));
+        var later = new UsageSampleRecord(30, List.of(), List.of(), List.of());
+        try (DistributionStore store = new JdbcDistributionStore(url, "SA", "")) {
+            store.initialize();
+            store.recordUsageSample(new UsageSampleRecord(10, List.of(), List.of(), List.of()), 0);
+            store.recordUsageSample(later, 0);
+            store.recordUsageSample(earlier, 20);
+            store.recordUsageSample(earlier, 20);
+        }
+        try (DistributionStore store = new JdbcDistributionStore(url, "SA", "")) {
+            store.initialize();
+            assertThat(store.listUsageSamples(0, 19)).isEmpty();
+            assertThat(store.listUsageSamples(20, 30)).containsExactly(earlier, later);
+            assertThat(store.listUsageSamples(20, 20)).containsExactly(earlier);
+            assertThat(store.listUsageSamples(21, 29)).isEmpty();
+        }
+    }
+
+    @Test
+    void shouldRollBackUsageSampleIfPruningFails() throws Exception {
+        String url = "jdbc:hsqldb:mem:usage_rollback";
+        var earlier = new UsageSampleRecord(1, List.of(), List.of(), List.of());
+        try (DistributionStore store = new JdbcDistributionStore(url, "SA", "")) {
+            store.initialize();
+            store.recordUsageSample(earlier, 0);
+            try (Connection conn = DriverManager.getConnection(url, "SA", ""); Statement stmt = conn.createStatement()) {
+                stmt.execute("CREATE TABLE pinned_sample (sampled_at BIGINT REFERENCES dist_usage_samples(sampled_at))");
+                stmt.execute("INSERT INTO pinned_sample VALUES (1)");
+            }
+            var later = new UsageSampleRecord(10, List.of(), List.of(), List.of());
+            assertThatThrownBy(() -> store.recordUsageSample(later, 5)).isInstanceOf(IllegalStateException.class);
+            assertThat(store.listUsageSamples(0, 10)).containsExactly(earlier);
+        }
+    }
+
+    @Test
+    void shouldPersistAndClearWorkerPoolMetadataAndWarnings() {
+        var warnings = List.of(new WorkerWarning(WorkerWarningCode.KEY_REVOKED, "Key revoked", 2, 8),
+                new WorkerWarning(WorkerWarningCode.POOL_DELETED, "Pool deleted", 3, 9));
+        var pooled = new WorkerRecord("worker", "host", "1.0", "pool", "Build agents", Map.of("jdk", "21"),
+                WorkerState.BUSY, "part", "OrderTest > create", 3, 4, 1, null, warnings);
+        var unpooled = new WorkerRecord("worker", "host", "1.1", null, null, Map.of(), WorkerState.IDLE,
+                null, null, 5, 6, 1, null, List.of());
+        try (DistributionStore store = new JdbcDistributionStore("jdbc:hsqldb:mem:worker_pool", "SA", "")) {
+            store.initialize();
+            store.upsertWorker(pooled);
+            assertThat(store.listWorkers()).containsExactly(pooled);
+            store.upsertWorker(unpooled);
+            assertThat(store.listWorkers()).containsExactly(unpooled);
+        }
+    }
 
     @Test
     void keepsTimingHistorySeparateForProjectsWithTheSameDisplayNameAndTestClass() {
@@ -330,18 +494,18 @@ class JdbcDistributionStoreTest {
             store.upsertWorker(new WorkerRecord("healthy", "h", capabilities, WorkerState.IDLE, null, 1L, 2L, stats));
             try (Connection conn = DriverManager.getConnection(jdbcUrl, "SA", "");
                  Statement stmt = conn.createStatement()) {
-                assertThat(stmt.executeUpdate("UPDATE dist_workers SET capabilities_json='{', cache_stats_json='[' "
-                        + "WHERE worker_id='broken'")).isEqualTo(1);
+                assertThat(stmt.executeUpdate("UPDATE dist_workers SET capabilities_json='{', cache_stats_json='[', "
+                        + "warnings_json='[null]' WHERE worker_id='broken'")).isEqualTo(1);
             }
 
             assertThat(store.listWorkers())
-                    .extracting(WorkerRecord::workerId, WorkerRecord::capabilities, WorkerRecord::cacheStats)
-                    .containsExactly(tuple("broken", Map.of(), null), tuple("healthy", capabilities, stats));
+                    .extracting(WorkerRecord::workerId, WorkerRecord::capabilities, WorkerRecord::cacheStats, WorkerRecord::warnings)
+                    .containsExactly(tuple("broken", Map.of(), null, List.of()), tuple("healthy", capabilities, stats, List.of()));
         }
     }
 
     @Test
-    void shouldAddCacheStatsColumnToLegacyWorkerTable() throws Exception {
+    void shouldMigrateLegacyWorkerRowsWithoutLosingTelemetry() throws Exception {
         String jdbcUrl = "jdbc:hsqldb:file:" + tempDir.resolve("db/legacy-workers").toAbsolutePath() + ";shutdown=true";
         try (java.sql.Connection conn = java.sql.DriverManager.getConnection(jdbcUrl, "SA", "");
              java.sql.Statement stmt = conn.createStatement()) {
@@ -354,9 +518,14 @@ class JdbcDistributionStoreTest {
         WorkerCacheStats stats = new WorkerCacheStats(true, 1L, 2, 3L, 4L, 5L, false);
         try (JdbcDistributionStore store = new JdbcDistributionStore(jdbcUrl, "SA", "")) {
             store.initialize();
-            assertThat(store.listWorkers()).singleElement().satisfies(w -> assertThat(w.cacheStats()).isNull());
-            store.upsertWorker(new WorkerRecord("w-legacy", "h", Map.of(), WorkerState.IDLE, null, 2L, 1L, stats));
-            assertThat(store.listWorkers()).singleElement().satisfies(w -> assertThat(w.cacheStats()).isEqualTo(stats));
+            store.initialize();
+            assertThat(store.listWorkers()).containsExactly(
+                    new WorkerRecord("w-legacy", "h", Map.of(), WorkerState.IDLE, null, 1L, 1L));
+            var migrated = new WorkerRecord("w-legacy", "h", "2.0", "pool", "Linux", Map.of(), WorkerState.BUSY,
+                    "part", "Test > method", 2, 3, 1, stats,
+                    List.of(new WorkerWarning(WorkerWarningCode.POOL_CAPABILITY_MISMATCH, "Missing docker", 2, 10)));
+            store.upsertWorker(migrated);
+            assertThat(store.listWorkers()).containsExactly(migrated);
         }
     }
 
