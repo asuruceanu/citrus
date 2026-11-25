@@ -20,6 +20,17 @@ A few small configuration inconsistencies also get in the way of running workers
 
 The goal is a clear, complete operator reference for both run-times, backed by consistent Citrus-native configuration.
 
+## Worker entry points: both are supported
+
+We considered choosing a single supported way to start a worker and dropping the other. We kept both.
+
+- `citrus dist worker start` is the lightweight JBang entry point. It starts only the worker client, local file cache, and forked test JVMs. It has no HTTP server, REST API, or UI. It fits CI jobs and container or Kubernetes deployments that need only a worker process.
+- `citrus-agent --mode worker` runs the same worker client inside the existing `citrus-agent` Vert.x server. It keeps `/health`, `/config`, and the UI, and uses the published `citrus-agent` container image. It fits deployments that already run `citrus-agent` or need monitoring endpoints, and it can still run standalone agent tests.
+
+Both entry points are thin front-ends over the same `DistributionWorkerClient`. Supporting two entry points does not duplicate scheduling or worker logic. Neither starts a Coordinator; `citrus dist coordinator start` remains the only Coordinator entry point.
+
+Keeping both is intentional. Removing either one would break an existing deployment shape, and forcing all users onto one entry point would trade away either the minimal worker footprint or the existing server and container integration. This work documents both run-times. It does not deprecate, merge, or replace either one.
+
 ## Goals
 
 1. Document both worker run-times with enough detail to deploy and operate them without reading source code: quick start, CLI options, environment variables and system properties, precedence rules, capabilities, local file cache, lifecycle and exit behaviour, and container deployment.
