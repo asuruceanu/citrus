@@ -959,15 +959,23 @@ public class JdbcDistributionStore implements DistributionStore {
             ps.setLong(5, worker.lastHeartbeatAt());
             ps.setLong(6, worker.registeredAt());
             ps.setString(7, worker.cacheStats() == null ? null : DistributionJson.toJson(worker.cacheStats()));
-            ps.setString(8, worker.version());
+            ps.setString(8, truncateWorkerText(worker.version(), 64));
             ps.setString(9, worker.poolId());
             ps.setString(10, worker.poolDisplayName());
-            ps.setString(11, worker.activeTestDisplay());
+            ps.setString(11, truncateWorkerText(worker.activeTestDisplay(), 512));
             ps.setLong(12, worker.stateUpdatedAt());
             ps.setString(13, DistributionJson.toJson(worker.warnings()));
             ps.setString(14, worker.workerId());
             return ps.executeUpdate();
         }
+    }
+
+    private static String truncateWorkerText(String text, int limit) {
+        if (text != null && text.length() > limit
+                && Character.isSurrogatePair(text.charAt(limit - 1), text.charAt(limit))) {
+            return text.substring(0, limit - 1);
+        }
+        return truncate(text, limit);
     }
 
     @Override

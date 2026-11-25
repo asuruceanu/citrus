@@ -212,6 +212,33 @@ class JdbcDistributionStoreTest {
     }
 
     @Test
+    void shouldBoundWorkerVersionOnInsert() {
+        String prefix = "v".repeat(64);
+        try (DistributionStore store = new JdbcDistributionStore("jdbc:hsqldb:mem:long_version", "SA", "")) {
+            store.initialize();
+            store.upsertWorker(workerWithTelemetry(prefix + "-snapshot", "Suite > test"));
+            assertThat(store.listWorkers()).containsExactly(workerWithTelemetry(prefix, "Suite > test"));
+        }
+    }
+
+    @Test
+    void shouldBoundWorkerTestDisplayOnUpdateWithoutSplittingACharacter() {
+        String prefix = "t".repeat(511);
+        try (DistributionStore store = new JdbcDistributionStore("jdbc:hsqldb:mem:long_test_display", "SA", "")) {
+            store.initialize();
+            store.upsertWorker(new WorkerRecord("worker", "host", Map.of(), WorkerState.IDLE, null, 1, 1));
+            store.upsertWorker(workerWithTelemetry("2.0", prefix + "🧪 parameterized case"));
+            assertThat(store.listWorkers()).containsExactly(workerWithTelemetry("2.0", prefix));
+        }
+    }
+
+    private static WorkerRecord workerWithTelemetry(String version, String display) {
+        var warning = new WorkerWarning(WorkerWarningCode.POOL_CAPABILITY_MISMATCH, "Missing docker", 2, 10);
+        return new WorkerRecord("worker", "host", version, "pool", "Build agents", Map.of("jdk", "21"), WorkerState.BUSY,
+                "part", display, 3, 4, 1, new WorkerCacheStats(true, 1, 2, 3, 4, 5, false), List.of(warning));
+    }
+
+    @Test
     void keepsTimingHistorySeparateForProjectsWithTheSameDisplayNameAndTestClass() {
         String key = "pkg.SharedTest";
         String jdbcUrl = "jdbc:hsqldb:file:" + tempDir.resolve("scoped-history");
