@@ -1193,6 +1193,52 @@ class SessionCoordinatorTest {
     }
 
     @Test
+    void sendsWorkerRejectionAndClosesWhenEventPersistenceFails() {
+        var database = "jdbc:hsqldb:mem:rejection_failure_" + System.nanoTime();
+        try (var failing = new JdbcDistributionStore(database, "SA", "") {
+            @Override
+            public long appendEvent(CoordinatorEvent event, String deliveryId, TestExecutionRecord result,
+                                    List<PartitionRecord> partitions) {
+                if ("worker.rejected".equals(event.type())) {
+                    throw new IllegalStateException("Simulated rejection event write failure");
+                }
+                return super.appendEvent(event, deliveryId, result, partitions);
+            }
+        }) {
+            failing.initialize();
+            var config = DistributionCoordinatorConfig.builder().requireAgentPool(true).build();
+            var rejecting = new SessionCoordinator(config, failing, new CoordinatorEventStreamHub(failing));
+            var worker = new Worker("rejected");
+            assertThatThrownBy(() -> rejecting.registerWorker(worker.connectionId,
+                    new WorkerRegisterPayload("worker", "host", JDK),
+                    message -> {
+                        assertThat(worker.closed).isFalse();
+                        worker.received.add(message);
+                    }, () -> worker.closed = true))
+                    .isInstanceOf(IllegalStateException.class).hasMessage("Simulated rejection event write failure");
+            assertRejected(worker, "POOL_REQUIRED");
+        }
+    }
+
+    @Test
+    void persistsWorkerRejectionWhenTheSocketWriteThrows() {
+        useControlledClock(true);
+        var worker = new Worker("rejected");
+        assertThatThrownBy(() -> coordinator.registerWorker(worker.connectionId,
+                new WorkerRegisterPayload("worker", "host", JDK),
+                message -> { throw new IllegalStateException("Simulated socket write failure"); },
+                () -> worker.closed = true))
+                .isInstanceOf(IllegalStateException.class).hasMessage("Simulated socket write failure");
+        assertThat(worker.closed).isTrue();
+        var events = new java.util.ArrayList<CoordinatorEvent>();
+        store.replayEvents(null, 0, 100, events::add);
+        assertThat(events).singleElement().satisfies(event -> {
+            assertThat(event.type()).isEqualTo("worker.rejected");
+            assertThat(event.data()).containsEntry("code", "POOL_REQUIRED");
+        });
+    }
+
+    @Test
     void honorsRevocationDeadlineAndReassignsActiveWorkOnRenewal() {
         var now = useControlledClock(false);
         var a = coordinator.createAgentPool("A", JDK, true, "key");

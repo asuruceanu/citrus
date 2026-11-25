@@ -860,10 +860,13 @@ public final class SessionCoordinator {
     private void reject(String workerId, Consumer<WorkerWsMessage> sender, Runnable closer, RegistrationFailure failure) {
         Map<String, Object> data = Map.of("code", failure.name(), "message", failure.message);
         try {
-            eventHub.publish("worker.rejected", null, null, workerId, data);
             sender.accept(new WorkerWsMessage(WorkerWsMessage.WORKER_REJECTED, data));
         } finally {
-            closer.run();
+            try {
+                closer.run();
+            } finally {
+                eventHub.publish("worker.rejected", null, null, workerId, data);
+            }
         }
     }
 
