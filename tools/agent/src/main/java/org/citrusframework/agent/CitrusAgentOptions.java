@@ -23,6 +23,7 @@ import java.util.Set;
 import java.util.stream.Collectors;
 
 import org.citrusframework.api.agent.CitrusAgentConfiguration;
+import org.citrusframework.api.agent.CitrusAgentSettings;
 import org.citrusframework.distribution.config.WorkerCacheCliOptions;
 import org.citrusframework.exceptions.CitrusRuntimeException;
 import org.citrusframework.main.CitrusAppOptions;
@@ -52,7 +53,7 @@ public class CitrusAgentOptions extends CitrusAppOptions<CitrusAgentConfiguratio
             @Override
             protected void doProcess(CitrusAgentConfiguration configuration, String arg, String value, LinkedList<String> remainingArgs) {
                 if (StringUtils.hasText(value)) {
-                    configuration.setMode(value);
+                    configuration.setMode(CitrusAgentSettings.parseMode(value, "-m/--mode"));
                 } else {
                     throw new CitrusRuntimeException("Missing parameter value for -m/--mode option");
                 }
@@ -70,7 +71,7 @@ public class CitrusAgentOptions extends CitrusAppOptions<CitrusAgentConfiguratio
             }
         });
 
-        options.add(new CliOption<>("t", "auth-token", "Test distribution coordinator auth token") {
+        options.add(new CliOption<>("", "auth-token", "Test distribution coordinator auth token") {
             @Override
             protected void doProcess(CitrusAgentConfiguration configuration, String arg, String value, LinkedList<String> remainingArgs) {
                 configuration.setAuthToken(value != null ? value : "");

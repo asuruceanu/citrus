@@ -399,6 +399,15 @@ public final class DistributionSettings {
         return getString(COORDINATOR_URL_PROPERTY, COORDINATOR_URL_ENV, DEFAULT_COORDINATOR_URL);
     }
 
+    public static String resolveCoordinatorUrl(String defaultValue) {
+        return resolveCoordinatorUrl(System::getProperty, System::getenv, defaultValue);
+    }
+
+    public static String resolveCoordinatorUrl(UnaryOperator<String> prop, UnaryOperator<String> env,
+                                               String defaultValue) {
+        return getString(prop, env, COORDINATOR_URL_PROPERTY, COORDINATOR_URL_ENV, defaultValue);
+    }
+
     public static String getAuthToken() {
         return getString(AUTH_TOKEN_PROPERTY, AUTH_TOKEN_ENV, "");
     }

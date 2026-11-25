@@ -32,6 +32,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.UnaryOperator;
 import java.util.stream.Stream;
 
 import io.vertx.core.Context;
@@ -70,6 +71,76 @@ class CitrusAgentWorkerOptionsTest {
 
     private static CitrusAgentConfiguration parse(String... args) {
         return new CitrusAgentOptions().apply(args);
+    }
+
+    @Test
+    void shouldRejectInvalidCliModeAtStartup() {
+        assertInvalidModeAtStartup(new String[] {"--mode", "bogus"}, "-m/--mode");
+    }
+
+    @Test
+    @ResourceLock(Resources.SYSTEM_PROPERTIES)
+    void shouldRejectInvalidModePropertyAtStartup() {
+        String key = "citrus.agent.mode";
+        String previous = System.setProperty(key, "bogus");
+        try {
+            assertInvalidModeAtStartup(new String[0], key);
+        } finally {
+            restoreProperty(key, previous);
+        }
+    }
+
+    private static void assertInvalidModeAtStartup(String[] args, String source) {
+        var errors = new ByteArrayOutputStream();
+        try (var err = new PrintStream(errors, true, StandardCharsets.UTF_8)) {
+            assertThat(CitrusAgentServer.parseOptions(args, err)).isEmpty();
+            errors.reset();
+            List<Integer> exitCodes = new ArrayList<>();
+            CitrusAgentServer.entrypoint(args, List.of(), System.out, err, exitCodes::add);
+            assertThat(exitCodes).containsExactly(1);
+            assertThat(errors.toString(StandardCharsets.UTF_8)).hasLineCount(1)
+                    .contains("Invalid Citrus agent options:", "'bogus'", source);
+        }
+    }
+
+    @Test
+    @ResourceLock(Resources.SYSTEM_PROPERTIES)
+    void shouldOverrideInheritedModeWithCliMode() {
+        String key = "citrus.agent.mode";
+        String previous = System.setProperty(key, "standalone");
+        try {
+            assertThat(CitrusAgentServer.parseOptions(new String[] {"-m", " WORKER "}, System.err))
+                    .hasValueSatisfying(options -> assertThat(options.configuration().getMode()).isEqualTo("worker"));
+        } finally {
+            restoreProperty(key, previous);
+        }
+    }
+
+    @Test
+    @ResourceLock(Resources.SYSTEM_PROPERTIES)
+    void shouldPreserveInheritedAuthTokenWhenCliTokenAbsent() {
+        String key = DistributionSettings.AUTH_TOKEN_PROPERTY;
+        String previous = System.setProperty(key, "inherited-token");
+        try {
+            assertThat(DistributionWorkerBridge.buildWorkerConfig(parse("--mode", "worker")).authToken())
+                    .isEqualTo("inherited-token");
+            assertThat(DistributionWorkerBridge.buildWorkerConfig(
+                    parse("--mode", "worker", "--auth-token", "   ")).authToken())
+                    .isEqualTo("inherited-token");
+            assertThat(DistributionWorkerBridge.buildWorkerConfig(
+                    parse("--mode", "worker", "--auth-token", "cli-token")).authToken())
+                    .isEqualTo("cli-token");
+        } finally {
+            restoreProperty(key, previous);
+        }
+    }
+
+    private static void restoreProperty(String key, String previous) {
+        if (previous == null) {
+            System.clearProperty(key);
+        } else {
+            System.setProperty(key, previous);
+        }
     }
 
     @Test
@@ -330,25 +401,26 @@ class CitrusAgentWorkerOptionsTest {
 
     @Test
     @ResourceLock(Resources.SYSTEM_PROPERTIES)
-    void shouldUseCliUrlThenSystemPropertyThenAgentDefault() {
+    void shouldResolveAgentCoordinatorUrlFromEnvironmentWhenCliUrlAbsent() {
         String key = DistributionSettings.COORDINATOR_URL_PROPERTY;
+        UnaryOperator<String> env = name -> DistributionSettings.COORDINATOR_URL_ENV.equals(name)
+                ? "http://coordinator-env:9100" : null;
         String previous = System.setProperty(key, "http://coordinator-prop:9100/");
         try {
-            assertThat(DistributionWorkerBridge.buildWorkerConfig(parse("--mode", "worker")).coordinatorUrl())
+            var worker = parse("--mode", "worker");
+            assertThat(DistributionWorkerBridge.buildWorkerConfig(worker, env).coordinatorUrl())
                     .isEqualTo("http://coordinator-prop:9100");
             assertThat(DistributionWorkerBridge.buildWorkerConfig(
-                    parse("--mode", "worker", "--coordinator-url", "http://localhost:8084")).coordinatorUrl())
+                    parse("--mode", "worker", "--coordinator-url", "http://localhost:8084"), env).coordinatorUrl())
                     .isEqualTo("http://localhost:8084");
 
             System.clearProperty(key);
-            assertThat(DistributionWorkerBridge.buildWorkerConfig(parse("--mode", "worker")).coordinatorUrl())
+            assertThat(DistributionWorkerBridge.buildWorkerConfig(worker, env).coordinatorUrl())
+                    .isEqualTo("http://coordinator-env:9100");
+            assertThat(DistributionWorkerBridge.buildWorkerConfig(worker, name -> null).coordinatorUrl())
                     .isEqualTo("http://localhost:8084");
         } finally {
-            if (previous == null) {
-                System.clearProperty(key);
-            } else {
-                System.setProperty(key, previous);
-            }
+            restoreProperty(key, previous);
         }
     }
 
@@ -529,7 +601,9 @@ class CitrusAgentWorkerOptionsTest {
                     new PrintStream(errors, true, StandardCharsets.UTF_8), exitCodes::add);
 
             assertThat(output.toString(StandardCharsets.UTF_8)).contains("Citrus application option usage:",
-                    "--cache-dir", "--cache-cleanup", "--no-cache-cleanup", "--cache-free-space-buffer-size");
+                    "-t or --test", "--auth-token", "--cache-dir", "--cache-cleanup", "--no-cache-cleanup",
+                    "--cache-free-space-buffer-size")
+                    .doesNotContain("-t or --auth-token");
             assertThat(errors.toString(StandardCharsets.UTF_8)).isEmpty();
             assertThat(exitCodes).isEmpty();
             assertThat(cacheDir).doesNotExist();
