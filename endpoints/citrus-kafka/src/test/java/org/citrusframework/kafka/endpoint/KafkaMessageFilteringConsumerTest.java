@@ -18,11 +18,15 @@ package org.citrusframework.kafka.endpoint;
 
 import java.time.Duration;
 import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeoutException;
 import java.util.stream.Stream;
 
+import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.citrusframework.context.TestContext;
 import org.citrusframework.exceptions.CitrusRuntimeException;
+import org.citrusframework.exceptions.MessageTimeoutException;
 import org.citrusframework.kafka.endpoint.selector.KafkaMessageSelector;
 import org.citrusframework.message.MessageSelectorBuilder;
 import org.junit.jupiter.api.Test;
@@ -38,6 +42,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.citrusframework.kafka.endpoint.selector.KafkaMessageByHeaderSelector.kafkaHeaderEquals;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 import static org.springframework.test.util.ReflectionTestUtils.setField;
 
 @SuppressWarnings("unchecked")
@@ -133,6 +138,58 @@ public class KafkaMessageFilteringConsumerTest {
         assertThatThrownBy(() -> fixture.receive(selector, testContextMock, TIMEOUT))
                 .isInstanceOf(CitrusRuntimeException.class)
                 .hasMessage(randomUUID);
+    }
+
+    @Test
+    void receive_reportsTimeoutWhenThePollUsesTheWholeReceiveBudget() {
+        KafkaConsumer<Object, Object> consumer = mock(KafkaConsumer.class);
+        when(consumer.poll(Duration.ofSeconds(2))).thenReturn(ConsumerRecords.empty());
+
+        var fixture = filteringConsumer(consumer, Duration.ofSeconds(4));
+
+        assertThatThrownBy(() -> fixture.receive("", new TestContext(), 2000))
+                .isInstanceOf(MessageTimeoutException.class);
+        assertThat(fixture.getKafkaMessageFilter().getPollTimeout()).isEqualTo(Duration.ofSeconds(4));
+    }
+
+    @Test
+    void receive_reportsNoMatchWhenThePollFinishesWithinTheReceiveBudget() {
+        KafkaConsumer<Object, Object> consumer = mock(KafkaConsumer.class);
+        when(consumer.poll(Duration.ofMillis(100))).thenReturn(ConsumerRecords.empty());
+
+        var fixture = filteringConsumer(consumer, Duration.ofMillis(100));
+
+        assertThatThrownBy(() -> fixture.receive("", new TestContext(), 2000))
+                .isExactlyInstanceOf(CitrusRuntimeException.class)
+                .hasMessageStartingWith("Failed to resolve Kafka message using selector");
+    }
+
+    @Test
+    void receive_reportsTimeoutWhenTheConsumerTaskIsStillRunning() {
+        KafkaConsumer<Object, Object> consumer = mock(KafkaConsumer.class);
+        when(consumer.partitionsFor("names")).thenAnswer(invocation -> {
+            new CountDownLatch(1).await();
+            throw new AssertionError("The consumer task should be cancelled");
+        });
+
+        var fixture = filteringConsumer(consumer, Duration.ofMillis(100));
+
+        assertThatThrownBy(() -> fixture.receive("", new TestContext(), 500))
+                .isInstanceOf(MessageTimeoutException.class)
+                .hasCauseInstanceOf(TimeoutException.class);
+    }
+
+    private static KafkaMessageFilteringConsumer filteringConsumer(KafkaConsumer<Object, Object> consumer,
+                                                                  Duration pollTimeout) {
+        var configuration = new KafkaEndpointConfiguration();
+        configuration.setTopic("names");
+        return KafkaMessageFilteringConsumer.builder()
+                .endpointConfiguration(configuration)
+                .consumer(consumer)
+                .pollTimeout(pollTimeout)
+                .eventLookbackWindow(Duration.ofSeconds(1))
+                .kafkaMessageSelector(kafkaHeaderEquals("Name", "Samwise"))
+                .build();
     }
 
     @Test

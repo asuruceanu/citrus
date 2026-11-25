@@ -20,11 +20,24 @@ import io.cucumber.java.en.Then;
 import org.assertj.core.api.Assertions;
 import org.citrusframework.Citrus;
 import org.citrusframework.annotations.CitrusFramework;
+import org.citrusframework.annotations.CitrusResource;
+import org.citrusframework.context.TestContext;
+import org.citrusframework.http.server.HttpServer;
 
 public class GroovyTestSteps {
 
     @CitrusFramework
     private Citrus citrus;
+
+    @CitrusResource
+    private TestContext context;
+
+    @Then("store the port of HTTP server {word} as {word}")
+    public void storeHttpServerPort(String endpoint, String variable) {
+        HttpServer server = citrus.getCitrusContext().getReferenceResolver().resolve(endpoint, HttpServer.class);
+        Assertions.assertThat(server.getPort()).isPositive();
+        context.setVariable(variable, server.getPort());
+    }
 
     @Then("^verify endpoint ([^\"\\s]+)$")
     public void verifyEndpointResolvable(String endpoint) {
