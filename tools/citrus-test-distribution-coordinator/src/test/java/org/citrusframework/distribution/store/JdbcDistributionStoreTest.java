@@ -539,7 +539,7 @@ class JdbcDistributionStoreTest {
             stmt.execute("CREATE TABLE dist_workers (worker_id VARCHAR(128) PRIMARY KEY, host VARCHAR(255), "
                     + "capabilities_json VARCHAR(4096), state VARCHAR(32), active_partition_id VARCHAR(64), "
                     + "last_heartbeat_at BIGINT, registered_at BIGINT)");
-            stmt.execute("INSERT INTO dist_workers VALUES ('w-legacy', 'h', '{}', 'IDLE', NULL, 1, 1)");
+            stmt.execute("INSERT INTO dist_workers VALUES ('w-legacy', 'h', '{\"os\":\"linux\"}', 'IDLE', NULL, 1, 1)");
         }
 
         WorkerCacheStats stats = new WorkerCacheStats(true, 1L, 2, 3L, 4L, 5L, false);
@@ -547,11 +547,13 @@ class JdbcDistributionStoreTest {
             store.initialize();
             store.initialize();
             assertThat(store.listWorkers()).containsExactly(
-                    new WorkerRecord("w-legacy", "h", Map.of(), WorkerState.IDLE, null, 1L, 1L));
-            var migrated = new WorkerRecord("w-legacy", "h", "2.0", "pool", "Linux", Map.of(), WorkerState.BUSY,
+                    new WorkerRecord("w-legacy", "h", Map.of("os", "linux"), WorkerState.IDLE, null, 1L, 1L));
+            var capabilities = Map.of("large", "x".repeat(5000), "tail", "exact");
+            var migrated = new WorkerRecord("w-legacy", "h", "2.0", "pool", "Linux", capabilities, WorkerState.BUSY,
                     "part", "Test > method", 2, 3, 1, stats,
                     List.of(new WorkerWarning(WorkerWarningCode.POOL_CAPABILITY_MISMATCH, "Missing docker", 2, 10)));
             store.upsertWorker(migrated);
+            store.initialize();
             assertThat(store.listWorkers()).containsExactly(migrated);
         }
     }

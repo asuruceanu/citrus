@@ -453,7 +453,7 @@ public final class DistributionWorkerClient implements AutoCloseable {
         switch (message.type()) {
             case WorkerWsMessage.WORKER_REGISTERED -> {
                 if (!closed.get() && registeredLatch.getCount() > 0) {
-                    if (config.poolId() != null && !config.poolId().isBlank()) {
+                    if (requiresPoolConfirmation()) {
                         long interval = config.registrationRenewalIntervalMs();
                         renewal = scheduler.scheduleWithFixedDelay(() -> renewRegistration(ws),
                                 interval, interval, TimeUnit.MILLISECONDS);
@@ -547,6 +547,42 @@ public final class DistributionWorkerClient implements AutoCloseable {
         }
     }
 
+    private boolean requiresPoolConfirmation() {
+        return config.poolId() != null && !config.poolId().isBlank();
+    }
+
+    private WorkerRejectedPayload registrationFailure(WorkerWsMessage message) {
+        if (message == null) {
+            return null;
+        }
+        if (WorkerWsMessage.WORKER_REJECTED.equals(message.type())) {
+            var reason = DistributionJson.convert(message.payload(), WorkerRejectedPayload.class);
+            return reason == null ? genericRejection() : new WorkerRejectedPayload(
+                    sanitizeReason(reason.code()), sanitizeReason(reason.message()));
+        }
+        if (requiresPoolConfirmation()) {
+            boolean unconfirmed = WorkerWsMessage.WORKER_REGISTERED.equals(message.type())
+                    && (message.payload() == null || !config.poolId().equals(message.payload().get("poolId")));
+            boolean prematureAssignment = WorkerWsMessage.PARTITION_ASSIGN.equals(message.type()) && registeredLatch.getCount() > 0;
+            if (unconfirmed || prematureAssignment) {
+                return new WorkerRejectedPayload("POOL_NOT_CONFIRMED", "The coordinator did not confirm the configured agent pool");
+            }
+        }
+        return null;
+    }
+
+    private String sanitizeReason(String value) {
+        if (value == null) {
+            return null;
+        }
+        for (String credential : new String[] {config.registrationKey(), config.authToken()}) {
+            if (credential != null && !credential.isEmpty()) {
+                value = value.replace(credential, "[redacted]");
+            }
+        }
+        return value.replace('\r', ' ').replace('\n', ' ');
+    }
+
     private static WorkerRejectedPayload genericRejection() {
         return new WorkerRejectedPayload("WORKER_REJECTED", "The coordinator rejected the worker registration");
     }
@@ -593,9 +629,9 @@ public final class DistributionWorkerClient implements AutoCloseable {
                 buffer.setLength(0);
                 try {
                     WorkerWsMessage msg = DistributionJson.fromJson(json, WorkerWsMessage.class);
-                    if (msg != null && WorkerWsMessage.WORKER_REJECTED.equals(msg.type())) {
-                        var reason = DistributionJson.convert(msg.payload(), WorkerRejectedPayload.class);
-                        disconnected(webSocket, reason != null ? reason : genericRejection());
+                    var reason = registrationFailure(msg);
+                    if (reason != null) {
+                        disconnected(webSocket, reason);
                     } else {
                         handleWsMessage(webSocket, msg);
                     }

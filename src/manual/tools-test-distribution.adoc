@@ -483,6 +483,7 @@ the `citrus.test.distribution.coordinatorUrl` system property. When neither is s
 `http://localhost:8084`.
 
 To join an <<tools-test-distribution-agent-pools,agent pool>>, configure its ID and a registration key belonging to it.
+Upgrade the coordinator before enabling pooled workers. A pooled worker stops if the coordinator cannot confirm its pool ID.
 The JBang worker accepts `--pool` / `-p` and `--registration-key` / `-k`. In Citrus Agent worker mode, use
 `--pool` and `--registration-key` / `-k`. The agent's `-p` selects a test package.
 

@@ -665,8 +665,9 @@ public final class SessionCoordinator {
         }
         long now = now();
         AgentPoolRecord updated = pools.update(previous, displayName, capabilities, now);
-        for (WorkerConnection conn : List.copyOf(workers.values())) {
-            if (conn.inPool(poolId) && !expireWarning(conn, now)) {
+        var affected = workersInPool(poolId);
+        for (WorkerConnection conn : affected) {
+            if (conn.expiredWarning(now) == null) {
                 conn.pool = updated;
                 if (CapabilityMatcher.matches(updated.capabilities(), conn.capabilities)) {
                     conn.warnings.remove(WorkerWarningCode.POOL_CAPABILITY_MISMATCH);
@@ -674,7 +675,11 @@ public final class SessionCoordinator {
                     conn.warn(WorkerWarningCode.POOL_CAPABILITY_MISMATCH, "Worker no longer meets pool capabilities",
                             now, config.poolDriftGraceMs());
                 }
-                persistWorker(conn);
+            }
+        }
+        for (WorkerConnection conn : affected) {
+            if (!expireWarning(conn, now)) {
+                tryPersistWorker(conn);
             }
         }
         poolUpdated(poolId);
@@ -687,12 +692,10 @@ public final class SessionCoordinator {
             return false;
         }
         long now = now();
-        for (WorkerConnection conn : workers.values()) {
-            if (conn.inPool(poolId)) {
-                conn.warn(WorkerWarningCode.POOL_DELETED, "Agent pool was deleted", now, config.poolDriftGraceMs());
-                persistWorker(conn);
-            }
-        }
+        var affected = workersInPool(poolId);
+        affected.forEach(conn -> conn.warn(WorkerWarningCode.POOL_DELETED, "Agent pool was deleted",
+                now, config.poolDriftGraceMs()));
+        affected.forEach(this::tryPersistWorker);
         eventHub.publish("pool.deleted", null, null, null, Map.of("poolId", poolId));
         return true;
     }
@@ -736,15 +739,16 @@ public final class SessionCoordinator {
             return Optional.empty();
         }
         var key = store.findRegistrationKey(keyId).orElseThrow().metadata();
-        for (WorkerConnection conn : workers.values()) {
-            if (conn.inPool(poolId) && conn.key.metadata().keyId().equals(keyId)) {
-                conn.warn(WorkerWarningCode.KEY_REVOKED, "Registration key was revoked", key.revokedAt(),
-                        config.keyRevocationGraceMs());
-                persistWorker(conn);
-            }
-        }
+        var affected = workersInPool(poolId).stream().filter(conn -> conn.key.metadata().keyId().equals(keyId)).toList();
+        affected.forEach(conn -> conn.warn(WorkerWarningCode.KEY_REVOKED, "Registration key was revoked",
+                key.revokedAt(), config.keyRevocationGraceMs()));
+        affected.forEach(this::tryPersistWorker);
         poolUpdated(poolId);
         return Optional.of(key);
+    }
+
+    private List<WorkerConnection> workersInPool(String poolId) {
+        return workers.values().stream().filter(conn -> conn.inPool(poolId)).toList();
     }
 
     private long now() {
@@ -764,8 +768,7 @@ public final class SessionCoordinator {
             terminate(workers.get(connectionId), RegistrationFailure.ALREADY_REGISTERED);
             return;
         }
-        if (workerId.length() > 128 || (payload.host() != null && payload.host().length() > 255)
-                || DistributionJson.toJson(payload.capabilities()).length() > 4096) {
+        if (workerId.length() > 128 || (payload.host() != null && payload.host().length() > 255)) {
             reject(workerId, sender, closer, RegistrationFailure.INVALID_WORKER_METADATA);
             return;
         }
@@ -808,7 +811,9 @@ public final class SessionCoordinator {
             handleWorkerDisconnect(connectionId);
             throw e;
         }
-        sender.accept(new WorkerWsMessage(WorkerWsMessage.WORKER_REGISTERED, Map.of("workerId", workerId)));
+        Map<String, Object> acknowledgement = pool == null ? Map.of("workerId", workerId)
+                : Map.of("workerId", workerId, "poolId", pool.poolId());
+        sender.accept(new WorkerWsMessage(WorkerWsMessage.WORKER_REGISTERED, acknowledgement));
         eventHub.publish("worker.registered", null, null, workerId, Map.of("host", conn.host,
                 "capabilities", conn.capabilities));
         dispatchPendingPartitions();
@@ -847,7 +852,7 @@ public final class SessionCoordinator {
         INVALID_REGISTRATION_KEY("Invalid registration credentials"),
         REVOKED_REGISTRATION_KEY("Registration key was revoked"),
         MISSING_POOL_CAPABILITIES("Worker does not meet mandatory pool capabilities"),
-        INVALID_WORKER_METADATA("Worker identity, host or capabilities exceed the supported length"),
+        INVALID_WORKER_METADATA("Worker identity or host exceeds the supported length"),
         ALREADY_REGISTERED("Connection is already registered");
 
         private final String message;
@@ -879,18 +884,17 @@ public final class SessionCoordinator {
     }
 
     private boolean expireWarning(WorkerConnection conn, long now) {
-        for (WorkerWarning warning : conn.warnings.values()) {
-            if (now >= warning.disconnectAt()) {
-                var failure = switch (warning.code()) {
-                    case KEY_REVOKED -> RegistrationFailure.REVOKED_REGISTRATION_KEY;
-                    case POOL_DELETED -> RegistrationFailure.POOL_NOT_FOUND;
-                    case POOL_CAPABILITY_MISMATCH -> RegistrationFailure.MISSING_POOL_CAPABILITIES;
-                };
-                terminate(conn, failure);
-                return true;
-            }
+        WorkerWarning warning = conn.expiredWarning(now);
+        if (warning == null) {
+            return false;
         }
-        return false;
+        var failure = switch (warning.code()) {
+            case KEY_REVOKED -> RegistrationFailure.REVOKED_REGISTRATION_KEY;
+            case POOL_DELETED -> RegistrationFailure.POOL_NOT_FOUND;
+            case POOL_CAPABILITY_MISMATCH -> RegistrationFailure.MISSING_POOL_CAPABILITIES;
+        };
+        terminate(conn, failure);
+        return true;
     }
 
     public synchronized void handleWorkerMessage(String connectionId, WorkerWsMessage message) {
@@ -933,7 +937,7 @@ public final class SessionCoordinator {
                         pr.lastProgressAt = now();
                     }
                 }
-                persistWorker(conn);
+                tryPersistWorker(conn);
             }
             case WorkerWsMessage.WORKER_DRAINING -> {
                 conn.state = WorkerState.DRAINING;
@@ -1113,7 +1117,7 @@ public final class SessionCoordinator {
         conn.warnings.clear();
         String inFlightPartitionId = conn.activePartitionId;
         conn.activePartitionId = null;
-        persistWorker(conn);
+        tryPersistWorker(conn);
 
         if (remaining.isEmpty()) {
             eventHub.publish("worker.offline", null, inFlightPartitionId, conn.workerId, Map.of());
@@ -1282,7 +1286,7 @@ public final class SessionCoordinator {
             matchingWorker.lastAssignedAt = ++assignmentSequence;
             matchingWorker.activePartitionId = pr.record.partitionId();
             pr.activeConnectionId = matchingWorker.connectionId;
-            persistWorker(matchingWorker);
+            tryPersistWorker(matchingWorker);
 
             PartitionAssignPayload assignPayload = new PartitionAssignPayload(
                     pr.record.partitionId(),
@@ -1383,7 +1387,7 @@ public final class SessionCoordinator {
                 && conn.cancelledPartitionId == null
                 && !conn.warnings.containsKey(WorkerWarningCode.POOL_DELETED)
                 && conn.lastHeartbeatAt >= now - config.leaseTimeoutMs()
-                && conn.warnings.values().stream().noneMatch(w -> now >= w.disconnectAt())
+                && conn.expiredWarning(now) == null
                 && (conn.pool == null || (current != null && CapabilityMatcher.matches(requirements, current.capabilities())))
                 && CapabilityMatcher.matches(requirements, conn.capabilities);
     }
@@ -1418,6 +1422,15 @@ public final class SessionCoordinator {
         return connections.getLast();
     }
 
+    /** A worker status projection must not interrupt an assignment or a committed pool transition. */
+    private void tryPersistWorker(WorkerConnection conn) {
+        try {
+            persistWorker(conn);
+        } catch (RuntimeException e) {
+            LOG.warn("Could not persist status for worker {}", conn.workerId, e);
+        }
+    }
+
     private void persistWorker(WorkerConnection conn) {
         if (conn.activePartitionId == null) {
             conn.activeTests.clear();
@@ -1438,11 +1451,19 @@ public final class SessionCoordinator {
         WorkerConnection displayed = connections == null ? conn : displayedWorker(connections);
         WorkerRecord visible = displayed == conn ? row : displayed.lastPersisted;
         store.upsertWorker(visible);
-        if (stateChanged || !Objects.equals(old.poolDisplayName(), row.poolDisplayName())
-                || !old.warnings().equals(row.warnings()) || !Objects.equals(old.cacheStats(), row.cacheStats())) {
-            eventHub.publish("worker.updated", null, visible.activePartitionId(), visible.workerId(), Map.of("state", visible.state().name()));
-        }
         conn.lastPersisted = row;
+        if (conn.updatePending || stateChanged || !Objects.equals(old.poolDisplayName(), row.poolDisplayName())
+                || !old.warnings().equals(row.warnings()) || !Objects.equals(old.cacheStats(), row.cacheStats())) {
+            try {
+                eventHub.publish("worker.updated", null, visible.activePartitionId(), visible.workerId(),
+                        Map.of("state", visible.state().name()));
+                conn.updatePending = false;
+            } catch (RuntimeException e) {
+                // The row already committed. Retry the notification with the latest visible status on the next heartbeat.
+                conn.updatePending = true;
+                LOG.warn("Could not publish status update for worker {}", conn.workerId, e);
+            }
+        }
     }
 
     private void resetPersistedWorker(WorkerRecord worker, WorkerState state) {
@@ -1745,6 +1766,7 @@ public final class SessionCoordinator {
         private long lastHeartbeatAt;
         private long stateUpdatedAt;
         private WorkerRecord lastPersisted;
+        private boolean updatePending;
         private WorkerState state = WorkerState.IDLE;
         /** Sequence number of this worker's latest assignment (0 = never), for least-recently-used dispatch. */
         private long lastAssignedAt;
@@ -1785,6 +1807,10 @@ public final class SessionCoordinator {
 
         private boolean inPool(String id) {
             return pool != null && pool.poolId().equals(id) && !warnings.containsKey(WorkerWarningCode.POOL_DELETED);
+        }
+
+        private WorkerWarning expiredWarning(long now) {
+            return warnings.values().stream().filter(warning -> now >= warning.disconnectAt()).findFirst().orElse(null);
         }
 
         private boolean utilized() {

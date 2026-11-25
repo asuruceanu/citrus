@@ -341,7 +341,7 @@ class DistCommandTest extends CommandTest {
             var server = vertx.createHttpServer().webSocketHandler(socket -> socket.textMessageHandler(json -> {
                 String type = DistributionJson.fromJson(json, WorkerWsMessage.class).type();
                 if (WorkerWsMessage.WORKER_REGISTER.equals(type)) {
-                    socket.writeTextMessage(DistributionJson.toJson(new WorkerWsMessage(WorkerWsMessage.WORKER_REGISTERED, Map.of())));
+                    socket.writeTextMessage(DistributionJson.toJson(new WorkerWsMessage(WorkerWsMessage.WORKER_REGISTERED, Map.of("poolId", "pool1"))));
                 } else if (WorkerWsMessage.WORKER_RENEW.equals(type)) {
                     socket.writeTextMessage(DistributionJson.toJson(new WorkerWsMessage(WorkerWsMessage.WORKER_REJECTED,
                             Map.of("code", "INVALID_REGISTRATION_KEY", "message", "Key revoked: test-secret"))));

@@ -155,6 +155,48 @@ class DistributionWorkerClientTest {
     }
 
     @Test
+    void rejectsPooledRegistrationsWithoutMatchingConfirmationAndClosesTheSocket() throws Exception {
+        var responses = List.of(
+                new WorkerWsMessage(WorkerWsMessage.WORKER_REGISTERED, Map.of("workerId", "worker1")),
+                new WorkerWsMessage(WorkerWsMessage.WORKER_REGISTERED, Map.of("poolId", "unexpected-secret")),
+                new WorkerWsMessage(WorkerWsMessage.PARTITION_ASSIGN, Map.of()));
+        for (WorkerWsMessage response : responses) {
+            try (var peer = new WorkerPeer(); var worker = new DistributionWorkerClient(peer.config(tempDir))) {
+                worker.start();
+                var socket = peer.nextSocket();
+                var closed = new CompletableFuture<Void>();
+                socket.closeHandler(ignored -> closed.complete(null));
+                peer.nextMessage(WorkerWsMessage.WORKER_REGISTER);
+                var callbackOutsideLock = new CompletableFuture<Boolean>();
+                worker.onRejection(() -> callbackOutsideLock.complete(!Thread.holdsLock(worker)));
+                peer.write(socket, response.type(), response.payload());
+                assertThat(worker.awaitRegistration(2, TimeUnit.SECONDS)).isFalse();
+                assertThat(callbackOutsideLock.get(2, TimeUnit.SECONDS)).isTrue();
+                assertThat(worker.rejectionReason()).hasValueSatisfying(reason -> {
+                    assertThat(reason.code()).isEqualTo("POOL_NOT_CONFIRMED");
+                    assertThat(reason.message()).doesNotContain("test-key", "unexpected-secret");
+                });
+                closed.get(2, TimeUnit.SECONDS);
+                assertThat(peer.sockets.poll(200, TimeUnit.MILLISECONDS)).isNull();
+                assertThat(peer.messages).isEmpty();
+            }
+        }
+    }
+
+    @Test
+    void acceptsLegacyRegistrationAcknowledgementForAnUnpooledWorker() throws Exception {
+        try (var peer = new WorkerPeer(); var worker = new DistributionWorkerClient(DistributionWorkerConfig.builder()
+                .workerId("worker1").cacheDir(tempDir).coordinatorUrl("http://127.0.0.1:" + peer.server.actualPort()).build())) {
+            worker.start();
+            var socket = peer.nextSocket();
+            peer.nextMessage(WorkerWsMessage.WORKER_REGISTER);
+            peer.write(socket, WorkerWsMessage.WORKER_REGISTERED, Map.of("workerId", "worker1"));
+            assertThat(worker.awaitRegistration(2, TimeUnit.SECONDS)).isTrue();
+            assertThat(worker.rejectionReason()).isEmpty();
+        }
+    }
+
+    @Test
     void shouldRenewOnlyAfterRegistrationOnEachConnectionAndStopOnRejection() throws Exception {
         try (var peer = new WorkerPeer(); var worker = new DistributionWorkerClient(peer.config(tempDir))) {
             worker.start();
@@ -164,7 +206,7 @@ class DistributionWorkerClientTest {
                 assertThat(register.payload()).containsEntry("poolId", "pool1").containsEntry("registrationKey", "test-key")
                         .containsEntry("version", "v1");
                 assertThat(peer.messages.poll(300, TimeUnit.MILLISECONDS)).isNull();
-                peer.write(socket, WorkerWsMessage.WORKER_REGISTERED, Map.of());
+                peer.write(socket, WorkerWsMessage.WORKER_REGISTERED, Map.of("poolId", "pool1"));
                 assertThat(worker.awaitRegistration(2, TimeUnit.SECONDS)).isTrue();
                 for (int renewal = 0; renewal < 2; renewal++) {
                     var renew = peer.nextMessage(WorkerWsMessage.WORKER_RENEW);

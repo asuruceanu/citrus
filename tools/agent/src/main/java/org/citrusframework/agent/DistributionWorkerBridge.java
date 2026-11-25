@@ -24,16 +24,22 @@ import org.citrusframework.distribution.config.DistributionSettings;
 import org.citrusframework.distribution.worker.DistributionWorkerClient;
 import org.citrusframework.distribution.worker.DistributionWorkerConfig;
 import org.citrusframework.util.StringUtils;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Lifecycle bridge connecting {@link CitrusAgentServer} worker mode to {@link DistributionWorkerClient}.
  */
 final class DistributionWorkerBridge implements AutoCloseable {
 
+    private static final Logger LOG = LoggerFactory.getLogger(DistributionWorkerBridge.class);
+
     private final DistributionWorkerClient workerClient;
 
     DistributionWorkerBridge(DistributionWorkerConfig configuration) {
         this.workerClient = new DistributionWorkerClient(configuration);
+        workerClient.onRejection(() -> workerClient.rejectionReason().ifPresent(reason ->
+                LOG.warn("Distribution worker registration rejected ({}): {}", reason.code(), reason.message())));
     }
 
     /**

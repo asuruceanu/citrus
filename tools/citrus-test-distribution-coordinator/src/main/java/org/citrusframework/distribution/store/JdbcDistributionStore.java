@@ -162,7 +162,7 @@ public class JdbcDistributionStore implements DistributionStore {
                 "CREATE TABLE IF NOT EXISTS dist_workers (" +
                         "worker_id VARCHAR(128) PRIMARY KEY, " +
                         "host VARCHAR(255), " +
-                        "capabilities_json VARCHAR(4096), " +
+                        "capabilities_json " + longText + ", " +
                         "state VARCHAR(32), " +
                         "active_partition_id VARCHAR(64), " +
                         "last_heartbeat_at BIGINT, " +
@@ -261,6 +261,7 @@ public class JdbcDistributionStore implements DistributionStore {
     private static void ensureColumns(Connection conn, Statement stmt, String longText) throws SQLException {
         Map<String, java.util.Set<String>> existing = new java.util.HashMap<>();
         String partitionsTable = null;
+        boolean widenWorkerCapabilities = false;
         try (ResultSet rs = conn.getMetaData().getColumns(conn.getCatalog(), conn.getSchema(), null, null)) {
             while (rs.next()) {
                 String table = rs.getString("TABLE_NAME");
@@ -268,11 +269,17 @@ public class JdbcDistributionStore implements DistributionStore {
                 if (table != null && col != null) {
                     existing.computeIfAbsent(table.toLowerCase(Locale.ROOT), k -> new java.util.HashSet<>())
                             .add(col.toLowerCase(Locale.ROOT));
+                    if ("dist_workers".equalsIgnoreCase(table) && "capabilities_json".equalsIgnoreCase(col)) {
+                        widenWorkerCapabilities = !longText.equalsIgnoreCase(rs.getString("TYPE_NAME"));
+                    }
                     if ("dist_partitions".equalsIgnoreCase(table)) {
                         partitionsTable = table;
                     }
                 }
             }
+        }
+        if (widenWorkerCapabilities) {
+            stmt.execute("ALTER TABLE dist_workers ALTER COLUMN capabilities_json SET DATA TYPE " + longText);
         }
         Map<String, Map<String, String>> additions = new LinkedHashMap<>();
         Map<String, String> partitionColumns = new LinkedHashMap<>();
@@ -953,7 +960,7 @@ public class JdbcDistributionStore implements DistributionStore {
     private static int writeWorker(Connection conn, String sql, WorkerRecord worker) throws SQLException {
         try (PreparedStatement ps = conn.prepareStatement(sql)) {
             ps.setString(1, worker.host());
-            ps.setString(2, truncate(DistributionJson.toJson(worker.capabilities()), 4096));
+            ps.setString(2, DistributionJson.toJson(worker.capabilities()));
             ps.setString(3, worker.state().name());
             ps.setString(4, worker.activePartitionId());
             ps.setLong(5, worker.lastHeartbeatAt());

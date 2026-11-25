@@ -205,6 +205,51 @@ class CitrusAgentWorkerOptionsTest {
     }
 
     @Test
+    @ResourceLock(Resources.SYSTEM_OUT)
+    void logsOneSanitizedWorkerRejectionWhileKeepingTheStandaloneAgentRunning() throws Exception {
+        var peer = Vertx.vertx();
+        var messages = new java.util.concurrent.LinkedBlockingQueue<String>();
+        var appender = new AbstractAppender("agent-worker-rejection", null, null, true, Property.EMPTY_ARRAY) {
+            @Override
+            public void append(LogEvent event) {
+                messages.add(event.getMessage().getFormattedMessage());
+            }
+        };
+        var logger = (Logger) LogManager.getLogger(DistributionWorkerBridge.class);
+        var previousLevel = logger.getLevel();
+        var originalOutput = System.out;
+        appender.start();
+        logger.addAppender(appender);
+        logger.setLevel(Level.WARN);
+        try {
+            var endpoint = peer.createHttpServer().webSocketHandler(socket -> socket.textMessageHandler(message ->
+                    socket.writeTextMessage("""
+                            {"type":"worker.rejected","payload":{"code":"INVALID_REGISTRATION_KEY",
+                            "message":"Invalid worker-key and bearer-secret"}}
+                            """))).listen(0, "127.0.0.1").toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
+            var server = new CitrusAgentServer(parse("--mode", "worker", "--port", "0", "--duration", "-1",
+                    "--coordinator-url", "http://127.0.0.1:" + endpoint.actualPort(), "--pool", "pool1",
+                    "--registration-key", "worker-key", "--auth-token", "bearer-secret",
+                    "--cache-dir", tempDir.resolve("rejection").toString()));
+            try {
+                server.start();
+                assertThat(messages.poll(3, TimeUnit.SECONDS)).contains("INVALID_REGISTRATION_KEY")
+                        .doesNotContain("worker-key", "bearer-secret");
+                assertThat(server.isRunning()).isTrue();
+            } finally {
+                server.stop();
+            }
+            assertThat(messages).isEmpty();
+        } finally {
+            logger.removeAppender(appender);
+            logger.setLevel(previousLevel);
+            appender.stop();
+            System.setOut(originalOutput);
+            peer.close().toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
     void shouldKeepPackageShortOptionAndForwardPoolCredentials() {
         var options = parse("--mode", "worker", "-p", "com.acme.tests", "--pool", "pool1", "-k", "ctrk_1_2");
         assertThat(options.getPackages()).containsExactly("com.acme.tests");

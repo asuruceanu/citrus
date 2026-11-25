@@ -292,7 +292,9 @@ class DistributionCoordinatorServerTest {
             var worker = connectWorker(server.wsUrl(), collector, new WorkerRegisterPayload("worker", "host", null,
                     poolId, key.secretKey(), Map.of(), null));
             try {
-                assertThat(collector.nextMessage().type()).isEqualTo(WorkerWsMessage.WORKER_REGISTERED);
+                var acknowledgement = collector.nextMessage();
+                assertThat(acknowledgement.type()).isEqualTo(WorkerWsMessage.WORKER_REGISTERED);
+                assertThat(acknowledgement.payload()).containsExactlyInAnyOrderEntriesOf(Map.of("workerId", "worker", "poolId", poolId));
                 var stream = httpClient.send(HttpRequest.newBuilder(URI.create(server.baseUrl() + "/api/v1/events/stream"))
                         .build(), HttpResponse.BodyHandlers.ofLines());
                 assertThat(stream.statusCode()).isEqualTo(200);

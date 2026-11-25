@@ -1530,6 +1530,143 @@ class SessionCoordinatorTest {
     }
 
     @Test
+    void registersLegacyWorkersWithLargeCapabilityMapsAndMatchesTheirExactValues() {
+        useControlledClock(false);
+        var capabilities = Map.of("large", "x".repeat(5000), "variant", "exact");
+        var worker = register("legacy", "legacy", capabilities);
+        assertThat(worker.messagesOfType(WorkerWsMessage.WORKER_REGISTERED)).hasSize(1);
+        assertThat(row("legacy").capabilities()).isEqualTo(capabilities);
+        var session = newSession(0);
+        demand(session, "wrong", Map.of("variant", "other"));
+        demand(session, "right", Map.of("variant", "exact"));
+        assertThat(worker.assignments()).singleElement().satisfies(
+                assignment -> assertThat(assignment.workUnits().getFirst().key()).isEqualTo("right"));
+        assertThat(coordinator.sampleUsageNow().unpooledWorkers().getFirst().capabilities()).isEqualTo(capabilities);
+    }
+
+    private static final class FailingWorkerProjectionStore extends JdbcDistributionStore {
+        private boolean failWorkerRow;
+        private boolean failWorkerEvent;
+
+        FailingWorkerProjectionStore() {
+            super("jdbc:hsqldb:mem:worker_projection_" + System.nanoTime(), "SA", "");
+        }
+
+        @Override
+        public void upsertWorker(WorkerRecord worker) {
+            if (failWorkerRow) {
+                failWorkerRow = false;
+                throw new IllegalStateException("Simulated worker row failure");
+            }
+            super.upsertWorker(worker);
+        }
+
+        @Override
+        public long appendEvent(CoordinatorEvent event, String deliveryId, TestExecutionRecord result,
+                                List<PartitionRecord> partitions) {
+            if (failWorkerEvent && "worker.updated".equals(event.type())) {
+                failWorkerEvent = false;
+                throw new IllegalStateException("Simulated worker event failure");
+            }
+            return super.appendEvent(event, deliveryId, result, partitions);
+        }
+    }
+
+    private AtomicLong useProjectionStore(FailingWorkerProjectionStore failing) {
+        failing.initialize();
+        store = failing;
+        hub = new CoordinatorEventStreamHub(store);
+        return useControlledClock(false);
+    }
+
+    @Test
+    void preservesDeletedPoolGraceForEveryConnectionWhenWorkerProjectionFails() {
+        try (var failing = new FailingWorkerProjectionStore()) {
+            var clock = useProjectionStore(failing);
+            var pool = coordinator.createAgentPool("Retiring", JDK, true, null);
+            String id = pool.pool().poolId();
+            String key = pool.generatedKey().secretKey();
+            var first = join("first", id, key, JDK);
+            var second = join("second", id, key, JDK);
+            failing.failWorkerRow = true;
+            assertThat(coordinator.deleteAgentPool(id)).isTrue();
+            long deadline = clock.get() + 14_400_000L;
+            clock.set(deadline - 1);
+            demand(newSession(0), "unassigned", JDK);
+            for (Worker worker : List.of(first, second)) {
+                renew(worker, id, key);
+                assertThat(worker.messagesOfType(WorkerWsMessage.WORKER_RENEWED)).hasSize(1);
+                worker.heartbeat(null);
+                assertThat(row(worker.connectionId).warnings()).singleElement().satisfies(warning -> {
+                    assertThat(warning.code()).isEqualTo(WorkerWarningCode.POOL_DELETED);
+                    assertThat(warning.disconnectAt()).isEqualTo(deadline);
+                });
+                assertThat(worker.assignments()).isEmpty();
+            }
+            clock.set(deadline);
+            coordinator.sweepExpiredLeases();
+            assertRejected(first, "POOL_NOT_FOUND");
+            assertRejected(second, "POOL_NOT_FOUND");
+        }
+    }
+
+    @Test
+    void appliesPoolEditsAndRevocationsToAllWorkersWhenTheirUpdateEventFails() {
+        try (var failing = new FailingWorkerProjectionStore()) {
+            var clock = useProjectionStore(failing);
+            var pool = coordinator.createAgentPool("Pool", JDK, true, null);
+            String id = pool.pool().poolId();
+            String key = pool.generatedKey().secretKey();
+            var first = join("first", id, key, JDK);
+            var second = join("second", id, key, JDK);
+            failing.failWorkerEvent = true;
+            coordinator.updateAgentPool(id, "Renamed", DOCKER);
+            for (Worker worker : List.of(first, second)) {
+                worker.heartbeat(null);
+                assertThat(row(worker.connectionId).warnings()).singleElement().satisfies(warning -> {
+                    assertThat(warning.code()).isEqualTo(WorkerWarningCode.POOL_CAPABILITY_MISMATCH);
+                    assertThat(warning.detectedAt()).isEqualTo(clock.get());
+                });
+            }
+            failing.failWorkerRow = true;
+            coordinator.revokeRegistrationKey(id, pool.generatedKey().metadata().keyId());
+            for (Worker worker : List.of(first, second)) {
+                worker.heartbeat(null);
+                assertThat(row(worker.connectionId).warnings()).anySatisfy(warning -> {
+                    assertThat(warning.code()).isEqualTo(WorkerWarningCode.KEY_REVOKED);
+                    assertThat(warning.disconnectAt()).isEqualTo(clock.get() + 3_600_000L);
+                });
+            }
+            clock.addAndGet(3_600_000L);
+            coordinator.sweepExpiredLeases();
+            assertRejected(first, "REVOKED_REGISTRATION_KEY");
+            assertRejected(second, "REVOKED_REGISTRATION_KEY");
+        }
+    }
+
+    @Test
+    void dispatchesCommittedAssignmentAndRetriesItsWorkerUpdateOnHeartbeat() {
+        try (var failing = new FailingWorkerProjectionStore()) {
+            var clock = useProjectionStore(failing);
+            var worker = join("worker", null, null, JDK);
+            var session = newSession(0);
+            failing.failWorkerEvent = true;
+            demand(session, "only-attempt", JDK);
+            var assignment = worker.lastAssignment();
+            assertThat(partition(session).state()).isEqualTo(PartitionState.ASSIGNED);
+            long assignedAt = row("worker").stateUpdatedAt();
+            assertThat(lastEvent(null, "worker.updated").data()).containsEntry("state", "IDLE");
+            clock.incrementAndGet();
+            worker.heartbeat(assignment.partitionId());
+            assertThat(row("worker").stateUpdatedAt()).isEqualTo(assignedAt);
+            assertThat(lastEvent(null, "worker.updated").data()).containsEntry("state", "BUSY");
+            worker.complete(assignment, 1, List.of());
+            assertThat(partition(session).state()).isEqualTo(PartitionState.COMPLETED);
+            assertThat(worker.assignments()).hasSize(1);
+        }
+    }
+
+    @Test
     void samplesLegacyUnpooledCapabilitiesContainingNullValues() {
         useControlledClock(false);
         var capabilities = new java.util.LinkedHashMap<String, String>();
