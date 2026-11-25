@@ -1,5 +1,28 @@
 = Citrus Agent
 
-The Citrus agent is a Quarkus web application capable of running Citrus tests.
-The agent can be used as a local service or as a Docker image deployed to Kubernetes to run tests inside the platform.
+Citrus Agent is a Vert.x HTTP server for running Citrus tests. It exposes a REST API and a Web UI.
+In standalone mode it runs matching tests at startup by default and accepts on-demand test requests.
 
+With the executable `citrus-agent.jar` and its packaged `lib/` directory beside it, start the standalone server
+and open http://localhost:4567[the agent Web UI].
+
+[source,bash]
+----
+java -jar citrus-agent.jar
+----
+
+To execute partitions from a Test Distribution coordinator, start the agent in worker mode. Pass the coordinator
+address explicitly when it listens on its default port, `8765`. The agent skips startup tests and continues serving
+the Web UI and on-demand requests.
+
+[source,bash]
+----
+java -jar citrus-agent.jar --mode worker --coordinator-url http://localhost:8765
+----
+
+In the Citrus Agent container image, set `CITRUS_AGENT_MODE=worker` and `CITRUS_DIST_COORDINATOR_URL` to the
+coordinator's reachable address. To join a pool, supply `CITRUS_DIST_WORKER_POOL` and
+`CITRUS_DIST_WORKER_REGISTRATION_KEY`. If the coordinator requires a bearer token, set `CITRUS_DIST_AUTH_TOKEN`.
+
+See the link:../../src/manual/agent.adoc[agent manual] for REST operations and deployment examples, and the
+link:../../src/manual/tools-test-distribution.adoc[Test Distribution manual] for worker settings and lifecycle.
