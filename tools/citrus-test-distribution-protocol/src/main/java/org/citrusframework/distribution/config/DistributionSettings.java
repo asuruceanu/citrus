@@ -25,11 +25,13 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.OptionalInt;
+import java.util.Properties;
 import java.util.function.UnaryOperator;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 import org.citrusframework.distribution.model.PartitionPolicy;
+import org.citrusframework.distribution.scheduler.CapabilityMatcher;
 
 /**
  * Centralized configuration keys, environment variable fallbacks, and host capability detection
@@ -83,6 +85,10 @@ public final class DistributionSettings {
     public static final String COORDINATOR_MAX_WAVES_PER_WORKER_ENV = "CITRUS_DIST_COORDINATOR_MAX_WAVES_PER_WORKER";
     public static final int DEFAULT_COORDINATOR_MAX_WAVES_PER_WORKER = 2;
 
+    public static final String COORDINATOR_REQUIRE_AGENT_POOL_PROPERTY =
+            "citrus.test.distribution.coordinator.requireAgentPool";
+    public static final String COORDINATOR_REQUIRE_AGENT_POOL_ENV = "CITRUS_DIST_COORDINATOR_REQUIRE_AGENT_POOL";
+
     public static final String MIN_REMOTE_DURATION_MS_PROPERTY = "citrus.test.distribution.minRemoteDurationMs";
     public static final String MIN_REMOTE_DURATION_MS_ENV = "CITRUS_DIST_MIN_REMOTE_DURATION_MS";
     public static final long DEFAULT_MIN_REMOTE_DURATION_MS = 2_000L;
@@ -120,6 +126,22 @@ public final class DistributionSettings {
     public static final String CACHE_DIR_PROPERTY = "citrus.test.distribution.cacheDir";
     public static final String CACHE_DIR_ENV = "CITRUS_DIST_CACHE_DIR";
     public static final String DEFAULT_CACHE_DIR = ".citrus-dist/cache";
+
+    public static final String WORKER_POOL_PROPERTY = "citrus.test.distribution.worker.pool";
+    public static final String WORKER_POOL_ENV = "CITRUS_DIST_WORKER_POOL";
+    public static final String DEVELOCITY_AGENT_POOL_ENV = "TEST_DISTRIBUTION_AGENT_POOL";
+
+    public static final String WORKER_REGISTRATION_KEY_PROPERTY = "citrus.test.distribution.worker.registrationKey";
+    public static final String WORKER_REGISTRATION_KEY_ENV = "CITRUS_DIST_WORKER_REGISTRATION_KEY";
+    public static final String DEVELOCITY_AGENT_REGISTRATION_KEY_ENV = "TEST_DISTRIBUTION_AGENT_REGISTRATION_KEY";
+
+    public static final String WORKER_ID_PROPERTY = "citrus.test.distribution.worker.id";
+    public static final String WORKER_ID_ENV = "CITRUS_DIST_WORKER_ID";
+    public static final String DEVELOCITY_AGENT_NAME_ENV = "TEST_DISTRIBUTION_AGENT_NAME";
+
+    public static final String WORKER_CAPABILITIES_PROPERTY = "citrus.test.distribution.worker.capabilities";
+    public static final String WORKER_CAPABILITIES_ENV = "CITRUS_DIST_WORKER_CAPABILITIES";
+    public static final String DEVELOCITY_AGENT_CAPABILITIES_ENV = "TEST_DISTRIBUTION_AGENT_CAPABILITIES";
 
     public static final String WORKER_CACHE_DIR_PROPERTY = "citrus.test.distribution.worker.cacheDir";
     public static final String WORKER_CACHE_DIR_ENV = "CITRUS_DIST_WORKER_CACHE_DIR";
@@ -431,6 +453,15 @@ public final class DistributionSettings {
                 DEFAULT_COORDINATOR_MAX_WAVES_PER_WORKER));
     }
 
+    public static boolean isCoordinatorRequireAgentPool() {
+        return isCoordinatorRequireAgentPool(System::getProperty, System::getenv);
+    }
+
+    static boolean isCoordinatorRequireAgentPool(UnaryOperator<String> prop, UnaryOperator<String> env) {
+        return Boolean.parseBoolean(getString(prop, env, COORDINATOR_REQUIRE_AGENT_POOL_PROPERTY,
+                COORDINATOR_REQUIRE_AGENT_POOL_ENV, null));
+    }
+
     public static int getMaxRetries() {
         return Math.max(0, getInt(MAX_RETRIES_PROPERTY, MAX_RETRIES_ENV, DEFAULT_MAX_RETRIES));
     }
@@ -461,6 +492,37 @@ public final class DistributionSettings {
 
     public static String getCacheDir() {
         return getString(CACHE_DIR_PROPERTY, CACHE_DIR_ENV, DEFAULT_CACHE_DIR);
+    }
+
+    public static String resolveWorkerPool(Properties properties, Map<String, String> environment) {
+        return resolveWorkerSetting(properties, environment, WORKER_POOL_PROPERTY, WORKER_POOL_ENV,
+                DEVELOCITY_AGENT_POOL_ENV);
+    }
+
+    public static String resolveWorkerRegistrationKey(Properties properties, Map<String, String> environment) {
+        return resolveWorkerSetting(properties, environment, WORKER_REGISTRATION_KEY_PROPERTY, WORKER_REGISTRATION_KEY_ENV,
+                DEVELOCITY_AGENT_REGISTRATION_KEY_ENV);
+    }
+
+    public static String resolveWorkerId(Properties properties, Map<String, String> environment) {
+        return resolveWorkerSetting(properties, environment, WORKER_ID_PROPERTY, WORKER_ID_ENV, DEVELOCITY_AGENT_NAME_ENV);
+    }
+
+    public static String resolveWorkerCapabilitiesCsv(Properties properties, Map<String, String> environment) {
+        return resolveWorkerSetting(properties, environment, WORKER_CAPABILITIES_PROPERTY, WORKER_CAPABILITIES_ENV,
+                DEVELOCITY_AGENT_CAPABILITIES_ENV);
+    }
+
+    private static String resolveWorkerSetting(Properties properties, Map<String, String> environment,
+                                               String propertyKey, String environmentKey, String aliasKey) {
+        String value = environment.get(environmentKey);
+        if (value == null || value.isBlank()) {
+            value = environment.get(aliasKey);
+        }
+        if (value == null || value.isBlank()) {
+            value = properties.getProperty(propertyKey);
+        }
+        return value == null || value.isBlank() ? null : value.trim();
     }
 
     /** Default worker file cache directory, private to one worker host account. */
@@ -660,6 +722,26 @@ public final class DistributionSettings {
             } else {
                 parsed.put(trimmed, "true");
             }
+        }
+        return parsed;
+    }
+
+    /**
+     * Parses strict comma-separated capability tokens. A bare key has the value {@code true}.
+     *
+     * @throws IllegalArgumentException if any entry has an invalid key or value
+     */
+    public static Map<String, String> parseStrictCapabilitiesCsv(String csv) {
+        Map<String, String> parsed = new LinkedHashMap<>();
+        if (csv == null || csv.isBlank()) {
+            return parsed;
+        }
+        for (String entry : csv.split(",", -1)) {
+            String[] pair = entry.split("=", 2);
+            String key = pair[0].trim();
+            String value = pair.length == 2 ? pair[1].trim() : "true";
+            CapabilityMatcher.validateCapabilities(Map.of(key, value));
+            parsed.put(key, value);
         }
         return parsed;
     }

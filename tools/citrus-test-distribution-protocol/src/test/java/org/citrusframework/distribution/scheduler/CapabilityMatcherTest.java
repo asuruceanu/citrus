@@ -17,14 +17,18 @@
 package org.citrusframework.distribution.scheduler;
 
 import java.lang.reflect.Method;
+import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 import org.citrusframework.distribution.annotations.AgentRequirement;
 import org.citrusframework.distribution.annotations.LocalOnly;
 import org.citrusframework.distribution.annotations.RemoteOnly;
+import org.citrusframework.distribution.config.DistributionSettings;
 import org.junit.jupiter.api.Test;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class CapabilityMatcherTest {
 
@@ -38,13 +42,52 @@ class CapabilityMatcherTest {
     @AgentRequirement(key = "os", value = "linux")
     @AgentRequirement(key = "memoryMb", value = "4096")
     static class RemoteCapabilitySampleTest {
-        @AgentRequirement(key = "docker", value = "true")
+        @AgentRequirement(key = "docker")
         @AgentRequirement(key = "memoryMb", value = ">=8192")
         void heavyDockerTest() {
         }
 
         void normalRemoteTest() {
         }
+    }
+
+    @Test
+    void shouldDefaultBareAgentRequirementsAndCapabilitiesToTrue() throws Exception {
+        Method method = RemoteCapabilitySampleTest.class.getDeclaredMethod("heavyDockerTest");
+        assertThat(method.getAnnotationsByType(AgentRequirement.class))
+                .anyMatch(requirement -> requirement.key().equals("docker") && requirement.value().equals("true"));
+        Map<String, String> worker = DistributionSettings.parseStrictCapabilitiesCsv("docker,postgres=18");
+        assertThat(worker).containsExactlyInAnyOrderEntriesOf(Map.of("docker", "true", "postgres", "18"));
+        assertThat(CapabilityMatcher.matches(Map.of("docker", "true"), worker)).isTrue();
+    }
+
+    @Test
+    void shouldRejectInvalidStrictCapabilityEntries() {
+        for (String csv : List.of("a=b=c", "bad space=1", "=val", "key=", "docker,,postgres", "docker,")) {
+            assertThatThrownBy(() -> DistributionSettings.parseStrictCapabilitiesCsv(csv))
+                    .as("strict capability entry in %s", csv)
+                    .isInstanceOf(IllegalArgumentException.class);
+        }
+        assertThat(DistributionSettings.parseStrictCapabilitiesCsv("label_1.2-x=value-2.0"))
+                .containsExactlyEntriesOf(Map.of("label_1.2-x", "value-2.0"));
+        assertThat(DistributionSettings.parseStrictCapabilitiesCsv(null)).isEmpty();
+        assertThat(DistributionSettings.parseStrictCapabilitiesCsv(" ")).isEmpty();
+        assertThat(DistributionSettings.parseCapabilitiesCsv("bad space=1,a=b=c,key="))
+                .containsExactlyInAnyOrderEntriesOf(Map.of("bad space", "1", "a", "b=c", "key", ""));
+    }
+
+    @Test
+    void shouldValidateCapabilityMapsWithoutChangingMatcherSemantics() {
+        CapabilityMatcher.validateCapabilities(Map.of("capability_1.2-x", "value-2.0"));
+        assertThatThrownBy(() -> CapabilityMatcher.validateCapabilities(Map.of("bad key", "value")))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> CapabilityMatcher.validateCapabilities(Map.of("key", "bad=value")))
+                .isInstanceOf(IllegalArgumentException.class);
+        Map<String, String> nullValue = new HashMap<>();
+        nullValue.put("key", null);
+        assertThatThrownBy(() -> CapabilityMatcher.validateCapabilities(nullValue))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThat(CapabilityMatcher.matches(Map.of("memoryMb", ">=8192"), Map.of("memoryMb", "16384"))).isTrue();
     }
 
     @Test

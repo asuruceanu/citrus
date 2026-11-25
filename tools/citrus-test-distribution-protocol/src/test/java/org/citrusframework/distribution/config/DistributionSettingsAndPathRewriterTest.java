@@ -23,6 +23,8 @@ import java.nio.file.Paths;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Properties;
+import java.util.function.BiFunction;
 import java.util.function.UnaryOperator;
 
 import org.citrusframework.distribution.config.DistributionSettings.DeclaredPathSpec;
@@ -43,6 +45,55 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class DistributionSettingsAndPathRewriterTest {
 
     private static final String TOKEN = DistributionSettings.WORKSPACE_TOKEN;
+
+    @Test
+    void shouldResolveWorkerSettingsWithCitrusEnvironmentThenDevelocityThenProperties() {
+        assertWorkerSettingPrecedence(DistributionSettings::resolveWorkerPool,
+                "citrus.test.distribution.worker.pool", "CITRUS_DIST_WORKER_POOL", "TEST_DISTRIBUTION_AGENT_POOL");
+        assertWorkerSettingPrecedence(DistributionSettings::resolveWorkerRegistrationKey,
+                "citrus.test.distribution.worker.registrationKey", "CITRUS_DIST_WORKER_REGISTRATION_KEY",
+                "TEST_DISTRIBUTION_AGENT_REGISTRATION_KEY");
+        assertWorkerSettingPrecedence(DistributionSettings::resolveWorkerId,
+                "citrus.test.distribution.worker.id", "CITRUS_DIST_WORKER_ID", "TEST_DISTRIBUTION_AGENT_NAME");
+        assertWorkerSettingPrecedence(DistributionSettings::resolveWorkerCapabilitiesCsv,
+                "citrus.test.distribution.worker.capabilities", "CITRUS_DIST_WORKER_CAPABILITIES",
+                "TEST_DISTRIBUTION_AGENT_CAPABILITIES");
+    }
+
+    private static void assertWorkerSettingPrecedence(BiFunction<Properties, Map<String, String>, String> resolve,
+                                                      String property, String citrusEnv, String develocityEnv) {
+        Properties properties = new Properties();
+        assertThat(resolve.apply(properties, Map.of())).isNull();
+        properties.setProperty(property, " property ");
+        assertThat(resolve.apply(properties, Map.of(citrusEnv, " explicit ", develocityEnv, "alias")))
+                .isEqualTo("explicit");
+        assertThat(resolve.apply(properties, Map.of(citrusEnv, " ", develocityEnv, " alias "))).isEqualTo("alias");
+        assertThat(resolve.apply(properties, Map.of(develocityEnv, " "))).isEqualTo("property");
+    }
+
+    @Test
+    void shouldResolveCoordinatorAgentPoolRequirement() {
+        String property = "citrus.test.distribution.coordinator.requireAgentPool";
+        String env = "CITRUS_DIST_COORDINATOR_REQUIRE_AGENT_POOL";
+        assertThat(DistributionSettings.COORDINATOR_REQUIRE_AGENT_POOL_PROPERTY).isEqualTo(property);
+        assertThat(DistributionSettings.COORDINATOR_REQUIRE_AGENT_POOL_ENV).isEqualTo(env);
+        UnaryOperator<String> unset = key -> null;
+        UnaryOperator<String> enabledEnv = Map.of(env, " true ")::get;
+        assertThat(DistributionSettings.isCoordinatorRequireAgentPool(unset, unset)).isFalse();
+        assertThat(DistributionSettings.isCoordinatorRequireAgentPool(unset, enabledEnv)).isTrue();
+        assertThat(DistributionSettings.isCoordinatorRequireAgentPool(Map.of(property, "false")::get, enabledEnv))
+                .isFalse();
+
+        String previous = System.getProperty(property);
+        try {
+            System.setProperty(property, "true");
+            assertThat(DistributionSettings.isCoordinatorRequireAgentPool()).isTrue();
+            System.setProperty(property, "false");
+            assertThat(DistributionSettings.isCoordinatorRequireAgentPool()).isFalse();
+        } finally {
+            restoreProperty(property, previous);
+        }
+    }
 
     @Test
     void shouldResolveAdaptiveCoordinatorSettingsFromSystemProperties() {

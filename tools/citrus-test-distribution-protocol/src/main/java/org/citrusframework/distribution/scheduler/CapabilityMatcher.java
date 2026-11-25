@@ -20,6 +20,7 @@ import java.lang.reflect.Method;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Set;
+import java.util.regex.Pattern;
 
 import org.citrusframework.distribution.annotations.AgentRequirement;
 import org.citrusframework.distribution.annotations.LocalOnly;
@@ -31,6 +32,7 @@ import org.citrusframework.distribution.annotations.RemoteOnly;
 public final class CapabilityMatcher {
 
     private static final Set<String> NUMERIC_THRESHOLD_KEYS = Set.of("memoryMb", "cpuCores");
+    private static final Pattern CAPABILITY_TOKEN = Pattern.compile("[A-Za-z0-9._-]+");
 
     private CapabilityMatcher() {
     }
@@ -70,6 +72,27 @@ public final class CapabilityMatcher {
             }
         }
         return merged;
+    }
+
+    /**
+     * Validates capability keys and values for settings that require strict capability tokens.
+     *
+     * @throws IllegalArgumentException if a key or value does not match {@code [A-Za-z0-9._-]+}
+     */
+    public static void validateCapabilities(Map<String, String> capabilities) {
+        if (capabilities == null) {
+            return;
+        }
+        for (Map.Entry<String, String> entry : capabilities.entrySet()) {
+            String key = entry.getKey();
+            String value = entry.getValue();
+            if (key == null || !CAPABILITY_TOKEN.matcher(key).matches()) {
+                throw new IllegalArgumentException("Invalid capability key '" + key + "'");
+            }
+            if (value == null || !CAPABILITY_TOKEN.matcher(value).matches()) {
+                throw new IllegalArgumentException("Invalid value '" + value + "' for capability '" + key + "'");
+            }
+        }
     }
 
     public static boolean matches(Map<String, String> requiredCapabilities, Map<String, String> workerCapabilities) {

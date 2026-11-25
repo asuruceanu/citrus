@@ -21,9 +21,20 @@ import java.util.Map;
 public record WorkerRegisterPayload(
         String workerId,
         String host,
+        String version,
+        String poolId,
+        String registrationKey,
         Map<String, String> capabilities,
         WorkerCacheStats cacheStats
 ) {
+
+    public WorkerRegisterPayload {
+        capabilities = capabilities == null ? Map.of() : Map.copyOf(capabilities);
+    }
+
+    public WorkerRegisterPayload(String workerId, String host, Map<String, String> capabilities, WorkerCacheStats cacheStats) {
+        this(workerId, host, null, null, null, capabilities, cacheStats);
+    }
 
     public WorkerRegisterPayload(String workerId, String host, Map<String, String> capabilities) {
         this(workerId, host, capabilities, null);
