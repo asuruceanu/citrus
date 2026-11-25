@@ -28,7 +28,6 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -125,9 +124,17 @@ class CitrusAgentWorkerOptionsTest {
     void shouldApplyAgentStartupPropertiesWithoutLoggingTheRegistrationCredential() {
         String key = DistributionSettings.WORKER_REGISTRATION_KEY_PROPERTY;
         String visibleProperty = "citrus.test.worker.visible";
-        var config = parse("--mode", "worker", "--port", "0", "--coordinator-url", "http://127.0.0.1:1",
-                "--cache-dir", tempDir.resolve("logging").toString(), "--properties",
-                key + "=property-credential," + visibleProperty + "=retained");
+        var calls = new AtomicInteger();
+        var config = new CitrusAgentConfiguration() {
+            @Override
+            public void setDefaultProperties() {
+                calls.incrementAndGet();
+                super.setDefaultProperties();
+            }
+        };
+        new CitrusAgentOptions().apply(config, new String[] {"--mode", "worker", "--port", "0",
+                "--coordinator-url", "http://127.0.0.1:1", "--cache-dir", tempDir.resolve("logging").toString(),
+                "--properties", key + "=property-credential," + visibleProperty + "=retained"});
         var original = new HashMap<String, String>();
         for (String name : List.of(key, visibleProperty, CitrusSettings.DEFAULT_MESSAGE_TYPE_PROPERTY)) {
             original.put(name, System.getProperty(name));
@@ -149,6 +156,7 @@ class CitrusAgentWorkerOptionsTest {
         var server = new CitrusAgentServer(config);
         try {
             server.start();
+            assertThat(calls.get()).as("supplied configuration startup hook").isEqualTo(1);
             assertThat(System.getProperty(key)).isEqualTo("property-credential");
             assertThat(messages).contains("Setting application property " + visibleProperty + "=retained")
                     .noneMatch(message -> message.contains("property-credential"));
@@ -170,7 +178,7 @@ class CitrusAgentWorkerOptionsTest {
 
     @Test
     @ResourceLock(Resources.SYSTEM_PROPERTIES)
-    void shouldApplyConfigClassOnceWithEitherPropertyEntryPoint() {
+    void shouldApplyConfigClassOnceWithAndWithoutPropertyRedaction() {
         AtomicInteger lookups = new AtomicInteger();
         var config = new CitrusAgentConfiguration() {
             @Override
@@ -183,7 +191,8 @@ class CitrusAgentWorkerOptionsTest {
         try {
             config.setDefaultProperties();
             assertThat(System.getProperty(key)).isEqualTo("example.Config1");
-            config.applyDefaultProperties(Set.of(DistributionSettings.WORKER_REGISTRATION_KEY_PROPERTY));
+            config.redactDefaultPropertyInLogs(DistributionSettings.WORKER_REGISTRATION_KEY_PROPERTY);
+            config.setDefaultProperties();
             assertThat(System.getProperty(key)).isEqualTo("example.Config2");
             assertThat(lookups.get()).isEqualTo(2);
         } finally {

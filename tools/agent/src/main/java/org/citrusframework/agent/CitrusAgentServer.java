@@ -20,7 +20,6 @@ import java.io.PrintStream;
 import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
-import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
@@ -221,7 +220,8 @@ public class CitrusAgentServer implements Server {
         startRequested = true;
         ConfigurationHelper.resolveArtifacts(configuration);
         configuration.addDefaultProperty(CitrusSettings.DEFAULT_MESSAGE_TYPE_PROPERTY, MessageType.JSON.name(), false);
-        configuration.applyDefaultProperties(Set.of(DistributionSettings.WORKER_REGISTRATION_KEY_PROPERTY));
+        configuration.redactDefaultPropertyInLogs(DistributionSettings.WORKER_REGISTRATION_KEY_PROPERTY);
+        configuration.setDefaultProperties();
 
         // Validate worker settings and acquire its cache lock before accepting HTTP requests.
         if (configuration.isWorkerMode()) {
