@@ -118,7 +118,7 @@ class DistributionUiResourcesTest {
                     .contains("function paginate(key, items, pageSize = 25, context = '')")
                     .contains("paginate('sessions', filtered, 25, `${state.sessionStatusFilter}|${q}`)")
                     .contains("paginate('partitions', filtered, 25, JSON.stringify([sessionId, query, filters.state, filters.sort, filters.module]))")
-                    .contains("paginate('tests', filteredTests, 50, `${state.selectedSessionId}|${state.testStatusFilter}|${tq}`)")
+                    .contains("paginate('tests', filteredTests, 50, `${state.selectedSessionId}|${state.testStatusFilter}|${localOnly}|${tq}`)")
                     .contains("paginate('history', filtered, 25,", "historyPage.controls")
                     .contains("class=\"pager\"");
 
