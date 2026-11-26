@@ -344,8 +344,10 @@ class DistributedLauncherTest {
 
     @Test
     void shouldFailRunAndWriteNothingWhenPartitionsProduceConflictingOutputs() throws Exception {
+        String previousPolicy = System.getProperty(DistributionSettings.PARTITION_POLICY_PROPERTY);
         try (Cluster cluster = Cluster.start(tempDir)) {
             Path module = Files.createDirectories(tempDir.resolve("module-conflict"));
+            System.setProperty(DistributionSettings.PARTITION_POLICY_PROPERTY, PartitionPolicy.LPT.name());
             System.setProperty(DistributionSettings.ENABLED_PROPERTY, "true");
             System.setProperty(DistributionSettings.COORDINATOR_URL_PROPERTY, cluster.coordinator.baseUrl());
             System.setProperty(DistributionSettings.BASEDIR_PROPERTY, module.toString());
@@ -361,6 +363,12 @@ class DistributedLauncherTest {
             assertThat(cluster.coordinator.store().listSessions(1).getFirst().failureReason())
                     .as("the launcher reports why its own session failed")
                     .contains("target/citrus-docs/conflict.txt");
+        } finally {
+            if (previousPolicy == null) {
+                System.clearProperty(DistributionSettings.PARTITION_POLICY_PROPERTY);
+            } else {
+                System.setProperty(DistributionSettings.PARTITION_POLICY_PROPERTY, previousPolicy);
+            }
         }
     }
 
