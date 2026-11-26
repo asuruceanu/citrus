@@ -65,6 +65,7 @@ import org.citrusframework.distribution.config.DistributionSettings;
 import org.citrusframework.distribution.config.ForkedJvmOptions;
 import org.citrusframework.distribution.config.DistributionSettings.WorkerCwdCheckMode;
 import org.citrusframework.distribution.config.PathRewriter;
+import org.citrusframework.distribution.model.InputPreparation;
 import org.citrusframework.distribution.model.ArtifactRef;
 import org.citrusframework.distribution.model.PartitionAssignPayload;
 import org.citrusframework.distribution.model.WorkerTestEventPayload;
@@ -114,7 +115,12 @@ public final class IsolatedPartitionRunner implements PartitionRunner {
      * Outcome of a partition run. {@code success} is {@code false} when the partition could not be executed or broke
      * a worker rule (such as writing into the worker's working directory); failing tests are reported as test events.
      */
-    public record PartitionExecutionResult(boolean success, String errorMessage, List<WorkspaceFileSet> outputArtifacts) {
+    public record PartitionExecutionResult(boolean success, String errorMessage, List<WorkspaceFileSet> outputArtifacts,
+                                           InputPreparation inputPreparation) {
+
+        public PartitionExecutionResult(boolean success, String errorMessage, List<WorkspaceFileSet> outputArtifacts) {
+            this(success, errorMessage, outputArtifacts, null);
+        }
 
         public PartitionExecutionResult {
             outputArtifacts = outputArtifacts == null ? List.of() : List.copyOf(outputArtifacts);

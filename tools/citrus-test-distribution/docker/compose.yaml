@@ -57,18 +57,49 @@ services:
     init: true
     restart: unless-stopped
 
+  pool-init:
+    image: python:3.13-alpine
+    command: ["python", "/provision-pool.py"]
+    environment:
+      CITRUS_DIST_AUTH_TOKEN: ${CITRUS_DIST_AUTH_TOKEN:-}
+    volumes:
+      - ./provision-pool.py:/provision-pool.py:ro
+      - pool-registration:/registration
+    depends_on:
+      coordinator:
+        condition: service_healthy
+
   worker:
     build:
       context: ../../..
       dockerfile: tools/citrus-test-distribution/docker/Dockerfile
       target: worker
     environment:
+      CITRUS_DIST_WORKER_MAX_SLOTS: ${CITRUS_DIST_WORKER_MAX_SLOTS:-1}
+      CITRUS_DIST_WORKER_HANDSHAKE_TIMEOUT_MS: ${CITRUS_DIST_WORKER_HANDSHAKE_TIMEOUT_MS:-90000}
+      CITRUS_DIST_SHARED_INPUTS_DIR: /var/lib/citrus/shared-base-inputs
+      CITRUS_DIST_COMPOSE_WORKER: "true"
       CITRUS_DIST_COORDINATOR_URL: http://coordinator:8765
       CITRUS_DIST_AUTH_TOKEN: ${CITRUS_DIST_AUTH_TOKEN:-}
-      CITRUS_DIST_WORKER_CAPABILITIES: ${CITRUS_DIST_WORKER_CAPABILITIES:-}
+      CITRUS_DIST_WORKER_CAPABILITIES: ${CITRUS_DIST_WORKER_CAPABILITIES:-docker=true}
+      TESTCONTAINERS_HOST_OVERRIDE: citrus-docker-host
+      TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE: ${CITRUS_DIST_DOCKER_SOCKET:-/var/run/docker.sock}
+    extra_hosts:
+      - "citrus-docker-host:host-gateway"
+    group_add:
+      - "${CITRUS_DIST_DOCKER_GID:-0}"
+    volumes:
+      - pool-registration:/registration:ro
+      - type: bind
+        source: ${CITRUS_DIST_DOCKER_SOCKET:-/var/run/docker.sock}
+        target: /var/run/docker.sock
+        bind:
+          create_host_path: false
     depends_on:
       coordinator:
         condition: service_healthy
+      pool-init:
+        condition: service_completed_successfully
     scale: ${CITRUS_DIST_WORKERS:-8}
     stop_grace_period: 65s
     init: true
@@ -77,3 +108,4 @@ services:
 volumes:
   postgres-data:
   coordinator-data:
+  pool-registration:

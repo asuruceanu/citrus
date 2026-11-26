@@ -128,6 +128,10 @@ public interface DistributionStore extends AutoCloseable {
 
     void upsertWorker(WorkerRecord worker);
 
+    void deleteFinishedSession(String sessionId);
+
+    boolean deleteOfflineWorker(String workerId);
+
     List<WorkerRecord> listWorkers();
 
     void savePartition(PartitionRecord partition);
@@ -154,6 +158,14 @@ public interface DistributionStore extends AutoCloseable {
     boolean hasDelivery(String deliveryId);
 
     void replayEvents(String sessionId, long afterSequence, int globalLimit, Consumer<CoordinatorEvent> consumer);
+
+    default void replayPartitionEvents(String sessionId, String partitionId, Consumer<CoordinatorEvent> consumer) {
+        replayEvents(sessionId, 0, 0, event -> {
+            if (partitionId.equals(event.partitionId())) {
+                consumer.accept(event);
+            }
+        });
+    }
 
     void saveTestExecution(TestExecutionRecord execution);
 

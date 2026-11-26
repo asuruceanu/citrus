@@ -55,6 +55,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 import java.util.jar.JarFile;
 import java.util.stream.Collectors;
@@ -66,6 +67,7 @@ import org.citrusframework.distribution.config.DistributionJson;
 import org.citrusframework.distribution.config.DistributionSettings;
 import org.citrusframework.distribution.config.ForkedJvmOptions;
 import org.citrusframework.distribution.config.QuarkusWorkspace;
+import org.citrusframework.distribution.model.InputPreparation;
 import org.citrusframework.distribution.model.ArtifactKind;
 import org.citrusframework.distribution.model.ArtifactRef;
 import org.citrusframework.distribution.model.PartitionAssignPayload;
@@ -151,12 +153,13 @@ final class ForkedPartitionRunner implements PartitionRunner {
     private final WorkerFileCache sharedCache;
     private final CoordinatorBlobClient sharedBlobs;
     private final long handshakeTimeoutMs;
+    private final BiConsumer<PartitionAssignPayload, InputPreparation> inputsReady;
 
     /**
      * Runs partitions against the worker's shared cache and blob client, both owned by the caller.
      */
     ForkedPartitionRunner(DistributionWorkerConfig config, WorkerFileCache cache, CoordinatorBlobClient blobs) {
-        this(config, Objects.requireNonNull(cache, "cache"), Objects.requireNonNull(blobs, "blobs"), true);
+        this(config, cache, blobs, (assignment, preparation) -> {});
     }
 
     /**
@@ -164,14 +167,15 @@ final class ForkedPartitionRunner implements PartitionRunner {
      * releasing both when the partition ends.
      */
     ForkedPartitionRunner(DistributionWorkerConfig config) {
-        this(config, null, null, false);
+        this(config, null, null, (assignment, preparation) -> {});
     }
 
-    private ForkedPartitionRunner(DistributionWorkerConfig config, WorkerFileCache cache, CoordinatorBlobClient blobs,
-                                  boolean shared) {
+    ForkedPartitionRunner(DistributionWorkerConfig config, WorkerFileCache cache, CoordinatorBlobClient blobs,
+                          BiConsumer<PartitionAssignPayload, InputPreparation> inputsReady) {
         this.config = Objects.requireNonNull(config, "config");
-        this.sharedCache = shared ? cache : null;
-        this.sharedBlobs = shared ? blobs : null;
+        this.sharedCache = cache;
+        this.sharedBlobs = blobs;
+        this.inputsReady = inputsReady;
         this.handshakeTimeoutMs = Math.max(1_000L, DistributionSettings.getLong(
                 DistributionSettings.WORKER_HANDSHAKE_TIMEOUT_PROPERTY, null,
                 DistributionSettings.DEFAULT_WORKER_HANDSHAKE_TIMEOUT_MS));
@@ -221,6 +225,7 @@ final class ForkedPartitionRunner implements PartitionRunner {
         } finally {
             startLock.unlock();
         }
+        InputPreparation preparation = null;
         WorkerFileCache.PinLease pins = null;
         try {
             List<ArtifactRef> classpathArtifacts = assignment.classpathArtifacts() != null
@@ -254,7 +259,30 @@ final class ForkedPartitionRunner implements PartitionRunner {
             ForkedJvmOptions.Layout jvmLayout = jvmLayoutJson == null ? null
                     : DistributionJson.fromJson(jvmLayoutJson, ForkedJvmOptions.Layout.class);
             List<Path> classpath = new ArrayList<>();
+            String sharedRoot = System.getenv("CITRUS_DIST_SHARED_INPUTS_DIR");
+            Path privateInputs = fork.partitionRoot.resolve("base-inputs");
+            if ("citrus-base".equals(assignment.moduleName()) && sharedRoot != null && !sharedRoot.isBlank()
+                    && quarkus == null && SharedBaseInputs.supports(classpathArtifacts)) {
+                synchronized (fork.cleanupMonitor) {
+                    if (jvmStopping) {
+                        return cancelledResult();
+                    }
+                    preparation = SharedBaseInputs.materialize(Path.of(sharedRoot), assignment.sessionId(), classpathArtifacts,
+                            cache, blobs, privateInputs);
+                }
+                inputsReady.accept(assignment, preparation);
+            }
             for (ArtifactRef artifact : classpathArtifacts) {
+                if (preparation != null && artifact.kind() == ArtifactKind.DIRECTORY_ZIP) {
+                    synchronized (fork.cleanupMonitor) {
+                        if (jvmStopping) {
+                            return cancelledResult();
+                        }
+                        classpath.add(privateClasspathDirectory(privateInputs, artifact, workspace,
+                                jvmLayout == null ? null : jvmLayout.workspaceDirectories().get(classpath.size())));
+                    }
+                    continue;
+                }
                 Path verified = blobs.ensureCached(artifact);
                 synchronized (fork.cleanupMonitor) {
                     if (jvmStopping) {
@@ -371,13 +399,13 @@ final class ForkedPartitionRunner implements PartitionRunner {
                 return cancelledResult();
             }
             if (summary == null) {
-                return new IsolatedPartitionRunner.PartitionExecutionResult(false, crashDiagnostic(fork));
+                return new IsolatedPartitionRunner.PartitionExecutionResult(false, crashDiagnostic(fork), List.of(), preparation);
             }
             awaitExit(fork, POST_RESULT_EXIT_WAIT_MS);
             // Processes left behind by tests must not keep writing while outputs are hashed and packaged.
             fork.killAll();
             if (!summary.success()) {
-                return new IsolatedPartitionRunner.PartitionExecutionResult(false, summary.errorMessage());
+                return new IsolatedPartitionRunner.PartitionExecutionResult(false, summary.errorMessage(), List.of(), preparation);
             }
 
             List<WorkspaceFileSet> outputs = new ArrayList<>();
@@ -391,14 +419,14 @@ final class ForkedPartitionRunner implements PartitionRunner {
                 return cancelledResult();
             }
             blobs.uploadMissing(outputs.stream().map(o -> o.artifact().sha256()).toList());
-            return new IsolatedPartitionRunner.PartitionExecutionResult(true, null, outputs);
+            return new IsolatedPartitionRunner.PartitionExecutionResult(true, null, outputs, preparation);
         } catch (Throwable t) {
             if (t instanceof InterruptedException) {
                 Thread.currentThread().interrupt();
             }
             LOG.warn("Forked partition {} failed", assignment.partitionId(), t);
             return new IsolatedPartitionRunner.PartitionExecutionResult(false,
-                    t.getMessage() != null ? t.getMessage() : t.getClass().getName());
+                    t.getMessage() != null ? t.getMessage() : t.getClass().getName(), List.of(), preparation);
         } finally {
             try {
                 fork.cleanUp();
@@ -443,6 +471,30 @@ final class ForkedPartitionRunner implements PartitionRunner {
 
     private static boolean cancelled(CancellationToken cancellationToken) {
         return cancellationToken != null && cancellationToken.isCancellationRequested();
+    }
+
+    private static Path privateClasspathDirectory(Path privateInputs, ArtifactRef artifact, Path workspace,
+                                                  String mapped) throws IOException {
+        Path extracted = privateInputs.resolve(artifact.sha256());
+        if (mapped == null) {
+            Path target = BlobCacheDirectory.classpathExtractionDirectory(artifact, privateInputs.getParent());
+            Files.createDirectories(target.getParent());
+            Files.move(extracted, target);
+            Files.writeString(target.resolve(".complete"), "ok");
+            return target;
+        }
+        Path target = workspace.resolve(WorkspacePackager.validateRelativePath(mapped));
+        Files.createDirectories(target.getParent());
+        if (Files.exists(target)) {
+            try (var children = Files.list(extracted)) {
+                for (Path child : children.toList()) {
+                    Files.move(child, target.resolve(child.getFileName()));
+                }
+            }
+        } else {
+            Files.move(extracted, target);
+        }
+        return target;
     }
 
     private static IsolatedPartitionRunner.PartitionExecutionResult cancelledResult() {
@@ -682,7 +734,12 @@ final class ForkedPartitionRunner implements PartitionRunner {
         command.add(ForkedPartitionMain.class.getName());
         command.add(request.toString());
         command.add(String.valueOf(port));
-        return new ProcessBuilder(command).directory(workingDirectory.toFile()).start();
+        var child = new ProcessBuilder(command).directory(workingDirectory.toFile());
+        // Registration belongs to the worker. A test that starts its own worker must register independently.
+        child.environment().keySet().removeAll(List.of(DistributionSettings.WORKER_POOL_ENV,
+                DistributionSettings.WORKER_REGISTRATION_KEY_ENV, DistributionSettings.DEVELOCITY_AGENT_POOL_ENV,
+                DistributionSettings.DEVELOCITY_AGENT_REGISTRATION_KEY_ENV));
+        return child.start();
     }
 
     /**

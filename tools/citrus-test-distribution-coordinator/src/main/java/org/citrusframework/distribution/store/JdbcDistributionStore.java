@@ -41,6 +41,7 @@ import java.util.function.Consumer;
 import org.apache.commons.dbcp2.BasicDataSource;
 import org.citrusframework.distribution.TestExecutionIdentity;
 import org.citrusframework.distribution.config.DistributionJson;
+import org.citrusframework.distribution.model.InputPreparation;
 import org.citrusframework.distribution.model.AgentPoolRecord;
 import org.citrusframework.distribution.model.BuildSessionRecord;
 import org.citrusframework.distribution.model.CoordinatorEvent;
@@ -289,6 +290,7 @@ public class JdbcDistributionStore implements DistributionStore {
         partitionColumns.put("inputs_json", longText);
         partitionColumns.put("outputs_json", longText);
         partitionColumns.put("produced_outputs_json", longText);
+        partitionColumns.put("input_preparation_json", longText);
         partitionColumns.put("error_message", "VARCHAR(4096)");
         additions.put("dist_partitions", partitionColumns);
         additions.put("dist_session_changes", Map.of("change_json", longText));
@@ -986,6 +988,37 @@ public class JdbcDistributionStore implements DistributionStore {
     }
 
     @Override
+    public void deleteFinishedSession(String sessionId) {
+        inTransaction("delete session " + sessionId, conn -> {
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "DELETE FROM dist_sessions WHERE session_id=? AND status IN ('PASSED','FAILED','ABORTED')")) {
+                ps.setString(1, sessionId);
+                if (ps.executeUpdate() != 1) {
+                    throw new IllegalStateException("Session is missing or still running");
+                }
+            }
+            for (String table : List.of("dist_work_submissions", "dist_partitions", "dist_test_executions",
+                    "dist_session_changes", "dist_events")) {
+                try (PreparedStatement ps = conn.prepareStatement("DELETE FROM " + table + " WHERE session_id=?")) {
+                    ps.setString(1, sessionId);
+                    ps.executeUpdate();
+                }
+            }
+        });
+    }
+
+    @Override
+    public boolean deleteOfflineWorker(String workerId) {
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement ps = conn.prepareStatement("DELETE FROM dist_workers WHERE worker_id=? AND state='OFFLINE'")) {
+            ps.setString(1, workerId);
+            return ps.executeUpdate() == 1;
+        } catch (SQLException e) {
+            throw new IllegalStateException("Failed to delete worker " + workerId, e);
+        }
+    }
+
+    @Override
     public List<WorkerRecord> listWorkers() {
         String sql = "SELECT worker_id, host, capabilities_json, state, active_partition_id, " +
                 "last_heartbeat_at, registered_at, cache_stats_json, version, pool_id, pool_display_name, " +
@@ -1075,16 +1108,17 @@ public class JdbcDistributionStore implements DistributionStore {
         String unitsJson = DistributionJson.toJson(p.workUnits() != null ? p.workUnits() : List.of());
         String inputsJson = DistributionJson.toJson(p.inputPaths() != null ? p.inputPaths() : List.of());
         String outputsJson = DistributionJson.toJson(p.outputPaths() != null ? p.outputPaths() : List.of());
+        String preparation = p.inputPreparation() == null ? null : DistributionJson.toJson(p.inputPreparation());
         String producedJson = DistributionJson.toJson(p.producedOutputs() != null ? p.producedOutputs() : List.of());
         String updateSql = "UPDATE dist_partitions SET session_id=?, worker_id=?, state=?, " +
                 "estimated_duration_ms=?, started_at=?, finished_at=?, required_caps_json=?, work_units_json=?, " +
                 "module_name=?, fork_workspace=?, working_directory=?, inputs_json=?, outputs_json=?, " +
-                "produced_outputs_json=?, error_message=? " +
+                "produced_outputs_json=?, error_message=?, input_preparation_json=? " +
                 "WHERE partition_id=? AND attempt=?";
         String insertSql = "INSERT INTO dist_partitions (partition_id, session_id, worker_id, state, attempt, " +
                 "estimated_duration_ms, started_at, finished_at, required_caps_json, work_units_json, " +
-                "module_name, fork_workspace, working_directory, inputs_json, outputs_json, produced_outputs_json, error_message) " +
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+                "module_name, fork_workspace, working_directory, inputs_json, outputs_json, produced_outputs_json, error_message, input_preparation_json) " +
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
         try (PreparedStatement ps = conn.prepareStatement(updateSql)) {
             ps.setString(1, p.sessionId());
             ps.setString(2, p.workerId());
@@ -1101,8 +1135,9 @@ public class JdbcDistributionStore implements DistributionStore {
             ps.setString(13, outputsJson);
             ps.setString(14, producedJson);
             ps.setString(15, truncate(p.errorMessage(), 4096));
-            ps.setString(16, p.partitionId());
-            ps.setInt(17, p.attempt());
+            ps.setString(16, preparation);
+            ps.setString(17, p.partitionId());
+            ps.setInt(18, p.attempt());
             if (ps.executeUpdate() > 0) {
                 return;
             }
@@ -1125,6 +1160,7 @@ public class JdbcDistributionStore implements DistributionStore {
             ps.setString(15, outputsJson);
             ps.setString(16, producedJson);
             ps.setString(17, truncate(p.errorMessage(), 4096));
+            ps.setString(18, preparation);
             ps.executeUpdate();
         }
     }
@@ -1133,7 +1169,7 @@ public class JdbcDistributionStore implements DistributionStore {
     public List<PartitionRecord> listPartitions(String sessionId) {
         String sql = "SELECT partition_id, session_id, worker_id, state, attempt, estimated_duration_ms, " +
                 "started_at, finished_at, required_caps_json, work_units_json, module_name, fork_workspace, " +
-                "working_directory, inputs_json, outputs_json, produced_outputs_json, error_message " +
+                "working_directory, inputs_json, outputs_json, produced_outputs_json, error_message, input_preparation_json " +
                 "FROM dist_partitions WHERE session_id=? " +
                 "ORDER BY CASE WHEN started_at > 0 THEN 0 ELSE 1 END ASC, started_at ASC, partition_id ASC, attempt ASC";
         List<PartitionRecord> partitions = new ArrayList<>();
@@ -1164,7 +1200,9 @@ public class JdbcDistributionStore implements DistributionStore {
                             inputsRaw == null || inputsRaw.isBlank() ? List.of() : DistributionJson.fromJson(inputsRaw, STRING_LIST_TYPE),
                             outputsRaw == null || outputsRaw.isBlank() ? List.of() : DistributionJson.fromJson(outputsRaw, STRING_LIST_TYPE),
                             producedRaw == null || producedRaw.isBlank() ? List.of() : DistributionJson.fromJson(producedRaw, STRING_LIST_TYPE),
-                            rs.getString("error_message")
+                            rs.getString("error_message"),
+                            rs.getString("input_preparation_json") == null ? null : DistributionJson.fromJson(
+                                    rs.getString("input_preparation_json"), InputPreparation.class)
                     ));
                 }
             }
@@ -1330,11 +1368,22 @@ public class JdbcDistributionStore implements DistributionStore {
 
     @Override
     public void replayEvents(String sessionId, long afterSequence, int globalLimit, Consumer<CoordinatorEvent> consumer) {
+        replayEvents(sessionId, afterSequence, globalLimit, null, consumer);
+    }
+
+    @Override
+    public void replayPartitionEvents(String sessionId, String partitionId, Consumer<CoordinatorEvent> consumer) {
+        replayEvents(sessionId, 0, 0, partitionId, consumer);
+    }
+
+    private void replayEvents(String sessionId, long afterSequence, int globalLimit, String partitionId,
+                              Consumer<CoordinatorEvent> consumer) {
         String sql = sessionId == null
                 ? "SELECT sequence_id, event_json FROM (SELECT sequence_id, event_json FROM dist_events "
                     + "WHERE sequence_id > ? ORDER BY sequence_id DESC FETCH FIRST " + globalLimit + " ROWS ONLY) recent "
                     + "ORDER BY sequence_id"
-                : "SELECT sequence_id, event_json FROM dist_events WHERE sequence_id > ? AND session_id = ? ORDER BY sequence_id";
+                : "SELECT sequence_id, event_json FROM dist_events WHERE sequence_id > ? AND session_id = ?"
+                    + (partitionId == null ? "" : " AND event_json LIKE ?") + " ORDER BY sequence_id";
         try (Connection conn = dataSource.getConnection();
              PreparedStatement ps = conn.prepareStatement(sql)) {
             // PostgreSQL only uses a cursor with autocommit disabled.
@@ -1343,6 +1392,9 @@ public class JdbcDistributionStore implements DistributionStore {
             ps.setLong(1, afterSequence);
             if (sessionId != null) {
                 ps.setString(2, sessionId);
+            }
+            if (partitionId != null) {
+                ps.setString(3, "%" + partitionId + "%");
             }
             try (ResultSet rs = ps.executeQuery()) {
                 while (rs.next()) {

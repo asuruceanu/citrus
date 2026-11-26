@@ -143,7 +143,10 @@ public final class DistributionWorkerClient implements AutoCloseable {
         try {
             CoordinatorBlobClient blobs = new CoordinatorBlobClient(config, cache);
             inProcessRunner = new IsolatedPartitionRunner(config, cache, blobs);
-            forkedRunner = new ForkedPartitionRunner(config, cache, blobs);
+            forkedRunner = new ForkedPartitionRunner(config, cache, blobs, (assignment, preparation) ->
+                    sendMessageSafe(WorkerWsMessage.PARTITION_INPUTS_READY, Map.of(
+                            "partitionId", assignment.partitionId(), "attempt", assignment.attempt(),
+                            "inputPreparation", preparation)));
             String resultScope = java.util.UUID.nameUUIDFromBytes((config.coordinatorUrl() + "\n" + config.workerId())
                     .getBytes(java.nio.charset.StandardCharsets.UTF_8)).toString();
             resultOutbox = new ResultJournal(config.cacheDir().resolve("result-outbox").resolve(resultScope));
@@ -331,7 +334,8 @@ public final class DistributionWorkerClient implements AutoCloseable {
         Map<String, String> caps = new LinkedHashMap<>(config.capabilities());
         caps.put("citrus-worker", "true");
         WorkerRegisterPayload register = new WorkerRegisterPayload(config.workerId(), config.hostName(),
-                config.version(), config.poolId(), config.registrationKey(), caps, cacheStats());
+                config.version(), config.poolId(), config.registrationKey(), caps, cacheStats(),
+                Boolean.getBoolean("citrus.test.distribution.worker.overflowSlot"));
         sendMessageSafe(WorkerWsMessage.WORKER_REGISTER, DistributionJson.convert(register, Map.class));
         ws.request(1);
     }
@@ -505,7 +509,7 @@ public final class DistributionWorkerClient implements AutoCloseable {
                                 });
                         PartitionCompletedPayload completed = new PartitionCompletedPayload(assign.partitionId(),
                                 assign.sessionId(), assign.attempt(), result.success(), result.errorMessage(),
-                                result.outputArtifacts());
+                                result.outputArtifacts(), result.inputPreparation());
                         @SuppressWarnings("unchecked")
                         Map<String, Object> completedMap = DistributionJson.convert(completed, Map.class);
                         var durableCompletion = resultOutbox.persist(WorkerWsMessage.PARTITION_COMPLETED, completedMap);

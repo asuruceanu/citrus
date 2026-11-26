@@ -23,7 +23,7 @@
 
             <assert exception="org.citrusframework.exceptions.MessageTimeoutException" message="Action timeout after 5000 milliseconds. Failed to receive message on endpoint: 'httpServer.inbound'">
                 <when>
-                    <http:receive-request server="httpServer">
+                    <http:receive-request server="httpServer" timeout="5000">
                         <http:GET path="/api/v3/pet/1234"/>
                     </http:receive-request>
                 </when>

@@ -183,7 +183,7 @@ class GeneratedRestApiIT {
         public HttpServer httpServer() {
             return new HttpServerBuilder()
                 .port(port)
-                .timeout(5000L)
+                .timeout(30000L)
                 .autoStart(true)
                 .defaultStatus(NO_CONTENT)
                 .handleCookies(true)
@@ -208,7 +208,7 @@ class GeneratedRestApiIT {
         public HttpServer otherHttpServer() {
             return new HttpServerBuilder()
                 .port(otherPort)
-                .timeout(5000L)
+                .timeout(30000L)
                 .autoStart(true)
                 .defaultStatus(NO_CONTENT)
                 .build();
@@ -2554,6 +2554,7 @@ class GeneratedRestApiIT {
                 .receive()
                 .get("/api/v3/pet/${petId}")
                 .message()
+                .timeout(5000L)
                 .accept("@contains('application/json')@");
 
             assertThatThrownBy(() -> runner.$(builder))

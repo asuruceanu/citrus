@@ -17,7 +17,7 @@
 set -eu
 
 usage() {
-    printf 'Usage: %s -all | -module <artifactId-or-module-path>\n' "${0##*/}"
+    printf 'Usage: %s (-all | -module <artifactId-or-module-path>) [-name <session-display-name>]\n' "${0##*/}"
 }
 
 usage_error() {
@@ -25,27 +25,41 @@ usage_error() {
     exit 2
 }
 
+mode=
 selector=
-case "${1:-}" in
-    -h|--help)
-        usage
-        exit 0
-        ;;
-    -all)
-        [ "$#" -eq 1 ] || usage_error
-        ;;
-    -module)
-        [ "$#" -eq 2 ] || usage_error
-        case "$2" in
-            ''|-*|!*|*,*) usage_error ;;
-            *[/:]*) selector=$2 ;;
-            *) selector=:$2 ;;
-        esac
-        ;;
-    *)
-        usage_error
-        ;;
-esac
+session_name=
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        -all|-module)
+            [ -z "$mode" ] || usage_error
+            mode=$1
+            if [ "$mode" = -module ]; then
+                shift
+                case "${1:-}" in
+                    ''|-*|!*|*,*) usage_error ;;
+                    *[/:]*) selector=$1 ;;
+                    *) selector=:$1 ;;
+                esac
+            fi
+            ;;
+        -name)
+            [ -z "$session_name" ] || usage_error
+            shift
+            case "${1:-}" in
+                -*) usage_error ;;
+                *[![:space:]]*) session_name=$1 ;;
+                *) usage_error ;;
+            esac
+            ;;
+        *) usage_error ;;
+    esac
+    shift
+done
+[ -n "$mode" ] || usage_error
 
 script_dir=$(CDPATH= cd "$(dirname "$0")" && pwd -P)
 cd "$script_dir"
@@ -113,9 +127,20 @@ else
     set --
 fi
 
-maven "$settings_dir" "$@" --fail-at-end verify \
+if [ -n "$session_name" ]; then
+    set -- "$@" "-Dcitrus.test.distribution.projectName=$session_name"
+fi
+
+# Maven's fail-never mode visits downstream projects, but suppresses its failure exit code.
+# Preserve both the live console output and the reactor outcome.
+verify_log="$settings_dir/verify.log"
+{ maven "$settings_dir" "$@" --fail-never -Dstyle.color=never verify \
     -Dcitrus.test.distribution.enabled=true \
     "-Dcitrus.test.distribution.coordinatorUrl=$coordinator_url" \
     -Dcitrus.test.distribution.fallbackLocal=false \
     -Dcitrus.test.distribution.minRemoteDurationMs=0 \
-    -Dcitrus.test.distribution.minRemoteColdUnits=0
+    -Dcitrus.test.distribution.minRemoteColdUnits=0 || echo failed > "$settings_dir/maven-failed"; } | tee "$verify_log"
+if [ -f "$settings_dir/maven-failed" ] || grep -Fqx '[INFO] Build failures were ignored.' "$verify_log" ||
+    grep -Fqx '[INFO] BUILD FAILURE' "$verify_log" || ! grep -Fqx '[INFO] BUILD SUCCESS' "$verify_log"; then
+    exit 1
+fi

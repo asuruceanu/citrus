@@ -200,29 +200,22 @@ public class LocalStackSettings {
             context.setVariable(LocalStackTestVariables.SERVICE_PORT.variableName(), serviceEndpoint.getPort());
             context.setVariable(LocalStackTestVariables.SERVICE_LOCAL_URL.variableName(), String.format("http://localhost:%s", serviceEndpoint.getPort()));
 
-            if (!KubernetesSupport.isConnected(context) || !TestContainersSettings.isKubedockEnabled()) {
-                context.setVariable(LocalStackTestVariables.SERVICE_NAME.variableName(), serviceName);
-                context.setVariable(LocalStackTestVariables.SERVICE_URL.variableName(), String.format("http://localhost:%s", serviceEndpoint.getPort()));
-            } else {
-                context.setVariable(LocalStackTestVariables.SERVICE_NAME.variableName(), serviceName);
-                context.setVariable(LocalStackTestVariables.SERVICE_URL.variableName(), String.format("http://%s:%s", serviceName, serviceEndpoint.getPort()));
-            }
+            String kubeDockUrl = String.format("http://%s:%s", serviceName, serviceEndpoint.getPort());
+            String serviceUrl = KubernetesSupport.isConnected(context) && TestContainersSettings.isKubedockEnabled()
+                    ? kubeDockUrl : serviceEndpoint.toString();
+            context.setVariable(LocalStackTestVariables.SERVICE_NAME.variableName(), serviceName);
+            context.setVariable(LocalStackTestVariables.SERVICE_URL.variableName(), serviceUrl);
 
             String containerType = "LOCALSTACK";
             Stream.of(container.getServices()).forEach(service -> {
                 String aws2ServiceName = service.getServiceName().toUpperCase(Locale.US);
 
-                if (!KubernetesSupport.isConnected(context) || !TestContainersSettings.isKubedockEnabled()) {
-                    context.setVariable(getEnvVarName(containerType, String.format("%s_URL", aws2ServiceName)), String.format("http://localhost:%s", serviceEndpoint.getPort()));
-                } else {
-                    context.setVariable(getEnvVarName(containerType, String.format("%s_URL", aws2ServiceName)), String.format("http://%s:%s", serviceName, serviceEndpoint.getPort()));
-                }
-
+                context.setVariable(getEnvVarName(containerType, String.format("%s_URL", aws2ServiceName)), serviceUrl);
                 context.setVariable(getEnvVarName(containerType, String.format("%s_LOCAL_URL", aws2ServiceName)), String.format("http://localhost:%s", serviceEndpoint.getPort()));
                 context.setVariable(getEnvVarName(containerType, String.format("%s_PORT", aws2ServiceName)), serviceEndpoint.getPort());
             });
 
-            context.setVariable(LocalStackTestVariables.KUBE_DOCK_SERVICE_URL.variableName(), String.format("http://%s:%s", serviceName, serviceEndpoint.getPort()));
+            context.setVariable(LocalStackTestVariables.KUBE_DOCK_SERVICE_URL.variableName(), kubeDockUrl);
             context.setVariable(LocalStackTestVariables.KUBE_DOCK_HOST.variableName(), serviceName);
 
             for (Map.Entry<Object, Object> connectionProperty : getConnectionProperties(container).entrySet()) {

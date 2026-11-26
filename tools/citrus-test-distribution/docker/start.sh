@@ -29,6 +29,15 @@ compose() {
     docker compose --project-name "$project_name" --file "$script_dir/compose.yaml" "$@"
 }
 
+# The socket belongs to the Docker engine host, which may be a Linux VM.
+if [ -z "${CITRUS_DIST_DOCKER_GID:-}" ]; then
+    engine_socket=${CITRUS_DIST_DOCKER_SOCKET:-/var/run/docker.sock}
+    CITRUS_DIST_DOCKER_GID=$(docker run --rm \
+        --mount "type=bind,source=$engine_socket,target=/engine.sock" \
+        --entrypoint stat postgres:16-alpine -c %g /engine.sock)
+    export CITRUS_DIST_DOCKER_GID
+fi
+
 compose up --detach --build --wait
 coordinator_address=$(compose port coordinator 8765)
 if [ -z "$coordinator_address" ]; then

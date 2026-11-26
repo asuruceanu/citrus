@@ -27,11 +27,17 @@ public record WorkerRegisterPayload(
         String poolId,
         String registrationKey,
         Map<String, String> capabilities,
-        WorkerCacheStats cacheStats
+        WorkerCacheStats cacheStats,
+        boolean overflowSlot
 ) {
 
     public WorkerRegisterPayload {
         capabilities = capabilities == null ? Map.of() : Collections.unmodifiableMap(new LinkedHashMap<>(capabilities));
+    }
+
+    public WorkerRegisterPayload(String workerId, String host, String version, String poolId, String registrationKey,
+                                 Map<String, String> capabilities, WorkerCacheStats cacheStats) {
+        this(workerId, host, version, poolId, registrationKey, capabilities, cacheStats, false);
     }
 
     public WorkerRegisterPayload(String workerId, String host, Map<String, String> capabilities, WorkerCacheStats cacheStats) {

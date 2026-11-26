@@ -32,6 +32,11 @@
 
   <dependencies>
     <dependency>
+      <groupId>org.junit.support</groupId>
+      <artifactId>testng-engine</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
       <groupId>junit</groupId>
       <artifactId>junit</artifactId>
       <scope>test</scope>
@@ -167,17 +172,6 @@
             </configuration>
           </execution>
         </executions>
-      </plugin>
-      <plugin>
-        <groupId>org.apache.maven.plugins</groupId>
-        <artifactId>maven-failsafe-plugin</artifactId>
-        <dependencies>
-          <dependency>
-            <groupId>org.apache.maven.surefire</groupId>
-            <artifactId>surefire-testng</artifactId>
-            <version>${maven.surefire.plugin.version}</version>
-          </dependency>
-        </dependencies>
       </plugin>
       <!-- Do not deploy this module to Maven central -->
       <plugin>

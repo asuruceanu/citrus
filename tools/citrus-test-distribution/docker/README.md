@@ -34,14 +34,35 @@ the coordinator's status. The `/api/v1/workers` endpoint lists registered worker
 
 ## Workers
 
-Each worker connects to `http://coordinator:8765` on the Compose network and runs one assigned
-partition at a time. Workers and PostgreSQL use the Compose network. The coordinator is the only
+Compose registers the eight replicas in the **Local Docker** worker pool. A one-time service
+runs before the workers start and reuses the pool and its active registration key on later
+starts. The key is stored in the project’s `pool-registration` volume, mounted read-only by
+the workers. The Overview summarizes pool capacity, and Workers lists each replica and its slots.
+
+Each worker connects to `http://coordinator:8765` on the Compose network with one execution slot by default.
+Run `CITRUS_DIST_WORKER_MAX_SLOTS=2 ./start.sh` to enable a standby slot on each worker.
+The coordinator assigns queued partitions to eligible idle workers first. Once those workers are busy,
+a worker with a standby slot can run a second partition in an independent JVM. Both slots use the same worker ID.
+The standby JVM uses its own cache and working directory under `/var/lib/citrus/overflow-slot`.
+Admission uses queue demand without CPU or memory thresholds. Workers and PostgreSQL use the Compose network. The coordinator is the only
 service that publishes a host port.
 
 Each worker stores downloaded test artifacts in its own writable container storage at
 `/var/lib/citrus/cache`. Stopping and resuming the same container preserves its identity and cache.
-A replacement worker starts with a fresh cache. Use `CITRUS_DIST_WORKERS` to resize the pool and
+For the local `citrus-base` experiment, both slots share preparation of compiled class and resource directories.
+The worker verifies and unpacks one snapshot for a session and input set. Every partition gets private writable
+copies and starts its own test JVM. A different input set, such as the Failsafe classpath, needs fresh preparation.
+JARs still use the slot's cache. The waterfall shows one **Inputs** lane per worker and measures each partition's
+wait for shared inputs. **Other startup** estimates the remaining time before its first test.
+
+Compose uses the replica number as the registered ID (`worker-1` through `worker-8` by default). A replacement worker registers under the same ID and starts with a fresh cache. Use `CITRUS_DIST_WORKERS` to resize the pool and
 `CITRUS_DIST_WORKER_CAPABILITIES` to advertise tags required by your tests.
+
+The worker image includes Git, JBang, and the Docker CLI with its Compose and Buildx plugins. On Rancher Desktop, workers use the
+engine VM's Docker socket to start sibling containers for Testcontainers. The start script
+detects the socket group and adds it to each worker. Tests connect to published ports via
+the engine's host gateway. Run trusted tests on this local stack because the socket gives
+worker code control over the developer's Docker engine.
 
 ## Run tests from the checkout
 
@@ -58,6 +79,26 @@ Use `-all` to run `verify` across the reactor.
 ./tools/citrus-test-distribution/docker/run-tests.sh -all
 ```
 
+Use `-name` with either mode to set the display name shown in the Sessions UI. Quote names
+that contain spaces. The script passes the name to Maven as `citrus.test.distribution.projectName`.
+
+```sh
+./tools/citrus-test-distribution/docker/run-tests.sh -all -name "Full reactor baseline"
+./tools/citrus-test-distribution/docker/run-tests.sh -module citrus-api -name "Workers UI responsiveness after"
+```
+
+By default Maven builds one module at a time on the host. The workers share the eligible tests
+from that module. To let two independent modules build and submit tests concurrently, run:
+
+```sh
+MAVEN_CONFIG='-T 2' ./tools/citrus-test-distribution/docker/run-tests.sh -all
+```
+
+Verification attempts downstream modules after a test failure and the script exits with a failure if Maven reports a failed build. A missing prerequisite can still prevent a module from building. Individual tests retain their configured skip conditions.
+
+Maven still waits for module dependencies. All eight local worker containers share the CPU and
+memory assigned to Rancher Desktop.
+
 The script builds the Maven distribution extension and prerequisites with tests skipped and uses a
 checkout-local Maven repository under `target/citrus-distribution/maven-repository`. It loads the
 extension from a temporary Maven configuration for the test run. Tests execute in the selected modules.
@@ -66,6 +107,9 @@ The script discovers the coordinator port for the selected Compose project. Set
 
 The runner disables local fallback when the coordinator is unreachable or a partition is lost.
 It sets the local duration and cold-start thresholds to zero so eligible tests can be sent to workers.
+The worker image includes Chromium and its Linux libraries for `citrus-playwright`. The image build
+uses the Playwright Java version resolved from the checkout. Both worker slots use the installed browser.
+The `citrus-cucumber-playwright` step tests also support worker execution.
 Placement rules such as `@LocalOnly` and `@AgentRequirement` still apply. Tests that need external
 services or tools require them in the environment where they execute.
 
@@ -90,10 +134,14 @@ stop, and cleanup when you select a project name.
 | --- | --- | --- |
 | `COMPOSE_PROJECT_NAME` | `citrus-test-distribution` | Selects the stack and its named resources. |
 | `CITRUS_DIST_HOST_PORT` | `8765` | Changes the port on the host loopback address. Workers still use the coordinator's internal port. |
+| `CITRUS_DIST_WORKER_HANDSHAKE_TIMEOUT_MS` | `90000` | Time allowed for a forked test JVM to connect to its worker during startup. |
+| `CITRUS_DIST_WORKER_MAX_SLOTS` | `1` | Set to `2` to allow a second partition when work is queued. |
 | `CITRUS_DIST_WORKERS` | `8` | Sets the number of worker replicas. |
 | `CITRUS_DIST_JDBC_PASSWORD` | `citrus` | Sets the initial PostgreSQL password and the coordinator's JDBC password. Configure it before creating the database volume. To change it later, update the PostgreSQL role as well. |
 | `CITRUS_DIST_AUTH_TOKEN` | Empty | Enables bearer authentication on the coordinator and supplies the token to the workers. Export the same value for Maven. |
-| `CITRUS_DIST_WORKER_CAPABILITIES` | Empty | Adds comma-separated capability tags to each worker, for example `suite=local`. |
+| `CITRUS_DIST_DOCKER_GID` | Detected by `start.sh` | Group that can access the Docker engine socket. |
+| `CITRUS_DIST_DOCKER_SOCKET` | `/var/run/docker.sock` | Absolute socket path on the engine host. For Rancher Desktop, use the path inside its Linux VM. |
+| `CITRUS_DIST_WORKER_CAPABILITIES` | `docker=true` | Sets comma-separated capability tags to each worker, for example `suite=local`. |
 | `CITRUS_DIST_COORDINATOR_URL` | Published Compose address | Overrides the coordinator URL used by `run-tests.sh`. |
 
 When bearer authentication is enabled, send the token with API requests. For dashboard access with
@@ -152,7 +200,8 @@ describes using the images with deployment tooling and connecting a worker to an
 | `-Dcitrus.test.distribution.fallbackLocal=false` | Disables local fallback. `run-tests.sh` sets this automatically. |
 | `-Dcitrus.test.distribution.minRemoteDurationMs=0` | Disables duration-based local execution. `run-tests.sh` sets this automatically. |
 | `-Dcitrus.test.distribution.minRemoteColdUnits=0` | Disables the local shortcut based on the number of work units when duration history is missing. `run-tests.sh` sets this automatically. |
-| `-Dcitrus.test.distribution.maxPartitionSize=1` | Places at most one work unit in a partition. Leave it unset for adaptive sizing. |
+| `-Dcitrus.test.distribution.partitionPolicy=LPT` | Opts into duration-balanced partitions. The default, `SINGLE`, creates one partition per remote Surefire or Failsafe submission. |
+| `-Dcitrus.test.distribution.maxPartitionSize=1` | With LPT, places at most one work unit in a partition. Leave the size unset for adaptive sizing under LPT. |
 | `-Djunit.platform.launcher.interceptors.enabled=true` | Enables interceptor discovery when using the Citrus distribution library directly. The Maven extension sets it automatically. |
 
 The Dockerfile uses these flags while building both images.

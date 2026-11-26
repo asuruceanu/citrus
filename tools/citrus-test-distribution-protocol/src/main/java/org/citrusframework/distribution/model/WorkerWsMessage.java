@@ -34,6 +34,7 @@ public record WorkerWsMessage(
     public static final String RESULT_ACK = "result.ack";
     public static final String DELIVERY_ID = "deliveryId";
     public static final String TEST_EVENT = "test.event";
+    public static final String PARTITION_INPUTS_READY = "partition.inputs.ready";
     public static final String PARTITION_COMPLETED = "partition.completed";
     public static final String PARTITION_CANCEL = "partition.cancel";
 }

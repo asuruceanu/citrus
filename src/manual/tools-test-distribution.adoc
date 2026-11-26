@@ -7,7 +7,7 @@ Citrus Test Distribution partitions and executes JUnit Platform and Citrus integ
 == Modules
 
 * `org.citrusframework:citrus-test-distribution-protocol` — Shared WebSocket/REST protocol DTOs, SHA-256 content-addressed blob cache, Citrus endpoint telemetry collector, capability matcher, and `@LocalOnly` / `@RemoteOnly` / `@AgentRequirement` annotations.
-* `org.citrusframework:citrus-test-distribution-ui` — Zero-Node monitoring Web UI served at `/ui/` (overview KPIs, live SVG Gantt partition waterfall, workspace/resource inspector, worker pool health, test history/flakiness, and failing test / partition crash diagnostics).
+* `org.citrusframework:citrus-test-distribution-ui` — Zero-Node monitoring Web UI served at `/ui/` (overview KPIs, live SVG Gantt partition waterfall, workspace/resource inspector, worker health, test history/flakiness, and failing test / partition crash diagnostics).
 * `org.citrusframework:citrus-test-distribution-coordinator` — Vert.x HTTP/WebSocket coordinator, Longest-Processing-Time (LPT) scheduler, SSE event hub, and JDBC persistence (file-backed `HSQLDB` or `PostgreSQL`).
 * `org.citrusframework:citrus-test-distribution-worker` — Standalone Java worker runtime with child-first `ClassLoader` or forked-JVM workspace isolation and graceful `SIGTERM` draining (`citrus-agent --mode worker` or `citrus dist worker start`).
 * `org.citrusframework:citrus-test-distribution` — JUnit Platform launcher interceptor, `@LocalOnly` / lost-partition local fallback executor, Surefire XML writer, and `@CitrusTestFactory` declarative source splitter.
@@ -19,7 +19,7 @@ Citrus Test Distribution partitions and executes JUnit Platform and Citrus integ
 A distributed test run involves three components:
 
 . *Build Host (Maven Extension + JUnit `LauncherInterceptor`):* Opens a single build session on the coordinator (recording project name, Git branch, commit SHA, and changed workspace files), discovers JUnit Platform test descriptors per module, executes `@LocalOnly` tests locally, packages the test classpath and any declared external input paths into SHA-256 content-addressed blobs, uploads only missing digests, submits remote work units, streams live test and partition events over Server-Sent Events (SSE), writes standard `TEST-*.xml` Surefire/Failsafe reports, and atomically commits any declared output files back into the module.
-. *Coordinator (`DistributionCoordinatorServer`):* Persists sessions, partitions, worker leases, and historical test durations in JDBC (`HSQLDB` or `PostgreSQL`), schedules work units onto capability-matching workers using Longest-Processing-Time (LPT) bin packing seeded from historical execution times (choosing an eligible idle worker by pool priority and then favoring workers least recently assigned), deduplicates classpath/workspace blobs on disk, monitors worker heartbeats, automatically requeues evicted or stalled partitions up to `maxRetries`, and serves the real-time Web UI and REST/SSE APIs.
+. *Coordinator (`DistributionCoordinatorServer`):* Persists sessions, partitions, worker leases, and historical test durations in JDBC (`HSQLDB` or `PostgreSQL`), schedules partitions on capability-matching workers and, when LPT is selected, balances work units using historical execution times (choosing an eligible idle worker by pool priority and then favoring workers least recently assigned), deduplicates classpath/workspace blobs on disk, monitors worker heartbeats, automatically requeues evicted or stalled partitions up to `maxRetries`, and serves the real-time Web UI and REST/SSE APIs.
 . *Workers (`DistributionWorkerClient`):* Maintain outbound WebSocket connections (`/ws/v1/worker`) to the coordinator, advertise auto-detected host capabilities (`os`, `arch`, `jdk`, `cpuCores`, `memoryMb`, `citrus.workspace.v1`) plus user tags, pull missing blobs into a local content-addressed cache, execute assigned partitions in a forked JVM (default) or, with `forkMode=AUTO`, an isolated child-first `ClassLoader` inside the worker JVM, stream per-test outcomes and captured Citrus endpoint names, and drain cleanly on `SIGTERM`.
 
 [[tools-test-distribution-maven]]
@@ -392,7 +392,7 @@ Provides fleet-wide KPIs across recent sessions and workers:
 * *Build Sessions* and *Session Pass Rate* (`PASSED` out of completed sessions).
 * *Online Workers* (non-`OFFLINE` workers — `IDLE`, `BUSY`, and `DRAINING` — vs total registered fleet).
 * *Distribution Speedup* (aggregate serial test time divided by distributed wall-clock duration) and *Blob Cache Efficiency* (`cachedBlobs / totalBlobs`).
-* *Flaky Tests Detected* (tests that failed or were interrupted on an initial attempt and passed on automatic partition retry), plus quick-jump tables for *Recent Build Sessions* and *Worker Pool Health*.
+* *Flaky Tests Detected* (tests that failed or were interrupted on an initial attempt and passed on automatic partition retry), plus quick-jump tables for *Recent Build Sessions* and *Worker Health*.
 
 ==== Build Sessions Explorer (`#sessions`)
 
@@ -409,7 +409,7 @@ Inspects a single build session across five session KPIs (`Passed Tests`, `Faile
 
 Long lists (build sessions, partitions, test executions and test history) are paginated; a table returns to its first page when the selected session or one of its filters changes.
 
-==== Workers Pool (`#workers`)
+==== Workers (`#workers`)
 
 Workers appear in tables grouped by pool, with a separate group for unpooled workers. Each row shows the worker ID,
 host, version, capabilities, state, last heartbeat, and current test or partition. Search by ID, host, or capability
@@ -418,7 +418,7 @@ Workers that report local file cache statistics show the cleanup policy, cached 
 and eviction count. The *Low Disk* filter selects workers whose usable disk space is below their configured buffer.
 
 [[tools-test-distribution-agent-pools]]
-==== Agent Pools (`#pools`)
+==== Worker Pools (`#pools`)
 
 Create a pool with a display name and the capabilities every member must advertise. The coordinator assigns a unique,
 stable pool ID. Copy that ID into the worker configuration. For example, a pool with `docker` and `jdk=21` admits
@@ -448,7 +448,7 @@ revoking the old key. Workers use their startup credential for every renewal.
 
 [cols="2,4",options="header"]
 |===
-|Workers Pool warning |What happens
+|Worker warning |What happens
 |`KEY_REVOKED`
 |New registrations with that key fail immediately. Connected workers using it disconnect on their next renewal
 (normally hourly) or at the one-hour deadline, whichever comes first.
@@ -494,7 +494,7 @@ when you also need its HTTP service, Web UI or on-demand test runs.
 === Start a worker
 
 Start the coordinator separately with `citrus dist coordinator start`. It listens on port `8765` by default.
-For a pooled worker, create an <<tools-test-distribution-agent-pools,agent pool>> and supply its ID and registration
+For a pooled worker, create a <<tools-test-distribution-agent-pools,worker pool>> and supply its ID and registration
 key. The examples read those values from the environment. If your coordinator accepts unpooled workers, you can
 omit both settings. A coordinator with bearer authentication also requires `CITRUS_DIST_AUTH_TOKEN` or `--auth-token`.
 
@@ -764,10 +764,10 @@ marker `?` is not allowed here.
 inputs or outputs implies a forked JVM.
 |`false`
 |`citrus.test.distribution.partitionPolicy`
-|`LPT` splits the module's tests into several partitions by historical duration; `SINGLE` runs all of them in one
-partition and workspace (for tests that depend on files written by other test classes). Under `SINGLE`, tests requiring
+|`SINGLE` groups all remote work units from one Surefire or Failsafe submission into one partition. Unit tests and integration tests submit separately.
+Select `LPT` to distribute a submission across partitions by estimated duration. Under `SINGLE`, tests requiring
 different values for the same capability are rejected.
-|`LPT`
+|`SINGLE`
 |`citrus.test.distribution.skip`
 |`true` keeps the module's tests local, exactly as without Test Distribution. Set it to `false` on the command
 line to override a module's skip setting for an opt-in run. The value is taken from the command line, then the

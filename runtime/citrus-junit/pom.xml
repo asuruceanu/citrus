@@ -13,11 +13,6 @@
   <name>Citrus :: Runtime :: JUnit</name>
   <description>Citrus JUnit framework integration</description>
 
-  <!-- Runs on the JUnit4 provider while the rest of the build uses the JUnit Platform -->
-  <properties>
-    <surefire.provider>surefire-junit47</surefire.provider>
-  </properties>
-
   <dependencies>
     <dependency>
       <groupId>org.citrusframework</groupId>
@@ -46,6 +41,16 @@
     </dependency>
 
     <!-- Test scoped dependencies -->
+    <dependency>
+      <groupId>org.junit.vintage</groupId>
+      <artifactId>junit-vintage-engine</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.junit.platform</groupId>
+      <artifactId>junit-platform-launcher</artifactId>
+      <scope>test</scope>
+    </dependency>
     <dependency>
       <groupId>org.citrusframework</groupId>
       <artifactId>citrus-groovy</artifactId>

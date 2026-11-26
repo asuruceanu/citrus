@@ -29,8 +29,23 @@ public record PartitionAssignPayload(
         List<WorkspaceFileSet> inputArtifacts,
         List<String> outputPaths,
         boolean forkWorkspace,
-        String workingDirectory
+        String workingDirectory,
+        String moduleName
 ) {
+
+    public PartitionAssignPayload(String partitionId,
+                                  String sessionId,
+                                  int attempt,
+                                  List<ArtifactRef> classpathArtifacts,
+                                  Map<String, String> systemProperties,
+                                  List<WorkUnitSpec> workUnits,
+                                  List<WorkspaceFileSet> inputArtifacts,
+                                  List<String> outputPaths,
+                                  boolean forkWorkspace,
+                                  String workingDirectory) {
+        this(partitionId, sessionId, attempt, classpathArtifacts, systemProperties, workUnits,
+                inputArtifacts, outputPaths, forkWorkspace, workingDirectory, null);
+    }
 
     /**
      * Normalizes absent values; {@code workingDirectory} is relative to the workspace, empty for its root.

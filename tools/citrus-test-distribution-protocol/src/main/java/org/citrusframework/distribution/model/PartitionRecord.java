@@ -36,8 +36,31 @@ public record PartitionRecord(
         List<String> inputPaths,
         List<String> outputPaths,
         List<String> producedOutputs,
-        String errorMessage
+        String errorMessage,
+        InputPreparation inputPreparation
 ) {
+
+    public PartitionRecord(String partitionId,
+                           String sessionId,
+                           String workerId,
+                           PartitionState state,
+                           int attempt,
+                           long estimatedDurationMs,
+                           long startedAt,
+                           long finishedAt,
+                           Map<String, String> requiredCapabilities,
+                           List<WorkUnitSpec> workUnits,
+                           String moduleName,
+                           boolean forkWorkspace,
+                           String workingDirectory,
+                           List<String> inputPaths,
+                           List<String> outputPaths,
+                           List<String> producedOutputs,
+                           String errorMessage) {
+        this(partitionId, sessionId, workerId, state, attempt, estimatedDurationMs, startedAt, finishedAt,
+                requiredCapabilities, workUnits, moduleName, forkWorkspace, workingDirectory, inputPaths,
+                outputPaths, producedOutputs, errorMessage, null);
+    }
 
     public PartitionRecord {
         requiredCapabilities = requiredCapabilities == null ? Map.of() : Map.copyOf(requiredCapabilities);

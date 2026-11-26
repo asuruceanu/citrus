@@ -544,6 +544,7 @@ class DistributedLauncherTest {
 
             try (DistributionWorkerClient worker = new DistributionWorkerClient(workerCfg)) {
                 worker.start();
+                assertThat(worker.awaitRegistration(5, TimeUnit.SECONDS)).isTrue();
 
                 Path reportDir = tempDir.resolve("surefire-reports");
                 System.setProperty(DistributionSettings.ENABLED_PROPERTY, "true");

@@ -334,12 +334,12 @@ public final class DistributionSettings {
     }
 
     /**
-     * Parses the partition policy; {@code null}/blank yields {@link PartitionPolicy#LPT}.
+     * Parses the partition policy; {@code null}/blank yields {@link PartitionPolicy#SINGLE}.
      *
      * @throws IllegalArgumentException for an unknown policy
      */
     public static PartitionPolicy parsePartitionPolicy(String rawValue) {
-        return parseEnum(rawValue, PartitionPolicy.class, PartitionPolicy.LPT, PARTITION_POLICY_PROPERTY);
+        return parseEnum(rawValue, PartitionPolicy.class, PartitionPolicy.SINGLE, PARTITION_POLICY_PROPERTY);
     }
 
     /**

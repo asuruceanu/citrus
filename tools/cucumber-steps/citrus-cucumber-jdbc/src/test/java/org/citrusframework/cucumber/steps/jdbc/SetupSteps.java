@@ -16,34 +16,37 @@
 
 package org.citrusframework.cucumber.steps.jdbc;
 
-import com.github.dockerjava.api.model.ExposedPort;
-import com.github.dockerjava.api.model.PortBinding;
-import com.github.dockerjava.api.model.Ports;
 import io.cucumber.java.en.Given;
+import org.citrusframework.annotations.CitrusResource;
+import org.citrusframework.context.TestContext;
 import org.citrusframework.testcontainers.postgresql.PostgreSQLSettings;
 import org.testcontainers.postgresql.PostgreSQLContainer;
 import org.testcontainers.utility.DockerImageName;
 
 public class SetupSteps {
 
-    public static PostgreSQLContainer testdbContainer = createContainer();
+    @CitrusResource
+    private TestContext context;
 
-    @SuppressWarnings("deprecation")
+    private static final PostgreSQLContainer testdbContainer = createContainer();
+
     private static PostgreSQLContainer createContainer() {
         return new PostgreSQLContainer(
                 DockerImageName.parse(PostgreSQLSettings.getImageName()).withTag(PostgreSQLSettings.getPostgreSQLVersion()))
                 .withDatabaseName("testdb")
                 .withUsername("test")
                 .withPassword("secret")
-                .withInitScript("test-db-init.sql")
-                .withCreateContainerCmdModifier(modifier -> modifier.withPortBindings(
-                        new PortBinding(Ports.Binding.bindPort(PostgreSQLContainer.POSTGRESQL_PORT),
-                                new ExposedPort(PostgreSQLContainer.POSTGRESQL_PORT))));
+                .withInitScript("test-db-init.sql");
     }
 
     @Given("^Start database$")
     public void startDatabase() {
         testdbContainer.start();
+    }
+
+    @Given("^Use the database container URL$")
+    public void useDatabaseContainerUrl() {
+        context.setVariable("database.url", testdbContainer.getJdbcUrl());
     }
 
     @Given("^Stop database$")

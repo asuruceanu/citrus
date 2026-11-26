@@ -28,6 +28,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Properties;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
@@ -72,6 +73,11 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTimeout;
 
 class DistributionWorkerClientTest {
+
+    private static DistributionWorkerConfig.Builder testWorkerBuilder() {
+        // These clients register with test coordinators, independently of the outer worker's pool identity.
+        return new DistributionWorkerConfig.Builder(new Properties(), Map.of());
+    }
 
     @TempDir
     Path tempDir;
@@ -185,7 +191,7 @@ class DistributionWorkerClientTest {
 
     @Test
     void acceptsLegacyRegistrationAcknowledgementForAnUnpooledWorker() throws Exception {
-        try (var peer = new WorkerPeer(); var worker = new DistributionWorkerClient(DistributionWorkerConfig.builder()
+        try (var peer = new WorkerPeer(); var worker = new DistributionWorkerClient(testWorkerBuilder()
                 .workerId("worker1").cacheDir(tempDir).coordinatorUrl("http://127.0.0.1:" + peer.server.actualPort()).build())) {
             worker.start();
             var socket = peer.nextSocket();
@@ -240,7 +246,7 @@ class DistributionWorkerClientTest {
         }
 
         DistributionWorkerConfig config(Path cacheDir) {
-            return DistributionWorkerConfig.builder().workerId("worker1").poolId("pool1").registrationKey("test-key")
+            return testWorkerBuilder().workerId("worker1").poolId("pool1").registrationKey("test-key")
                     .version("v1").registrationRenewalIntervalMs(150).reconnectDelayMs(50).cacheDir(cacheDir)
                     .coordinatorUrl("http://127.0.0.1:" + server.actualPort()).build();
         }
@@ -281,7 +287,7 @@ class DistributionWorkerClientTest {
         try (DistributionCoordinatorServer coordinator = new DistributionCoordinatorServer(coordinatorConfig)) {
             coordinator.start();
 
-            DistributionWorkerConfig workerConfig = DistributionWorkerConfig.builder()
+            DistributionWorkerConfig workerConfig = testWorkerBuilder()
                     .workerId("worker-1")
                     .coordinatorUrl(coordinator.baseUrl())
                     .authToken("worker-secret")
@@ -370,14 +376,14 @@ class DistributionWorkerClientTest {
         try (DistributionCoordinatorServer coordinator = new DistributionCoordinatorServer(coordinatorConfig)) {
             coordinator.start();
 
-            DistributionWorkerConfig alphaConfig = DistributionWorkerConfig.builder()
+            DistributionWorkerConfig alphaConfig = testWorkerBuilder()
                     .workerId("worker-alpha")
                     .coordinatorUrl(coordinator.baseUrl())
                     .authToken("worker-secret")
                     .cacheDir(tempDir.resolve("worker-alpha-cache"))
                     .forkMode(DistributionSettings.WorkerForkMode.AUTO) // exercises the shared worker JVM
                     .build();
-            DistributionWorkerConfig betaConfig = DistributionWorkerConfig.builder()
+            DistributionWorkerConfig betaConfig = testWorkerBuilder()
                     .workerId("worker-beta")
                     .coordinatorUrl(coordinator.baseUrl())
                     .authToken("worker-secret")
@@ -560,7 +566,7 @@ class DistributionWorkerClientTest {
                     }))
                     .listen(0, "127.0.0.1").toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
             Path cacheDir = tempDir.resolve("stalled-worker-cache");
-            DistributionWorkerConfig config = DistributionWorkerConfig.builder()
+            DistributionWorkerConfig config = testWorkerBuilder()
                     .coordinatorUrl("http://127.0.0.1:" + coordinator.actualPort())
                     .cacheDir(cacheDir)
                     .cacheCleanup(false)
@@ -662,7 +668,7 @@ class DistributionWorkerClientTest {
 
     @Test
     void shouldNotHoldTheClientMonitorWhileCloseWaitsForTheCache() throws Exception {
-        DistributionWorkerConfig config = DistributionWorkerConfig.builder()
+        DistributionWorkerConfig config = testWorkerBuilder()
                 .workerId("worker-close-latency")
                 .coordinatorUrl("http://127.0.0.1:9")
                 .cacheDir(tempDir.resolve("close-latency-cache"))
@@ -730,7 +736,7 @@ class DistributionWorkerClientTest {
     }
 
     private static DistributionWorkerConfig.Builder workerConfig(String workerId, DistributionCoordinatorServer coordinator, Path cacheDir) {
-        return DistributionWorkerConfig.builder()
+        return testWorkerBuilder()
                 .workerId(workerId)
                 .coordinatorUrl(coordinator.baseUrl())
                 .authToken("worker-secret")
@@ -796,11 +802,11 @@ class DistributionWorkerClientTest {
 
     @Test
     void shouldNormalizeWebSocketCoordinatorUrlsToHttpBaseUrl() {
-        assertThat(DistributionWorkerConfig.builder()
+        assertThat(testWorkerBuilder()
                 .coordinatorUrl("ws://127.0.0.1:18080/ws/v1/worker")
                 .build()
                 .coordinatorUrl()).isEqualTo("http://127.0.0.1:18080");
-        assertThat(DistributionWorkerConfig.builder()
+        assertThat(testWorkerBuilder()
                 .coordinatorUrl("wss://coordinator.example.org/ws/v1/worker/")
                 .build()
                 .coordinatorUrl()).isEqualTo("https://coordinator.example.org");

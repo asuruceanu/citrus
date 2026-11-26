@@ -279,6 +279,23 @@ class DistributionCoordinatorServerTest {
     }
 
     @Test
+    void shouldSendDashboardChangeTypesWithoutReplayingEarlierEvents() throws Exception {
+        try (var server = new DistributionCoordinatorServer(poolConfig().build())) {
+            server.start();
+            createPool(server.baseUrl() + "/api/v1/agent-pools", "Existing", Map.of());
+            var request = HttpRequest.newBuilder(URI.create(server.baseUrl() + "/api/v1/events/stream?mode=dashboard")).build();
+            var stream = httpClient.send(request, HttpResponse.BodyHandlers.ofLines());
+            try (var lines = stream.body()) {
+                var frame = CompletableFuture.supplyAsync(() -> lines.filter(line -> line.startsWith("data: "))
+                        .findFirst().orElseThrow());
+                var create = new CreateSessionRequest("dashboard-test", "main", "abc", List.of(), 1, 0);
+                assertThat(api("POST", server.baseUrl() + "/api/v1/sessions", create).statusCode()).isEqualTo(201);
+                assertThat(frame.get(5, TimeUnit.SECONDS)).isEqualTo("data: [\"session.created\"]");
+            }
+        }
+    }
+
+    @Test
     void shouldSendSafePoolAndWarningEventsAndRejectWorkerBeforeClosing() throws Exception {
         try (var server = new DistributionCoordinatorServer(poolConfig().build())) {
             server.start();

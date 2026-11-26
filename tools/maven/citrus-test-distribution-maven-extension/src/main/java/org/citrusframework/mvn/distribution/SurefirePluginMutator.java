@@ -49,7 +49,7 @@ public final class SurefirePluginMutator {
         INPUTS(DistributionSettings.INPUTS_PROPERTY, DistributionSettings.INPUTS_ENV, DistributionSettings.NONE_SENTINEL),
         OUTPUTS(DistributionSettings.OUTPUTS_PROPERTY, DistributionSettings.OUTPUTS_ENV, DistributionSettings.NONE_SENTINEL),
         FORK(DistributionSettings.FORK_PROPERTY, DistributionSettings.FORK_ENV, "false"),
-        PARTITION_POLICY(DistributionSettings.PARTITION_POLICY_PROPERTY, DistributionSettings.PARTITION_POLICY_ENV, "LPT");
+        PARTITION_POLICY(DistributionSettings.PARTITION_POLICY_PROPERTY, DistributionSettings.PARTITION_POLICY_ENV, DistributionSettings.parsePartitionPolicy(null).name());
 
         private final String property;
         private final String env;

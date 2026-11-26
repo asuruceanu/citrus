@@ -17,6 +17,7 @@
 package org.citrusframework.distribution.coordinator;
 
 import java.time.Instant;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -43,6 +44,38 @@ public final class CoordinatorEventStreamHub {
     private final DistributionStore store;
     private final Map<String, Set<HttpServerResponse>> sessionSubscribers = new ConcurrentHashMap<>();
     private final Set<HttpServerResponse> globalSubscribers = new CopyOnWriteArraySet<>();
+
+    private final Set<HttpServerResponse> dashboardSubscribers = new CopyOnWriteArraySet<>();
+    private final Set<String> dashboardChanges = new HashSet<>();
+
+    // The dashboard reads snapshots. It only needs to know which kinds of data changed.
+    void subscribeDashboard(HttpServerResponse response) {
+        prepareSseHeaders(response);
+        response.closeHandler(v -> dashboardSubscribers.remove(response));
+        response.exceptionHandler(err -> dashboardSubscribers.remove(response));
+        dashboardSubscribers.add(response);
+    }
+
+    void flushDashboardChanges() {
+        Set<String> changes;
+        synchronized (dashboardChanges) {
+            if (dashboardChanges.isEmpty()) {
+                return;
+            }
+            changes = Set.copyOf(dashboardChanges);
+            dashboardChanges.clear();
+        }
+        String frame = "event: dashboard.updated\ndata: " + DistributionJson.toJson(changes) + "\n\n";
+        for (HttpServerResponse response : dashboardSubscribers) {
+            if (response.writeQueueFull()) {
+                // EventSource reconnects and the UI fetches a fresh snapshot.
+                dashboardSubscribers.remove(response);
+                closeQuietly(response);
+            } else {
+                response.write(frame).onFailure(err -> dashboardSubscribers.remove(response));
+            }
+        }
+    }
 
     public CoordinatorEventStreamHub(DistributionStore store) {
         this.store = store;
@@ -81,6 +114,14 @@ public final class CoordinatorEventStreamHub {
     private void broadcastEvent(CoordinatorEvent event) {
         String sessionId = event.sessionId();
         String type = event.type();
+        if (!dashboardSubscribers.isEmpty()) {
+            synchronized (dashboardChanges) {
+                dashboardChanges.add(type);
+            }
+        }
+        if (globalSubscribers.isEmpty() && (sessionId == null || !sessionSubscribers.containsKey(sessionId))) {
+            return;
+        }
         String formatted = formatSse(event);
         broadcast(globalSubscribers, formatted);
         if (sessionId != null) {
