@@ -1283,8 +1283,17 @@ function renderWaterfallSvg(session, partitions, modules, selectedModule) {
       preparations.set(key, interval);
     }
     if (preparations.size) laneEntries.push({ workerId, parts: [], preparations: [...preparations.values()] });
-    tracks.forEach((parts, index) => laneEntries.push({ workerId, parts, slot: index + 1 }));
-    if (untimed.length) laneEntries.push({ workerId, parts: untimed });
+    const liveWorker = session.status === 'RUNNING' && state.workers.find(worker => worker.workerId === workerId);
+    const labelSlots = tracks.length > 1 || liveWorker?.connectedSlots > 1;
+    tracks.forEach((parts, index) => laneEntries.push({ workerId, parts, slot: labelSlots ? index + 1 : null }));
+    if (untimed.length) laneEntries.push({ workerId, parts: untimed, untimed: true });
+  }
+  const notes = [];
+  if (laneEntries.some(lane => lane.slot)) {
+    notes.push('Slot lanes are inferred from partition times. Bars aligned vertically on the same worker show concurrent work.');
+  }
+  if (laneEntries.some(lane => lane.preparations)) {
+    notes.push('The Inputs lane shows shared preparation. An amber underline marks each partition’s wait for those inputs.');
   }
   const labelWidth = 205;
   const chartWidth = 760;
@@ -1316,8 +1325,7 @@ function renderWaterfallSvg(session, partitions, modules, selectedModule) {
 
   return html`
     <div>
-      <p class="waterfall-slot-note">Slot lanes are inferred from partition times. Bars aligned vertically on the same worker show concurrent work.
-        ${laneEntries.some(lane => lane.preparations) ? 'The Inputs lane shows shared preparation. An amber underline marks each partition’s wait for those inputs.' : ''}</p>
+      ${notes.length ? html`<p class="waterfall-slot-note">${notes.join(' ')}</p>` : null}
       <div class="waterfall-scroll" data-scroll-key="waterfall" tabindex="0" aria-label="Worker partition timeline">
         <svg style="width:100%;height:auto;display:block" viewBox=${`0 0 ${svgWidth} ${svgHeight}`}>
           <defs>
@@ -1366,18 +1374,18 @@ function renderWaterfallSvg(session, partitions, modules, selectedModule) {
             `;
           })}
 
-          ${laneEntries.map(({ workerId, parts: laneParts, slot, preparations }, idx) => {
+          ${laneEntries.map(({ workerId, parts: laneParts, slot, preparations, untimed }, idx) => {
             const y = headerHeight + idx * rowHeight;
             const workerLabel = workerId || 'Unassigned';
             const first = idx === 0 || laneEntries[idx - 1].workerId !== workerId;
-            const slotLabel = preparations ? 'Inputs' : slot ? `Slot ${slot}` : workerId ? 'Untimed' : '';
+            const slotLabel = preparations ? 'Inputs' : slot ? `Slot ${slot}` : untimed ? 'Untimed' : '';
             const laneLabel = [workerLabel, slotLabel].filter(Boolean).join(' · ');
             return html`
               <g>
                 <rect x="4" y=${y + 3} width=${svgWidth - 8} height=${rowHeight - 6} rx="6" fill="#94a3b8" fill-opacity="0.07" pointer-events="none" />
                 <g class="waterfall-worker-label" role="img" aria-label=${laneLabel}>
                   <title>${workerLabel}</title>
-                  ${first ? html`<text x="14" y=${y + 26} font-size="12" font-weight="600" fill="currentColor"
+                  ${first || !slotLabel ? html`<text x="14" y=${y + 26} font-size="12" font-weight="600" fill="currentColor"
                     clip-path="url(#waterfall-worker-label-clip)">${fitWorkerLaneLabel(workerLabel)}</text>` : null}
                   ${slotLabel ? html`
                     <rect class="waterfall-slot-chip" x=${labelWidth - 65} y=${y + 12} width="55" height="22" rx="7" />
