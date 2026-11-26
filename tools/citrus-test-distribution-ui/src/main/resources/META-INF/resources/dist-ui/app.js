@@ -76,6 +76,7 @@ const state = {
   // Modals
   selectedPartition: null,
   waterfallExpanded: false,
+  showMavenBuildTime: true,
   pages: {}, // current page per paginated table
   pageContexts: {}, // session and filters each table's current page belongs to
   selectedTestExecution: null,
@@ -1304,7 +1305,7 @@ function renderWaterfallSvg(session, partitions, modules, selectedModule) {
     if (!testsByPartition.has(test.partitionId)) testsByPartition.set(test.partitionId, []);
     testsByPartition.get(test.partitionId).push(test);
   }
-  const buildGaps = mavenBuildGaps(partitions, endOf);
+  const buildGaps = state.showMavenBuildTime ? mavenBuildGaps(partitions, endOf) : [];
   const headerHeight = buildGaps.length > 0 ? 60 : 34;
   const svgHeight = headerHeight + laneEntries.length * rowHeight + 16;
   const timeToX = time => labelWidth + ((time - minStart) / totalSpan) * chartWidth;
@@ -1846,6 +1847,14 @@ function renderSessionDetail() {
                 }}>View local results <span aria-hidden="true">→</span></button>
               </div>` : null}
               ${renderModuleLegend(modules, partitionFilters)}
+              <label class="waterfall-build-toggle">
+                <input type="checkbox" data-focus-id="waterfall-build-time" checked=${state.showMavenBuildTime}
+                    onChange=${event => {
+                      state.showMavenBuildTime = event.target.checked;
+                      renderApp();
+                    }} />
+                Show Maven build time (estimated)
+              </label>
               ${renderWaterfallSvg(session, waterfallPartitions, modules, selectedModule)}
             </div>
           </div>

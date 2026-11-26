@@ -1714,3 +1714,14 @@ form.dashboard-actions { align-items: end; }
 .shard-group-id { color: var(--text-muted); font-size: 0.75rem; overflow-wrap: anywhere; }
 .shard-status-list { display: flex; flex-wrap: wrap; gap: 0.35rem; }
 .shard-child { margin-inline-start: 0.55rem; padding-inline-start: 0.75rem; border-inline-start: 2px solid var(--border-strong); }
+
+.waterfall-build-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  margin-bottom: 0.75rem;
+  color: var(--text-secondary);
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+.waterfall-build-toggle input { margin: 0; accent-color: var(--blue); }
