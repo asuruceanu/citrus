@@ -125,7 +125,8 @@ public class TestDistributionLifecycleParticipant extends AbstractMavenLifecycle
             } else {
                 BuildSessionResponse created = client.createSession(new CreateSessionRequest(
                         projectName, gitInfo.branch(), gitInfo.commit(), gitInfo.changedFiles(), maxPartitionSize.orElse(0),
-                        maxRetries, gitInfo.workspaceChanges(), projectKey));
+                        maxRetries, gitInfo.workspaceChanges(), projectKey,
+                        resolveProperty(session, DistributionSettings.RUN_GROUP_PROPERTY, null)));
                 sessionId = created.sessionId();
                 LOG.info("Opened Citrus Test Distribution reactor session {} on coordinator {}", sessionId, coordinatorUrl);
             }

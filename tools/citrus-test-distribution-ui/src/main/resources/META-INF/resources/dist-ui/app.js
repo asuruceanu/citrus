@@ -59,6 +59,7 @@ const state = {
 
   // Filters
   sessionQuery: '',
+  expandedRunGroups: new Set(),
   sessionStatusFilter: 'ALL',
   testQuery: '',
   testStatusFilter: 'ALL',
@@ -838,7 +839,7 @@ function renderOverview() {
             <h2 class="card-title">Recent Build Sessions</h2>
             <button class="btn btn-sm" onClick=${() => setView('sessions')}>View All →</button>
           </div>
-          ${renderSessionsTable(state.sessions.slice(0, 6))}
+          ${renderSessionsTable(groupSessions(state.sessions).slice(0, 6))}
         </div>
 
         <div class="card pool-health-card">
@@ -870,6 +871,42 @@ async function deleteDashboardRecord(collection, id, message) {
   await refreshAll();
 }
 
+// Preserve newest-first order and paginate whole groups, so a shard stays with its siblings.
+function groupSessions(sessions) {
+  const rows = [];
+  const groups = new Map();
+  for (const session of sessions) {
+    if (!session.runGroup) {
+      rows.push(session);
+      continue;
+    }
+    if (!groups.has(session.runGroup)) {
+      const group = { runGroup: session.runGroup, shards: [] };
+      groups.set(session.runGroup, group);
+      rows.push(group);
+    }
+    groups.get(session.runGroup).shards.push(session);
+  }
+  return rows;
+}
+
+function renderRunGroup(group, showActions) {
+  const expanded = state.expandedRunGroups.has(group.runGroup);
+  const shards = group.shards;
+  const counts = new Map();
+  for (const shard of shards) counts.set(shard.status, (counts.get(shard.status) || 0) + 1);
+  const tests = shards.reduce((sum, shard) => sum + shard.totalTests, 0);
+  return html`<tr><td colspan=${showActions ? 8 : 7}>
+    <button class="btn btn-sm" type="button" aria-expanded=${String(expanded)} onClick=${() => {
+      if (expanded) state.expandedRunGroups.delete(group.runGroup);
+      else state.expandedRunGroups.add(group.runGroup);
+      renderApp();
+    }}>${expanded ? '▾' : '▸'} ${group.runGroup}</button>
+    <span>${shards.length} registered shards · ${tests} tests ·
+      ${[...counts].map(([status, count]) => count + ' ' + status.toLowerCase()).join(' · ')}</span>
+  </td></tr>`;
+}
+
 function renderSessionsTable(rows, showActions = false) {
   if (!rows || rows.length === 0) {
     return html`<div class="empty-state">No matching build sessions found.</div>`;
@@ -890,7 +927,8 @@ function renderSessionsTable(rows, showActions = false) {
           </tr>
         </thead>
         <tbody>
-          ${rows.map(s => {
+          ${rows.flatMap(row => row.shards && state.expandedRunGroups.has(row.runGroup) ? [row, ...row.shards] : [row]).map(s => {
+            if (s.shards) return renderRunGroup(s, showActions);
             const total = Math.max(1, s.totalTests || (s.passedTests + s.failedTests + s.skippedTests));
             const passPct = Math.round(((s.passedTests || 0) / total) * 100);
             const failPct = Math.round(((s.failedTests || 0) / total) * 100);
@@ -951,14 +989,16 @@ function renderSessionsTable(rows, showActions = false) {
 
 function renderSessionResults() {
   const q = state.sessionQuery.trim().toLowerCase();
-  const filtered = state.sessions.filter(s => {
+  const matches = s => {
     if (state.sessionStatusFilter !== 'ALL' && s.status !== state.sessionStatusFilter) return false;
     if (!q) return true;
     return (s.sessionId || '').toLowerCase().includes(q)
       || (s.gitBranch || '').toLowerCase().includes(q)
       || (s.gitCommit || '').toLowerCase().includes(q)
-      || (s.projectName || '').toLowerCase().includes(q);
-  });
+      || (s.projectName || '').toLowerCase().includes(q)
+      || (s.runGroup || '').toLowerCase().includes(q);
+  };
+  const filtered = groupSessions(state.sessions).filter(row => row.shards ? row.shards.some(matches) : matches(row));
 
   const page = paginate('sessions', filtered, 25, `${state.sessionStatusFilter}|${q}`);
   return html`<div class="card" id="session-results">${renderSessionsTable(page.items, true)}${page.controls}</div>`;
@@ -980,8 +1020,8 @@ function renderSessionsExplorer() {
           class="search-input explorer-search"
           data-focus-id="sessions-search"
           type="search"
-          aria-label="Filter sessions by session ID, branch, commit, or project"
-          placeholder="Session ID, branch, commit, or project"
+          aria-label="Filter sessions by session ID, run group, branch, commit, or project"
+          placeholder="Session, group, branch, commit, or project"
           value=${state.sessionQuery}
           onInput=${e => {
             state.sessionQuery = e.target.value;

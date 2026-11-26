@@ -224,3 +224,17 @@ To verify changes to the Citrus CLI, `-Dtest=DistCommandTest` selects its distri
 `-Dsurefire.failIfNoSpecifiedTests=false` lets prerequisite modules without that class pass. See the
 [Maven settings guide](../../../src/manual/tools-test-distribution.adoc#tools-test-distribution-maven)
 for the rest of the distribution settings.
+
+### Group parallel Maven shards in the dashboard
+
+Generate a fresh run ID once in the shell that launches the shards, for example
+`run_group="local-$(uuidgen)"`. Pass the same
+`-Dcitrus.test.distribution.runGroup="$run_group"` to every distributed Maven
+command in that run. Give each command its own display name, for example
+`-Dcitrus.test.distribution.projectName=Core` or
+`-Dcitrus.test.distribution.projectName=Camel`.
+
+Overview and Sessions show one expandable group. Its counts cover the shards
+that have registered so far. Expand it to open a shard's waterfall or inspect
+its failure. Each Maven process still closes its own session and reports its own
+exit status. Reusing a group ID combines the runs in the dashboard.

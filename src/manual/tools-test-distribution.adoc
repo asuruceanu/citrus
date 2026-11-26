@@ -79,6 +79,10 @@ TIP: Projects that do not use the Maven extension can add `org.citrusframework:c
 |Display name recorded on the build session (defaults to the root Maven artifactId or working directory name).
 |auto-detected
 
+|`citrus.test.distribution.runGroup`
+|Groups independent Maven sessions in Overview and Sessions. Pass the same unique value (up to 255 characters) to each shard of a build attempt. Each shard retains its own result and waterfall.
+|unset
+
 |`citrus.test.distribution.fallbackLocal` / `CITRUS_DIST_FALLBACK_LOCAL`
 |When `true`, allows local execution if the coordinator is unreachable or partitions are permanently `LOST`. A selection containing `@RemoteOnly` tests requires workers.
 |`true`

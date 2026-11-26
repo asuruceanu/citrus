@@ -51,6 +51,7 @@ public final class DistributionSettings {
     public static final String SESSION_ID_PROPERTY = "citrus.test.distribution.sessionId";
     public static final String MODULE_NAME_PROPERTY = "citrus.test.distribution.moduleName";
     public static final String REPORT_DIR_PROPERTY = "citrus.test.distribution.reportDir";
+    public static final String RUN_GROUP_PROPERTY = "citrus.test.distribution.runGroup";
     public static final String PROJECT_NAME_PROPERTY = "citrus.test.distribution.projectName";
     public static final String PROJECT_KEY_PROPERTY = "citrus.test.distribution.projectKey";
 

@@ -298,7 +298,7 @@ public class JdbcDistributionStore implements DistributionStore {
                 "pool_id", "VARCHAR(64)", "pool_display_name", "VARCHAR(255)", "active_test_display", "VARCHAR(512)",
                 "state_updated_at", "BIGINT", "warnings_json", longText));
         additions.put("dist_sessions", Map.of("failure_reason", "VARCHAR(4096)",
-                "requested_max_partition_size", "INT", "history_scope", "VARCHAR(1024)", "max_retries", "INT"));
+                "run_group", "VARCHAR(255)", "requested_max_partition_size", "INT", "history_scope", "VARCHAR(1024)", "max_retries", "INT"));
         additions.put("dist_events", Map.of("delivery_id", "VARCHAR(64)"));
         additions.put("dist_work_submissions", Map.of("request_json", longText, "max_retries", "INT"));
         additions.put("dist_test_executions", Map.of("unique_id", "VARCHAR(1024)"));
@@ -392,11 +392,11 @@ public class JdbcDistributionStore implements DistributionStore {
                 "started_at=?, finished_at=?, total_tests=?, passed_tests=?, failed_tests=?, skipped_tests=?, " +
                 "total_blobs=?, cached_blobs=?, serial_duration_ms=?, wall_duration_ms=?, failure_reason=?, " +
                 "requested_max_partition_size=COALESCE(?, requested_max_partition_size), " +
-                "history_scope=COALESCE(?, history_scope), max_retries=COALESCE(?, max_retries) WHERE session_id=?";
+                "history_scope=COALESCE(?, history_scope), max_retries=COALESCE(?, max_retries), run_group=COALESCE(?, run_group) WHERE session_id=?";
         String insertSql = "INSERT INTO dist_sessions (session_id, project_name, git_branch, git_commit, status, " +
                 "started_at, finished_at, total_tests, passed_tests, failed_tests, skipped_tests, " +
-                "total_blobs, cached_blobs, serial_duration_ms, wall_duration_ms, failure_reason, requested_max_partition_size, history_scope, max_retries) " +
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+                "total_blobs, cached_blobs, serial_duration_ms, wall_duration_ms, failure_reason, requested_max_partition_size, history_scope, max_retries, run_group) " +
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
         try (Connection conn = dataSource.getConnection()) {
             try (PreparedStatement ps = conn.prepareStatement(updateSql)) {
                 ps.setString(1, s.projectName());
@@ -417,7 +417,8 @@ public class JdbcDistributionStore implements DistributionStore {
                 ps.setObject(16, requestedMaxPartitionSize, Types.INTEGER);
                 ps.setString(17, historyScope);
                 ps.setObject(18, maxRetries, Types.INTEGER);
-                ps.setString(19, s.sessionId());
+                ps.setString(19, s.runGroup());
+                ps.setString(20, s.sessionId());
                 if (ps.executeUpdate() > 0) {
                     return;
                 }
@@ -442,6 +443,7 @@ public class JdbcDistributionStore implements DistributionStore {
                 ps.setObject(17, requestedMaxPartitionSize, Types.INTEGER);
                 ps.setString(18, historyScope);
                 ps.setObject(19, maxRetries, Types.INTEGER);
+                ps.setString(20, s.runGroup());
                 ps.executeUpdate();
             }
         } catch (SQLException e) {
@@ -542,7 +544,7 @@ public class JdbcDistributionStore implements DistributionStore {
     public Optional<BuildSessionRecord> findSession(String sessionId) {
         String sql = "SELECT session_id, project_name, git_branch, git_commit, status, started_at, finished_at, " +
                 "total_tests, passed_tests, failed_tests, skipped_tests, total_blobs, cached_blobs, " +
-                "serial_duration_ms, wall_duration_ms, failure_reason FROM dist_sessions WHERE session_id=?";
+                "serial_duration_ms, wall_duration_ms, failure_reason, run_group FROM dist_sessions WHERE session_id=?";
         try (Connection conn = dataSource.getConnection();
              PreparedStatement ps = conn.prepareStatement(sql)) {
             ps.setString(1, sessionId);
@@ -563,7 +565,7 @@ public class JdbcDistributionStore implements DistributionStore {
     public List<BuildSessionRecord> listSessions(int limit) {
         String sql = "SELECT session_id, project_name, git_branch, git_commit, status, started_at, finished_at, " +
                 "total_tests, passed_tests, failed_tests, skipped_tests, total_blobs, cached_blobs, " +
-                "serial_duration_ms, wall_duration_ms, failure_reason FROM dist_sessions ORDER BY started_at DESC";
+                "serial_duration_ms, wall_duration_ms, failure_reason, run_group FROM dist_sessions ORDER BY started_at DESC";
         List<BuildSessionRecord> result = new ArrayList<>();
         try (Connection conn = dataSource.getConnection();
              PreparedStatement ps = conn.prepareStatement(sql)) {
@@ -1906,7 +1908,7 @@ public class JdbcDistributionStore implements DistributionStore {
                 rs.getInt("cached_blobs"),
                 rs.getLong("serial_duration_ms"),
                 rs.getLong("wall_duration_ms"),
-                rs.getString("failure_reason")
+                rs.getString("failure_reason"), List.of(), rs.getString("run_group")
         );
     }
 

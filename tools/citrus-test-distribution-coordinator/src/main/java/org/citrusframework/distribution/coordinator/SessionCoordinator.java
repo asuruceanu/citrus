@@ -177,7 +177,7 @@ public final class SessionCoordinator {
                 SessionStatus.RUNNING,
                 now,
                 0L,
-                0, 0, 0, 0, 0, 0, 0L, 0L
+                0, 0, 0, 0, 0, 0, 0L, 0L, null, List.of(), request.runGroup()
         );
         String historyScope = DistributionSettings.historyScope(request.projectKey(), record.projectName());
         store.saveSession(record, request.maxPartitionSize(), historyScope, maxRetries);
