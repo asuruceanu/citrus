@@ -896,15 +896,35 @@ function renderRunGroup(group, showActions) {
   const counts = new Map();
   for (const shard of shards) counts.set(shard.status, (counts.get(shard.status) || 0) + 1);
   const tests = shards.reduce((sum, shard) => sum + shard.totalTests, 0);
-  return html`<tr><td colspan=${showActions ? 8 : 7}>
-    <button class="btn btn-sm" type="button" aria-expanded=${String(expanded)} onClick=${() => {
-      if (expanded) state.expandedRunGroups.delete(group.runGroup);
-      else state.expandedRunGroups.add(group.runGroup);
-      renderApp();
-    }}>${expanded ? '▾' : '▸'} ${group.runGroup}</button>
-    <span>${shards.length} registered shards · ${tests} tests ·
-      ${[...counts].map(([status, count]) => count + ' ' + status.toLowerCase()).join(' · ')}</span>
-  </td></tr>`;
+  const startedAt = Math.min(...shards.map(s => s.startedAt));
+  const finishedAt = counts.has('RUNNING') ? Date.now() : Math.max(...shards.map(s => s.finishedAt));
+  const branches = new Set(shards.map(s => s.gitBranch || 'local'));
+  const commits = new Set(shards.map(s => s.gitCommit));
+  const action = expanded ? 'Hide' : 'Show';
+  return html`<tr class="shard-group-row">
+    <td>
+      <strong>Sharded build</strong>
+      <div class="shard-group-id mono">${group.runGroup}</div>
+      <button class="btn btn-sm" type="button" data-focus-id=${'run-group-' + group.runGroup}
+        aria-label=${action + ' shards for ' + group.runGroup}
+        aria-expanded=${String(expanded)} onClick=${() => {
+          if (expanded) state.expandedRunGroups.delete(group.runGroup);
+          else state.expandedRunGroups.add(group.runGroup);
+          renderApp();
+        }}>${action} ${shards.length} ${shards.length === 1 ? 'shard' : 'shards'}</button>
+    </td>
+    <td>${branches.size === 1 ? shards[0].gitBranch || 'local' : 'Multiple branches'}
+      <div class="shard-group-id mono">${commits.size === 1 ? (shards[0].gitCommit || '').slice(0, 10) : 'Multiple commits'}</div>
+    </td>
+    <td><div class="shard-status-list">${[...counts].map(([status, count]) => html`
+      <span class=${'badge badge-' + status.toLowerCase()}>${count} ${status.toLowerCase()}</span>
+    `)}</div></td>
+    <td><strong>${tests.toLocaleString()}</strong></td>
+    <td>—</td>
+    <td class="mono">${formatDuration(Math.max(0, finishedAt - startedAt))}</td>
+    <td>${formatAgo(startedAt)}</td>
+    ${showActions ? html`<td></td>` : null}
+  </tr>`;
 }
 
 function renderSessionsTable(rows, showActions = false) {
@@ -943,8 +963,13 @@ function renderSessionsTable(rows, showActions = false) {
             return html`
               <tr class="clickable-row" onClick=${() => loadSessionDetail(s.sessionId, true)}>
                 <td>
-                  <div class="mono" style="font-weight:700;color:var(--citrus-orange-deep)">${s.sessionId}</div>
-                  <div style="font-size:11.5px;color:var(--text-muted)">${s.projectName || 'citrus'}</div>
+                  ${s.runGroup ? html`<div class="shard-child">
+                    <strong>${s.projectName || 'Shard'}</strong>
+                    <div class="mono shard-group-id">${s.sessionId}</div>
+                  </div>` : html`
+                    <div class="mono" style="font-weight:700;color:var(--citrus-orange-deep)">${s.sessionId}</div>
+                    <div style="font-size:11.5px;color:var(--text-muted)">${s.projectName || 'citrus'}</div>
+                  `}
                   ${Array.isArray(s.modules) && s.modules.length > 0 ? html`
                     <div class="session-modules" title=${s.modules.join('\n')}>${modulesLabel(s)}</div>
                   ` : null}

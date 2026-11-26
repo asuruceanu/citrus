@@ -1707,3 +1707,10 @@ form.dashboard-actions { align-items: end; }
 .pool-health-metrics > :last-child progress { color: var(--blue); }
 .pool-health-row .overview-worker-badges { flex-wrap: wrap; }
 .pool-health-row .badge { margin-top: 10px; }
+
+.shard-group-row { background: var(--bg-subtle); }
+.shard-group-row td:first-child { border-inline-start: 3px solid var(--citrus-orange); }
+.shard-group-row .btn { margin-top: 0.4rem; }
+.shard-group-id { color: var(--text-muted); font-size: 0.75rem; overflow-wrap: anywhere; }
+.shard-status-list { display: flex; flex-wrap: wrap; gap: 0.35rem; }
+.shard-child { margin-inline-start: 0.55rem; padding-inline-start: 0.75rem; border-inline-start: 2px solid var(--border-strong); }
