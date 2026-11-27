@@ -37,6 +37,8 @@ import org.junit.jupiter.api.Test;
 
 public class ComposeIT extends AbstractTestcontainersIT implements TestActionSupport {
 
+    private static final String WEB_URL = "http://${CITRUS_TESTCONTAINERS_WEB_1_SERVICE_HOST}:${CITRUS_TESTCONTAINERS_WEB_1_SERVICE_PORT}";
+
     @Test
     @CitrusTest
     public void shouldStartContainer(@CitrusResource TestCaseRunner runner) {
@@ -45,9 +47,10 @@ public class ComposeIT extends AbstractTestcontainersIT implements TestActionSup
 
         runner.when(testcontainers()
                 .compose()
-                .up(Resources.create("compose.yaml", ComposeIT.class)));
+                .up(Resources.create("compose.yaml", ComposeIT.class))
+                .withExposedService("web-1", 80));
 
-        runner.then(waitFor().http().url("http://localhost:8880"));
+        runner.then(waitFor().http().url(WEB_URL));
 
         runner.then(verifyExposedHttpEndpoint());
     }
@@ -59,7 +62,7 @@ public class ComposeIT extends AbstractTestcontainersIT implements TestActionSup
                 try {
                     HttpResponse<String> response = HttpClient.newHttpClient().send(
                             HttpRequest.newBuilder()
-                                    .uri(new URI("http://localhost:8880"))
+                                    .uri(new URI(context.replaceDynamicContentInString(WEB_URL)))
                                     .GET()
                                     .build(), HttpResponse.BodyHandlers.ofString());
 

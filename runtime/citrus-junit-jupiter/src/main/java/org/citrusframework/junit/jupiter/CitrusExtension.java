@@ -99,9 +99,8 @@ public class CitrusExtension implements BeforeAllCallback, InvocationInterceptor
             removeCitrus(extensionContext);
         }
 
-        if (requiresCitrus(extensionContext)) {
-            setCitrus(CitrusInstanceManager.getOrDefault(), extensionContext);
-        }
+        Citrus suiteCitrus = extensionContext.getRoot().getStore(NAMESPACE)
+                .getOrComputeIfAbsent(Citrus.class.getName(), key -> CitrusInstanceManager.getOrDefault(), Citrus.class);
 
         if (beforeSuite.getAndSet(false)) {
             // Assertion: If the beforeAll callback is called for a test, the annotated tags are currently
@@ -118,7 +117,7 @@ public class CitrusExtension implements BeforeAllCallback, InvocationInterceptor
 
             extensionContext.getRoot().getStore(ExtensionContext.Namespace.GLOBAL).put("afterSuiteCallback", new AfterSuiteCallback(extensionContext, suiteName, tags));
 
-            getCitrus(extensionContext).beforeSuite(suiteName, tags);
+            suiteCitrus.beforeSuite(suiteName, tags);
         }
     }
 

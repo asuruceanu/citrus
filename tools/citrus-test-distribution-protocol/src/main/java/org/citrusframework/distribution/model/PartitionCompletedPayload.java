@@ -28,8 +28,18 @@ public record PartitionCompletedPayload(
         int attempt,
         boolean success,
         String errorMessage,
-        List<WorkspaceFileSet> outputArtifacts
+        List<WorkspaceFileSet> outputArtifacts,
+        InputPreparation inputPreparation
 ) {
+
+    public PartitionCompletedPayload(String partitionId,
+                                     String sessionId,
+                                     int attempt,
+                                     boolean success,
+                                     String errorMessage,
+                                     List<WorkspaceFileSet> outputArtifacts) {
+        this(partitionId, sessionId, attempt, success, errorMessage, outputArtifacts, null);
+    }
 
     public PartitionCompletedPayload {
         attempt = Math.max(0, attempt);

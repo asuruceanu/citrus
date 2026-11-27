@@ -42,6 +42,7 @@
 
   <properties>
     <!-- Citrus Test Distribution: see the External Test Resources section of the user manual. -->
+    <citrus.test.distribution.inputs>src/test/resources</citrus.test.distribution.inputs>
     <citrus.test.distribution.fork>true</citrus.test.distribution.fork>
   </properties>
 

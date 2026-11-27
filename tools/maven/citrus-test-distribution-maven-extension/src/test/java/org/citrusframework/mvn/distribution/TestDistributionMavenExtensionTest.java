@@ -230,6 +230,7 @@ class TestDistributionMavenExtensionTest {
             Properties customProps = new Properties();
             customProps.putAll(userProps);
             customProps.setProperty(DistributionSettings.PROJECT_NAME_PROPERTY, "custom-citrus-suite");
+            customProps.setProperty(DistributionSettings.RUN_GROUP_PROPERTY, "six-shard-run");
             MavenProject modSignal = createSampleProject("citrus-mod-signal", tempDir.resolve("mod-signal"));
             MavenSession signalSession = mockSession(List.of(modSignal), customProps);
             TestDistributionLifecycleParticipant p4 = new TestDistributionLifecycleParticipant();
@@ -241,6 +242,9 @@ class TestDistributionMavenExtensionTest {
             p4.afterSessionEnd(signalSession);
             assertThat(p4.getShutdownHook()).isNull();
             BuildSessionRecord r4 = coordinator.store().findSession(sid4).orElseThrow();
+            assertThat(r4.runGroup()).isEqualTo("six-shard-run");
+            assertThat(coordinator.store().listSessions(10)).filteredOn(s -> "six-shard-run".equals(s.runGroup()))
+                    .extracting(BuildSessionRecord::sessionId).containsExactly(sid4);
             assertThat(r4.status()).isEqualTo(SessionStatus.ABORTED);
         }
     }

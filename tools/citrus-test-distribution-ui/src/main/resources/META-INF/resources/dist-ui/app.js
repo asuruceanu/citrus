@@ -6,6 +6,7 @@
  */
 
 import { html } from './vendor/htm-mini.js';
+import { openPicker } from './search-picker.js';
 import { renderUsageChart } from './usage-chart.js';
 
 const STORAGE_THEME_KEY = 'citrus.dist.theme';
@@ -58,11 +59,14 @@ const state = {
 
   // Filters
   sessionQuery: '',
+  expandedRunGroups: new Set(),
   sessionStatusFilter: 'ALL',
   testQuery: '',
   testStatusFilter: 'ALL',
+  localTestsSession: null,
   workerQuery: '',
   workerStateFilter: 'ALL',
+  expandedWorkers: new Set(),
   historyQuery: '',
   historyOutcome: 'all',
   historyProject: '',
@@ -72,6 +76,7 @@ const state = {
   // Modals
   selectedPartition: null,
   waterfallExpanded: false,
+  showMavenBuildTime: true,
   pages: {}, // current page per paginated table
   pageContexts: {}, // session and filters each table's current page belongs to
   selectedTestExecution: null,
@@ -84,7 +89,9 @@ let eventSource = null;
 let toastTimer = null;
 let refreshTimer = null;
 let refreshInFlight = false;
+let overviewRefreshing = false;
 let refreshPending = false;
+let activityPending = false;
 let lastDetailLoadAt = 0;
 let detailTimer = null;
 // A new request or leaving the detail view invalidates earlier responses.
@@ -203,6 +210,7 @@ function changeView(view, poolId = null) {
 }
 
 function refreshCurrentView() {
+  if (['sessions', 'overview'].includes(state.view) && activityPending) scheduleRefresh();
   loadPools();
   if (state.view === 'usage') loadUsage(true);
 }
@@ -292,14 +300,14 @@ const HISTORY_VIEWS = new Set(['overview', 'history']);
 async function loadHistory(force = false) {
   if (historyInFlight) return;
   if (!force && (!HISTORY_VIEWS.has(state.view) || Date.now() - lastHistoryLoadAt < HISTORY_MIN_INTERVAL_MS)) {
-    if (state.history.length > 0) return;
+    return;
   }
   historyInFlight = true;
   lastHistoryLoadAt = Date.now();
   try {
     const history = await apiGet('/api/v1/tests/history?limit=2000');
     state.history = Array.isArray(history) ? history : [];
-    renderApp();
+    if (HISTORY_VIEWS.has(state.view)) renderApp();
   } catch (err) {
     if (err.message !== 'Unauthorized') {
       console.warn('History refresh error:', err.message);
@@ -334,17 +342,18 @@ async function pollWorkers() {
   }
 }
 
-async function refreshAll() {
+async function refreshAll(includeWorkers = true) {
   // One refresh at a time: events arriving meanwhile coalesce into a single follow-up refresh.
   if (refreshInFlight) {
     refreshPending = true;
     return;
   }
   refreshInFlight = true;
+  activityPending = false;
   try {
     const [sessions] = await Promise.all([
       apiGet('/api/v1/sessions?limit=500'),
-      loadWorkers()
+      includeWorkers ? loadWorkers() : Promise.resolve()
     ]);
     state.sessions = Array.isArray(sessions) ? sessions : [];
     loadHistory(); // independent: a slow history query must not hold back sessions and workers
@@ -354,22 +363,20 @@ async function refreshAll() {
     if (state.selectedSessionId && state.view === 'session-detail') {
       const current = state.sessionDetail && state.sessionDetail.session
         && state.sessionDetail.session.sessionId === state.selectedSessionId;
-      const sinceDetail = Date.now() - lastDetailLoadAt;
-      if (!current || sinceDetail >= DETAIL_MIN_INTERVAL_MS) {
-        await loadSessionDetail(state.selectedSessionId, false);
-      } else {
-        // Keep the KPI counters live from the light session list; reload the heavy detail on the trailing edge.
-        const summary = state.sessions.find(s => s.sessionId === state.selectedSessionId);
-        if (summary) {
-          state.sessionDetail = { ...state.sessionDetail, session: summary };
+      const summary = state.sessions.find(s => s.sessionId === state.selectedSessionId);
+      if (!current || state.sessionDetail.session.status === 'RUNNING') {
+        const delay = DETAIL_MIN_INTERVAL_MS - (Date.now() - lastDetailLoadAt);
+        if (!current || (summary && summary.status !== 'RUNNING') || delay <= 0) {
+          clearTimeout(detailTimer);
+          detailTimer = null;
+          await loadSessionDetail(state.selectedSessionId, false);
+          return; // The detail loader renders the new snapshot.
         }
         if (!detailTimer) {
           detailTimer = setTimeout(() => {
             detailTimer = null;
-            if (state.view === 'session-detail' && state.selectedSessionId) {
-              loadSessionDetail(state.selectedSessionId, false);
-            }
-          }, DETAIL_MIN_INTERVAL_MS - sinceDetail);
+            if (state.view === 'session-detail' && state.selectedSessionId) loadSessionDetail(state.selectedSessionId, false);
+          }, delay);
         }
       }
     } else if (state.selectedSessionId) {
@@ -387,6 +394,10 @@ async function refreshAll() {
     }
   } finally {
     refreshInFlight = false;
+    if (overviewRefreshing) {
+      overviewRefreshing = false;
+      if (state.view === 'overview') renderApp();
+    }
     if (refreshPending) {
       refreshPending = false;
       scheduleRefresh();
@@ -433,6 +444,7 @@ async function loadSessionDetail(sessionId, switchView = true) {
     renderApp();
   } catch (err) {
     if (!isCurrent() || err.message === 'Unauthorized') return;
+    if (err.status === 404 && state.sessionDetail?.session?.sessionId === sessionId) state.sessionDetail = null;
     if (sessionId === state.selectedSessionId && state.sessionDetail?.session?.sessionId !== sessionId) {
       state.sessionDetailError = { sessionId, message: `Could not load build session (${err.message}).` };
       renderApp();
@@ -452,10 +464,13 @@ function ensurePollingLoop() {
       }
       refreshAll();
       if (showsPoolData()) schedulePoolRefresh();
+    } else if (activityPending && (state.view === 'sessions' || state.view === 'overview' ||
+        (state.view === 'session-detail' && state.sessionDetail?.session.status === 'RUNNING'))) {
+      refreshAll(state.view === 'overview');
     } else if (shouldPollWorkers()) {
       // Heartbeats update worker telemetry without publishing a lifecycle event.
       pollWorkers();
-    } else if (state.sessions.some(s => s.status === 'RUNNING')) {
+    } else if (state.view === 'sessions' && state.sessions.some(s => s.status === 'RUNNING')) {
       renderApp();
     }
   }, POLL_INTERVAL_MS);
@@ -469,37 +484,40 @@ function connectSse() {
   if (eventSource) {
     eventSource.close();
   }
-  eventSource = new EventSource('/api/v1/events/stream');
+  eventSource = new EventSource('/api/v1/events/stream?mode=dashboard');
   eventSource.onopen = () => {
     state.sseConnected = true;
     if (showsPoolData()) schedulePoolRefresh();
     renderApp();
-    if (shouldPollWorkers()) {
-      pollWorkers();
+    // Reconcile a cached session that may have been deleted while disconnected.
+    if (state.view === 'session-detail' && state.sessionDetail?.session.sessionId === state.selectedSessionId) {
+      loadSessionDetail(state.selectedSessionId, false);
     }
+    scheduleRefresh();
   };
   eventSource.onerror = () => {
     state.sseConnected = false;
     renderApp();
   };
-  const eventTypes = [
-    'session.created', 'session.completed', 'session.aborted', 'work.submitted',
-    'partition.assigned', 'partition.started', 'partition.requeued',
-    'partition.completed', 'partition.lost', 'test.event',
-    'worker.registered', 'worker.draining', 'worker.offline', 'worker.disconnected',
-    'worker.updated', 'worker.rejected'
-  ];
-  for (const evt of eventTypes) {
-    eventSource.addEventListener(evt, () => {
+  eventSource.addEventListener('dashboard.updated', event => {
+    const changes = JSON.parse(event.data);
+    const sessionListChanged = changes.some(type => ['session.created', 'session.completed', 'session.aborted', 'session.deleted'].includes(type));
+    const workerListChanged = changes.some(type => ['worker.registered', 'worker.offline', 'worker.deleted'].includes(type));
+    activityPending = true;
+    if (sessionListChanged || workerListChanged) {
       scheduleRefresh();
-      if (state.view === 'pools' && evt.startsWith('worker.')) schedulePoolRefresh();
-    });
-  }
-  for (const evt of ['pool.updated', 'pool.deleted']) {
-    eventSource.addEventListener(evt, () => {
-      if (showsPoolData()) schedulePoolRefresh();
-    });
-  }
+      // A deleted session can be outside the limited session list.
+      if (state.view === 'session-detail' && changes.includes('session.deleted') && state.selectedSessionId) {
+        loadSessionDetail(state.selectedSessionId, false);
+      }
+    } else if (!['workers', 'sessions', 'overview', 'session-detail'].includes(state.view)) {
+      scheduleRefresh();
+    }
+    if ((showsPoolData() && changes.some(type => type.startsWith('pool.')))
+        || (state.view === 'pools' && changes.some(type => type.startsWith('worker.')))) {
+      schedulePoolRefresh();
+    }
+  });
 }
 
 function toggleTheme() {
@@ -600,9 +618,17 @@ function renderTopbar() {
       </div>
 
       <div class="topbar-right">
-        <span class=${`sse-pill ${state.sseConnected ? '' : 'offline'}`}>
-          <span class="sse-dot"></span>
-          ${state.sseConnected ? 'Live SSE' : 'Polling'}
+        <span class="connection-help">
+          <span class=${`sse-pill ${state.sseConnected ? '' : 'offline'}`} tabindex="0"
+              data-focus-id="connection-status" aria-describedby="connection-tooltip">
+            <span class="sse-dot" aria-hidden="true"></span>
+            ${state.sseConnected ? 'Live SSE' : 'Polling'}
+          </span>
+          <span id="connection-tooltip" role="tooltip">
+            ${state.sseConnected
+              ? 'The coordinator sends updates to this dashboard as tests run. SSE stands for server-sent events.'
+              : 'While the live connection is unavailable, the dashboard checks the coordinator for updates.'}
+          </span>
         </span>
         <button class="icon-btn" onClick=${toggleTheme} aria-label="Toggle dark or light theme">
           ${state.theme === 'light' ? '☾ Dark' : '☀ Light'}
@@ -659,10 +685,10 @@ function renderSidebar() {
         ${navItem('session-detail', 'Session Waterfall', '⇶', state.sessionDetail ? state.sessionDetail.session.status : null)}
         ${navItem('usage', 'Historical Usage', '◴', null)}
         <div class="nav-section-label" style="margin-top:10px">Infrastructure & Quality</div>
-        ${navItem('workers', 'Workers Pool', '⚙', `${activeWorkers}/${state.workers.length}`)}
-        ${navItem('pools', 'Agent Pools', '▦', null)}
+        ${navItem('workers', 'Workers', '⚙', `${activeWorkers}/${state.workers.length}`)}
+        ${navItem('pools', 'Worker Pools', '▦', null)}
         ${navItem('history', 'Test History & Flakiness', '⚡',
-          flakyCount > 0 ? `${flakyCount} flaky` : state.history.length, flakyCount > 0 ? openFlakyHistory : null)}
+          flakyCount > 0 ? `${flakyCount} flaky` : (lastHistoryLoadAt ? state.history.length : null), flakyCount > 0 ? openFlakyHistory : null)}
       </div>
 
       <div class="sidebar-footer">
@@ -672,7 +698,66 @@ function renderSidebar() {
   `;
 }
 
+function refreshOverview() {
+  if (overviewRefreshing) return;
+  overviewRefreshing = true;
+  renderApp();
+  refreshAll();
+}
+
+function groupWorkersByPool(workers) {
+  const groups = new Map((state.pools || []).map(pool =>
+    [pool.poolId, { name: pool.displayName, workers: [] }]));
+  const unpooled = { name: 'Unpooled Workers', workers: [] };
+  for (const worker of workers) {
+    if (!worker.poolId) {
+      unpooled.workers.push(worker);
+      continue;
+    }
+    if (!groups.has(worker.poolId)) {
+      groups.set(worker.poolId, { name: worker.poolDisplayName || worker.poolId, workers: [] });
+    }
+    const group = groups.get(worker.poolId);
+    group.workers.push(worker);
+    if (warningList(worker).some(w => w.code === 'POOL_DELETED')) group.deleted = true;
+  }
+  return [...groups.values(), ...(unpooled.workers.length ? [unpooled] : [])];
+}
+
+function renderPoolHealth({ name, workers, deleted }) {
+  const online = workers.filter(w => w.state !== 'OFFLINE');
+  const offline = workers.length - online.length;
+  const draining = online.filter(w => w.state === 'DRAINING').length;
+  const lowDisk = online.filter(isLowDisk).length;
+  const warnings = online.filter(w => warningList(w).length).length;
+  const slots = online.reduce((sum, w) => sum + (w.connectedSlots ?? 1), 0);
+  const active = online.reduce((sum, w) => sum + (w.activePartitionIds?.length ?? Number(Boolean(w.activePartitionId))), 0);
+  return html`<li class="pool-health-row">
+    <div class="pool-health-heading">
+      <span class="pool-health-symbol" aria-hidden="true">▦</span><strong>${name}</strong>
+    </div>
+    ${workers.length ? html`<div class="pool-health-metrics">
+      <div>
+        <span>Workers online</span><strong>${online.length}<small> / ${workers.length}</small></strong>
+        <progress aria-label="Workers online" value=${online.length} max=${workers.length}></progress>
+      </div>
+      <div>
+        <span>Slots in use</span><strong>${active}<small> / ${slots}</small></strong>
+        <progress aria-label="Slots in use" value=${active} max=${slots || 1}></progress>
+      </div>
+    </div>` : html`<span class="muted">No registered workers</span>`}
+    <div class="overview-worker-badges">
+      ${deleted ? html`<span class="badge badge-offline">Pool deleted</span>` : null}
+      ${offline ? html`<span class="badge badge-offline">${offline} offline</span>` : null}
+      ${draining ? html`<span class="badge badge-warning">${draining} draining</span>` : null}
+      ${lowDisk ? html`<span class="badge badge-failed">${lowDisk} low disk</span>` : null}
+      ${warnings ? html`<span class="badge badge-warning">${warnings} with warnings</span>` : null}
+    </div>
+  </li>`;
+}
+
 function renderOverview() {
+  const workerGroups = groupWorkersByPool(state.workers);
   const totalSessions = state.sessions.length;
   const passedSessions = state.sessions.filter(s => s.status === 'PASSED').length;
   const failedSessions = state.sessions.filter(s => s.status === 'FAILED').length;
@@ -701,12 +786,19 @@ function renderOverview() {
 
   return html`
     <div>
-      <div class="page-header">
+      <div class="page-header overview-header">
         <div>
           <h1 class="page-title">Test Distribution Control Plane</h1>
           <p class="page-subtitle">Real-time LPT partition scheduling, content-addressed classpath & workspace caching, and Citrus execution telemetry.</p>
         </div>
-        <button class="btn" onClick=${refreshAll}>↻ Refresh</button>
+        <button type="button" class="btn overview-refresh" aria-busy=${String(overviewRefreshing)}
+            onClick=${refreshOverview}>
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+               stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M20 7v5h-5 M19.5 12a7.5 7.5 0 1 0-2.2 5.3"></path>
+          </svg>
+          ${overviewRefreshing ? 'Refreshing…' : 'Refresh'}
+        </button>
       </div>
 
       <div class="kpi-grid">
@@ -748,29 +840,19 @@ function renderOverview() {
             <h2 class="card-title">Recent Build Sessions</h2>
             <button class="btn btn-sm" onClick=${() => setView('sessions')}>View All →</button>
           </div>
-          ${renderSessionsTable(state.sessions.slice(0, 6))}
+          ${renderSessionsTable(groupSessions(state.sessions).slice(0, 6))}
         </div>
 
-        <div class="card">
+        <div class="card pool-health-card">
           <div class="card-header">
-            <h2 class="card-title">Worker Pool Health</h2>
-            <button class="btn btn-sm" onClick=${() => setView('workers')}>Inspect Pool →</button>
+            <h2 class="card-title">Worker Health by Pool</h2>
+            <button class="btn btn-sm" onClick=${() => setView('workers')}>View Workers →</button>
           </div>
-          <div class="card-body" style="display:flex;flex-direction:column;gap:10px">
-            ${state.workers.length === 0
-              ? html`<div class="empty-state">No workers registered yet.</div>`
-              : state.workers.map(w => html`
-                  <div style="display:flex;align-items:center;justify-content:space-between;padding:8px 10px;border-radius:8px;background:var(--bg-subtle)">
-                    <div>
-                      <div class="mono" style="font-weight:700;font-size:12.5px">${w.workerId}</div>
-                      <div style="font-size:11.5px;color:var(--text-muted)">${w.host} · heartbeat ${formatAgo(w.lastHeartbeatAt)}</div>
-                    </div>
-                    <div class="overview-worker-badges">
-                      ${isLowDisk(w) ? html`<span class="badge badge-failed">LOW DISK</span>` : null}
-                      ${statusBadge(w.state)}
-                    </div>
-                  </div>
-                `)}
+          <div class="card-body">
+            ${state.poolListError ? html`<p role="status">${state.poolListError}</p>` : null}
+            ${workerGroups.length
+              ? html`<ul class="pool-health-list">${workerGroups.map(renderPoolHealth)}</ul>`
+              : html`<div class="empty-state">No workers registered yet.</div>`}
           </div>
         </div>
       </div>
@@ -778,12 +860,80 @@ function renderOverview() {
   `;
 }
 
-function renderSessionsTable(rows) {
+async function deleteDashboardRecord(collection, id, message) {
+  if (!window.confirm(message)) return;
+  try {
+    await apiDelete(`/api/v1/${collection}/${encodeURIComponent(id)}`);
+  } catch (err) {
+    if (err.status !== 404) {
+      window.alert(err.status === 409 ? 'This record is active and cannot be deleted.' : `Could not delete ${id}: ${err.message}`);
+    }
+  }
+  await refreshAll();
+}
+
+// Preserve newest-first order and paginate whole groups, so a shard stays with its siblings.
+function groupSessions(sessions) {
+  const rows = [];
+  const groups = new Map();
+  for (const session of sessions) {
+    if (!session.runGroup) {
+      rows.push(session);
+      continue;
+    }
+    if (!groups.has(session.runGroup)) {
+      const group = { runGroup: session.runGroup, shards: [] };
+      groups.set(session.runGroup, group);
+      rows.push(group);
+    }
+    groups.get(session.runGroup).shards.push(session);
+  }
+  return rows;
+}
+
+function renderRunGroup(group, showActions) {
+  const expanded = state.expandedRunGroups.has(group.runGroup);
+  const shards = group.shards;
+  const counts = new Map();
+  for (const shard of shards) counts.set(shard.status, (counts.get(shard.status) || 0) + 1);
+  const tests = shards.reduce((sum, shard) => sum + shard.totalTests, 0);
+  const startedAt = Math.min(...shards.map(s => s.startedAt));
+  const finishedAt = counts.has('RUNNING') ? Date.now() : Math.max(...shards.map(s => s.finishedAt));
+  const branches = new Set(shards.map(s => s.gitBranch || 'local'));
+  const commits = new Set(shards.map(s => s.gitCommit));
+  const action = expanded ? 'Hide' : 'Show';
+  return html`<tr class="shard-group-row">
+    <td>
+      <strong>Sharded build</strong>
+      <div class="shard-group-id mono">${group.runGroup}</div>
+      <button class="btn btn-sm" type="button" data-focus-id=${'run-group-' + group.runGroup}
+        aria-label=${action + ' shards for ' + group.runGroup}
+        aria-expanded=${String(expanded)} onClick=${() => {
+          if (expanded) state.expandedRunGroups.delete(group.runGroup);
+          else state.expandedRunGroups.add(group.runGroup);
+          renderApp();
+        }}>${action} ${shards.length} ${shards.length === 1 ? 'shard' : 'shards'}</button>
+    </td>
+    <td>${branches.size === 1 ? shards[0].gitBranch || 'local' : 'Multiple branches'}
+      <div class="shard-group-id mono">${commits.size === 1 ? (shards[0].gitCommit || '').slice(0, 10) : 'Multiple commits'}</div>
+    </td>
+    <td><div class="shard-status-list">${[...counts].map(([status, count]) => html`
+      <span class=${'badge badge-' + status.toLowerCase()}>${count} ${status.toLowerCase()}</span>
+    `)}</div></td>
+    <td><strong>${tests.toLocaleString()}</strong></td>
+    <td>—</td>
+    <td class="mono">${formatDuration(Math.max(0, finishedAt - startedAt))}</td>
+    <td>${formatAgo(startedAt)}</td>
+    ${showActions ? html`<td></td>` : null}
+  </tr>`;
+}
+
+function renderSessionsTable(rows, showActions = false) {
   if (!rows || rows.length === 0) {
     return html`<div class="empty-state">No matching build sessions found.</div>`;
   }
   return html`
-    <div class="table-wrap">
+    <div class="table-wrap" data-scroll-key="sessions">
       <table>
         <thead>
           <tr>
@@ -794,10 +944,12 @@ function renderSessionsTable(rows) {
             <th>Cache Hit</th>
             <th>Wall / Speedup</th>
             <th>Started</th>
+            ${showActions ? html`<th>Actions</th>` : null}
           </tr>
         </thead>
         <tbody>
-          ${rows.map(s => {
+          ${rows.flatMap(row => row.shards && state.expandedRunGroups.has(row.runGroup) ? [row, ...row.shards] : [row]).map(s => {
+            if (s.shards) return renderRunGroup(s, showActions);
             const total = Math.max(1, s.totalTests || (s.passedTests + s.failedTests + s.skippedTests));
             const passPct = Math.round(((s.passedTests || 0) / total) * 100);
             const failPct = Math.round(((s.failedTests || 0) / total) * 100);
@@ -812,8 +964,13 @@ function renderSessionsTable(rows) {
             return html`
               <tr class="clickable-row" onClick=${() => loadSessionDetail(s.sessionId, true)}>
                 <td>
-                  <div class="mono" style="font-weight:700;color:var(--citrus-orange-deep)">${s.sessionId}</div>
-                  <div style="font-size:11.5px;color:var(--text-muted)">${s.projectName || 'citrus'}</div>
+                  ${s.runGroup ? html`<div class="shard-child">
+                    <strong>${s.projectName || 'Shard'}</strong>
+                    <div class="mono shard-group-id">${s.sessionId}</div>
+                  </div>` : html`
+                    <div class="mono" style="font-weight:700;color:var(--citrus-orange-deep)">${s.sessionId}</div>
+                    <div style="font-size:11.5px;color:var(--text-muted)">${s.projectName || 'citrus'}</div>
+                  `}
                   ${Array.isArray(s.modules) && s.modules.length > 0 ? html`
                     <div class="session-modules" title=${s.modules.join('\n')}>${modulesLabel(s)}</div>
                   ` : null}
@@ -842,6 +999,11 @@ function renderSessionsTable(rows) {
                   ${speedup ? html` <span class="speedup-badge">${speedup}</span>` : null}
                 </td>
                 <td style="color:var(--text-muted);font-size:12.5px">${formatAgo(s.startedAt)}</td>
+                ${showActions ? html`<td>${s.status !== 'RUNNING' ? html`
+                  <button class="btn btn-sm btn-danger" type="button" onClick=${event => {
+                    event.stopPropagation();
+                    deleteDashboardRecord('sessions', s.sessionId, `Delete ${s.sessionId} and its test results?`);
+                  }}>Delete</button>` : null}</td>` : null}
               </tr>
             `;
           })}
@@ -851,18 +1013,25 @@ function renderSessionsTable(rows) {
   `;
 }
 
-function renderSessionsExplorer() {
-  const statuses = ['ALL', 'RUNNING', 'PASSED', 'FAILED', 'ABORTED'];
+function renderSessionResults() {
   const q = state.sessionQuery.trim().toLowerCase();
-  const filtered = state.sessions.filter(s => {
+  const matches = s => {
     if (state.sessionStatusFilter !== 'ALL' && s.status !== state.sessionStatusFilter) return false;
     if (!q) return true;
     return (s.sessionId || '').toLowerCase().includes(q)
       || (s.gitBranch || '').toLowerCase().includes(q)
       || (s.gitCommit || '').toLowerCase().includes(q)
-      || (s.projectName || '').toLowerCase().includes(q);
-  });
+      || (s.projectName || '').toLowerCase().includes(q)
+      || (s.runGroup || '').toLowerCase().includes(q);
+  };
+  const filtered = groupSessions(state.sessions).filter(row => row.shards ? row.shards.some(matches) : matches(row));
 
+  const page = paginate('sessions', filtered, 25, `${state.sessionStatusFilter}|${q}`);
+  return html`<div class="card" id="session-results">${renderSessionsTable(page.items, true)}${page.controls}</div>`;
+}
+
+function renderSessionsExplorer() {
+  const statuses = ['ALL', 'RUNNING', 'PASSED', 'FAILED', 'ABORTED'];
   return html`
     <div>
       <div class="page-header">
@@ -874,12 +1043,16 @@ function renderSessionsExplorer() {
 
       <div class="toolbar">
         <input
-          class="search-input"
+          class="search-input explorer-search"
           data-focus-id="sessions-search"
           type="search"
-          placeholder="Filter by session ID, branch, commit, or project…"
+          aria-label="Filter sessions by session ID, run group, branch, commit, or project"
+          placeholder="Session, group, branch, commit, or project"
           value=${state.sessionQuery}
-          onInput=${e => { state.sessionQuery = e.target.value; renderApp(); }}
+          onInput=${e => {
+            state.sessionQuery = e.target.value;
+            document.getElementById('session-results').replaceWith(renderSessionResults());
+          }}
         />
         <div class="pill-group">
           ${statuses.map(st => html`
@@ -891,12 +1064,7 @@ function renderSessionsExplorer() {
         </div>
       </div>
 
-      <div class="card">
-        ${(() => {
-          const page = paginate('sessions', filtered, 25, `${state.sessionStatusFilter}|${q}`);
-          return html`${renderSessionsTable(page.items)}${page.controls}`;
-        })()}
-      </div>
+      ${renderSessionResults()}
     </div>
   `;
 }
@@ -990,6 +1158,11 @@ function fitBarLabel(label, barWidth) {
   return maxChars >= 5 ? `${distinctive.slice(0, maxChars - 1)}…` : '';
 }
 
+function fitWorkerLaneLabel(label) {
+  const characters = Array.from(label);
+  return characters.length <= 16 ? label : `${characters.slice(0, 15).join('')}…`;
+}
+
 // The session records worker activity, so Maven build time is inferred from idle time between modules.
 function mavenBuildGaps(partitions, endOf) {
   const started = partitions.filter(p => p.startedAt > 0).sort((a, b) => a.startedAt - b.startedAt);
@@ -1014,9 +1187,50 @@ function toggleWaterfall() {
   document.querySelector('[data-focus-id="waterfall-toggle"]')?.focus();
 }
 
-function renderWaterfallSvg(session, partitions) {
+function renderModuleLegend(modules, filters) {
+  function select(module) {
+    filters.module = filters.module === module ? '' : module;
+    renderApp();
+  }
+  function moduleButton(name) {
+    return html`<button type="button" class="legend-item module-filter" data-focus-id=${'waterfall-module-' + name}
+        aria-pressed=${String(filters.module === name)} onClick=${() => select(name)}>
+      <span class="legend-swatch" style=${`background:${moduleColor(modules, name)}`}></span> ${name}</button>`;
+  }
+  function choices() {
+    const query = filters.moduleQuery.trim().toLowerCase();
+    const matches = modules.filter(name => name.toLowerCase().includes(query));
+    return html`<div class="waterfall-legend module-choices">
+      <button type="button" class="legend-item module-filter" data-focus-id="waterfall-all-modules"
+          aria-pressed=${String(!filters.module)} onClick=${() => select('')}>All modules</button>
+      ${filters.module && !matches.includes(filters.module) ? moduleButton(filters.module) : null}
+      ${matches.map(moduleButton)}
+      ${query && !matches.length ? html`<span role="status">No matching modules</span>` : null}
+    </div>`;
+  }
+  return html`
+      <div class="module-legend">
+        <input class="search-input module-legend-search" type="search" data-focus-id="waterfall-module-search"
+            aria-label="Search modules" placeholder="Search modules…" value=${filters.moduleQuery}
+            onInput=${event => {
+              filters.moduleQuery = event.target.value;
+              event.target.parentElement.querySelector('.module-choices').replaceWith(choices());
+            }} />
+        ${choices()}
+      </div>
+      <div class="waterfall-legend">
+        <span class="legend-item legend-outline"><span class="legend-swatch legend-swatch-outline" style="border-color:#ef4444"></span> Failed</span>
+        <span class="legend-item legend-outline"><span class="legend-swatch legend-swatch-outline" style="border-color:#3b82f6;border-style:dashed"></span> Running</span>
+        <span class="legend-item legend-outline"><span class="legend-swatch legend-swatch-outline" style="border-color:#f59e0b;border-style:dashed"></span> Lost / Requeued</span>
+        <span style="margin-left:auto;font-size:12px;color:var(--text-muted)">Hover a bar for details · click to inspect</span>
+      </div>
+
+  `;
+}
+
+function renderWaterfallSvg(session, partitions, modules, selectedModule) {
   if (!partitions || partitions.length === 0) {
-    return html`<div class="empty-state">No partitions recorded for this session yet.</div>`;
+    return html`<div class="empty-state">${selectedModule ? 'No partitions recorded for this module.' : 'No partitions recorded for this session yet.'}</div>`;
   }
 
   const minStart = Math.min(...partitions.map(p => p.startedAt > 0 ? p.startedAt : session.startedAt));
@@ -1028,7 +1242,7 @@ function renderWaterfallSvg(session, partitions) {
     : ((p.state === 'RUNNING' || p.state === 'ASSIGNED') ? Math.max(startOf(p), nowMs) : startOf(p) + estOf(p));
   const maxEnd = Math.max(
     minStart + 1000,
-    session.finishedAt > 0 ? session.finishedAt : 0,
+    !selectedModule && session.finishedAt > 0 ? session.finishedAt : 0,
     ...partitions.map(endOf)
   );
   const totalSpan = Math.max(1000, maxEnd - minStart);
@@ -1036,23 +1250,67 @@ function renderWaterfallSvg(session, partitions) {
   // Group partitions by worker swimlane
   const lanes = new Map();
   for (const p of partitions) {
-    const laneKey = p.workerId || 'unassigned-queue';
+    const laneKey = p.workerId || null;
     if (!lanes.has(laneKey)) lanes.set(laneKey, []);
     lanes.get(laneKey).push(p);
   }
 
-  const laneEntries = Array.from(lanes.entries());
+  const laneEntries = [];
+  for (const [workerId, parts] of lanes) {
+    if (!workerId) {
+      laneEntries.push({ workerId, parts });
+      continue;
+    }
+    // Session history records the worker and interval, but no physical slot identifier.
+    const tracks = [];
+    const untimed = [];
+    for (const part of parts.sort((a, b) => startOf(a) - startOf(b)
+        || a.partitionId.localeCompare(b.partitionId) || a.attempt - b.attempt)) {
+      if (!(part.startedAt > 0) || !(part.finishedAt > 0 || part.state === 'RUNNING')) {
+        untimed.push(part);
+        continue;
+      }
+      const track = tracks.find(items => endOf(items[items.length - 1]) <= startOf(part));
+      if (track) track.push(part);
+      else tracks.push([part]);
+    }
+    const preparations = new Map();
+    for (const part of parts) {
+      const prep = part.inputPreparation;
+      if (!prep) continue;
+      const key = prep.startedAt + '/' + prep.readyAt;
+      const interval = preparations.get(key) || { ...prep, partitionCount: 0 };
+      interval.partitionCount++;
+      preparations.set(key, interval);
+    }
+    if (preparations.size) laneEntries.push({ workerId, parts: [], preparations: [...preparations.values()] });
+    const liveWorker = session.status === 'RUNNING' && state.workers.find(worker => worker.workerId === workerId);
+    const labelSlots = tracks.length > 1 || liveWorker?.connectedSlots > 1;
+    tracks.forEach((parts, index) => laneEntries.push({ workerId, parts, slot: labelSlots ? index + 1 : null }));
+    if (untimed.length) laneEntries.push({ workerId, parts: untimed, untimed: true });
+  }
+  const notes = [];
+  if (laneEntries.some(lane => lane.slot)) {
+    notes.push('Slot lanes are inferred from partition times. Bars aligned vertically on the same worker show concurrent work.');
+  }
+  if (laneEntries.some(lane => lane.preparations)) {
+    notes.push('The Inputs lane shows shared preparation. An amber underline marks each partition’s wait for those inputs.');
+  }
   const labelWidth = 205;
   const chartWidth = 760;
   const svgWidth = labelWidth + chartWidth + 30;
   const rowHeight = 46;
-  const buildGaps = mavenBuildGaps(partitions, endOf);
+  const testsByPartition = new Map();
+  for (const test of state.sessionDetail?.tests || []) {
+    if (!testsByPartition.has(test.partitionId)) testsByPartition.set(test.partitionId, []);
+    testsByPartition.get(test.partitionId).push(test);
+  }
+  const buildGaps = state.showMavenBuildTime ? mavenBuildGaps(partitions, endOf) : [];
   const headerHeight = buildGaps.length > 0 ? 60 : 34;
   const svgHeight = headerHeight + laneEntries.length * rowHeight + 16;
   const timeToX = time => labelWidth + ((time - minStart) / totalSpan) * chartWidth;
   let lastGapLabelEnd = labelWidth;
 
-  const modules = moduleOrder(session, partitions);
   // Fill shows the module; the outline shows the state.
   const outlineFor = st => {
     switch (st) {
@@ -1068,18 +1326,14 @@ function renderWaterfallSvg(session, partitions) {
 
   return html`
     <div>
-      <div class="waterfall-legend">
-        ${modules.map(m => html`
-          <span class="legend-item"><span class="legend-swatch" style=${`background:${moduleColor(modules, m)}`}></span> ${m}</span>
-        `)}
-        <span class="legend-item legend-outline"><span class="legend-swatch legend-swatch-outline" style="border-color:#ef4444"></span> Failed</span>
-        <span class="legend-item legend-outline"><span class="legend-swatch legend-swatch-outline" style="border-color:#3b82f6;border-style:dashed"></span> Running</span>
-        <span class="legend-item legend-outline"><span class="legend-swatch legend-swatch-outline" style="border-color:#f59e0b;border-style:dashed"></span> Lost / Requeued</span>
-        <span style="margin-left:auto;font-size:12px;color:var(--text-muted)">Hover a bar for details · click to inspect</span>
-      </div>
-
-      <div class="waterfall-scroll" tabindex="0" aria-label="Worker partition timeline">
+      ${notes.length ? html`<p class="waterfall-slot-note">${notes.join(' ')}</p>` : null}
+      <div class="waterfall-scroll" data-scroll-key="waterfall" tabindex="0" aria-label="Worker partition timeline">
         <svg style="width:100%;height:auto;display:block" viewBox=${`0 0 ${svgWidth} ${svgHeight}`}>
+          <defs>
+            <clipPath id="waterfall-worker-label-clip">
+              <rect x="14" width=${labelWidth - 84} height=${svgHeight} />
+            </clipPath>
+          </defs>
           ${ticks.map((t, tIdx) => {
             const x = labelWidth + Math.round(t * chartWidth);
             const label = formatDuration(Math.round(t * totalSpan));
@@ -1121,12 +1375,32 @@ function renderWaterfallSvg(session, partitions) {
             `;
           })}
 
-          ${laneEntries.map(([workerId, laneParts], idx) => {
+          ${laneEntries.map(({ workerId, parts: laneParts, slot, preparations, untimed }, idx) => {
             const y = headerHeight + idx * rowHeight;
+            const workerLabel = workerId || 'Unassigned';
+            const first = idx === 0 || laneEntries[idx - 1].workerId !== workerId;
+            const slotLabel = preparations ? 'Inputs' : slot ? `Slot ${slot}` : untimed ? 'Untimed' : '';
+            const laneLabel = [workerLabel, slotLabel].filter(Boolean).join(' · ');
             return html`
               <g>
                 <rect x="4" y=${y + 3} width=${svgWidth - 8} height=${rowHeight - 6} rx="6" fill="#94a3b8" fill-opacity="0.07" pointer-events="none" />
-                <text x="14" y=${y + 26} font-size="12" font-weight="600" fill="currentColor">${workerId}</text>
+                <g class="waterfall-worker-label" role="img" aria-label=${laneLabel}>
+                  <title>${workerLabel}</title>
+                  ${first || !slotLabel ? html`<text x="14" y=${y + 26} font-size="12" font-weight="600" fill="currentColor"
+                    clip-path="url(#waterfall-worker-label-clip)">${fitWorkerLaneLabel(workerLabel)}</text>` : null}
+                  ${slotLabel ? html`
+                    <rect class="waterfall-slot-chip" x=${labelWidth - 65} y=${y + 12} width="55" height="22" rx="7" />
+                    <text class="waterfall-slot-label" x=${labelWidth - 37} y=${y + 27} text-anchor="middle">${slotLabel}</text>
+                  ` : null}
+                </g>
+                ${(preparations || []).map(prep => {
+                  const duration = formatDuration(prep.readyAt - prep.startedAt);
+                  const label = `Shared input preparation · ${workerLabel} · ${duration} · ${prep.partitionCount} partition(s)`;
+                  return html`<g role="img" aria-label=${label}><title>${label}</title>
+                    <rect x=${timeToX(prep.startedAt)} y=${y + 14} width=${Math.max(2, timeToX(prep.readyAt) - timeToX(prep.startedAt))} height="16" rx="3" fill="#f59e0b" />
+                    <text x=${timeToX(prep.readyAt) + 6} y=${y + 26} font-size="11" fill="currentColor">${duration}</text>
+                  </g>`;
+                })}
                 ${laneParts.map(p => {
                   const pStart = startOf(p);
                   const pEnd = endOf(p);
@@ -1135,22 +1409,29 @@ function renderWaterfallSvg(session, partitions) {
                   const barLabel = `${p.partitionId} ${p.attempt > 1 ? `(#${p.attempt})` : p.state === 'LOST' ? `(LOST #${p.attempt || 1})` : ''}`.trim();
                   const shownLabel = fitBarLabel(barLabel, width);
                   const outline = outlineFor(p.state);
-                  const timing = partitionTiming(p, state.sessionDetail?.tests);
+                  const timing = partitionTiming(p, testsByPartition.get(p.partitionId));
                   const tooltip = [
                     `${p.moduleName || 'default'} · ${p.partitionId}${p.attempt > 1 ? ` (attempt ${p.attempt})` : ''}`,
-                    `Worker ${p.workerId || '—'} · ${p.state}`,
+                    `${laneLabel} · ${p.state}`,
                     `${(p.workUnits || []).length} work unit(s) · ${formatDuration(Math.max(0, pEnd - pStart))}`,
-                    timing ? `Setup ${formatDuration(timing.setup)} · tests ${formatDuration(timing.tests)} · wrap-up ${formatDuration(timing.wrapUp)}` : null,
+                    p.inputPreparation ? `Shared input wait ${formatDuration(p.inputPreparation.waitMs)}` : null,
+                    timing ? `Before first test (estimated) ${formatDuration(timing.setup)} · tests ${formatDuration(timing.tests)} · wrap-up ${formatDuration(timing.wrapUp)}` : null,
                     p.forkWorkspace ? 'Forked JVM workspace' : 'In worker JVM',
                     p.errorMessage ? `Error: ${p.errorMessage}` : null
                   ].filter(Boolean).join('\n');
                   return html`
-                    <g class="waterfall-bar" onClick=${() => { state.selectedPartition = p; renderApp(); }}>
+                    <g class="waterfall-bar" onClick=${() => { openPartition(p); }}>
                       <title>${tooltip}</title>
                       <rect x=${x} y=${y + 8} width=${width} height=${rowHeight - 16} rx="6"
                         fill=${moduleColor(modules, p.moduleName)}
                         fill-opacity=${p.state === 'RUNNING' || p.state === 'ASSIGNED' ? 0.55 : 1}
                         stroke=${outline.stroke} stroke-width=${outline.width} stroke-dasharray=${outline.dash} />
+                      ${p.inputPreparation?.waitMs > 0 ? html`
+                        <line stroke="#f59e0b" stroke-width="3" pointer-events="none"
+                          x1=${timeToX(Math.max(pStart, Math.min(pEnd, p.inputPreparation.readyAt - p.inputPreparation.waitMs)))}
+                          x2=${timeToX(Math.max(pStart, Math.min(pEnd, p.inputPreparation.readyAt)))}
+                          y1=${y + rowHeight - 9} y2=${y + rowHeight - 9} />
+                      ` : null}
                       ${width === 0 ? html`
                         <line x1=${x} x2=${x} y1=${y + 8} y2=${y + rowHeight - 8}
                           stroke=${outline.width > 0 ? outline.stroke : moduleColor(modules, p.moduleName)} />
@@ -1267,7 +1548,7 @@ function renderWorkspaceChanges(sessionId, changes) {
                     </button>
                     <div id=${diffId} hidden=${!expanded}>
                       ${expanded ? html`
-                        <pre class="workspace-diff mono" tabindex="0" aria-label=${`Git diff for ${path}`}>${change.patch
+                        <pre class="workspace-diff mono" data-scroll-key=${`diff-${path}`} tabindex="0" aria-label=${`Git diff for ${path}`}>${change.patch
                           .split('\n').filter((line, i, lines) => line || i !== lines.length - 1)
                           .map(line => {
                             let style = '';
@@ -1292,6 +1573,115 @@ function renderWorkspaceChanges(sessionId, changes) {
   `;
 }
 
+let partitionFilters;
+function renderPartitionBreakdown(sessionId, partitions) {
+  const filters = partitionFilters;
+  const query = filters.query.trim().toLowerCase();
+  const contains = value => value?.toLowerCase().includes(query);
+  const filtered = partitions.filter(p => (!filters.state || filters.state === p.state)
+    && (!query || [p.partitionId, p.workerId, p.moduleName, p.errorMessage].some(contains)
+      || p.workUnits?.some(u => [u.key, u.className, u.methodName, u.dynamicSourceName].some(contains))));
+  const now = Date.now();
+  const elapsed = p => p.startedAt > 0 && (p.finishedAt > 0 || p.state === 'RUNNING')
+    ? Math.max(0, (p.finishedAt > 0 ? p.finishedAt : now) - p.startedAt) : -1;
+  if (filters.sort === 'duration') filtered.sort((a, b) => elapsed(b) - elapsed(a));
+  if (filters.sort === 'units') filtered.sort((a, b) => (b.workUnits?.length || 0) - (a.workUnits?.length || 0));
+  if (filters.sort === 'attempt') filtered.sort((a, b) => b.attempt - a.attempt);
+  const page = paginate('partitions', filtered, 25, JSON.stringify([sessionId, query, filters.state, filters.sort, filters.module]));
+  // Keep the input and waterfall mounted while the user types.
+  function update(key, value) {
+    filters[key] = value;
+    const current = document.querySelector('.partition-breakdown');
+    const next = renderPartitionBreakdown(sessionId, partitions);
+    for (const selector of ['[role=status]', 'tbody']) {
+      current.querySelector(selector).replaceWith(next.querySelector(selector));
+    }
+    current.querySelector('.pager')?.remove();
+    const pager = next.querySelector('.pager');
+    if (pager) current.append(pager);
+  }
+  return html`
+    <section class="card partition-breakdown">
+      <div class="card-header">
+        <h2 class="card-title">Partition Breakdown</h2>
+        <span role="status">${filtered.length} of ${partitions.length}${filters.module ? ` · ${filters.module}` : ''}</span>
+      </div>
+      <div class="toolbar partition-controls">
+        <input class="search-input" type="search" data-focus-id="partition-search"
+            aria-label="Search partitions by ID, worker, module, work unit, or error"
+            placeholder="Search partitions…" value=${filters.query}
+            onInput=${e => update('query', e.target.value)} />
+        <label>State <select data-focus-id="partition-state" value=${filters.state}
+            onChange=${e => update('state', e.target.value)}>
+          <option value="">All states</option>
+          ${['PENDING', 'ASSIGNED', 'RUNNING', 'COMPLETED', 'FAILED', 'LOST'].map(st => html`<option value=${st}>${st}</option>`)}
+        </select></label>
+        <label>Sort <select data-focus-id="partition-sort" value=${filters.sort}
+            onChange=${e => update('sort', e.target.value)}>
+          <option value="">Session order</option>
+          <option value="duration">Longest elapsed</option>
+          <option value="units">Most work units</option>
+          <option value="attempt">Highest attempt</option>
+        </select></label>
+      </div>
+      <div class="table-wrap" data-scroll-key="partitions">
+        <table>
+          <thead>
+            <tr>
+              <th>Partition</th>
+              <th>Worker</th>
+              <th>State</th>
+              <th>Attempt</th>
+              <th>Work Units</th>
+              <th>Capabilities & Resources</th>
+              <th>Duration</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${page.items.map(p => {
+              const duration = elapsed(p);
+              const dur = duration >= 0 ? formatDuration(duration) + (p.state === 'RUNNING' ? ' elapsed' : '')
+                : p.estimatedDurationMs > 0 ? 'Est. ' + formatDuration(p.estimatedDurationMs) : '—';
+              const caps = visibleCapabilities(p.requiredCapabilities);
+              const inCount = (p.inputPaths || []).length;
+              const outCount = (p.producedOutputs || []).length || (p.outputPaths || []).length;
+              return html`
+                <tr class="clickable-row" onClick=${() => { openPartition(p); }}>
+                  <td>
+                    <button type="button" class="partition-link mono" onClick=${e => {
+                      e.stopPropagation(); openPartition(p);
+                    }}>${p.partitionId}</button>
+                    ${p.moduleName ? html`<div class="mono" style="font-size:11px;color:var(--text-muted)">${p.moduleName}</div>` : null}
+                  </td>
+                  <td class="mono">${p.workerId || 'pending'}</td>
+                  <td>
+                    ${statusBadge(p.state)}
+                    ${p.errorMessage ? html`<div style="font-size:11px;color:var(--rose-text);margin-top:3px;max-width:260px">${p.errorMessage}</div>` : null}
+                  </td>
+                  <td class="mono">#${p.attempt}</td>
+                  <td>${(p.workUnits || []).length} units</td>
+                  <td>
+                    ${caps.length === 0 && inCount === 0 && outCount === 0
+                      ? html`<span style="color:var(--text-muted)">default</span>`
+                      : html`
+                          ${caps.map(([k, v]) => html`<span class="tag mono">${k}=${v}</span>`)}
+                          ${inCount > 0 ? html`<span class="tag tag-resource mono">${inCount} input(s)</span>` : null}
+                          ${outCount > 0 ? html`<span class="tag tag-resource mono">${outCount} output(s)</span>` : null}
+                        `}
+                  </td>
+                  <td class="mono">${dur}</td>
+                </tr>
+              `;
+            })}
+            ${!filtered.length ? html`<tr><td colspan="7" class="empty-state">${partitions.length ? 'No matching partitions.' : 'No partitions yet.'}</td></tr>` : null}
+          </tbody>
+        </table>
+      </div>
+      ${page.controls}
+    </section>
+  `;
+}
+
 function renderSessionDetail() {
   if (!state.sessionDetail?.session || state.sessionDetail.session.sessionId !== state.selectedSessionId) {
     const sessionId = state.selectedSessionId;
@@ -1302,6 +1692,14 @@ function renderSessionDetail() {
   }
 
   const { session, changedFiles = [], workspaceChanges, partitions = [], tests = [] } = state.sessionDetail;
+  if (partitionFilters?.sessionId !== session.sessionId) {
+    partitionFilters = { sessionId: session.sessionId, module: '', moduleQuery: '', query: '', state: '', sort: '' };
+  }
+  const selectedModule = partitionFilters.module;
+  const modules = state.detailTab === 'waterfall' ? moduleOrder(session, partitions) : [];
+  const waterfallPartitions = selectedModule
+    ? partitions.filter(p => (p.moduleName || 'default') === selectedModule)
+    : partitions;
   const fileChanges = workspaceChanges?.length ? workspaceChanges : changedFiles.map(path => ({ path }));
   const failures = collectLatestTestFailures(tests);
   const partitionFailures = collectPartitionFailures(partitions);
@@ -1317,9 +1715,12 @@ function renderSessionDetail() {
     ? formatDuration(session.wallDurationMs)
     : (session.status === 'RUNNING' ? `Live · ${formatDuration(Math.max(0, Date.now() - session.startedAt))}` : '—');
 
+  const localCount = tests.filter(t => t.partitionId === 'local').length;
+  const localOnly = localCount > 0 && state.localTestsSession === session.sessionId;
   const testFilterPills = ['ALL', 'FAILED', 'FLAKY', 'PASSED', 'SKIPPED'];
   const tq = state.testQuery.trim().toLowerCase();
   const filteredTests = tests.filter(t => {
+    if (localOnly && t.partitionId !== 'local') return false;
     if (state.testStatusFilter === 'FLAKY' && !t.flaky) return false;
     if (state.testStatusFilter !== 'ALL' && state.testStatusFilter !== 'FLAKY' && t.status !== state.testStatusFilter) return false;
     if (!tq) return true;
@@ -1356,14 +1757,17 @@ function renderSessionDetail() {
               title="Cancel active worker partitions and abort this build session"
             >✕ Abort Session</button>
           ` : null}
-          <span class="dashboard-select session-switcher">
-            <select aria-label="Switch build session" data-focus-id="session-switcher"
-                value=${session.sessionId} onChange=${e => loadSessionDetail(e.target.value, false)}>
-              ${state.sessions.map(s => html`
-                <option value=${s.sessionId}>${s.sessionId} (${s.status})</option>
-              `)}
-            </select>
-          </span>
+          <button class="btn picker-trigger" type="button" aria-haspopup="dialog" data-focus-id="session-switcher"
+              onClick=${() => openPicker({
+                trigger: 'session-switcher', title: 'Switch session', prompt: 'Search recent sessions',
+                selected: session.sessionId, recentLimit: 8,
+                options: [...state.sessions].sort((a, b) => b.startedAt - a.startedAt).map(s => ({
+                  key: s.sessionId, label: s.projectName || s.sessionId, status: s.status,
+                  detail: [s.gitBranch, s.startedAt && new Date(s.startedAt).toLocaleString(), s.sessionId].filter(Boolean).join(' · '),
+                  commit: s.gitCommit
+                })),
+                onSelect: id => loadSessionDetail(id)
+              })}>Switch session</button>
         </div>
       </div>
 
@@ -1373,7 +1777,7 @@ function renderSessionDetail() {
           role="alert"
         >
           <div class="session-failure-title">${session.status === 'FAILED' ? 'Why this session failed' : 'Why this session was aborted'}</div>
-          <pre class="session-failure-reason">${session.failureReason}</pre>
+          <pre class="session-failure-reason" data-scroll-key="failure-reason">${session.failureReason}</pre>
         </div>
       ` : null}
 
@@ -1405,7 +1809,7 @@ function renderSessionDetail() {
         </div>
       </div>
 
-      <div class="subtabs">
+      <div class="subtabs" data-scroll-key="detail-tabs">
         <button class=${`subtab-btn ${state.detailTab === 'waterfall' ? 'active' : ''}`} onClick=${() => setView('session-detail', 'waterfall')}>
           Waterfall & Partitions (${partitions.length})
         </button>
@@ -1432,67 +1836,30 @@ function renderSessionDetail() {
                   aria-expanded=${String(state.waterfallExpanded)} aria-controls="worker-waterfall"
                   onClick=${toggleWaterfall}>${state.waterfallExpanded ? 'Collapse waterfall' : 'Expand waterfall'}</button>
             </div>
-            <div class="card-body" id="worker-waterfall">
-              ${renderWaterfallSvg(session, partitions)}
+            <div class="card-body" id="worker-waterfall" data-scroll-key="expanded-waterfall">
+              ${localCount > 0 ? html`<div class="local-results-row">
+                <span class="local-results-summary"><strong>Maven host</strong><span>${localCount} local test execution${localCount === 1 ? '' : 's'}</span></span>
+                <button class="btn btn-sm" onClick=${() => {
+                  state.localTestsSession = session.sessionId;
+                  state.testQuery = '';
+                  state.testStatusFilter = 'ALL';
+                  setView('session-detail', 'tests');
+                }}>View local results <span aria-hidden="true">→</span></button>
+              </div>` : null}
+              ${renderModuleLegend(modules, partitionFilters)}
+              <label class="waterfall-build-toggle">
+                <input type="checkbox" data-focus-id="waterfall-build-time" checked=${state.showMavenBuildTime}
+                    onChange=${event => {
+                      state.showMavenBuildTime = event.target.checked;
+                      renderApp();
+                    }} />
+                Show Maven build time (estimated)
+              </label>
+              ${renderWaterfallSvg(session, waterfallPartitions, modules, selectedModule)}
             </div>
           </div>
 
-          <div class="card">
-            <div class="card-header">
-              <h2 class="card-title">Partition Breakdown</h2>
-            </div>
-            <div class="table-wrap">
-              <table>
-                <thead>
-                  <tr>
-                    <th>Partition</th>
-                    <th>Worker</th>
-                    <th>State</th>
-                    <th>Attempt</th>
-                    <th>Work Units</th>
-                    <th>Capabilities & Resources</th>
-                    <th>Duration</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  ${paginate('partitions', partitions, 25, state.selectedSessionId).items.map(p => {
-                    const dur = (p.startedAt > 0 && p.finishedAt > 0)
-                      ? formatDuration(p.finishedAt - p.startedAt)
-                      : (p.state === 'RUNNING' ? 'running…' : formatDuration(p.estimatedDurationMs));
-                    const caps = visibleCapabilities(p.requiredCapabilities);
-                    const inCount = (p.inputPaths || []).length;
-                    const outCount = (p.producedOutputs || []).length || (p.outputPaths || []).length;
-                    return html`
-                      <tr class="clickable-row" onClick=${() => { state.selectedPartition = p; renderApp(); }}>
-                        <td>
-                          <div class="mono" style="font-weight:700;color:var(--citrus-orange-deep)">${p.partitionId}</div>
-                          ${p.moduleName ? html`<div class="mono" style="font-size:11px;color:var(--text-muted)">${p.moduleName}</div>` : null}
-                        </td>
-                        <td class="mono">${p.workerId || 'pending'}</td>
-                        <td>
-                          ${statusBadge(p.state)}
-                          ${p.errorMessage ? html`<div style="font-size:11px;color:var(--rose-text);margin-top:3px;max-width:260px">${p.errorMessage}</div>` : null}
-                        </td>
-                        <td class="mono">#${p.attempt}</td>
-                        <td>${(p.workUnits || []).length} units</td>
-                        <td>
-                          ${caps.length === 0 && inCount === 0 && outCount === 0
-                            ? html`<span style="color:var(--text-muted)">default</span>`
-                            : html`
-                                ${caps.map(([k, v]) => html`<span class="tag mono">${k}=${v}</span>`)}
-                                ${inCount > 0 ? html`<span class="tag tag-resource mono">${inCount} input(s)</span>` : null}
-                                ${outCount > 0 ? html`<span class="tag tag-resource mono">${outCount} output(s)</span>` : null}
-                              `}
-                        </td>
-                        <td class="mono">${dur}</td>
-                      </tr>
-                    `;
-                  })}
-                </tbody>
-              </table>
-            </div>
-            ${paginate('partitions', partitions, 25, state.selectedSessionId).controls}
-          </div>
+          ${renderPartitionBreakdown(session.sessionId, waterfallPartitions)}
         </div>
       ` : null}
 
@@ -1500,14 +1867,20 @@ function renderSessionDetail() {
         <div>
           <div class="toolbar">
             <input
-              class="search-input"
+              class="search-input explorer-search"
               data-focus-id="detail-tests-search"
               type="search"
-              placeholder="Search class, test method, worker, partition, or Citrus endpoint…"
+              aria-label="Search tests by class, method, worker, or partition"
+              placeholder="Search tests, workers, or partitions"
               value=${state.testQuery}
               onInput=${e => { state.testQuery = e.target.value; renderApp(); }}
             />
             <div class="pill-group">
+              ${localCount > 0 ? html`<button class=${'filter-pill' + (localOnly ? ' active' : '')}
+                aria-pressed=${String(localOnly)} onClick=${() => {
+                  state.localTestsSession = localOnly ? null : session.sessionId;
+                  renderApp();
+                }}>Maven host (${localCount})</button>` : null}
               ${testFilterPills.map(st => html`
                 <button
                   class=${`filter-pill ${state.testStatusFilter === st ? 'active' : ''}`}
@@ -1521,20 +1894,19 @@ function renderSessionDetail() {
             ${filteredTests.length === 0
               ? html`<div class="empty-state">No test executions match the active filter.</div>`
               : html`
-                <div class="table-wrap">
+                <div class="table-wrap" data-scroll-key="tests">
                   <table>
                     <thead>
                       <tr>
                         <th>Status</th>
                         <th>Test Case</th>
                         <th>Worker / Partition</th>
-                        <th>Citrus Endpoints</th>
                         <th>Attempt</th>
                         <th>Duration</th>
                       </tr>
                     </thead>
                     <tbody>
-                      ${paginate('tests', filteredTests, 50, `${state.selectedSessionId}|${state.testStatusFilter}|${tq}`).items.map(t => html`
+                      ${paginate('tests', filteredTests, 50, `${state.selectedSessionId}|${state.testStatusFilter}|${localOnly}|${tq}`).items.map(t => html`
                         <tr class="clickable-row" onClick=${() => { state.selectedTestExecution = t; renderApp(); }}>
                           <td>
                             ${statusBadge(t.status)}
@@ -1545,13 +1917,8 @@ function renderSessionDetail() {
                             <div class="mono" style="font-size:11.5px;color:var(--text-muted)">${t.className}</div>
                           </td>
                           <td>
-                            <div class="mono" style="font-size:12px">${t.workerId || 'local'}</div>
+                            <div class="mono" style="font-size:12px">${t.partitionId === 'local' ? 'Maven host' : t.workerId || '—'}</div>
                             <div class="mono" style="font-size:11px;color:var(--text-muted)">${t.partitionId || '—'}</div>
-                          </td>
-                          <td>
-                            ${(t.endpoints || []).length === 0
-                              ? html`<span style="color:var(--text-muted)">—</span>`
-                              : (t.endpoints || []).map(ep => html`<span class="tag tag-endpoint mono">${ep}</span>`)}
                           </td>
                           <td class="mono">#${t.attempt}</td>
                           <td class="mono">${formatDuration(t.durationMs)}</td>
@@ -1560,7 +1927,7 @@ function renderSessionDetail() {
                     </tbody>
                   </table>
                 </div>
-                ${paginate('tests', filteredTests, 50, `${state.selectedSessionId}|${state.testStatusFilter}|${tq}`).controls}
+                ${paginate('tests', filteredTests, 50, `${state.selectedSessionId}|${state.testStatusFilter}|${localOnly}|${tq}`).controls}
               `}
           </div>
         </div>
@@ -1584,7 +1951,7 @@ function renderSessionDetail() {
                           ${p.errorMessage || `Partition ended in ${p.state} state without completing all work units.`}
                         </div>
                       </div>
-                      <button class="btn btn-sm" onClick=${() => { state.selectedPartition = p; renderApp(); }}>Inspect Partition</button>
+                      <button class="btn btn-sm" onClick=${() => { openPartition(p); }}>Inspect Partition</button>
                     </div>
                   </div>
                 `)}
@@ -1598,9 +1965,6 @@ function renderSessionDetail() {
                           <span class="mono" style="font-size:12px;color:var(--text-muted)">on ${f.workerId} (${f.partitionId} #${f.attempt}) · ${formatDuration(f.durationMs)}</span>
                         </div>
                         <div style="margin-top:6px;font-weight:600;color:var(--rose-text)">${f.errorMessage || 'Assertion / validation failure'}</div>
-                        <div style="margin-top:6px">
-                          ${(f.endpoints || []).map(ep => html`<span class="tag tag-endpoint mono">endpoint: ${ep}</span>`)}
-                        </div>
                       </div>
                       <button
                         class="btn btn-sm"
@@ -1612,7 +1976,7 @@ function renderSessionDetail() {
                         }}
                       >Copy Trace</button>
                     </div>
-                    <pre class="stacktrace-box">${f.stackTrace || f.errorMessage || 'No stack trace captured.'}</pre>
+                    <pre class="stacktrace-box" data-scroll-key=${`trace-${f.id}`}>${f.stackTrace || f.errorMessage || 'No stack trace captured.'}</pre>
                   </div>
                 `)}
               `}
@@ -1707,7 +2071,7 @@ function renderWorkerStatus(worker, now) {
 
 const WORKER_WARNINGS = {
   POOL_CAPABILITY_MISMATCH: 'Worker no longer meets pool capabilities',
-  POOL_DELETED: 'Agent pool was deleted',
+  POOL_DELETED: 'Worker pool was deleted',
   KEY_REVOKED: 'Registration key was revoked'
 };
 
@@ -1725,39 +2089,80 @@ function renderWorkerWarning(warning, now) {
   `;
 }
 
+const workerSlotHelp = '1/2 means one of two connected slots is running a partition. At 2/2, both are running partitions. The coordinator gives queued work to eligible idle workers first. If none are idle and this worker’s primary slot is busy, its standby slot can take a matching partition.';
+
+function renderWorkerRow(w, now) {
+  const expanded = state.expandedWorkers.has(w.workerId);
+  const active = w.activePartitionIds || (w.activePartitionId ? [w.activePartitionId] : []);
+  const slots = w.connectedSlots ?? (w.state === 'OFFLINE' ? 0 : 1);
+  const detailId = `worker-detail-${encodeURIComponent(w.workerId)}`;
+  return html`
+    <tbody>
+      <tr class="worker-summary">
+        <td>
+          <button class="worker-disclosure" type="button" title=${w.workerId}
+            data-focus-id=${detailId + '-toggle'} aria-label=${'Details for ' + w.workerId}
+            aria-expanded=${String(expanded)} aria-controls=${expanded ? detailId : null}
+            onClick=${() => {
+              if (expanded) state.expandedWorkers.delete(w.workerId);
+              else state.expandedWorkers.add(w.workerId);
+              renderApp();
+            }}>
+            <span class="worker-chevron" aria-hidden="true">›</span><span class="worker-name mono">${w.workerId}</span>
+          </button>
+        </td>
+        <td>${statusBadge(w.state)}
+          ${isLowDisk(w) ? html`<span class="badge badge-failed">LOW DISK</span>` : null}
+          ${warningList(w).length ? html`<span class="badge badge-warning">Warning</span>` : null}
+        </td>
+        <td class="worker-slots" title=${[workerSlotHelp, ...active].join('\n')}>
+          ${slots ? html`<span aria-label=${`${active.length} of ${slots} slots in use`}>${active.length} / ${slots}</span>
+            <div class="worker-slot-meter" aria-hidden="true">${Array.from({length: slots}, (_, i) =>
+              html`<i class=${i < active.length ? 'occupied' : ''}></i>`)}</div>` : '—'}
+        </td>
+        <td class="worker-activity">${w.state === 'IDLE' ? `Idle for ${compactElapsed(now - (w.stateUpdatedAt || now))}` : renderWorkerStatus(w, now)}
+          <small class="muted">Last heartbeat ${formatAgo(w.lastHeartbeatAt)}</small>
+        </td>
+      </tr>
+      ${expanded ? html`<tr id=${detailId} class="worker-detail"><td colspan="4">
+        <div class="worker-detail-grid">
+          <div>
+            <div><strong>Worker ID</strong> <span class="mono">${w.workerId}</span></div>
+            <div><strong>Hostname</strong> <span class="mono">${w.host || '—'}</span></div>
+            <div><strong>Version</strong> <span class="mono">${w.version || '—'}</span></div>
+            <div class="worker-mobile-activity">${renderWorkerStatus(w, now)} · Last heartbeat ${formatAgo(w.lastHeartbeatAt)}</div>
+            ${active.length ? html`<div><strong>Partitions</strong> <span class="mono">${active.join(', ')}</span></div>` : null}
+            <div class="worker-tags">${visibleCapabilities(w.capabilities).map(([k, v]) => html`<span class="tag mono">${k}=${v}</span>`)}</div>
+            ${warningList(w).map(warning => renderWorkerWarning(warning, now))}
+            ${w.state === 'OFFLINE' ? html`<button class="btn btn-sm btn-danger" type="button" onClick=${() =>
+              deleteDashboardRecord('workers', w.workerId, `Delete offline worker ${w.workerId} from the worker list?`)}>Delete</button>` : null}
+          </div>
+          ${renderWorkerCacheTelemetry(w)}
+        </div>
+      </td></tr>` : null}
+    </tbody>`;
+}
+
 function renderWorkerGroup(label, workers, now, deleted = false) {
+  const slotHelpId = `slots-help-${encodeURIComponent(workers[0].poolId || 'unpooled')}`;
   const page = paginate(`workers-${workers[0].poolId || 'unpooled'}`, workers, 25,
     `${state.workerStateFilter}|${state.workerQuery.trim().toLowerCase()}`);
   return html`
-    <section class="card">
+    <section class="card worker-group">
       <div class="card-header">
         <h2 class="card-title">${label} ${deleted ? html`<span class="badge badge-offline">Deleted</span>` : null}</h2>
         <span class="muted">${workers.length} ${workers.length === 1 ? 'worker' : 'workers'}</span>
       </div>
-      <div class="table-wrap">
+      <div class="table-wrap" data-scroll-key="workers">
         <table class="workers-table">
           <thead><tr>
-            <th scope="col">Worker</th><th scope="col">Hostname</th><th scope="col">Version</th>
-            <th scope="col">State</th><th scope="col">Capabilities</th><th scope="col">Last status update</th>
-            <th scope="col">Local File Cache</th>
+            <th scope="col">Worker</th><th scope="col">State</th><th scope="col">
+              <span class="worker-slot-help" tabindex="0" data-focus-id=${slotHelpId} aria-describedby=${slotHelpId}>Slots in use</span>
+              <span class="worker-slot-tooltip" id=${slotHelpId} role="tooltip">${workerSlotHelp}</span>
+            </th>
+            <th scope="col" class="worker-activity">Activity</th>
           </tr></thead>
-          <tbody>
-            ${page.items.map(w => html`
-              <tr>
-                <td class="mono">${w.workerId}</td>
-                <td class="mono">${w.host || '—'}</td>
-                <td class="mono">${w.version || '—'}</td>
-                <td>${statusBadge(w.state)}</td>
-                <td>${visibleCapabilities(w.capabilities).map(([k, v]) => html`<span class="tag mono">${k}=${v}</span>`)}</td>
-                <td>
-                  <div>${renderWorkerStatus(w, now)}</div>
-                  <small class="muted">Last heartbeat ${formatAgo(w.lastHeartbeatAt)}</small>
-                  ${warningList(w).map(warning => renderWorkerWarning(warning, now))}
-                </td>
-                <td>${renderWorkerCacheTelemetry(w)}</td>
-              </tr>
-            `)}
-          </tbody>
+          ${page.items.map(w => renderWorkerRow(w, now))}
         </table>
       </div>
       ${page.controls}
@@ -1765,8 +2170,7 @@ function renderWorkerGroup(label, workers, now, deleted = false) {
   `;
 }
 
-function renderWorkersPool() {
-  const states = ['ALL', 'IDLE', 'BUSY', 'WARNING', 'DRAINING', 'OFFLINE', 'LOW_DISK'];
+function renderWorkerResults() {
   const q = state.workerQuery.trim().toLowerCase();
   const filtered = state.workers.filter(w => {
     if (state.workerStateFilter === 'LOW_DISK') {
@@ -1780,41 +2184,43 @@ function renderWorkersPool() {
       || (w.host || '').toLowerCase().includes(q)
       || capStr.includes(q);
   });
+  filtered.sort((a, b) => Number(a.state === 'OFFLINE') - Number(b.state === 'OFFLINE')
+    || a.workerId.localeCompare(b.workerId, undefined, { numeric: true }));
+  const now = Date.now();
+  return html`<div id="worker-results">
+      ${filtered.length === 0 ? html`<div class="card"><div class="empty-state">No workers match the current filter.</div></div>` : null}
+      ${groupWorkersByPool(filtered).filter(group => group.workers.length).map(group =>
+        renderWorkerGroup(group.name, group.workers, now, group.deleted))}
+    </div>`;
+}
+
+function renderWorkersPool() {
+  const states = ['ALL', 'IDLE', 'BUSY', 'WARNING', 'DRAINING', 'OFFLINE', 'LOW_DISK'];
   const busy = state.workers.filter(w => w.state === 'BUSY').length;
   const idle = state.workers.filter(w => w.state === 'IDLE').length;
-  const now = Date.now();
-  const workersByPool = new Map();
-  for (const worker of filtered) {
-    const poolId = worker.poolId || null;
-    if (!workersByPool.has(poolId)) workersByPool.set(poolId, []);
-    workersByPool.get(poolId).push(worker);
-  }
-  const fromConfigured = (state.pools || []).flatMap(pool => {
-    const workers = workersByPool.get(pool.poolId);
-    workersByPool.delete(pool.poolId);
-    return workers ? [renderWorkerGroup(pool.displayName, workers, now)] : [];
-  });
-  const unpooled = workersByPool.get(null);
-  workersByPool.delete(null);
 
   return html`
     <div>
       <div class="page-header">
         <div>
-          <h1 class="page-title">Workers Pool</h1>
+          <h1 class="page-title">Workers</h1>
           <p class="page-subtitle">${state.workers.length} workers, ${busy} busy, ${idle} idle</p>
         </div>
       </div>
 
       <div class="toolbar">
         <input
-          class="search-input"
+          class="search-input workers-search"
           data-focus-id="workers-search"
           aria-label="Filter workers by worker ID, host, or capability"
           type="search"
-          placeholder="Filter by worker ID, host, or capability (e.g. gpu, docker, macos)…"
+          placeholder="Filter by worker ID, host, or capability"
+          title="Filter by worker ID, host, or capability (e.g. gpu, docker, macos)"
           value=${state.workerQuery}
-          onInput=${e => { state.workerQuery = e.target.value; renderApp(); }}
+          onInput=${e => {
+            state.workerQuery = e.target.value;
+            document.getElementById('worker-results').replaceWith(renderWorkerResults());
+          }}
         />
         <div class="pill-group" aria-label="Worker state filters">
           ${states.map(st => html`
@@ -1827,12 +2233,7 @@ function renderWorkersPool() {
         </div>
       </div>
 
-      ${filtered.length === 0 ? html`<div class="card"><div class="empty-state">No workers match the current filter.</div></div>` : null}
-      ${fromConfigured}
-      ${[...workersByPool].map(([poolId, workers]) => renderWorkerGroup(
-        workers[0].poolDisplayName || poolId, workers, now,
-        workers.some(w => warningList(w).some(warning => warning.code === 'POOL_DELETED'))))}
-      ${unpooled ? renderWorkerGroup('Unpooled Workers', unpooled, now) : null}
+      ${renderWorkerResults()}
     </div>
   `;
 }
@@ -1854,7 +2255,7 @@ function isCurrentPoolVisit(visit) {
 }
 
 function showsPoolData() {
-  return state.view === 'pools' || state.view === 'workers';
+  return state.view === 'pools' || state.view === 'workers' || state.view === 'overview';
 }
 
 async function loadPools() {
@@ -1877,7 +2278,7 @@ async function loadPools() {
       state.poolListError = '';
     }).catch(err => {
       if (isCurrent() && err.message !== 'Unauthorized') {
-        state.poolListError = `Could not load agent pools (${err.message}).`;
+        state.poolListError = `Could not load worker pools (${err.message}).`;
       }
     });
     const detail = poolId ? apiGet(poolPath(poolId)).then(result => {
@@ -1891,9 +2292,9 @@ async function loadPools() {
       if (err.status === 404) {
         state.poolDetail = null;
         state.poolSecret = null;
-        state.poolDetailError = 'This agent pool is no longer available.';
+        state.poolDetailError = 'This worker pool is no longer available.';
       } else {
-        state.poolDetailError = `Could not refresh agent pool (${err.message}).`;
+        state.poolDetailError = `Could not refresh worker pool (${err.message}).`;
       }
     }) : null;
     await Promise.all([list, detail]);
@@ -2006,7 +2407,7 @@ function saveAgentPool(e) {
     return;
   }
   const request = { displayName, capabilities: draft.capabilities.chips };
-  runPoolMutation('save agent pool', async isCurrent => {
+  runPoolMutation('save worker pool', async isCurrent => {
     if (!poolId) {
       const created = await apiPost(AGENT_POOLS_API, { ...request, generateRegistrationKey: generate });
       if (isCurrent()) {
@@ -2030,7 +2431,7 @@ function saveAgentPool(e) {
 
 function deleteAgentPool(pool) {
   if (!window.confirm(`Delete "${pool.displayName}"? Connected workers will receive a warning and be disconnected after the grace period.`)) return;
-  runPoolMutation('delete agent pool', async isCurrent => {
+  runPoolMutation('delete worker pool', async isCurrent => {
     await apiDelete(poolPath(pool.poolId));
     if (isCurrent() && state.selectedPoolId) setView('pools');
   });
@@ -2091,14 +2492,14 @@ function renderAgentPoolTable() {
   const pools = state.pools;
   const busy = state.poolMutationInFlight;
   if (!pools) {
-    return state.poolListError ? null : html`<div class="card"><div class="empty-state" role="status">Loading agent pools…</div></div>`;
+    return state.poolListError ? null : html`<div class="card"><div class="empty-state" role="status">Loading worker pools…</div></div>`;
   }
   if (pools.length === 0) {
-    return html`<div class="card"><div class="empty-state">No agent pools configured.</div></div>`;
+    return html`<div class="card"><div class="empty-state">No worker pools configured.</div></div>`;
   }
   return html`
-    <div class="card table-wrap">
-      <table class="agent-pool-table" aria-label="Agent pools in priority order">
+    <div class="card table-wrap" data-scroll-key="pools">
+      <table class="agent-pool-table" aria-label="Worker pools in priority order">
         <thead><tr>
           <th scope="col">Priority</th><th scope="col">Display name</th><th scope="col">ID</th>
           <th scope="col">Workers</th><th scope="col">Capabilities</th><th scope="col">Registration keys</th>
@@ -2243,7 +2644,7 @@ function renderRegistrationKeys() {
         <button class="btn" type="submit" disabled=${busy}>Generate key</button>
       </form>
       ${registrationKeys.length ? html`
-        <div class="table-wrap">
+        <div class="table-wrap" data-scroll-key="pool-keys">
           <table>
             <thead><tr>
               <th scope="col">Prefix</th><th scope="col">Description</th><th scope="col">Created</th>
@@ -2279,10 +2680,12 @@ function renderAgentPools() {
     <div>
       <div class="page-header">
         <div>
-          <h1 class="page-title">${pool ? pool.displayName : 'Agent Pools'}</h1>
-          ${pool ? html`<p class="page-subtitle">${pool.connectedWorkers} connected · ${pool.busyWorkers} busy · ${pool.idleWorkers} idle</p>` : null}
+          <h1 class="page-title">${pool ? pool.displayName : 'Worker Pools'}</h1>
+          ${pool
+            ? html`<p class="page-subtitle">${pool.connectedWorkers} connected · ${pool.busyWorkers} busy · ${pool.idleWorkers} idle</p>`
+            : html`<p class="page-subtitle">Manage worker groups, scheduling priority, and registration keys.</p>`}
         </div>
-        ${poolId ? html`<button class="btn" onClick=${() => setView('pools')}>All Agent Pools</button>` : html`
+        ${poolId ? html`<button class="btn" onClick=${() => setView('pools')}>All Worker Pools</button>` : html`
           <button class="btn btn-primary" disabled=${state.poolDraft !== null || state.poolMutationInFlight}
             onClick=${() => { state.poolDraft = newPoolDraft(); state.poolMutationError = ''; renderApp(); }}>Create Pool</button>`}
       </div>
@@ -2290,7 +2693,7 @@ function renderAgentPools() {
       ${poolId ? renderPoolSecret(poolId) : null}
       ${state.poolDraft && (!poolId || pool) ? renderAgentPoolForm() : null}
       ${pool ? renderRegistrationKeys() : (!poolId ? renderAgentPoolTable() : (!state.poolDetailError
-        ? html`<div class="card"><div class="empty-state" role="status">Loading agent pool…</div></div>` : null))}
+        ? html`<div class="card"><div class="empty-state" role="status">Loading worker pool…</div></div>` : null))}
     </div>
   `;
 }
@@ -2375,10 +2778,10 @@ function renderHistoricalUsage() {
         <p id="usage-instructions" class="usage-instructions muted">Hover over a chart or use the arrow keys to inspect a time bucket.</p>
         ${renderUsageChart('usage-jobs', 'Active jobs', usage.series, ACTIVE_JOBS_METRICS, state.usageWindow, selections)}
         ${renderUsageChart('usage-workers', 'Worker utilization', usage.series, UTILIZATION_METRICS, state.usageWindow, selections)}
-        <h2 class="usage-section-heading">Agent pool utilization</h2>
+        <h2 class="usage-section-heading">Worker pool utilization</h2>
         ${usage.pools.length ? usage.pools.map(pool => renderUsageChart(
           `usage-pool-${pool.poolId}`, pool.displayName, pool.points, UTILIZATION_METRICS, state.usageWindow, selections))
-          : html`<div class="card"><div class="empty-state">No agent pools match this filter.</div></div>`}
+          : html`<div class="card"><div class="empty-state">No worker pools match this filter.</div></div>`}
       ` : (!state.usageError ? html`<div class="card"><div class="empty-state" role="status">Loading historical usage…</div></div>` : null)}
     </div>
   `;
@@ -2450,14 +2853,15 @@ function renderTestHistory() {
           <input class="search-input" data-focus-id="history-search" type="search" aria-label="Search tests"
             placeholder="Search by test class or method…" value=${state.historyQuery}
             onInput=${e => { state.historyQuery = e.target.value; renderApp(); }} />
-          <span class="dashboard-select">
-            <select aria-label="Project" data-focus-id="history-project" value=${state.historyProject}
-                onChange=${e => { state.historyProject = e.target.value; renderApp(); }}>
-              <option value="">All projects</option>
-              ${[...projects].sort((a, b) => a[1].localeCompare(b[1])).map(([key, label]) =>
-                html`<option value=${key}>${label}</option>`)}
-            </select>
-          </span>
+          <button class="btn picker-trigger" type="button" aria-haspopup="dialog" data-focus-id="history-project"
+              aria-label=${'Filter by project: ' + (projects.get(state.historyProject) || 'All projects')}
+              onClick=${() => openPicker({
+                trigger: 'history-project', title: 'Filter by project', prompt: 'Search projects',
+                selected: state.historyProject,
+                options: [{ key: '', label: 'All projects', pinned: true },
+                  ...[...projects].sort((a, b) => a[1].localeCompare(b[1])).map(([key, label]) => ({ key, label }))],
+                onSelect: key => { state.historyProject = key; renderApp(); }
+              })}><span>${projects.get(state.historyProject) || 'All projects'}</span></button>
           <span class="dashboard-select">
             <select aria-label="Sort tests" data-focus-id="history-sort" value=${state.historySort}
                 onChange=${e => { state.historySort = e.target.value; renderApp(); }}>
@@ -2486,7 +2890,7 @@ function renderTestHistory() {
         ${filtered.length === 0
           ? html`<div class="empty-state">No test records match these filters.</div>`
           : html`
-            <div class="table-wrap">
+            <div class="table-wrap" data-scroll-key="history">
               <table>
                 <thead><tr>
                   <th>Test case</th><th>Attempts</th><th>Attempt pass rate</th><th>Avg duration</th>
@@ -2550,7 +2954,7 @@ function renderHistoryRuns(details) {
           </div>
           <button class="btn btn-sm" data-focus-id="close-test-runs" onClick=${close}>Close</button>
         </div>
-        <div class="modal-body">
+        <div class="modal-body" data-scroll-key="history-runs">
           ${error ? html`<div class="empty-state">Could not load test runs. <button class="btn btn-sm" onClick=${() => openHistoryRuns(test)}>Retry</button></div>`
             : runs === null ? html`<div class="empty-state" role="status">Loading test runs…</div>`
             : grouped.size === 0 ? html`<div class="empty-state">No recorded attempts for this test.</div>` : html`
@@ -2599,10 +3003,33 @@ function renderHistoryRuns(details) {
   `;
 }
 
+let peakRequest = 0;
+let partitionPeakLabel = '';
+async function openPartition(p) {
+  const request = ++peakRequest;
+  const session = state.selectedSessionId;
+  state.selectedPartition = p;
+  partitionPeakLabel = 'Loading…';
+  renderApp();
+  let label;
+  try {
+    const { peak } = await apiGet(`/api/v1/sessions/${encodeURIComponent(session)}/partitions/${encodeURIComponent(p.partitionId)}/peak?attempt=${p.attempt}`);
+    label = peak > 0 ? `${peak} of ${p.workUnits?.length || 0} work units` : 'No starts recorded';
+  } catch {
+    label = 'Unavailable';
+  }
+  if (request === peakRequest && state.selectedSessionId === session && state.selectedPartition?.partitionId === p.partitionId
+      && state.selectedPartition.attempt === p.attempt) {
+    partitionPeakLabel = label;
+    renderApp();
+  }
+}
+
 function renderModals() {
   if (state.historyRunDetails && state.view === 'history') return renderHistoryRuns(state.historyRunDetails);
   if (state.selectedPartition) {
     const p = state.selectedPartition;
+    const workUnits = p.workUnits || [];
     const partTests = (state.sessionDetail?.tests || []).filter(
       t => t.partitionId === p.partitionId && (!t.attempt || t.attempt === p.attempt)
     );
@@ -2628,34 +3055,42 @@ function renderModals() {
                 <strong class="mono" style="font-size:16px">${p.partitionId}</strong>
                 ${statusBadge(p.state)}
                 <span class="tag mono">attempt #${p.attempt}</span>
+                <span class="tag">${workUnits.length} scheduled work ${workUnits.length === 1 ? 'unit' : 'units'}</span>
               </div>
               <div style="font-size:12px;color:var(--text-muted);margin-top:3px">
                 Assigned worker: <strong class="mono">${p.workerId || 'unassigned'}</strong> · Est. ${formatDuration(p.estimatedDurationMs)}
               </div>
+              <div title="Peak number of distinct work units with tests in progress, from the start and finish events received for this attempt when the dialog opened.">
+                Observed peak: <strong>${partitionPeakLabel}</strong>
+              </div>
             </div>
             <button class="btn btn-sm" onClick=${() => { state.selectedPartition = null; renderApp(); }}>✕ Close</button>
           </div>
-          <div class="modal-body">
+          <div class="modal-body" data-scroll-key=${`partition-${p.partitionId}-${p.attempt}`}>
             ${(() => {
               const timing = partitionTiming(p, partTests);
-              if (!timing) return null;
+              const wait = p.inputPreparation?.waitMs;
+              if (!timing) return wait == null ? null : html`<p>Shared input wait <strong>${formatDuration(wait)}</strong></p>`;
+              const startup = Math.max(0, timing.setup - (wait || 0));
               const pct = v => `${Math.max(0, Math.min(100, (v / Math.max(1, timing.total)) * 100)).toFixed(1)}%`;
               return html`
                 <h3 style="margin:0 0 8px;font-size:13px;text-transform:uppercase;color:var(--text-muted)">Where the time went</h3>
                 <div class="partition-timing">
                   <div class="partition-timing-bar">
-                    <span class="timing-setup" style=${`width:${pct(timing.setup)}`}></span>
+                    ${wait > 0 ? html`<span style=${`background:#f59e0b;width:${pct(Math.min(wait, timing.setup))}`}></span>` : null}
+                    <span style=${`background:#818cf8;width:${pct(startup)}`}></span>
                     <span class="timing-tests" style=${`width:${pct(timing.tests)}`}></span>
                     <span class="timing-wrapup" style=${`width:${pct(timing.wrapUp)}`}></span>
                   </div>
                   <div class="partition-timing-legend">
-                    <span><span class="timing-swatch timing-setup"></span> Setup ${formatDuration(timing.setup)}</span>
+                    ${wait != null ? html`<span><span class="timing-swatch timing-setup"></span> Shared input wait ${formatDuration(wait)}</span>` : null}
+                    <span><span class="timing-swatch" style="background:#818cf8"></span> ${wait == null ? 'Before first test' : 'Other startup'} (estimated) ${formatDuration(startup)}</span>
                     <span><span class="timing-swatch timing-tests"></span> Tests ${formatDuration(timing.tests)} (sum of test times ${formatDuration(timing.testTime)})</span>
                     <span><span class="timing-swatch timing-wrapup"></span> Wrap-up ${formatDuration(timing.wrapUp)}</span>
                   </div>
                   <div style="font-size:12px;color:var(--text-muted);margin-top:6px">
-                    Setup is the worker preparing the partition before its first test: fetching and unpacking the
-                    classpath, starting a JVM or class loader, and bootstrapping JUnit and the test framework.
+                    ${wait == null ? 'The first test timestamp gives an estimate of partition startup.' :
+                      'Shared input wait measures how long this partition waited for compiled classes and resources. Other startup includes the private workspace, JVM and test framework.'}
                   </div>
                 </div>
               `;
@@ -2711,9 +3146,9 @@ function renderModals() {
               </div>
             ` : null}
 
-            <h3 style="margin:0 0 8px;font-size:13px;text-transform:uppercase;color:var(--text-muted)">Scheduled Work Units (${(p.workUnits || []).length})</h3>
+            <h3 style="margin:0 0 8px;font-size:13px;text-transform:uppercase;color:var(--text-muted)">Scheduled Work Units (${workUnits.length})</h3>
             <div style="display:flex;flex-direction:column;gap:6px;margin-bottom:16px">
-              ${(p.workUnits || []).map(u => html`
+              ${workUnits.map(u => html`
                 <div style="padding:8px 12px;border-radius:8px;background:var(--bg-subtle);display:flex;justify-content:space-between;gap:8px">
                   <span class="mono" style="font-size:12.5px">${u.key}</span>
                   <span class="mono" style="font-size:12px;color:var(--text-muted)">est. ${formatDuration(u.estimatedDurationMs)}</span>
@@ -2763,15 +3198,15 @@ function renderModals() {
             </div>
             <button class="btn btn-sm" onClick=${() => { state.selectedTestExecution = null; renderApp(); }}>✕ Close</button>
           </div>
-          <div class="modal-body">
+          <div class="modal-body" data-scroll-key=${`execution-${t.id}`}>
             <div style="margin-bottom:12px;font-size:13px">
-              Worker: <strong class="mono">${t.workerId}</strong> · Partition: <strong class="mono">${t.partitionId}</strong> (#${t.attempt}) · Duration: <strong class="mono">${formatDuration(t.durationMs)}</strong>
+              ${t.partitionId === 'local' ? 'Executed on Maven host' : html`Worker: <strong class="mono">${t.workerId}</strong> · Partition: <strong class="mono">${t.partitionId}</strong>`} (#${t.attempt}) · Duration: <strong class="mono">${formatDuration(t.durationMs)}</strong>
             </div>
-            <div style="margin-bottom:14px">
-              ${(t.endpoints || []).map(ep => html`<span class="tag tag-endpoint mono">endpoint: ${ep}</span>`)}
-            </div>
+            ${t.endpoints?.length ? html`<div style="margin-bottom:14px">
+              Citrus endpoints: ${t.endpoints.map(ep => html`<span class="tag tag-endpoint mono">${ep}</span>`)}
+            </div>` : null}
             ${t.errorMessage ? html`<div style="margin-bottom:10px;font-weight:600;color:var(--rose-text)">${t.errorMessage}</div>` : null}
-            ${t.stackTrace ? html`<pre class="stacktrace-box">${t.stackTrace}</pre>` : html`<div style="color:var(--text-muted)">No failure stack trace recorded for this test execution.</div>`}
+            ${t.stackTrace ? html`<pre class="stacktrace-box" data-scroll-key=${`trace-detail-${t.id}`}>${t.stackTrace}</pre>` : html`<div style="color:var(--text-muted)">No failure stack trace recorded for this test execution.</div>`}
           </div>
         </div>
       </div>
@@ -2793,9 +3228,24 @@ function renderMainView() {
   }
 }
 
+let renderedRoute;
+
 export function renderApp() {
   const root = document.getElementById('app');
   if (!root || state.draggedPoolId) return;
+
+  const route = buildHash();
+  const samePage = route === renderedRoute;
+  const pageX = window.scrollX;
+  const pageY = window.scrollY;
+  const offsets = new Map();
+  if (samePage) {
+    for (const panel of root.querySelectorAll('[data-scroll-key]')) {
+      if (panel.scrollLeft || panel.scrollTop) {
+        offsets.set(panel.dataset.scrollKey, [panel.scrollLeft, panel.scrollTop]);
+      }
+    }
+  }
 
   // Preserve focused input and cursor position across DOM replacement
   const active = document.activeElement;
@@ -2820,10 +3270,10 @@ export function renderApp() {
 
   root.replaceChildren(tree);
 
-  if (focusId) {
+  if (samePage && focusId) {
     const nextInput = root.querySelector(`[data-focus-id="${CSS.escape(focusId)}"]`);
     if (nextInput) {
-      nextInput.focus();
+      nextInput.focus({ preventScroll: true });
       if (selStart !== null && typeof nextInput.setSelectionRange === 'function') {
         try {
           nextInput.setSelectionRange(selStart, selEnd);
@@ -2833,6 +3283,13 @@ export function renderApp() {
       }
     }
   }
+  for (const [key, [left, top]] of offsets) {
+    root.querySelector(`[data-scroll-key="${CSS.escape(key)}"]`)?.scrollTo(left, top);
+  }
+  if (samePage && (window.scrollX !== pageX || window.scrollY !== pageY)) {
+    window.scrollTo(pageX, pageY);
+  }
+  renderedRoute = route;
 }
 
 window.addEventListener('hashchange', () => {

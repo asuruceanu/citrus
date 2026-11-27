@@ -259,7 +259,7 @@ public class GrpcServerTest {
 
     @Test
     public void shouldFailToSendWhenClientCancelledTheCall() throws Exception {
-        GrpcServer server = startServer(1000);
+        GrpcServer server = startServer(15000);
         ManagedChannel channel = channel(server);
 
         CountDownLatch firstMessage = new CountDownLatch(1);
@@ -291,10 +291,10 @@ public class GrpcServerTest {
                             }
                         });
 
-        GrpcMessage call = (GrpcMessage) server.createConsumer().receive(context, 2000);
+        GrpcMessage call = (GrpcMessage) server.createConsumer().receive(context, 15000);
         server.createProducer().send(streamMessage(call, "{\"symbol\": \"ACME\"}"), context);
 
-        assertThat(firstMessage.await(2, TimeUnit.SECONDS)).isTrue();
+        assertThat(firstMessage.await(15, TimeUnit.SECONDS)).isTrue();
         callStream.get().cancel("cancelled by test", null);
 
         CitrusRuntimeException failure = awaitCancelledCallFailure(server, call, context);

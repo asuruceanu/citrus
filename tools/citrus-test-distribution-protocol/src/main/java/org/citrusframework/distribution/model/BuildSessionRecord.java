@@ -33,7 +33,8 @@ public record BuildSessionRecord(
         long serialDurationMs,
         long wallDurationMs,
         String failureReason,
-        java.util.List<String> modules
+        java.util.List<String> modules,
+        String runGroup
 ) {
 
     /** Modules (Maven artifact ids) that submitted work, in the order they first started. */
@@ -60,14 +61,23 @@ public record BuildSessionRecord(
             String failureReason) {
         this(sessionId, projectName, gitBranch, gitCommit, status, startedAt, finishedAt, totalTests, passedTests,
                 failedTests, skippedTests, totalBlobs, cachedBlobs, serialDurationMs, wallDurationMs, failureReason,
-                java.util.List.of());
+                java.util.List.of(), null);
+    }
+
+    public BuildSessionRecord(String sessionId, String projectName, String gitBranch, String gitCommit,
+                              SessionStatus status, long startedAt, long finishedAt, int totalTests,
+                              int passedTests, int failedTests, int skippedTests, int totalBlobs, int cachedBlobs,
+                              long serialDurationMs, long wallDurationMs, String failureReason, java.util.List<String> modules) {
+        this(sessionId, projectName, gitBranch, gitCommit, status, startedAt, finishedAt, totalTests, passedTests,
+                failedTests, skippedTests, totalBlobs, cachedBlobs, serialDurationMs, wallDurationMs, failureReason,
+                modules, null);
     }
 
     /** Copy listing {@code modules}. */
     public BuildSessionRecord withModules(java.util.List<String> modules) {
         return new BuildSessionRecord(sessionId, projectName, gitBranch, gitCommit, status, startedAt, finishedAt,
                 totalTests, passedTests, failedTests, skippedTests, totalBlobs, cachedBlobs, serialDurationMs,
-                wallDurationMs, failureReason, modules);
+                wallDurationMs, failureReason, modules, runGroup);
     }
 
     /** Session without a failure reason (running or passed sessions). */

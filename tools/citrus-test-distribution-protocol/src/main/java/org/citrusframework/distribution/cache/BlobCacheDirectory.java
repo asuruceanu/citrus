@@ -639,12 +639,7 @@ public class BlobCacheDirectory {
             throw new IOException("Cached blob does not exist: " + ref.sha256());
         }
 
-        String directoryName = ref.sha256();
-        // Preserve the reactor module name for classpath consumers that inspect entry names.
-        if (ref.name() != null && ClasspathPackager.MAVEN_OUTPUT_ARCHIVE.matcher(ref.name()).matches()) {
-            directoryName += "-" + ref.name().substring(0, ref.name().length() - ".zip".length());
-        }
-        Path extractDir = workspaceDir.toAbsolutePath().normalize().resolve("extracted").resolve(directoryName);
+        Path extractDir = classpathExtractionDirectory(ref, workspaceDir);
         Path marker = extractDir.resolve(".complete");
         if (Files.isRegularFile(marker)) {
             return extractDir;
@@ -662,6 +657,16 @@ public class BlobCacheDirectory {
             Files.writeString(marker, "ok");
             return extractDir;
         }
+    }
+
+    /** Private classpath directory, retaining the module name for consumers that inspect entry names. */
+    public static Path classpathExtractionDirectory(ArtifactRef ref, Path workspaceDir) {
+        String directoryName = ref.sha256();
+        // Preserve the reactor module name for classpath consumers that inspect entry names.
+        if (ref.name() != null && ClasspathPackager.MAVEN_OUTPUT_ARCHIVE.matcher(ref.name()).matches()) {
+            directoryName += "-" + ref.name().substring(0, ref.name().length() - ".zip".length());
+        }
+        return workspaceDir.toAbsolutePath().normalize().resolve("extracted").resolve(directoryName);
     }
 
     /**

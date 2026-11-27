@@ -1,0 +1,111 @@
+# Copyright the original author or authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: citrus-test-distribution
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: citrus_dist
+      POSTGRES_USER: citrus
+      POSTGRES_PASSWORD: ${CITRUS_DIST_JDBC_PASSWORD:-citrus}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  coordinator:
+    build:
+      context: ../../..
+      dockerfile: tools/citrus-test-distribution/docker/Dockerfile
+      target: coordinator
+    command:
+      - --jdbc-url=jdbc:postgresql://postgres:5432/citrus_dist
+      - --cache-dir=/var/lib/citrus/blobs
+    environment:
+      CITRUS_DIST_JDBC_USER: citrus
+      CITRUS_DIST_JDBC_PASSWORD: ${CITRUS_DIST_JDBC_PASSWORD:-citrus}
+      CITRUS_DIST_AUTH_TOKEN: ${CITRUS_DIST_AUTH_TOKEN:-}
+    ports:
+      - "127.0.0.1:${CITRUS_DIST_HOST_PORT:-8765}:8765"
+    volumes:
+      - coordinator-data:/var/lib/citrus
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8765/health"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+    init: true
+    restart: unless-stopped
+
+  pool-init:
+    image: python:3.13-alpine
+    command: ["python", "/provision-pool.py"]
+    environment:
+      CITRUS_DIST_AUTH_TOKEN: ${CITRUS_DIST_AUTH_TOKEN:-}
+    volumes:
+      - ./provision-pool.py:/provision-pool.py:ro
+      - pool-registration:/registration
+    depends_on:
+      coordinator:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: ../../..
+      dockerfile: tools/citrus-test-distribution/docker/Dockerfile
+      target: worker
+    environment:
+      CITRUS_DIST_WORKER_MAX_SLOTS: ${CITRUS_DIST_WORKER_MAX_SLOTS:-1}
+      CITRUS_DIST_WORKER_HANDSHAKE_TIMEOUT_MS: ${CITRUS_DIST_WORKER_HANDSHAKE_TIMEOUT_MS:-90000}
+      CITRUS_DIST_SHARED_INPUTS_DIR: /var/lib/citrus/shared-base-inputs
+      CITRUS_DIST_COMPOSE_WORKER: "true"
+      CITRUS_DIST_COORDINATOR_URL: http://coordinator:8765
+      CITRUS_DIST_AUTH_TOKEN: ${CITRUS_DIST_AUTH_TOKEN:-}
+      CITRUS_DIST_WORKER_CAPABILITIES: ${CITRUS_DIST_WORKER_CAPABILITIES:-docker=true}
+      TESTCONTAINERS_HOST_OVERRIDE: citrus-docker-host
+      TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE: ${CITRUS_DIST_DOCKER_SOCKET:-/var/run/docker.sock}
+    extra_hosts:
+      - "citrus-docker-host:host-gateway"
+    group_add:
+      - "${CITRUS_DIST_DOCKER_GID:-0}"
+    volumes:
+      - pool-registration:/registration:ro
+      - type: bind
+        source: ${CITRUS_DIST_DOCKER_SOCKET:-/var/run/docker.sock}
+        target: /var/run/docker.sock
+        bind:
+          create_host_path: false
+    depends_on:
+      coordinator:
+        condition: service_healthy
+      pool-init:
+        condition: service_completed_successfully
+    scale: ${CITRUS_DIST_WORKERS:-8}
+    stop_grace_period: 65s
+    init: true
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  coordinator-data:
+  pool-registration:

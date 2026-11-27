@@ -132,6 +132,23 @@ class CoordinatorBlobClientCacheTest {
     }
 
     @Test
+    void shouldDownloadCleartextBlobWithoutHttp2Upgrade() throws Exception {
+        byte[] content = "verified blob".getBytes(StandardCharsets.UTF_8);
+        AtomicReference<String> upgrade = new AtomicReference<>();
+        blobHandler = exchange -> {
+            upgrade.set(exchange.getRequestHeaders().getFirst("Upgrade"));
+            respond(exchange, 200, content);
+        };
+
+        try (WorkerFileCache cache = WorkerFileCache.open(tempDir, true, 0L);
+             CoordinatorBlobClient blobs = new CoordinatorBlobClient(config(tempDir), cache)) {
+            assertThat(blobs.ensureCached(ref(content))).hasBinaryContent(content);
+            assertThat(blobGets).hasValue(1);
+            assertThat(upgrade.get()).isNull();
+        }
+    }
+
+    @Test
     void shouldServeWarmBlobFromStampWithoutHttpRequestAndReDownloadAfterExternalCorruption() throws Exception {
         byte[] content = "warm blob content".getBytes(StandardCharsets.UTF_8);
         ArtifactRef ref = ref(content);

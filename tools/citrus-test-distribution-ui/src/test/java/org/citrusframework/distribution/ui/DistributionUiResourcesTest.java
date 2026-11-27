@@ -55,7 +55,9 @@ class DistributionUiResourcesTest {
             assertThat(appText)
                     .contains("Inspect distributed build sessions, artifact cache hit rates, and test outcomes.")
                     .doesNotContain("Inspect distributed Maven & JBang reactor runs, classpath cache hit rates, and test outcomes.")
-                    .contains("data-view=${id}", "navItem('usage', 'Historical Usage'", "navItem('pools', 'Agent Pools'")
+                    .contains("data-view=${id}", "navItem('usage', 'Historical Usage'")
+                    .contains("navItem('workers', 'Workers'", "navItem('pools', 'Worker Pools'")
+                    .doesNotContain("Workers Pool", "Agent Pools")
                     .doesNotContainIgnoringCase("Connecting Builds")
                     .doesNotContainIgnoringCase("project groups")
                     .doesNotContainIgnoringCase("access control")
@@ -72,7 +74,7 @@ class DistributionUiResourcesTest {
                     .contains("state.workerStateFilter = st", "st === 'LOW_DISK' ? 'LOW DISK' : st")
                     .contains("if (!Number.isFinite(buffer) || buffer <= 0) return 100;")
                     .containsPattern("usableLabel = Number\\(c\\.usableDiskBytes\\) < 0 [^\\n]+\\s*\\? 'N/A'")
-                    .containsPattern("(?s)<div class=\"overview-worker-badges\">.*?isLowDisk\\(w\\).*?statusBadge\\(w\\.state\\)")
+                    .contains("workerGroups.map(renderPoolHealth)", "online.filter(isLowDisk)", "Worker Health by Pool")
                     .contains("w.state !== 'OFFLINE' && w.cacheStats && w.cacheStats.lowDiskSpace")
                     .contains("const lowDisk = isLowDisk(w);")
                     .contains("worker-cache-panel ${lowDisk ? 'low-disk' : ''}",
@@ -106,6 +108,8 @@ class DistributionUiResourcesTest {
                     .contains("session-modules")
                     .contains("<title>")
                     .contains("fitBarLabel")
+                    .contains("class=\"waterfall-worker-label\"", "<title>${workerLabel}</title>",
+                            "${fitWorkerLaneLabel(workerLabel)}")
                     .contains("partitionTiming")
                     .contains("function paginate(")
                     .contains("function loadHistory(")
@@ -113,8 +117,8 @@ class DistributionUiResourcesTest {
                     // A table returns to its first page when the session or a filter it shows changes.
                     .contains("function paginate(key, items, pageSize = 25, context = '')")
                     .contains("paginate('sessions', filtered, 25, `${state.sessionStatusFilter}|${q}`)")
-                    .contains("paginate('partitions', partitions, 25, state.selectedSessionId)")
-                    .contains("paginate('tests', filteredTests, 50, `${state.selectedSessionId}|${state.testStatusFilter}|${tq}`)")
+                    .contains("paginate('partitions', filtered, 25, JSON.stringify([sessionId, query, filters.state, filters.sort, filters.module]))")
+                    .contains("paginate('tests', filteredTests, 50, `${state.selectedSessionId}|${state.testStatusFilter}|${localOnly}|${tq}`)")
                     .contains("paginate('history', filtered, 25,", "historyPage.controls")
                     .contains("class=\"pager\"");
 

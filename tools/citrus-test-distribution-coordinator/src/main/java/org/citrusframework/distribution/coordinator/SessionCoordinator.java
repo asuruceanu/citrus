@@ -34,6 +34,7 @@ import java.util.function.Consumer;
 import org.citrusframework.distribution.TestExecutionIdentity;
 import org.citrusframework.distribution.config.DistributionJson;
 import org.citrusframework.distribution.config.DistributionSettings;
+import org.citrusframework.distribution.model.InputPreparation;
 import org.citrusframework.distribution.model.AgentPoolRecord;
 import org.citrusframework.distribution.model.AgentPoolSummary;
 import org.citrusframework.distribution.model.ArtifactRef;
@@ -176,7 +177,7 @@ public final class SessionCoordinator {
                 SessionStatus.RUNNING,
                 now,
                 0L,
-                0, 0, 0, 0, 0, 0, 0L, 0L
+                0, 0, 0, 0, 0, 0, 0L, 0L, null, List.of(), request.runGroup()
         );
         String historyScope = DistributionSettings.historyScope(request.projectKey(), record.projectName());
         store.saveSession(record, request.maxPartitionSize(), historyScope, maxRetries);
@@ -536,6 +537,34 @@ public final class SessionCoordinator {
         return "Build failed outside distributed test execution (no reason reported by the launcher)";
     }
 
+    public int observedWorkUnitPeak(String sessionId, String partitionId, int attempt) {
+        Map<String, Set<String>> active = new HashMap<>();
+        int[] peak = {0};
+        store.replayPartitionEvents(sessionId, partitionId, event -> {
+            if (!partitionId.equals(event.partitionId()) || !"test.event".equals(event.type())) {
+                return;
+            }
+            var data = event.data();
+            if (!(data.get("attempt") instanceof Number number) || number.intValue() != attempt
+                    || !(data.get("workUnitKey") instanceof String unit) || unit.isBlank()) {
+                return;
+            }
+            String test = TestExecutionIdentity.key(unit, (String) data.get("className"),
+                    (String) data.get("testName"), (String) data.get("uniqueId"));
+            if ("STARTED".equals(data.get("status"))) {
+                active.computeIfAbsent(unit, ignored -> new HashSet<>()).add(test);
+                peak[0] = Math.max(peak[0], active.size());
+            } else if (active.containsKey(unit)) {
+                Set<String> tests = active.get(unit);
+                tests.remove(test);
+                if (tests.isEmpty()) {
+                    active.remove(unit);
+                }
+            }
+        });
+        return peak[0];
+    }
+
     public synchronized Optional<SessionDetailResponse> getSessionDetail(String sessionId) {
         return store.findSession(sessionId).map(session -> {
             List<WorkspaceChange> changes = store.findWorkspaceChanges(sessionId);
@@ -548,8 +577,45 @@ public final class SessionCoordinator {
         return store.listSessions(limit);
     }
 
-    public List<WorkerRecord> listWorkers() {
-        return store.listWorkers();
+    enum Deletion { DELETED, MISSING, ACTIVE }
+
+    synchronized Deletion deleteSession(String sessionId) {
+        var session = store.findSession(sessionId);
+        if (session.isEmpty()) {
+            return Deletion.MISSING;
+        }
+        if (session.get().status() == SessionStatus.RUNNING) {
+            return Deletion.ACTIVE;
+        }
+        store.deleteFinishedSession(sessionId);
+        sessions.remove(sessionId);
+        partitions.values().removeIf(p -> sessionId.equals(p.record.sessionId()));
+        eventHub.publish("session.deleted", null, null, null, Map.of("sessionId", sessionId));
+        return Deletion.DELETED;
+    }
+
+    synchronized Deletion deleteWorker(String workerId) {
+        if (connectionsByWorker.containsKey(workerId)) {
+            return Deletion.ACTIVE;
+        }
+        if (!store.deleteOfflineWorker(workerId)) {
+            return store.listWorkers().stream().anyMatch(worker -> workerId.equals(worker.workerId()))
+                    ? Deletion.ACTIVE : Deletion.MISSING;
+        }
+        eventHub.publish("worker.deleted", null, null, workerId, Map.of());
+        return Deletion.DELETED;
+    }
+
+    public synchronized List<WorkerRecord> listWorkers() {
+        return store.listWorkers().stream().map(worker -> {
+            var connections = connectionsByWorker.get(worker.workerId());
+            if (connections == null) {
+                return worker;
+            }
+            int slots = (int) connections.stream().map(conn -> conn.overflowSlot).distinct().count();
+            var active = connections.stream().map(conn -> conn.activePartitionId).filter(Objects::nonNull).toList();
+            return worker.withSlots(slots, active);
+        }).toList();
     }
 
     public List<TestHistorySummary> listTestHistory(int limit) {
@@ -967,6 +1033,20 @@ public final class SessionCoordinator {
                             "attempt", pr.record.attempt()), null, null, List.of(pr.record));
                 }
             }
+            case WorkerWsMessage.PARTITION_INPUTS_READY -> {
+                String partitionId = stringField(message.payload(), "partitionId");
+                PartitionRuntime pr = partitionId == null ? null : partitions.get(partitionId);
+                if (acceptsAttempt(pr, conn, intField(message.payload(), "attempt"))) {
+                    InputPreparation ready = DistributionJson.convert(message.payload().get("inputPreparation"), InputPreparation.class);
+                    if (ready != null && ready.startedAt() > 0 && ready.readyAt() >= ready.startedAt() && ready.waitMs() >= 0) {
+                        pr.inputPreparation = ready;
+                        pr.record = pr.buildRecord(conn.workerId, pr.record.state(), pr.record.attempt(),
+                                pr.record.startedAt(), 0, pr.record.producedOutputs(), null);
+                        eventHub.publish(WorkerWsMessage.PARTITION_INPUTS_READY, pr.record.sessionId(), partitionId,
+                                conn.workerId, Map.of("attempt", pr.record.attempt()), null, null, List.of(pr.record));
+                    }
+                }
+            }
             case WorkerWsMessage.TEST_EVENT -> handleTestEvent(conn, message.payload());
             case WorkerWsMessage.PARTITION_COMPLETED -> handleCompletion(conn, message.payload());
             default -> LOG.debug("Ignoring unknown worker message type {}", message.type());
@@ -1160,6 +1240,9 @@ public final class SessionCoordinator {
             List<String> producedOutputs = done.outputArtifacts().stream()
                     .map(WorkspaceFileSet::relativePath)
                     .toList();
+            if (done.inputPreparation() != null) {
+                pr.inputPreparation = done.inputPreparation();
+            }
             pr.record = pr.buildRecord(
                     conn.workerId,
                     endState,
@@ -1298,7 +1381,7 @@ public final class SessionCoordinator {
                     pr.inputArtifacts,
                     pr.outputPaths,
                     pr.forkWorkspace,
-                    pr.workingDirectory
+                    pr.workingDirectory, pr.moduleName
             );
             @SuppressWarnings("unchecked")
             Map<String, Object> payloadMap = DistributionJson.convert(assignPayload, Map.class);
@@ -1403,13 +1486,39 @@ public final class SessionCoordinator {
         return workers.values().stream()
                 .filter(conn -> conn.state == WorkerState.IDLE && conn.activePartitionId == null)
                 .filter(conn -> eligible(conn, requirements, now))
-                .min(Comparator.comparingInt((WorkerConnection conn) -> conn.pool == null
+                .filter(conn -> slotAvailable(conn, requirements, now))
+                .min(Comparator.comparing((WorkerConnection conn) -> connectionsByWorker.get(conn.workerId)
+                                .stream().anyMatch(SessionCoordinator::slotOccupied))
+                        .thenComparingInt(conn -> conn.pool == null
                                 ? Integer.MAX_VALUE : conn.pool.priorityOrder())
                         .thenComparing(conn -> preferAvoiding.contains(conn.workerId))
                         .thenComparingLong(conn -> conn.lastAssignedAt)
                         .thenComparing(conn -> conn.workerId)
                         .thenComparing(conn -> conn.connectionId))
                 .orElse(null);
+    }
+
+    private static boolean slotOccupied(WorkerConnection conn) {
+        return conn.activePartitionId != null || conn.cancelledPartitionId != null;
+    }
+
+    private boolean slotAvailable(WorkerConnection candidate, Map<String, String> requirements, long now) {
+        boolean primaryBusy = false;
+        for (WorkerConnection sibling : connectionsByWorker.get(candidate.workerId)) {
+            if (!slotOccupied(sibling)) {
+                continue;
+            }
+            // Reconnecting the same slot must never create additional execution capacity.
+            if (sibling.overflowSlot == candidate.overflowSlot) {
+                return false;
+            }
+            if (!sibling.overflowSlot && sibling.activePartitionId != null
+                    && sibling.host.equals(candidate.host) && Objects.equals(sibling.poolId(), candidate.poolId())
+                    && eligible(sibling, requirements, now)) {
+                primaryBusy = true;
+            }
+        }
+        return !candidate.overflowSlot || primaryBusy;
     }
 
     /** A reconnected idle socket must not hide another socket still executing under this worker ID. */
@@ -1687,6 +1796,7 @@ public final class SessionCoordinator {
 
     private static final class PartitionRuntime {
         private PartitionRecord record;
+        private InputPreparation inputPreparation;
         private final String moduleName;
         private final List<ArtifactRef> classpathArtifacts;
         private final Map<String, String> systemProperties;
@@ -1709,6 +1819,7 @@ public final class SessionCoordinator {
 
         private PartitionRuntime(PartitionRecord record, SubmitWorkRequest request, int maxRetries) {
             this.record = record;
+            this.inputPreparation = record.inputPreparation();
             this.moduleName = record.moduleName();
             this.classpathArtifacts = request.classpathArtifacts() == null ? List.of() : List.copyOf(request.classpathArtifacts());
             this.systemProperties = request.systemProperties() == null ? Map.of() : Map.copyOf(request.systemProperties());
@@ -1727,6 +1838,9 @@ public final class SessionCoordinator {
                                             long finishedAt,
                                             List<String> producedOutputs,
                                             String errorMessage) {
+            if (attempt != record.attempt()) {
+                inputPreparation = null;
+            }
             return new PartitionRecord(
                     record.partitionId(),
                     record.sessionId(),
@@ -1744,12 +1858,13 @@ public final class SessionCoordinator {
                     inputPaths,
                     outputPaths,
                     producedOutputs,
-                    errorMessage
+                    errorMessage, inputPreparation
             );
         }
     }
 
     private static final class WorkerConnection {
+        private final boolean overflowSlot;
         private final String connectionId;
         private final String workerId;
         private final String host;
@@ -1780,6 +1895,7 @@ public final class SessionCoordinator {
         private WorkerConnection(String connectionId, String workerId, WorkerRegisterPayload payload,
                                  AgentPoolRecord pool, StoredRegistrationKey key, long now,
                                  Consumer<WorkerWsMessage> sender, Runnable closer) {
+            this.overflowSlot = payload.overflowSlot();
             this.connectionId = connectionId;
             this.workerId = workerId;
             this.host = payload.host() == null ? "unknown" : payload.host();

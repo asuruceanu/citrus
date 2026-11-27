@@ -26,8 +26,21 @@ public record CreateSessionRequest(
         int maxPartitionSize,
         int maxRetries,
         List<WorkspaceChange> workspaceChanges,
-        String projectKey
+        String projectKey,
+        String runGroup
 ) {
+    public CreateSessionRequest {
+        runGroup = runGroup == null || runGroup.isBlank() ? null : runGroup.strip();
+        if (runGroup != null && runGroup.length() > 255) {
+            throw new IllegalArgumentException("runGroup must be at most 255 characters");
+        }
+    }
+
+    public CreateSessionRequest(String projectName, String gitBranch, String gitCommit, List<String> changedFiles,
+                                int maxPartitionSize, int maxRetries, List<WorkspaceChange> workspaceChanges, String projectKey) {
+        this(projectName, gitBranch, gitCommit, changedFiles, maxPartitionSize, maxRetries, workspaceChanges, projectKey, null);
+    }
+
     public CreateSessionRequest(String projectName, String gitBranch, String gitCommit, List<String> changedFiles,
                                 int maxPartitionSize, int maxRetries) {
         this(projectName, gitBranch, gitCommit, changedFiles, maxPartitionSize, maxRetries, List.of(), null);

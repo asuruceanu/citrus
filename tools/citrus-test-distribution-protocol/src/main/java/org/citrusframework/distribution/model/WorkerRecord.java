@@ -35,12 +35,37 @@ public record WorkerRecord(
         long lastHeartbeatAt,
         long registeredAt,
         WorkerCacheStats cacheStats,
-        List<WorkerWarning> warnings
+        List<WorkerWarning> warnings,
+        int connectedSlots,
+        List<String> activePartitionIds
 ) {
 
     public WorkerRecord {
         capabilities = capabilities == null ? Map.of() : Collections.unmodifiableMap(new LinkedHashMap<>(capabilities));
+        if (connectedSlots == 0 && state != WorkerState.OFFLINE) {
+            connectedSlots = 1;
+        }
+        if (activePartitionIds == null) {
+            activePartitionIds = activePartitionId == null ? List.of() : List.of(activePartitionId);
+        } else {
+            activePartitionIds = List.copyOf(activePartitionIds);
+        }
         warnings = warnings == null ? List.of() : List.copyOf(warnings);
+    }
+
+    public WorkerRecord(String workerId, String host, String version, String poolId, String poolDisplayName,
+                        Map<String, String> capabilities, WorkerState state, String activePartitionId,
+                        String activeTestDisplay, long stateUpdatedAt, long lastHeartbeatAt, long registeredAt,
+                        WorkerCacheStats cacheStats, List<WorkerWarning> warnings) {
+        this(workerId, host, version, poolId, poolDisplayName, capabilities, state, activePartitionId,
+                activeTestDisplay, stateUpdatedAt, lastHeartbeatAt, registeredAt, cacheStats, warnings,
+                state == WorkerState.OFFLINE ? 0 : 1, activePartitionId == null ? List.of() : List.of(activePartitionId));
+    }
+
+    public WorkerRecord withSlots(int count, List<String> partitions) {
+        return new WorkerRecord(workerId, host, version, poolId, poolDisplayName, capabilities, state,
+                activePartitionId, activeTestDisplay, stateUpdatedAt, lastHeartbeatAt, registeredAt,
+                cacheStats, warnings, count, partitions);
     }
 
     public WorkerRecord(String workerId, String host, Map<String, String> capabilities, WorkerState state,

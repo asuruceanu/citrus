@@ -282,7 +282,9 @@ class DistributionSettingsAndPathRewriterTest {
 
     @Test
     void shouldParseEnumSettingsStrictlyWithDefaults() {
-        assertThat(DistributionSettings.parsePartitionPolicy(null)).isEqualTo(PartitionPolicy.LPT);
+        assertThat(DistributionSettings.parsePartitionPolicy(null)).isEqualTo(PartitionPolicy.SINGLE);
+        assertThat(DistributionSettings.parsePartitionPolicy(" ")).isEqualTo(PartitionPolicy.SINGLE);
+        assertThat(DistributionSettings.parsePartitionPolicy("lpt")).isEqualTo(PartitionPolicy.LPT);
         assertThat(DistributionSettings.parsePartitionPolicy(" single ")).isEqualTo(PartitionPolicy.SINGLE);
         assertThatThrownBy(() -> DistributionSettings.parsePartitionPolicy("ROUND_ROBIN"))
                 .isInstanceOf(IllegalArgumentException.class)

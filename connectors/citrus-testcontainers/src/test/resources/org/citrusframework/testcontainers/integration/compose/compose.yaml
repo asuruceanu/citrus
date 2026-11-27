@@ -1,7 +1,9 @@
 services:
   web:
-    image: nginx:latest
-    ports:
-      - '8880:80'
-    volumes:
-      - ./html:/usr/share/nginx/html:ro
+    image: citrus-testcontainers-compose-fixture:local
+    pull_policy: build
+    build:
+      context: .
+      dockerfile_inline: |
+        FROM nginx:latest
+        COPY html/ /usr/share/nginx/html/

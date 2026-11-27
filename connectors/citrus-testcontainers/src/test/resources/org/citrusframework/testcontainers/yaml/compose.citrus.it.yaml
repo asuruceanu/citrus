@@ -7,15 +7,18 @@ actions:
       compose:
         up:
           file: "classpath:org/citrusframework/testcontainers/integration/compose/compose.yaml"
+          exposedServices:
+            - name: "web-1"
+              port: 80
   - waitFor:
       http:
-        url: "http://localhost:8880"
+        url: "http://${CITRUS_TESTCONTAINERS_WEB_1_SERVICE_HOST}:${CITRUS_TESTCONTAINERS_WEB_1_SERVICE_PORT}"
   - http:
-      client: "http://localhost:8880"
+      client: "http://${CITRUS_TESTCONTAINERS_WEB_1_SERVICE_HOST}:${CITRUS_TESTCONTAINERS_WEB_1_SERVICE_PORT}"
       sendRequest:
         GET: {}
   - http:
-      client: "http://localhost:8880"
+      client: "http://${CITRUS_TESTCONTAINERS_WEB_1_SERVICE_HOST}:${CITRUS_TESTCONTAINERS_WEB_1_SERVICE_PORT}"
       receiveResponse:
         response:
           status: "200"

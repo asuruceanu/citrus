@@ -67,7 +67,7 @@ export function renderUsageChart(id, heading, points, metrics, timeWindow, selec
         </ul>` : null}
       </div>
       ${points.length ? html`
-        <div class="usage-chart-scroll">
+        <div class="usage-chart-scroll" data-scroll-key=${id}>
           <svg class="usage-chart" viewBox=${`0 0 ${width} ${height}`} tabindex="0" role="group"
             aria-labelledby=${`${id}-heading`} aria-describedby="usage-instructions"
             data-focus-id=${id}

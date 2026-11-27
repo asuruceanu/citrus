@@ -89,6 +89,7 @@ public final class DistributionCoordinatorVerticle extends AbstractVerticle {
     private final SessionCoordinator coordinator;
 
     private HttpServer httpServer;
+    private long dashboardTimerId = -1L;
     private long leaseTimerId = -1L;
     private long usageTimerId = -1L;
     private Future<Void> leaseSweep = Future.succeededFuture();
@@ -138,10 +139,22 @@ public final class DistributionCoordinatorVerticle extends AbstractVerticle {
         router.post("/api/v1/sessions").handler(this::handleCreateSession);
         router.get("/api/v1/sessions").handler(this::handleListSessions);
         router.get("/api/v1/sessions/:sessionId").handler(this::handleGetSession);
+        router.delete("/api/v1/sessions/:sessionId").handler(ctx -> deleteRecord(ctx,
+                () -> coordinator.deleteSession(ctx.pathParam("sessionId")), "Only finished sessions can be deleted"));
+        router.delete("/api/v1/workers/:workerId").handler(ctx -> deleteRecord(ctx,
+                () -> coordinator.deleteWorker(ctx.pathParam("workerId")), "Only offline workers can be deleted"));
         router.post("/api/v1/sessions/:sessionId/work").handler(this::handleSubmitWork);
         router.post("/api/v1/sessions/:sessionId/local-tests").handler(this::handleReportLocalTests);
         router.post("/api/v1/sessions/:sessionId/complete").handler(this::handleCompleteSession);
         router.post("/api/v1/sessions/:sessionId/abort").handler(this::handleAbortSession);
+        router.get("/api/v1/sessions/:sessionId/partitions/:partitionId/peak").handler(ctx -> {
+            String session = ctx.pathParam("sessionId");
+            String partition = ctx.pathParam("partitionId");
+            int attempt = parseIntParam(ctx.request().getParam("attempt"), 1);
+            vertx.executeBlocking(() -> coordinator.observedWorkUnitPeak(session, partition, attempt))
+                    .onSuccess(peak -> writeJson(ctx, 200, Map.of("peak", peak)))
+                    .onFailure(err -> writeError(ctx, err));
+        });
         router.get("/api/v1/sessions/:sessionId/events").handler(this::handleSessionEvents);
         router.get("/api/v1/events/stream").handler(this::handleGlobalEvents);
 
@@ -155,7 +168,8 @@ public final class DistributionCoordinatorVerticle extends AbstractVerticle {
             respond(ctx, 200, () ->
                     coordinator.queryHistoricalUsage(ctx.request().getParam("window"), ctx.request().getParam("filter")));
         });
-        router.get("/api/v1/workers").handler(ctx -> writeJson(ctx, 200, coordinator.listWorkers()));
+        router.get("/api/v1/workers").handler(ctx -> vertx.executeBlocking(coordinator::listWorkers, false)
+                .onSuccess(workers -> writeJson(ctx, 200, workers)).onFailure(err -> writeError(ctx, err)));
         router.get("/api/v1/tests/history").handler(this::handleTestHistory);
         router.get("/api/v1/tests/history/runs").handler(this::handleTestHistoryRuns);
         router.post("/api/v1/history/durations").handler(this::handleHistoricalDurations);
@@ -163,6 +177,7 @@ public final class DistributionCoordinatorVerticle extends AbstractVerticle {
         httpServer = vertx.createHttpServer().requestHandler(router);
         sampleUsage().onComplete(initial -> httpServer.listen(config.port(), resolveListenHost(config))
                 .onSuccess(server -> {
+                    dashboardTimerId = vertx.setPeriodic(1_000L, id -> eventHub.flushDashboardChanges());
                     leaseTimerId = vertx.setPeriodic(5_000L, id -> leaseSweep =
                             runMaintenance(leaseSweep, coordinator::sweepExpiredLeases, "Lease sweep"));
                     usageTimerId = vertx.setPeriodic(config.usageSampleIntervalMs(), id -> sampleUsage());
@@ -195,6 +210,9 @@ public final class DistributionCoordinatorVerticle extends AbstractVerticle {
 
     @Override
     public void stop(Promise<Void> stopPromise) {
+        if (dashboardTimerId != -1L) {
+            vertx.cancelTimer(dashboardTimerId);
+        }
         if (leaseTimerId != -1L) {
             vertx.cancelTimer(leaseTimerId);
         }
@@ -310,6 +328,16 @@ public final class DistributionCoordinatorVerticle extends AbstractVerticle {
         }).onFailure(err -> writeError(ctx, err));
     }
 
+    private void deleteRecord(RoutingContext ctx, Callable<SessionCoordinator.Deletion> action, String activeMessage) {
+        vertx.executeBlocking(action).onSuccess(result -> {
+            switch (result) {
+                case DELETED -> writeJson(ctx, 200, Map.of("deleted", true));
+                case MISSING -> writeJson(ctx, 404, Map.of("error", "Record not found"));
+                case ACTIVE -> writeJson(ctx, 409, Map.of("error", activeMessage));
+            }
+        }).onFailure(err -> writeError(ctx, err));
+    }
+
     private void handleCreateSession(RoutingContext ctx) {
         vertx.executeBlocking(() -> {
             CreateSessionRequest req = DistributionJson.fromJson(ctx.body().asString(), CreateSessionRequest.class);
@@ -394,6 +422,10 @@ public final class DistributionCoordinatorVerticle extends AbstractVerticle {
     }
 
     private void handleGlobalEvents(RoutingContext ctx) {
+        if ("dashboard".equals(ctx.request().getParam("mode"))) {
+            eventHub.subscribeDashboard(ctx.response());
+            return;
+        }
         long afterSeq = resolveAfterSequence(ctx);
         eventHub.subscribeGlobal(afterSeq, ctx.response());
     }
@@ -433,15 +465,16 @@ public final class DistributionCoordinatorVerticle extends AbstractVerticle {
             if (!blobCache.contains(sha256)) {
                 return null;
             }
-            return blobCache.readBytes(sha256);
-        }).onSuccess(bytes -> {
-            if (bytes == null) {
+            return blobCache.resolveBlobPathForAccess(sha256);
+        }).onSuccess(path -> {
+            if (path == null) {
                 writeJson(ctx, 404, Map.of("error", "Blob not found: " + sha256));
             } else {
                 ctx.response()
                         .setStatusCode(200)
                         .putHeader("Content-Type", "application/octet-stream")
-                        .end(Buffer.buffer(bytes));
+                        .sendFile(path.toString())
+                        .onFailure(ctx::fail);
             }
         }).onFailure(err -> writeError(ctx, err));
     }

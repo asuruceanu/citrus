@@ -25,6 +25,7 @@ import org.aesh.command.CommandResult;
 import org.aesh.command.invocation.CommandInvocation;
 import org.aesh.command.option.Option;
 import org.aesh.command.option.ParentCommand;
+import org.citrusframework.distribution.config.DistributionSettings;
 import org.citrusframework.distribution.coordinator.DistributionCoordinatorConfig;
 import org.citrusframework.distribution.coordinator.DistributionCoordinatorServer;
 import org.citrusframework.jbang.cli.CitrusJBangMain;
@@ -75,11 +76,12 @@ public class DistCoordinatorStart extends CitrusCommand {
         return super.getMain();
     }
 
-    @Override
-    public CommandResult execute(CommandInvocation invocation) {
+    DistributionCoordinatorConfig buildCoordinatorConfig() {
         DistributionCoordinatorConfig.Builder builder = DistributionCoordinatorConfig.builder()
                 .host(host)
                 .port(port)
+                .jdbcUsername(DistributionSettings.getJdbcUser())
+                .jdbcPassword(DistributionSettings.getJdbcPassword())
                 .defaultMaxPartitionSize(maxPartitionSize)
                 .defaultMaxRetries(maxRetries);
         if (jdbcUrl != null && !jdbcUrl.isBlank()) {
@@ -88,15 +90,17 @@ public class DistCoordinatorStart extends CitrusCommand {
         if (cacheDir != null && !cacheDir.isBlank()) {
             builder.cacheDir(Paths.get(cacheDir));
         }
-        if (authToken != null && !authToken.isBlank()) {
-            builder.authToken(authToken);
-        }
+        String effectiveToken = authToken != null && !authToken.isBlank() ? authToken : DistributionSettings.getAuthToken();
+        return builder.authToken(effectiveToken).build();
+    }
 
+    @Override
+    public CommandResult execute(CommandInvocation invocation) {
         CountDownLatch stopLatch = new CountDownLatch(1);
         Thread hook = new Thread(stopLatch::countDown, "citrus-dist-coordinator-shutdown");
         Runtime.getRuntime().addShutdownHook(hook);
 
-        try (DistributionCoordinatorServer server = new DistributionCoordinatorServer(builder.build())) {
+        try (DistributionCoordinatorServer server = new DistributionCoordinatorServer(buildCoordinatorConfig())) {
             server.start();
             printer().println("Citrus Test Distribution Coordinator listening on " + server.baseUrl() + " (UI: " + server.baseUrl() + "/ui/)");
             if (durationSeconds > 0) {

@@ -205,7 +205,8 @@ public class DistributedLauncher implements Launcher {
                         "HEAD",
                         List.of(),
                         DistributionSettings.findConfiguredMaxPartitionSize().orElse(0),
-                        DistributionSettings.getMaxRetries(), List.of(), projectKey));
+                        DistributionSettings.getMaxRetries(), List.of(), projectKey,
+                        System.getProperty(DistributionSettings.RUN_GROUP_PROPERTY)));
                 sessionId = created.sessionId();
             }
         } catch (Exception e) {

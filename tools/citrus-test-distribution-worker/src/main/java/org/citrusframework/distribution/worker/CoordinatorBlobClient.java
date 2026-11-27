@@ -174,10 +174,12 @@ final class CoordinatorBlobClient implements AutoCloseable {
      */
     private Path download(String sha256, long expectedBytes) throws IOException, InterruptedException {
         downloadRequests.incrementAndGet();
-        HttpResponse<InputStream> response = httpClient.send(request("/api/v1/cache/blobs/" + sha256)
-                        .timeout(Duration.ofSeconds(60))
-                        .GET()
-                        .build(),
+        HttpRequest.Builder download = request("/api/v1/cache/blobs/" + sha256);
+        // Avoid h2c upgrades for streamed blobs on cleartext coordinator connections.
+        if ("http".equalsIgnoreCase(URI.create(config.coordinatorUrl()).getScheme())) {
+            download.version(HttpClient.Version.HTTP_1_1);
+        }
+        HttpResponse<InputStream> response = httpClient.send(download.timeout(Duration.ofSeconds(60)).GET().build(),
                 HttpResponse.BodyHandlers.ofInputStream());
         try (InputStream body = response.body()) {
             openBodies.add(body);

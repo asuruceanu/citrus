@@ -25,6 +25,7 @@ import java.util.stream.IntStream;
 
 import org.citrusframework.distribution.config.DistributionJson;
 import org.citrusframework.distribution.config.DistributionSettings;
+import org.citrusframework.distribution.model.InputPreparation;
 import org.citrusframework.distribution.model.ArtifactKind;
 import org.citrusframework.distribution.model.ArtifactRef;
 import org.citrusframework.distribution.model.BuildSessionRecord;
@@ -69,6 +70,7 @@ class SessionCoordinatorTest {
     @TempDir
     Path tempDir;
 
+    private final AtomicLong fixtureClock = new AtomicLong(System.currentTimeMillis());
     private JdbcDistributionStore store;
     private CoordinatorEventStreamHub hub;
     private SessionCoordinator coordinator;
@@ -77,12 +79,34 @@ class SessionCoordinatorTest {
     void setUp() {
         DistributionCoordinatorConfig config = DistributionCoordinatorConfig.builder()
                 .cacheDir(tempDir.resolve("cache"))
+                .clock(fixtureClock::get)
                 .leaseTimeoutMs(LEASE_MS)
                 .build();
         store = new JdbcDistributionStore("jdbc:hsqldb:mem:coordinator_" + System.nanoTime(), "SA", "");
         store.initialize();
         hub = new CoordinatorEventStreamHub(store);
         coordinator = new SessionCoordinator(config, store, hub);
+    }
+
+    @Test
+    void observedPeakCountsDistinctOverlappingUnitsInOneAttempt() {
+        String session = newSession(1);
+        recordTestEvent(session, "A", "first", "STARTED", 1);
+        recordTestEvent(session, "A", "second", "STARTED", 1);
+        recordTestEvent(session, "A", "first", "PASSED", 1);
+        recordTestEvent(session, "B", "third", "STARTED", 1);
+        recordTestEvent(session, "C", "fourth", "STARTED", 2);
+        recordTestEvent(session, "A", "second", "PASSED", 1);
+        recordTestEvent(session, "D", "fifth", "STARTED", 1);
+        assertThat(coordinator.observedWorkUnitPeak(session, "part-test", 1)).isEqualTo(2);
+        assertThat(coordinator.observedWorkUnitPeak(session, "part-test", 2)).isEqualTo(1);
+        assertThat(coordinator.observedWorkUnitPeak(session, "part-test", 3)).isZero();
+    }
+
+    private void recordTestEvent(String session, String unit, String test, String status, int attempt) {
+        store.appendEvent(new CoordinatorEvent(0, "test.event", session, "part-test", "worker", 0,
+                Map.of("attempt", attempt, "workUnitKey", unit, "uniqueId", test, "status", status)),
+                null, null, List.of());
     }
 
     @Test
@@ -328,14 +352,16 @@ class SessionCoordinatorTest {
     }
 
     @Test
-    void shouldCancelExpiredLeaseAndReassignOnlyAfterWorkerConfirmsItStopped() throws Exception {
+    void shouldCancelExpiredLeaseAndReassignOnlyAfterWorkerConfirmsItStopped() {
+        AtomicLong clock = useControlledClock(false, LEASE_MS);
         String sessionId = newSession(2);
         Worker worker = register("conn-1", "worker-1", WORKSPACE_CAPS);
         submit(sessionId, "sub-1", List.of(), List.of("target/docs"), true, unit("a.A"));
         PartitionAssignPayload first = worker.lastAssignment();
         assertThat(first.attempt()).isEqualTo(1);
 
-        expireLeases();
+        clock.addAndGet(LEASE_MS * 2);
+        coordinator.sweepExpiredLeases();
 
         assertThat(worker.messagesOfType(WorkerWsMessage.PARTITION_CANCEL)).singleElement()
                 .satisfies(cancel -> assertThat(cancel.payload())
@@ -397,7 +423,7 @@ class SessionCoordinatorTest {
     void shouldSkipWorkersSilentForLongerThanTheLease() throws Exception {
         String sessionId = newSession(1);
         Worker silent = register("conn-1", "worker-1", Map.of());
-        Thread.sleep(LEASE_MS * 2);
+        fixtureClock.addAndGet(LEASE_MS * 2);
         submit(sessionId, "sub-1", List.of(), List.of(), false, unit("a.A"));
         assertThat(silent.assignments()).isEmpty();
 
@@ -430,7 +456,7 @@ class SessionCoordinatorTest {
         assertThat(store.listTestExecutions(sessionId)).isEmpty();
 
         // A stalled worker's heartbeat naming the partition must not keep the new attempt's lease alive.
-        Thread.sleep(LEASE_MS * 2);
+        fixtureClock.addAndGet(LEASE_MS * 2);
         stalled.heartbeat(second.partitionId());
         coordinator.sweepExpiredLeases();
         assertThat(healthy.messagesOfType(WorkerWsMessage.PARTITION_CANCEL))
@@ -454,14 +480,32 @@ class SessionCoordinatorTest {
     }
 
     @Test
-    void shouldKeepAssignedLeaseAliveWithHeartbeatsBeforeStartedAndRejectStaleStarted() throws Exception {
+    void shouldExposeInputPreparationOnlyForTheActiveAttemptAndKeepItOnCompletion() {
+        String sessionId = newSession(1);
+        Worker worker = register("conn-1", "worker-1", Map.of());
+        submit(sessionId, "sub-1", List.of(), List.of(), false, unit("pkg.BaseTest"));
+        var assign = worker.lastAssignment();
+        var prep = new InputPreparation(100L, 290L, 50L);
+        worker.send(WorkerWsMessage.PARTITION_INPUTS_READY, Map.of(
+                "partitionId", assign.partitionId(), "attempt", 2, "inputPreparation", prep));
+        assertThat(partition(sessionId).inputPreparation()).isNull();
+        worker.send(WorkerWsMessage.PARTITION_INPUTS_READY, Map.of(
+                "partitionId", assign.partitionId(), "attempt", 1, "inputPreparation", prep));
+        assertThat(partition(sessionId).inputPreparation()).isEqualTo(prep);
+        worker.complete(assign, 1, List.of());
+        assertThat(partition(sessionId).inputPreparation()).isEqualTo(prep);
+    }
+
+    @Test
+    void shouldKeepAssignedLeaseAliveWithHeartbeatsBeforeStartedAndRejectStaleStarted() {
+        AtomicLong clock = useControlledClock(false, LEASE_MS);
         String sessionId = newSession(1);
         Worker worker = register("conn-1", "worker-1", Map.of());
         submit(sessionId, "sub-1", List.of(), List.of(), false, unit("a.A"));
         PartitionAssignPayload assign = worker.lastAssignment();
 
         for (int i = 0; i < 3; i++) {
-            Thread.sleep(LEASE_MS / 2);
+            clock.addAndGet(LEASE_MS / 2);
             worker.heartbeat(assign.partitionId());
         }
         coordinator.sweepExpiredLeases();
@@ -568,6 +612,34 @@ class SessionCoordinatorTest {
     }
 
     @Test
+    void shouldUseIdleWorkersBeforeGrantingOneOverflowSlotPerWorker() {
+        var a = register("a", "worker-a", Map.of());
+        var spare = new Worker("spare");
+        var spareRegistration = new WorkerRegisterPayload("worker-a", "host", null, null, null, Map.of(), null, true);
+        coordinator.registerWorker("spare", spareRegistration, spare.received::add);
+        var b = register("b", "worker-b", Map.of());
+        var session = newSession(1);
+        submit(session, "two", List.of(), List.of(), false, unit("A"), unit("B"));
+        assertThat(a.assignments()).hasSize(1);
+        assertThat(b.assignments()).hasSize(1);
+        assertThat(spare.assignments()).isEmpty();
+
+        submit(session, "more", List.of(), List.of(), false, unit("C"), unit("D"));
+        assertThat(spare.assignments()).hasSize(1);
+        var duplicate = new Worker("spare-reconnect");
+        coordinator.registerWorker(duplicate.connectionId, spareRegistration, duplicate.received::add);
+        assertThat(duplicate.assignments()).isEmpty();
+        assertThat(store.listPartitions(session)).filteredOn(p -> p.state() == PartitionState.PENDING).hasSize(1);
+        assertThat(coordinator.listWorkers()).filteredOn(w -> w.workerId().equals("worker-a")).singleElement()
+                .satisfies(w -> {
+                    assertThat(w.connectedSlots()).isEqualTo(2);
+                    assertThat(w.activePartitionIds()).hasSize(2);
+                });
+        b.complete(b.lastAssignment(), 1, List.of());
+        assertThat(b.assignments()).hasSize(2);
+    }
+
+    @Test
     void shouldPreferAnotherWorkerForRetry() {
         String sessionId = newSession(2);
         Worker original = register("conn-a1", "worker-a", Map.of());
@@ -588,7 +660,7 @@ class SessionCoordinatorTest {
     void shouldNotDispatchToSilentWorkerWhoseFirstMessageIsDraining() throws Exception {
         String sessionId = newSession(1);
         Worker worker = register("conn-1", "worker-1", Map.of());
-        Thread.sleep(LEASE_MS * 2);
+        fixtureClock.addAndGet(LEASE_MS * 2);
         submit(sessionId, "sub-1", List.of(), List.of(), false, unit("a.A"));
 
         worker.send(WorkerWsMessage.WORKER_DRAINING, Map.of());
@@ -938,6 +1010,35 @@ class SessionCoordinatorTest {
     }
 
     @Test
+    void shouldRemoveOnlyFinishedSessionsAndOfflineWorkers() {
+        String session = newSession(1);
+        String other = newSession(1);
+        Worker worker = register("connection", "worker-1", Map.of());
+        submit(session, "submission", List.of(), List.of(), false, unit("pkg.RemoteIT"));
+        var assignment = worker.lastAssignment();
+        worker.send(WorkerWsMessage.TEST_EVENT, DistributionJson.convert(new WorkerTestEventPayload(
+                assignment.partitionId(), session, 1, "pkg.RemoteIT", "pkg.RemoteIT", "test",
+                TestOutcomeStatus.PASSED, 5L, null, null, List.of()), Map.class));
+
+        assertThat(coordinator.deleteSession(session)).isEqualTo(SessionCoordinator.Deletion.ACTIVE);
+        assertThat(coordinator.deleteWorker("worker-1")).isEqualTo(SessionCoordinator.Deletion.ACTIVE);
+        coordinator.abortSession(session, "finished");
+        coordinator.handleWorkerDisconnect("connection");
+        assertThat(coordinator.deleteWorker("worker-1")).isEqualTo(SessionCoordinator.Deletion.DELETED);
+        assertThat(store.listTestExecutions(session)).isNotEmpty();
+        assertThat(partition(session).workerId()).isEqualTo("worker-1");
+        assertThat(coordinator.deleteSession(session)).isEqualTo(SessionCoordinator.Deletion.DELETED);
+        assertThat(coordinator.getSessionDetail(session)).isEmpty();
+        assertThat(coordinator.getSessionDetail(other)).isPresent();
+        assertThat(store.listPartitions(session)).isEmpty();
+        assertThat(store.listTestExecutions(session)).isEmpty();
+        assertThat(store.findWorkSubmission(session, "submission")).isEmpty();
+        store.replayEvents(session, 0, 0, event -> { throw new AssertionError(event); });
+        assertThat(coordinator.deleteSession(session)).isEqualTo(SessionCoordinator.Deletion.MISSING);
+        assertThat(coordinator.deleteWorker("worker-1")).isEqualTo(SessionCoordinator.Deletion.MISSING);
+    }
+
+    @Test
     void shouldRecordLocalTestExecutionsAndAbortRunningSession() {
         String sessionId = newSession(1);
         Worker worker = register("conn-abort", "worker-abort", Map.of());
@@ -1028,7 +1129,7 @@ class SessionCoordinatorTest {
     @Test
     void shouldPreserveWorkerCacheStatsWhenAbortingASessionResetsAnOrphanedBusyWorker() {
         WorkerCacheStats stats = new WorkerCacheStats(true, 100L, 2, 300L, 400L, 6L, false);
-        long now = System.currentTimeMillis();
+        long now = fixtureClock.get();
         store.saveSession(new BuildSessionRecord(
                 "sess-cache-abort", "citrus", "main", "deadbeef",
                 SessionStatus.RUNNING, now - 5_000L, 0L,
@@ -1061,7 +1162,7 @@ class SessionCoordinatorTest {
 
     @Test
     void shouldAbortPersistedRunningSessionAndMarkPersistedPartitionsLostAfterRehydration() {
-        long now = System.currentTimeMillis();
+        long now = fixtureClock.get();
         store.saveSession(new BuildSessionRecord(
                 "sess-rehydrated-abort", "citrus", "main", "deadbeef",
                 SessionStatus.RUNNING, now - 5_000L, 0L,
@@ -1136,9 +1237,13 @@ class SessionCoordinatorTest {
     private static final Map<String, String> DOCKER = Map.of("jdk", "21", "docker", "true");
 
     private AtomicLong useControlledClock(boolean requirePool) {
+        return useControlledClock(requirePool, 100_000_000L);
+    }
+
+    private AtomicLong useControlledClock(boolean requirePool, long leaseMs) {
         AtomicLong clock = new AtomicLong(10_000_000L);
         coordinator = new SessionCoordinator(DistributionCoordinatorConfig.builder().clock(clock::get)
-                .requireAgentPool(requirePool).leaseTimeoutMs(100_000_000L).build(), store, hub);
+                .requireAgentPool(requirePool).leaseTimeoutMs(leaseMs).build(), store, hub);
         return clock;
     }
 
@@ -1780,7 +1885,7 @@ class SessionCoordinatorTest {
      * Lets every lease expire, keeps {@code liveWorkers} alive with an idle heartbeat, then sweeps.
      */
     private void expireLeases(Worker... liveWorkers) throws InterruptedException {
-        Thread.sleep(LEASE_MS * 2);
+        fixtureClock.addAndGet(LEASE_MS * 2);
         for (Worker live : liveWorkers) {
             live.heartbeat(null);
         }

@@ -21,18 +21,20 @@
   <actions>
     <testcontainers>
       <compose>
-        <up file="classpath:org/citrusframework/testcontainers/integration/compose/compose.yaml"/>
+        <up file="classpath:org/citrusframework/testcontainers/integration/compose/compose.yaml">
+          <exposedServices name="web-1" port="80"/>
+        </up>
       </compose>
     </testcontainers>
     <wait-for>
-      <http url="http://localhost:8880"/>
+      <http url="http://${CITRUS_TESTCONTAINERS_WEB_1_SERVICE_HOST}:${CITRUS_TESTCONTAINERS_WEB_1_SERVICE_PORT}"/>
     </wait-for>
-    <http client="http://localhost:8880">
+    <http client="http://${CITRUS_TESTCONTAINERS_WEB_1_SERVICE_HOST}:${CITRUS_TESTCONTAINERS_WEB_1_SERVICE_PORT}">
       <send-request>
         <GET/>
       </send-request>
     </http>
-    <http client="http://localhost:8880">
+    <http client="http://${CITRUS_TESTCONTAINERS_WEB_1_SERVICE_HOST}:${CITRUS_TESTCONTAINERS_WEB_1_SERVICE_PORT}">
       <receive-response>
         <response status="200" reason-phrase="OK">
           <body>
