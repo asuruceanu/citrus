@@ -36,7 +36,7 @@ public class SpringSourceFixture extends TestNGCitrusSpringSupport {
     }
 
     @Test
-    @CitrusTestSource(type = TestLoader.SPRING, name = {"EchoActionIT", "FailActionIT"},
+    @CitrusTestSource(type = TestLoader.XML, name = {"EchoActionIT", "FailActionIT"},
             packageName = "org.citrusframework.testng.integration.actions")
     public void runSources() {
     }
