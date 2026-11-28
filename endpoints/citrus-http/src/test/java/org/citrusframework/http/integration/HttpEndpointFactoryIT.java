@@ -33,6 +33,6 @@ import org.springframework.test.context.ContextConfiguration;
 public class HttpEndpointFactoryIT {
 
     @Test
-    @CitrusTestSource(type = TestLoader.SPRING, name = "HttpEndpointFactoryIT")
+    @CitrusTestSource(type = TestLoader.XML, name = "HttpEndpointFactoryIT")
     public void testHttpEndpointFactory() {}
 }

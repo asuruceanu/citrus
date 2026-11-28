@@ -30,7 +30,7 @@ import org.junit.jupiter.api.parallel.Isolated;
 public class HttpSendMessageJsonSchemaValidationIT {
 
     @Test
-    @CitrusTestSource(type = TestLoader.SPRING, name = "HttpSendMessageJsonSchemaValidationIT")
+    @CitrusTestSource(type = TestLoader.XML, name = "HttpSendMessageJsonSchemaValidationIT")
     public void testHttpSendMessageJsonSchemaValidationIT() {}
 
 }

@@ -38,11 +38,11 @@ public class HttpServerIT {
     public void serverStandaloneIT() {}
 
     @Test
-    @CitrusTestSource(type = TestLoader.SPRING, name = "HttpParallelRequest_1_IT")
+    @CitrusTestSource(type = TestLoader.XML, name = "HttpParallelRequest_1_IT")
     public void parallelRequestsIterateIT() {}
 
     @Test
-    @CitrusTestSource(type = TestLoader.SPRING, name = "HttpParallelRequest_2_IT")
+    @CitrusTestSource(type = TestLoader.XML, name = "HttpParallelRequest_2_IT")
     public void parallelRequestsEndpointUriIT() {}
 
     @Test
