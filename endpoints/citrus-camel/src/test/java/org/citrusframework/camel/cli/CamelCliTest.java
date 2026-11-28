@@ -77,6 +77,67 @@ public class CamelCliTest {
         Assertions.assertFalse(error instanceof CamelCliTransientException);
     }
 
+    @Test
+    public void shouldStopIntegrationByPid() {
+        mockStopResult(0);
+        Assertions.assertDoesNotThrow(() -> new CamelCli(launcher).stop(42L));
+    }
+
+    @Test
+    public void shouldTreatNotFoundExitCodeAsSuccess() {
+        mockStopResult(3);
+        Assertions.assertDoesNotThrow(() -> new CamelCli(launcher).stop(42L));
+    }
+
+    @Test
+    public void shouldFailOnStopErrorExitCode() {
+        mockStopResult(2);
+        CitrusRuntimeException error = Assertions.assertThrows(CitrusRuntimeException.class,
+                () -> new CamelCli(launcher).stop(42L));
+        Assertions.assertTrue(error.getMessage().contains("exit code 2"));
+    }
+
+    @Test
+    public void shouldStopAllIntegrations() {
+        mockStopAllResult(0);
+        Assertions.assertDoesNotThrow(() -> new CamelCli(launcher).stop());
+    }
+
+    @Test
+    public void shouldTreatNotFoundExitCodeAsSuccessForStopAll() {
+        mockStopAllResult(3);
+        Assertions.assertDoesNotThrow(() -> new CamelCli(launcher).stop());
+    }
+
+    @Test
+    public void shouldReportTimeoutExitCodeForStopByPid() {
+        mockStopResult(124);
+        CitrusRuntimeException error = Assertions.assertThrows(CitrusRuntimeException.class,
+                () -> new CamelCli(launcher).stop(42L));
+        Assertions.assertTrue(error.getMessage().contains("did not stop within the timeout"));
+        Assertions.assertTrue(error.getMessage().contains("pid 42"));
+    }
+
+    @Test
+    public void shouldReportTimeoutExitCodeForStopAll() {
+        mockStopAllResult(124);
+        CitrusRuntimeException error = Assertions.assertThrows(CitrusRuntimeException.class,
+                () -> new CamelCli(launcher).stop());
+        Assertions.assertTrue(error.getMessage().contains("did not stop within the timeout"));
+    }
+
+    private void mockStopResult(int exitCode) {
+        when(launcher.run("stop", "42")).thenReturn(pao);
+        when(pao.getProcess()).thenReturn(process);
+        when(process.exitValue()).thenReturn(exitCode);
+    }
+
+    private void mockStopAllResult(int exitCode) {
+        when(launcher.run("stop")).thenReturn(pao);
+        when(pao.getProcess()).thenReturn(process);
+        when(process.exitValue()).thenReturn(exitCode);
+    }
+
     private void mockSendResult(int exitCode, String output) {
         when(launcher.run(eq("cmd"), anyList())).thenAnswer(invocation -> {
             List<String> args = invocation.getArgument(1);

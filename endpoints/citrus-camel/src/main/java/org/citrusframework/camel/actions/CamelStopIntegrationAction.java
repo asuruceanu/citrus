@@ -17,8 +17,12 @@
 package org.citrusframework.camel.actions;
 
 import java.util.List;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 import org.citrusframework.api.actions.camel.CamelIntegrationStopActionBuilder;
+import org.citrusframework.camel.cli.CamelCliSettings;
 import org.citrusframework.context.TestContext;
 import org.citrusframework.exceptions.CitrusRuntimeException;
 import org.citrusframework.jbang.ProcessAndOutput;
@@ -33,27 +37,37 @@ public class CamelStopIntegrationAction extends AbstractCamelCliAction {
     /** Logger */
     private static final Logger logger = LoggerFactory.getLogger(CamelStopIntegrationAction.class);
 
-    /** Route id */
-    private final String integrationName;
+    private static final long DEFAULT_STOP_TIMEOUT = 60000L;
 
-    /**
-     * Default constructor.
-     */
+    private final String integrationName;
+    private final boolean waitForStoppedState;
+    private final long stopTimeout;
+
     public CamelStopIntegrationAction(Builder builder) {
         super("stop", builder);
 
         this.integrationName = builder.integrationName;
+        this.waitForStoppedState = builder.waitForStoppedState;
+        this.stopTimeout = builder.stopTimeout;
     }
 
     @Override
     public void doExecute(TestContext context) {
         String name = context.replaceDynamicContentInString(integrationName);
 
+        if (context.getVariables().containsKey(CamelIntegrationExitWatcher.CONTEXT_VARIABLE)) {
+            CamelIntegrationExitWatcher watcher = context.getVariable(
+                    CamelIntegrationExitWatcher.CONTEXT_VARIABLE, CamelIntegrationExitWatcher.class);
+            if (name.equals("*")) {
+                watcher.unwatchAll();
+            } else {
+                watcher.unwatch(name);
+            }
+        }
+
         if (name.equals("*")) {
             logger.info("Stopping all Camel integrations ...");
-
             camelCli().stop();
-
             logger.info("Stopped all Camel integrations");
         } else {
             logger.info("Stopping Camel integration '%s' ...".formatted(name));
@@ -65,16 +79,18 @@ public class CamelStopIntegrationAction extends AbstractCamelCliAction {
                 pid = context.getVariable(pidKey, Long.class);
             } else {
                 pid = findIntegrationByName(name);
+                if (pid == null) {
+                    logger.info("Camel integration '{}' not found - may have already exited", name);
+                    return;
+                }
             }
 
             camelCli().stop(pid);
 
             String processKey = "%s:%d".formatted(processKeyPrefix, pid);
             if (context.getVariables().containsKey(processKey)) {
-                // check if process is still alive
                 ProcessAndOutput pao = context.getVariable(processKey, ProcessAndOutput.class);
                 if (pao.getProcess().isAlive()) {
-                    // Check if there is a descendant process to be stopped
                     List<Long> descendants = pao.getDescendants();
                     for (Long descendantPid : descendants) {
                         camelCli().stop(descendantPid);
@@ -83,19 +99,48 @@ public class CamelStopIntegrationAction extends AbstractCamelCliAction {
                 }
             }
 
+            if (waitForStoppedState) {
+                waitForStoppedState(pid, name);
+            }
+
             logger.info("Stopped Camel integration '%s' (%s)".formatted(name, pid));
         }
+    }
+
+    private void waitForStoppedState(Long pid, String name) {
+        ProcessHandle.of(pid).ifPresent(handle -> {
+            try {
+                handle.onExit().get(stopTimeout, TimeUnit.MILLISECONDS);
+            } catch (TimeoutException e) {
+                throw new CitrusRuntimeException(
+                        "Camel integration '%s' (pid %d) did not stop within %d ms".formatted(name, pid, stopTimeout));
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new CitrusRuntimeException(
+                        "Interrupted while waiting for Camel integration '%s' (pid %d) to stop".formatted(name, pid), e);
+            } catch (ExecutionException e) {
+                // process exited, which is what we wanted
+            }
+        });
     }
 
     private Long findIntegrationByName(String name) {
         return camelCli().getAll().stream()
                 .filter(props -> name.equals(props.get("name")) && !props.getOrDefault("pid", "").isBlank())
                 .map(props -> Long.valueOf(props.get("pid"))).findFirst()
-                .orElseThrow(() -> new CitrusRuntimeException(String.format("Camel integration '%s' not found", name)));
+                .orElse(null);
     }
 
     public String getIntegrationName() {
         return integrationName;
+    }
+
+    public boolean isWaitForStoppedState() {
+        return waitForStoppedState;
+    }
+
+    public long getStopTimeout() {
+        return stopTimeout;
     }
 
     /**
@@ -105,6 +150,8 @@ public class CamelStopIntegrationAction extends AbstractCamelCliAction {
             implements CamelIntegrationStopActionBuilder<CamelStopIntegrationAction, Builder> {
 
         private String integrationName = "*";
+        private boolean waitForStoppedState = CamelCliSettings.isWaitForStoppedState();
+        private long stopTimeout = DEFAULT_STOP_TIMEOUT;
 
         @Override
         public Builder integration(String name) {
@@ -115,6 +162,16 @@ public class CamelStopIntegrationAction extends AbstractCamelCliAction {
         @Override
         public Builder integrationName(String name) {
             this.integrationName = name;
+            return this;
+        }
+
+        public Builder waitForStoppedState(boolean enabled) {
+            this.waitForStoppedState = enabled;
+            return this;
+        }
+
+        public Builder stopTimeout(long timeout) {
+            this.stopTimeout = timeout;
             return this;
         }
 

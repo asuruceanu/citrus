@@ -56,6 +56,11 @@ public class CamelCli {
     /** Logger */
     private static final Logger logger = LoggerFactory.getLogger(CamelCli.class);
 
+    // Camel CLI exit code for "not found" (integration already exited)
+    private static final int NOT_FOUND_EXIT_CODE = 3;
+    // Camel CLI exit code for "timeout" (integration did not stop in time)
+    private static final int TIMEOUT_EXIT_CODE = 124;
+
     private final ProcessLauncher app;
 
     private boolean dumpIntegrationOutput = CamelCliSettings.isDumpIntegrationOutput();
@@ -211,20 +216,36 @@ public class CamelCli {
      * Stops all Camel integrations run via Came CLI.
      */
     public void stop() {
-        ProcessAndOutput p = app.run("stop") ;
-        if (p.getProcess().exitValue() != OK_EXIT_CODE) {
-            throw new CitrusRuntimeException(String.format("Failed to stop Camel integration - exit code %d", p.getProcess().exitValue()));
-        }
+        ProcessAndOutput p = app.run("stop");
+        checkStopExitCode(p.getProcess().exitValue(), null);
     }
 
     /**
      * Stops given Camel integration identified by its process id.
      */
     public void stop(Long pid) {
-        ProcessAndOutput p = app.run("stop", String.valueOf(pid)) ;
-        if (p.getProcess().exitValue() != OK_EXIT_CODE) {
-            throw new CitrusRuntimeException(String.format("Failed to stop Camel integration - exit code %d", p.getProcess().exitValue()));
+        ProcessAndOutput p = app.run("stop", String.valueOf(pid));
+        checkStopExitCode(p.getProcess().exitValue(), pid);
+    }
+
+    private void checkStopExitCode(int exitValue, Long pid) {
+        if (exitValue == OK_EXIT_CODE) {
+            return;
         }
+
+        if (exitValue == NOT_FOUND_EXIT_CODE) {
+            if (pid != null) {
+                logger.info("Camel integration (pid {}) had already exited", pid);
+            }
+            return;
+        }
+
+        if (exitValue == TIMEOUT_EXIT_CODE) {
+            throw new CitrusRuntimeException(
+                    "Camel integration%s did not stop within the timeout".formatted(pid != null ? " (pid %d)".formatted(pid) : ""));
+        }
+
+        throw new CitrusRuntimeException(String.format("Failed to stop Camel integration - exit code %d", exitValue));
     }
 
     /**
