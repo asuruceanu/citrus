@@ -12,6 +12,6 @@ import org.citrusframework.testng.spring.TestNGCitrusSpringSupport;
 @Test
 public class HelloService_Ok_IT extends TestNGCitrusSpringSupport {
 
-    @CitrusTestSource(type = TestLoader.SPRING, name = "HelloService_Ok_IT")
+    @CitrusTestSource(type = TestLoader.XML, name = "HelloService_Ok_IT")
     public void helloServiceOk() {}
 }

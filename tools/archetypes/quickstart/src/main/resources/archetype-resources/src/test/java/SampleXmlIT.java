@@ -13,6 +13,6 @@ import org.citrusframework.testng.spring.TestNGCitrusSpringSupport;
 @Test
 public class SampleXmlIT extends TestNGCitrusSpringSupport {
 
-    @CitrusTestSource(type = TestLoader.SPRING, name = "SampleXmlIT")
+    @CitrusTestSource(type = TestLoader.XML, name = "SampleXmlIT")
     public void sampleXml() {}
 }
