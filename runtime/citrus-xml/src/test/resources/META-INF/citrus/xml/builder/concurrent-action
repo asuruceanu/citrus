@@ -1,0 +1,2 @@
+type=org.citrusframework.xml.TestActionsTest$ConcurrentActionBuilder
+ns=http://citrusframework.org/schema/xml/testcase

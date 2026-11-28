@@ -17,15 +17,14 @@
 package org.citrusframework.xml;
 
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
 
 import jakarta.xml.bind.JAXBContext;
 import jakarta.xml.bind.JAXBElement;
 import jakarta.xml.bind.JAXBException;
-import jakarta.xml.bind.Unmarshaller;
 import jakarta.xml.bind.annotation.XmlAnyElement;
 import jakarta.xml.bind.annotation.XmlElementRef;
 import jakarta.xml.bind.annotation.XmlElementRefs;
@@ -48,8 +47,8 @@ import org.w3c.dom.Node;
 
 public class TestActions {
 
-    /** Unmarshaller cache filled with instances created for custom action Xml element refs */
-    private static final Map<String, Unmarshaller> UNMARSHALLER_CACHE = new HashMap<>();
+    /** JAXB context cache for custom action Xml element refs */
+    private static final Map<String, JAXBContext> JAXB_CONTEXT_CACHE = new ConcurrentHashMap<>();
 
     @XmlElementRefs({
             @XmlElementRef(name = "action", type = Action.class, required = false),
@@ -111,15 +110,15 @@ public class TestActions {
                 Optional<TestActionBuilder<?>> builder = XmlTestActionBuilder.lookup(node.getLocalName(), node.getNamespaceURI());
                 if (builder.isPresent()) {
                     try {
-                        Unmarshaller unmarshaller;
-                        if (UNMARSHALLER_CACHE.containsKey(builder.get().getClass().getName())) {
-                            unmarshaller = UNMARSHALLER_CACHE.get(builder.get().getClass().getName());
-                        } else {
-                            unmarshaller = JAXBContext.newInstance(builder.get().getClass()).createUnmarshaller();
-                            UNMARSHALLER_CACHE.put(builder.get().getClass().getName(), unmarshaller);
-                        }
+                        JAXBContext jaxbContext = JAXB_CONTEXT_CACHE.computeIfAbsent(builder.get().getClass().getName(), key -> {
+                            try {
+                                return JAXBContext.newInstance(builder.get().getClass());
+                            } catch (JAXBException e) {
+                                throw new CitrusRuntimeException("Failed to create XML test action unmarshaller", e);
+                            }
+                        });
 
-                        action = unmarshaller.unmarshal(node, builder.get().getClass()).getValue();
+                        action = jaxbContext.createUnmarshaller().unmarshal(node, builder.get().getClass()).getValue();
                     } catch (JAXBException e) {
                         throw new CitrusRuntimeException("Failed to create XMLTestLoader instance", e);
                     }
