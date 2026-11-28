@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<template xmlns="http://citrusframework.org/schema/xml/testcase" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" global-context="false" name="print" xsi:schemaLocation="http://citrusframework.org/schema/xml/testcase http://citrusframework.org/schema/xml/testcase/citrus-testcase.xsd">
+  <actions>
+    <echo>
+      <message>${param1}</message>
+    </echo>
+    <echo>
+      <message>${param2}</message>
+    </echo>
+  </actions>
+</template>
