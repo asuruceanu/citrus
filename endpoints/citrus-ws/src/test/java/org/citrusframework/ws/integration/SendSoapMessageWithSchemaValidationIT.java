@@ -33,7 +33,7 @@ import org.junit.jupiter.api.parallel.Isolated;
 public class SendSoapMessageWithSchemaValidationIT {
 
     @Test
-    @CitrusTestSource(type = TestLoader.SPRING)
+    @CitrusTestSource(type = TestLoader.XML)
     public void SendSoapMessageWithSchemaValidationIT() {}
 
 }
